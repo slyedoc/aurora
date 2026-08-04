@@ -16,6 +16,7 @@ use crate::{
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
     render_texture::RenderTexture,
+    vk_utils,
     vulkan_asset::VulkanAsset,
 };
 
@@ -418,10 +419,19 @@ pub fn build_blas_from_buffers(
         &size_info,
     );
 
+    // The scratch address must be a multiple of minAccelerationStructureScratchOffsetAlignment.
+    // The allocator gives no such guarantee, so over-allocate by one alignment and round the
+    // address up into that slack. (Same handling as the TLAS build in tlas_builder.rs.)
+    let as_properties = vk_utils::get_acceleration_structure_properties(render_device);
+    let scratch_alignment =
+        as_properties.min_acceleration_structure_scratch_offset_alignment as u64;
+
     let scratch_buffer: Buffer<u8> = render_device.create_device_buffer(
-        size_info.build_scratch_size,
+        size_info.build_scratch_size + scratch_alignment,
         vk::BufferUsageFlags::STORAGE_BUFFER,
     );
+
+    let scratch_address = vk_utils::aligned_size(scratch_buffer.address, scratch_alignment);
 
     let build_geometry_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
@@ -433,7 +443,7 @@ pub fn build_blas_from_buffers(
         .dst_acceleration_structure(acceleration_structure.handle)
         .geometries(&geometry_infos)
         .scratch_data(vk::DeviceOrHostAddressKHR {
-            device_address: scratch_buffer.address,
+            device_address: scratch_address,
         });
 
     let build_range_infos: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = geometries
@@ -526,54 +536,68 @@ pub fn build_blas_from_buffers(
         (compacted_sizes[0] as f32 / size_info.acceleration_structure_size as f32) * 100.0
     );
 
-    let compacted_buffer = render_device.create_device_buffer::<u8>(
-        compacted_sizes[0],
-        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-    );
+    // A zero compacted size means the query never produced a result -- creating a buffer of that
+    // size yields VK_NULL_HANDLE, which then fails AS creation and the compacting copy. Keep the
+    // uncompacted structure instead of building on top of a bad query.
+    if compacted_sizes[0] > 0 && compacted_sizes[0] < size_info.acceleration_structure_size {
+        let compacted_buffer = render_device.create_device_buffer::<u8>(
+            compacted_sizes[0],
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+        );
 
-    let compacted_as_info = vk::AccelerationStructureCreateInfoKHR::default()
-        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .size(compacted_sizes[0])
-        .buffer(compacted_buffer.handle);
+        let compacted_as_info = vk::AccelerationStructureCreateInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+            .size(compacted_sizes[0])
+            .buffer(compacted_buffer.handle);
 
-    let compacted_as = unsafe {
-        render_device
-            .ext_acc_struct
-            .create_acceleration_structure(&compacted_as_info, None)
-    }
-    .unwrap();
-
-    unsafe {
-        render_device.run_transfer_commands(&|cmd_buffer| {
-            let copy_info = vk::CopyAccelerationStructureInfoKHR::default()
-                .src(acceleration_structure.handle)
-                .dst(compacted_as)
-                .mode(vk::CopyAccelerationStructureModeKHR::COMPACT);
+        let compacted_as = unsafe {
             render_device
                 .ext_acc_struct
-                .cmd_copy_acceleration_structure(cmd_buffer, &copy_info);
-        })
+                .create_acceleration_structure(&compacted_as_info, None)
+        }
+        .unwrap();
+
+        unsafe {
+            render_device.run_transfer_commands(&|cmd_buffer| {
+                let copy_info = vk::CopyAccelerationStructureInfoKHR::default()
+                    .src(acceleration_structure.handle)
+                    .dst(compacted_as)
+                    .mode(vk::CopyAccelerationStructureModeKHR::COMPACT);
+                render_device
+                    .ext_acc_struct
+                    .cmd_copy_acceleration_structure(cmd_buffer, &copy_info);
+            })
+        }
+
+        unsafe {
+            render_device
+                .destroyer
+                .destroy_acceleration_structure(acceleration_structure.handle);
+            render_device
+                .destroyer
+                .destroy_buffer(acceleration_structure.buffer.handle);
+        }
+        acceleration_structure.buffer = compacted_buffer;
+        acceleration_structure.handle = compacted_as;
+        acceleration_structure.address = unsafe {
+            render_device
+                .ext_acc_struct
+                .get_acceleration_structure_device_address(
+                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                        .acceleration_structure(acceleration_structure.handle),
+                )
+        };
+    } else {
+        log::warn!(
+            "Skipping BLAS compaction: reported compacted size {} is not a shrink from {}",
+            compacted_sizes[0],
+            size_info.acceleration_structure_size
+        );
     }
 
     unsafe {
-        render_device
-            .destroyer
-            .destroy_acceleration_structure(acceleration_structure.handle);
-        render_device
-            .destroyer
-            .destroy_buffer(acceleration_structure.buffer.handle);
         render_device.device.destroy_query_pool(query_pool, None);
     }
-    acceleration_structure.buffer = compacted_buffer;
-    acceleration_structure.handle = compacted_as;
-    acceleration_structure.address = unsafe {
-        render_device
-            .ext_acc_struct
-            .get_acceleration_structure_device_address(
-                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                    .acceleration_structure(acceleration_structure.handle),
-            )
-    };
 
     BLAS {
         acceleration_structure,
