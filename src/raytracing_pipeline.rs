@@ -5,7 +5,7 @@ use bevy::{
     app::{Plugin, Update},
     asset::{Asset, AssetApp, AssetEvent, Assets, Handle},
     ecs::{
-        event::{EventReader, EventWriter},
+        message::{MessageReader, MessageWriter},
         system::{lifetimeless::SRes, Res},
     },
     reflect::TypePath,
@@ -309,8 +309,8 @@ impl VulkanAsset for RaytracingPipeline {
 
 fn propagate_modified(
     filters: Res<Assets<RaytracingPipeline>>,
-    mut shader_events: EventReader<AssetEvent<Shader>>,
-    mut parent_events: EventWriter<AssetEvent<RaytracingPipeline>>,
+    mut shader_events: MessageReader<AssetEvent<Shader>>,
+    mut parent_events: MessageWriter<AssetEvent<RaytracingPipeline>>,
 ) {
     for event in shader_events.read() {
         match event {

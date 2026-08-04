@@ -4,7 +4,7 @@ use bevy::{
     app::App,
     asset::{Asset, AssetEvent, AssetId, Assets, Handle},
     ecs::{
-        event::EventReader, resource::Resource, schedule::IntoScheduleConfigs, system::{Res, ResMut, StaticSystemParam, SystemParam, SystemParamItem}, world::{Mut, World}
+        message::MessageReader, resource::Resource, schedule::IntoScheduleConfigs, system::{Res, ResMut, StaticSystemParam, SystemParam, SystemParamItem}, world::{Mut, World}
     },
     prelude::{Deref, DerefMut},
     render::{ExtractSchedule, RenderApp},
@@ -87,7 +87,7 @@ impl<A: VulkanAsset> Default for VulkanAssets<A> {
 }
 
 fn extract_vulkan_asset<A: VulkanAsset>(
-    mut asset_events: Extract<EventReader<AssetEvent<A>>>,
+    mut asset_events: Extract<MessageReader<AssetEvent<A>>>,
     assets: Extract<Res<Assets<A>>>,
     mut render_assets: ResMut<VulkanAssets<A>>,
     comms: Res<VulkanAssetComms<A>>,

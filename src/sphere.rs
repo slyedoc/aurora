@@ -4,6 +4,7 @@ use bevy::{prelude::*, render::RenderApp};
 use crate::{
     blas::{allocate_acceleration_structure, AccelerationStructure},
     extract::Extract,
+    ray_render_plugin::ExtractedEntity,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
 };
@@ -176,6 +177,6 @@ fn extract_spheres(
     >,
 ) {
     for (sphere, mat, t, gt) in meshes.iter() {
-        commands.spawn((sphere.clone(), mat.clone(), t.clone(), gt.clone()));
+        commands.spawn((ExtractedEntity, sphere.clone(), mat.clone(), t.clone(), gt.clone()));
     }
 }

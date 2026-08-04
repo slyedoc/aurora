@@ -71,7 +71,7 @@ pub struct FocusData {
 
 fn close_when_requested(
     mut commands: Commands,
-    mut closed: EventReader<WindowCloseRequested>,
+    mut closed: MessageReader<WindowCloseRequested>,
     killswitch: Res<WorldToRenderKillSwitch>,
     mut waiting_state: Local<Option<WindowCloseRequested>>,
 ) {
@@ -213,7 +213,7 @@ impl Plugin for RayRenderPlugin {
 
         let sphere_blas = unsafe { crate::sphere::SphereBLAS::new(&render_device) };
 
-        render_app.add_event::<AppExit>();
+        render_app.add_message::<AppExit>();
         render_app.insert_resource(sphere_blas);
         render_app.insert_resource(render_device.clone());
         render_app.init_resource::<Frame>();
@@ -241,29 +241,33 @@ impl Plugin for RayRenderPlugin {
             Render,
             (
                 (render_frame).in_set(RenderSet::Render),
-                (World::clear_entities).in_set(RenderSet::Cleanup),
+                (despawn_extracted_entities).in_set(RenderSet::Cleanup),
                 (shutdown_render_app,).in_set(RenderSet::Shutdown),
             )
                 .run_if(run_if_render_device_exists),
         );
 
         render_app.set_extract(|main_world, render_world| {
-            assert_eq!(
-                render_world.entities().len(),
-                0,
-                "An entity was spawned after the entity list was cleared last frame and before the extract schedule began. This is not supported",
-            );
-
-            // SAFETY: This is safe given the clear_entities call in the past frame and the assert above
-            unsafe {
-                render_world
-                    .entities_mut()
-                    .flush_as_invalid()
-            }
-
             extract(main_world, render_world);
         });
         app.insert_sub_app(RenderApp, render_app);
+    }
+}
+
+/// Marks an entity that was spawned into the render world by the extract schedule.
+///
+/// These are re-extracted from scratch every frame, so they are despawned during
+/// [`RenderSet::Cleanup`]. This used to be a blanket `World::clear_entities`, but resources are
+/// stored as components now, so clearing every entity would wipe the render world's resources too.
+#[derive(Component)]
+pub struct ExtractedEntity;
+
+fn despawn_extracted_entities(
+    mut commands: Commands,
+    extracted: Query<Entity, With<ExtractedEntity>>,
+) {
+    for entity in extracted.iter() {
+        commands.entity(entity).despawn();
     }
 }
 
@@ -350,6 +354,7 @@ fn extract_render_config(
     commands.insert_resource(render_config.clone());
     for (camera, camera3d, projection, transform, global_transform) in cameras.iter() {
         commands.spawn((
+            ExtractedEntity,
             camera.clone(),
             camera3d.clone(),
             projection.clone(),
@@ -476,7 +481,7 @@ fn render_frame(
         *tick = 0;
     }
     let camera = camera.single().unwrap();
-    let inverse_view = camera.1.compute_matrix();
+    let inverse_view = camera.1.to_matrix();
     let projection_matrix = match camera.0 {
         Projection::Perspective(perspective) => Mat4::perspective_infinite_reverse_rh(
                 perspective.fov,
@@ -748,7 +753,7 @@ fn render_frame(
             shapes,
             pixels_per_point,
             ..
-        } = dev_ui.egui_ctx.run(raw_input, |ctx| {
+        } = dev_ui.egui_ctx.run_ui(raw_input, |ctx| {
             dev_ui_state.ticks = *tick as usize;
             // no idea why the running average starts at inf.
             if *fps_runnig_avg > 100000.0 {

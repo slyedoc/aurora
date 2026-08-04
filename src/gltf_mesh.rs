@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{
     blas::{build_blas_from_buffers, GeometryDescr, RTXMaterial, Vertex, BLAS},
     extract::Extract,
+    ray_render_plugin::ExtractedEntity,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
@@ -54,6 +55,7 @@ impl GltfModel {
 }
 
 #[derive(Default)]
+#[derive(TypePath)]
 pub struct GltfLoader;
 
 #[non_exhaustive]
@@ -91,12 +93,12 @@ impl AssetLoader for GltfLoader {
 
             log::info!(
                 "gltf {} has {} chunks of buffer data",
-                load_context.path().display(),
+                load_context.path(),
                 asset.buffers.len()
             );
             log::info!(
                 "gltf {} has {} chunks of image data",
-                load_context.path().display(),
+                load_context.path(),
                 asset.images.len()
             );
 
@@ -433,6 +435,6 @@ fn extract_gltfs(
     meshes: Extract<Query<(&GltfModelHandle, &Transform, &GlobalTransform)>>,
 ) {
     for (mesh, t, gt) in meshes.iter() {
-        commands.spawn((mesh.clone(), t.clone(), gt.clone()));
+        commands.spawn((ExtractedEntity, mesh.clone(), t.clone(), gt.clone()));
     }
 }

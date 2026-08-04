@@ -8,10 +8,12 @@ use bevy::{
     prelude::*,
     render::RenderApp,
     window::PrimaryWindow,
-    winit::{DisplayHandleWrapper, RawWinitWindowEvent, WinitWindows},
+    winit::{DisplayHandleWrapper, RawWinitWindowEvent, WINIT_WINDOWS},
 };
 use egui::{emath, Context, PlatformOutput, RawInput, ViewportId};
-use egui_ash_renderer::{DynamicRendering, Options, Renderer};
+use egui_ash_renderer::{
+    allocator::GpuAllocator, DynamicRendering, Options, RenderMode, Renderer,
+};
 
 use crate::{extract::Extract, ray_render_plugin::TeardownSchedule, render_device::RenderDevice};
 
@@ -51,7 +53,7 @@ impl Default for DevUIState {
 #[derive(Resource)]
 pub struct DevUI {
     pub egui_ctx: Context,
-    pub renderer: Renderer,
+    pub renderer: Renderer<GpuAllocator>,
 }
 
 #[derive(Resource, Clone, Default)]
@@ -135,10 +137,11 @@ impl Plugin for DevUIPlugin {
         let renderer = Renderer::with_gpu_allocator(
             allocator,
             render_device.device.clone(),
-            DynamicRendering {
+            RenderMode::DynamicRendering(DynamicRendering {
                 color_attachment_format: vk::Format::B8G8R8A8_UNORM,
                 depth_attachment_format: None,
-            },
+                stencil_attachment_format: None,
+            }),
             Options {
                 srgb_framebuffer: true,
                 ..Default::default()
@@ -173,19 +176,21 @@ fn handle_input(
     mut commands: Commands,
     mut dev_ui_world: NonSendMut<DevUIWorldState>,
     windows: Query<Entity, With<PrimaryWindow>>,
-    winit_windows: NonSend<WinitWindows>,
-    mut winit_events: EventReader<RawWinitWindowEvent>,
+    mut winit_events: MessageReader<RawWinitWindowEvent>,
 ) {
     if let Ok(window) = windows.single() {
-        let window = winit_windows.get_window(window).unwrap();
-        let raw_input = dev_ui_world.egui_winit.take_egui_input(window);
-        commands.insert_resource(DevUIWorldStateUpdate { raw_input });
+        // WinitWindows is no longer a NonSend resource; it lives in a thread-local.
+        WINIT_WINDOWS.with_borrow(|winit_windows| {
+            let window = winit_windows.get_window(window).unwrap();
+            let raw_input = dev_ui_world.egui_winit.take_egui_input(window);
+            commands.insert_resource(DevUIWorldStateUpdate { raw_input });
 
-        for ev in winit_events.read() {
-            if ev.window_id == window.id() {
-                let _ = dev_ui_world.egui_winit.on_window_event(&window, &ev.event);
+            for ev in winit_events.read() {
+                if ev.window_id == window.id() {
+                    let _ = dev_ui_world.egui_winit.on_window_event(&window, &ev.event);
+                }
             }
-        }
+        });
     }
 }
 
@@ -204,16 +209,17 @@ fn extract(
 fn handle_output(
     mut dev_ui_world: NonSendMut<DevUIWorldState>,
     windows: Query<Entity, With<PrimaryWindow>>,
-    winit_windows: NonSend<WinitWindows>,
     platform_output: Res<DevUIPlatformOutput>,
 ) {
     if let Ok(window) = windows.single() {
-        let window = winit_windows.get_window(window).unwrap();
-        if let Some(platform_output) = platform_output.platform_output.lock().unwrap().take() {
-            dev_ui_world
-                .egui_winit
-                .handle_platform_output(window, platform_output);
-        }
+        WINIT_WINDOWS.with_borrow(|winit_windows| {
+            let window = winit_windows.get_window(window).unwrap();
+            if let Some(platform_output) = platform_output.platform_output.lock().unwrap().take() {
+                dev_ui_world
+                    .egui_winit
+                    .handle_platform_output(window, platform_output);
+            }
+        });
     }
 }
 

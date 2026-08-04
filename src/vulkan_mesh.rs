@@ -6,6 +6,7 @@ use bevy::{
 use crate::{
     blas::{build_blas_from_buffers, GeometryDescr, Vertex, BLAS},
     extract::Extract,
+    ray_render_plugin::ExtractedEntity,
     render_buffer::BufferProvider,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
@@ -39,7 +40,7 @@ impl VulkanAsset for Mesh {
         assert!(attributes.len() == 3);
 
         let mut vertex_data = vec![0u8; asset.get_vertex_buffer_size()];
-        asset.write_packed_vertex_buffer_data(&mut vertex_data);
+        asset.write_packed_vertex_buffer_data(vertex_data.as_mut_slice().into());
         let index_data = asset.get_index_buffer_bytes().unwrap();
 
         let mut vertex_buffer_host = render_device.create_host_buffer::<Vertex>(
@@ -94,7 +95,7 @@ fn extract_meshes(
     >,
 ) {
     for (mesh, mat, t, gt) in meshes.iter() {
-        commands.spawn((mesh.clone(), mat.clone(), t.clone(), gt.clone()));
+        commands.spawn((ExtractedEntity, mesh.clone(), mat.clone(), t.clone(), gt.clone()));
     }
 }
 

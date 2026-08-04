@@ -15,6 +15,7 @@ pub enum ShaderLoaderError {
     Compile(#[from] shaderc::Error),
 }
 
+#[derive(TypePath)]
 pub struct ShaderLoader {
     compiler: shaderc::Compiler,
 }
@@ -51,8 +52,9 @@ impl AssetLoader for ShaderLoader {
         load_context: &mut bevy::asset::LoadContext,
     ) -> impl ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>> {
         Box::pin(async move {
-            let ext = load_context.path().extension().unwrap().to_str().unwrap();
-            let path = load_context.asset_path().to_string();
+            let ext = load_context.path().get_extension().unwrap().to_string();
+            let ext = ext.as_str();
+            let path = load_context.path().to_string();
             // On windows, the path will inconsistently use \ or /.
             // TODO: remove this once AssetPath forces cross-platform "slash" consistency. See #10511
             let path = path.replace(std::path::MAIN_SEPARATOR, "/");
@@ -61,7 +63,7 @@ impl AssetLoader for ShaderLoader {
 
             if ext == "glsl" {
                 return Ok(Shader {
-                    path: load_context.path().to_str().unwrap().to_string(),
+                    path: load_context.path().path().to_str().unwrap().to_string(),
                     spirv: None,
                     dependencies: Vec::new(),
                 });
@@ -123,7 +125,13 @@ impl AssetLoader for ShaderLoader {
             let dependencies = dependencies.borrow().clone();
 
             let shader = Shader {
-                path: load_context.borrow().path().to_str().unwrap().to_string(),
+                path: load_context
+                    .borrow()
+                    .path()
+                    .path()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
                 spirv: Some(Vec::from(binary.as_binary_u8()).into()),
                 dependencies,
             };
@@ -148,7 +156,7 @@ impl Plugin for ShaderPlugin {
 fn reload_modified(
     shaders: Res<Assets<Shader>>,
     asset_server: Res<AssetServer>,
-    mut shader_events: EventReader<AssetEvent<Shader>>,
+    mut shader_events: MessageReader<AssetEvent<Shader>>,
 ) {
     for event in shader_events.read() {
         match event {

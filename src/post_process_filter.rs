@@ -191,8 +191,8 @@ pub struct PostProcessFilterPlugin;
 
 fn propagate_modified(
     filters: Res<Assets<PostProcessFilter>>,
-    mut shader_events: EventReader<AssetEvent<crate::shader::Shader>>,
-    mut parent_events: EventWriter<AssetEvent<PostProcessFilter>>,
+    mut shader_events: MessageReader<AssetEvent<crate::shader::Shader>>,
+    mut parent_events: MessageWriter<AssetEvent<PostProcessFilter>>,
 ) {
     for event in shader_events.read() {
         match event {
