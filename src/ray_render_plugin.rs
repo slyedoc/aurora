@@ -200,10 +200,7 @@ impl Plugin for RayRenderPlugin {
             });
         render_app.world_mut().init_resource::<RenderConfig>();
 
-        let display_handle = app
-            .world()
-            .get_resource::<DisplayHandleWrapper>()
-            .unwrap();
+        let display_handle = app.world().get_resource::<DisplayHandleWrapper>().unwrap();
 
         let render_device = unsafe {
             crate::render_device::RenderDevice::from_display(
@@ -406,30 +403,32 @@ impl RenderFrameBuffers {
         swapchain: &crate::swapchain::Swapchain,
         cmd_buffer: vk::CommandBuffer,
     ) {
-        // (Re)create the render target if needed
-        if self.main.0 == vk::Image::null() || swapchain.resized {
-            log::trace!("(Re)creating render target");
-            render_device.destroyer.destroy_image_view(self.main.1);
-            render_device.destroyer.destroy_image(self.main.0);
-            let image_info = vk_init::image_info(
-                swapchain.swapchain_extent.width,
-                swapchain.swapchain_extent.height,
-                vk::Format::R32G32B32A32_SFLOAT,
-                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            );
-            self.main.0 = render_device.create_render_target(&image_info);
+        unsafe {
+            // (Re)create the render target if needed
+            if self.main.0 == vk::Image::null() || swapchain.resized {
+                log::trace!("(Re)creating render target");
+                render_device.destroyer.destroy_image_view(self.main.1);
+                render_device.destroyer.destroy_image(self.main.0);
+                let image_info = vk_init::image_info(
+                    swapchain.swapchain_extent.width,
+                    swapchain.swapchain_extent.height,
+                    vk::Format::R32G32B32A32_SFLOAT,
+                    vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                );
+                self.main.0 = render_device.create_render_target(&image_info);
 
-            let view_info = vk_init::image_view_info(self.main.0, image_info.format);
-            self.main.1 = render_device.create_image_view(&view_info, None).unwrap();
+                let view_info = vk_init::image_view_info(self.main.0, image_info.format);
+                self.main.1 = render_device.create_image_view(&view_info, None).unwrap();
 
-            // Transition to render target to general
-            vk_utils::transition_image_layout(
-                &render_device,
-                cmd_buffer,
-                self.main.0,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
-            );
+                // Transition to render target to general
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    self.main.0,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
         }
     }
 
@@ -484,10 +483,10 @@ fn render_frame(
     let inverse_view = camera.1.to_matrix();
     let projection_matrix = match camera.0 {
         Projection::Perspective(perspective) => Mat4::perspective_infinite_reverse_rh(
-                perspective.fov,
-                (window.width as f32) / (window.height as f32),
-                perspective.near,
-            ),
+            perspective.fov,
+            (window.width as f32) / (window.height as f32),
+            perspective.near,
+        ),
         Projection::Orthographic(_) => todo!("orthographic camera"),
         Projection::Custom(_) => todo!("custom_projection"),
     };

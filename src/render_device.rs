@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    ffi::{c_char, CStr},
+    ffi::{CStr, c_char},
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
 };
@@ -15,7 +15,7 @@ use ash::{
 };
 use bevy::prelude::*;
 use crossbeam::channel::Sender;
-use gpu_allocator::{vulkan::*, AllocationError, MemoryLocation};
+use gpu_allocator::{AllocationError, MemoryLocation, vulkan::*};
 use raw_window_handle::DisplayHandle;
 
 use crate::render_texture::RenderTexture;
@@ -122,67 +122,70 @@ impl Clone for RenderDevice {
 
 impl RenderDevice {
     pub unsafe fn from_display(display_handle: &DisplayHandle) -> Self {
-        let entry = ash::Entry::linked();
-        let instance = create_instance(display_handle, &entry);
-        let ext_surface = surface::Instance::new(&entry, &instance);
-        let (physical_device, queue_family_idx) = pick_physical_device(&instance);
-        let (device, queue) = create_logical_device(&instance, physical_device, queue_family_idx);
-        let ext_swapchain = swapchain::Device::new(&instance, &device);
-        let ext_sync2 = synchronization2::Device::new(&instance, &device);
-        let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
-        let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
-        let command_pool = create_command_pool(&device, queue_family_idx);
-        let transfer_command_pool = Mutex::new(create_command_pool(&device, queue_family_idx));
-        let command_buffers = create_command_buffers(&device, command_pool);
-        let descriptor_pool = create_descriptor_pool(&device);
-        let (bindless_descriptor_set, bindless_descriptor_set_layout) =
-            create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
-        let linear_sampler = create_linear_sampler(device.clone());
+        unsafe {
+            let entry = ash::Entry::linked();
+            let instance = create_instance(display_handle, &entry);
+            let ext_surface = surface::Instance::new(&entry, &instance);
+            let (physical_device, queue_family_idx) = pick_physical_device(&instance);
+            let (device, queue) =
+                create_logical_device(&instance, physical_device, queue_family_idx);
+            let ext_swapchain = swapchain::Device::new(&instance, &device);
+            let ext_sync2 = synchronization2::Device::new(&instance, &device);
+            let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
+            let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
+            let command_pool = create_command_pool(&device, queue_family_idx);
+            let transfer_command_pool = Mutex::new(create_command_pool(&device, queue_family_idx));
+            let command_buffers = create_command_buffers(&device, command_pool);
+            let descriptor_pool = create_descriptor_pool(&device);
+            let (bindless_descriptor_set, bindless_descriptor_set_layout) =
+                create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
+            let linear_sampler = create_linear_sampler(device.clone());
 
-        let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
-            allocator: Arc::new(Mutex::new(
-                Allocator::new(&AllocatorCreateDesc {
-                    instance: instance.clone(),
-                    device: device.clone(),
-                    physical_device,
-                    debug_settings: Default::default(),
-                    buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
-                    allocation_sizes: Default::default(),
-                })
-                .unwrap(),
-            )),
-            image_allocations: HashMap::new(),
-            buffer_allocations: HashMap::new(),
-        })));
+            let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
+                allocator: Arc::new(Mutex::new(
+                    Allocator::new(&AllocatorCreateDesc {
+                        instance: instance.clone(),
+                        device: device.clone(),
+                        physical_device,
+                        debug_settings: Default::default(),
+                        buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
+                        allocation_sizes: Default::default(),
+                    })
+                    .unwrap(),
+                )),
+                image_allocations: HashMap::new(),
+                buffer_allocations: HashMap::new(),
+            })));
 
-        let destroyer =
-            spawn_destroy_thread(instance.clone(), device.clone(), allocator_state.clone());
+            let destroyer =
+                spawn_destroy_thread(instance.clone(), device.clone(), allocator_state.clone());
 
-        let ret = RenderDevice(Arc::new(RenderDeviceData {
-            entry,
-            instance,
-            ext_surface,
-            physical_device,
-            device,
-            queue,
-            queue_family_idx,
-            ext_swapchain,
-            ext_sync2,
-            ext_rtx_pipeline,
-            ext_acc_struct,
-            command_pool,
-            bindless_descriptor_set,
-            bindless_descriptor_set_layout,
-            bindless_descriptor_map: Mutex::new(HashMap::new()),
-            transfer_command_pool,
-            command_buffers,
-            descriptor_pool,
-            linear_sampler,
-            destroyer,
-            allocator_state,
-        }));
+            let ret = RenderDevice(Arc::new(RenderDeviceData {
+                entry,
+                instance,
+                ext_surface,
+                physical_device,
+                device,
+                queue,
+                queue_family_idx,
+                ext_swapchain,
+                ext_sync2,
+                ext_rtx_pipeline,
+                ext_acc_struct,
+                command_pool,
+                bindless_descriptor_set,
+                bindless_descriptor_set_layout,
+                bindless_descriptor_map: Mutex::new(HashMap::new()),
+                transfer_command_pool,
+                command_buffers,
+                descriptor_pool,
+                linear_sampler,
+                destroyer,
+                allocator_state,
+            }));
 
-        ret
+            ret
+        }
     }
 
     pub fn create_render_target(&self, image_info: &vk::ImageCreateInfo) -> vk::Image {
@@ -330,90 +333,94 @@ impl Drop for RenderDeviceData {
 }
 
 unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) -> ash::Instance {
-    let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
-    let mut layer_names: Vec<&CStr> = Vec::new();
+    unsafe {
+        let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
+        let mut layer_names: Vec<&CStr> = Vec::new();
 
-    #[cfg(debug_assertions)]
-    layer_names.push(CStr::from_bytes_with_nul_unchecked(
-        b"VK_LAYER_KHRONOS_validation\0",
-    ));
+        #[cfg(debug_assertions)]
+        layer_names.push(CStr::from_bytes_with_nul_unchecked(
+            b"VK_LAYER_KHRONOS_validation\0",
+        ));
 
-    println!("Validation layers:");
-    for layer_name in layer_names.iter() {
-        println!("  - {}", layer_name.to_str().unwrap());
+        println!("Validation layers:");
+        for layer_name in layer_names.iter() {
+            println!("  - {}", layer_name.to_str().unwrap());
+        }
+
+        let layers_names_raw: Vec<*const c_char> = layer_names
+            .iter()
+            .map(|raw_name| raw_name.as_ptr())
+            .collect();
+        let instance_extensions =
+            ash_window::enumerate_required_extensions(display_handle.as_raw()).unwrap();
+
+        println!("Instance extensions:");
+        for extension_name in instance_extensions.iter() {
+            println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
+        }
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(app_name)
+            .application_version(0)
+            .engine_name(app_name)
+            .engine_version(0)
+            .api_version(vk::make_api_version(0, 1, 3, 0));
+
+        let instance_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_layer_names(&layers_names_raw)
+            .enabled_extension_names(&instance_extensions);
+
+        entry.create_instance(&instance_info, None).unwrap()
     }
-
-    let layers_names_raw: Vec<*const c_char> = layer_names
-        .iter()
-        .map(|raw_name| raw_name.as_ptr())
-        .collect();
-    let instance_extensions =
-        ash_window::enumerate_required_extensions(display_handle.as_raw()).unwrap();
-
-    println!("Instance extensions:");
-    for extension_name in instance_extensions.iter() {
-        println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
-    }
-
-    let app_info = vk::ApplicationInfo::default()
-        .application_name(app_name)
-        .application_version(0)
-        .engine_name(app_name)
-        .engine_version(0)
-        .api_version(vk::make_api_version(0, 1, 3, 0));
-
-    let instance_info = vk::InstanceCreateInfo::default()
-        .application_info(&app_info)
-        .enabled_layer_names(&layers_names_raw)
-        .enabled_extension_names(&instance_extensions);
-
-    entry.create_instance(&instance_info, None).unwrap()
 }
 
 unsafe fn pick_physical_device(instance: &ash::Instance) -> (vk::PhysicalDevice, u32) {
-    let all_devices = instance.enumerate_physical_devices().unwrap();
-    println!("Available devices:");
-    for device in all_devices.iter() {
-        let info = instance.get_physical_device_properties(*device);
-        println!(
-            "  - {}",
-            CStr::from_ptr(info.device_name.as_ptr()).to_str().unwrap()
-        );
-    }
+    unsafe {
+        let all_devices = instance.enumerate_physical_devices().unwrap();
+        println!("Available devices:");
+        for device in all_devices.iter() {
+            let info = instance.get_physical_device_properties(*device);
+            println!(
+                "  - {}",
+                CStr::from_ptr(info.device_name.as_ptr()).to_str().unwrap()
+            );
+        }
 
-    let (physical_device, queue_family_idx) = instance
-        .enumerate_physical_devices()
-        .unwrap()
-        .into_iter()
-        .find_map(|d| {
-            let info = instance.get_physical_device_properties(d);
-            if !CStr::from_ptr(info.device_name.as_ptr())
+        let (physical_device, queue_family_idx) = instance
+            .enumerate_physical_devices()
+            .unwrap()
+            .into_iter()
+            .find_map(|d| {
+                let info = instance.get_physical_device_properties(d);
+                if !CStr::from_ptr(info.device_name.as_ptr())
+                    .to_str()
+                    .unwrap()
+                    .contains("NVIDIA")
+                {
+                    return None;
+                }
+
+                let properties = instance.get_physical_device_queue_family_properties(d);
+                properties.iter().enumerate().find_map(|(i, p)| {
+                    if p.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                        Some((d, i as u32))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .expect("Not a single device found!");
+
+        let device_properties = instance.get_physical_device_properties(physical_device);
+        println!(
+            "Running on device: {}",
+            CStr::from_ptr(device_properties.device_name.as_ptr())
                 .to_str()
                 .unwrap()
-                .contains("NVIDIA")
-            {
-                return None;
-            }
-
-            let properties = instance.get_physical_device_queue_family_properties(d);
-            properties.iter().enumerate().find_map(|(i, p)| {
-                if p.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    Some((d, i as u32))
-                } else {
-                    None
-                }
-            })
-        })
-        .expect("Not a single device found!");
-
-    let device_properties = instance.get_physical_device_properties(physical_device);
-    println!(
-        "Running on device: {}",
-        CStr::from_ptr(device_properties.device_name.as_ptr())
-            .to_str()
-            .unwrap()
-    );
-    (physical_device, queue_family_idx)
+        );
+        (physical_device, queue_family_idx)
+    }
 }
 
 unsafe fn create_logical_device(
@@ -421,71 +428,75 @@ unsafe fn create_logical_device(
     physical_device: vk::PhysicalDevice,
     queue_family_idx: u32,
 ) -> (ash::Device, Mutex<vk::Queue>) {
-    let device_extensions = [
-        swapchain::NAME.as_ptr(),
-        synchronization2::NAME.as_ptr(),
-        maintenance4::NAME.as_ptr(),
-        acceleration_structure::NAME.as_ptr(),
-        ray_tracing_pipeline::NAME.as_ptr(),
-        deferred_host_operations::NAME.as_ptr(),
-        spirv_1_4::NAME.as_ptr(),
-        descriptor_indexing::NAME.as_ptr(),
-    ];
+    unsafe {
+        let device_extensions = [
+            swapchain::NAME.as_ptr(),
+            synchronization2::NAME.as_ptr(),
+            maintenance4::NAME.as_ptr(),
+            acceleration_structure::NAME.as_ptr(),
+            ray_tracing_pipeline::NAME.as_ptr(),
+            deferred_host_operations::NAME.as_ptr(),
+            spirv_1_4::NAME.as_ptr(),
+            descriptor_indexing::NAME.as_ptr(),
+        ];
 
-    println!("Device extensions:");
-    for extension_name in device_extensions.iter() {
-        println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
+        println!("Device extensions:");
+        for extension_name in device_extensions.iter() {
+            println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
+        }
+
+        let queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_idx)
+            .queue_priorities(&[1.0]);
+
+        let mut sync2_info =
+            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+
+        let mut dynamic_rendering_info =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
+        let mut maintaince4_info =
+            vk::PhysicalDeviceMaintenance4Features::default().maintenance4(true);
+
+        let mut bda_info =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+
+        let mut features_indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+            .descriptor_binding_partially_bound(true)
+            .runtime_descriptor_array(true)
+            .descriptor_binding_sampled_image_update_after_bind(true)
+            .descriptor_binding_storage_image_update_after_bind(true)
+            .descriptor_binding_variable_descriptor_count(true);
+
+        let mut features_acceleration_structure =
+            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
+
+        let mut features_raytracing_pipeline =
+            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
+
+        let mut features_scalar_block =
+            vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
+
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .enabled_extension_names(&device_extensions)
+            .push_next(&mut sync2_info)
+            .push_next(&mut dynamic_rendering_info)
+            .push_next(&mut maintaince4_info)
+            .push_next(&mut bda_info)
+            .push_next(&mut features_indexing)
+            .push_next(&mut features_acceleration_structure)
+            .push_next(&mut features_raytracing_pipeline)
+            .push_next(&mut features_scalar_block);
+
+        let device = instance
+            .create_device(physical_device, &device_info, None)
+            .unwrap();
+        let queue = device.get_device_queue(queue_family_idx, 0);
+
+        (device, Mutex::new(queue))
     }
-
-    let queue_info = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family_idx)
-        .queue_priorities(&[1.0]);
-
-    let mut sync2_info =
-        vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-
-    let mut dynamic_rendering_info =
-        vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-
-    let mut maintaince4_info = vk::PhysicalDeviceMaintenance4Features::default().maintenance4(true);
-
-    let mut bda_info =
-        vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
-
-    let mut features_indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
-        .descriptor_binding_partially_bound(true)
-        .runtime_descriptor_array(true)
-        .descriptor_binding_sampled_image_update_after_bind(true)
-        .descriptor_binding_storage_image_update_after_bind(true)
-        .descriptor_binding_variable_descriptor_count(true);
-
-    let mut features_acceleration_structure =
-        vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
-
-    let mut features_raytracing_pipeline =
-        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
-
-    let mut features_scalar_block =
-        vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
-
-    let device_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(std::slice::from_ref(&queue_info))
-        .enabled_extension_names(&device_extensions)
-        .push_next(&mut sync2_info)
-        .push_next(&mut dynamic_rendering_info)
-        .push_next(&mut maintaince4_info)
-        .push_next(&mut bda_info)
-        .push_next(&mut features_indexing)
-        .push_next(&mut features_acceleration_structure)
-        .push_next(&mut features_raytracing_pipeline)
-        .push_next(&mut features_scalar_block);
-
-    let device = instance
-        .create_device(physical_device, &device_info, None)
-        .unwrap();
-    let queue = device.get_device_queue(queue_family_idx, 0);
-
-    (device, Mutex::new(queue))
 }
 
 fn create_command_pool(device: &ash::Device, queue_family_idx: u32) -> vk::CommandPool {

@@ -4,9 +4,9 @@ use crate::{
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    tlas_builder::{update_tlas, TLAS},
+    tlas_builder::{TLAS, update_tlas},
     vk_utils,
-    vulkan_asset::{poll_for_asset, VulkanAssetLoadingState, VulkanAssets},
+    vulkan_asset::{VulkanAssetLoadingState, VulkanAssets, poll_for_asset},
 };
 use ash::vk;
 use bevy::{prelude::*, render::RenderApp};

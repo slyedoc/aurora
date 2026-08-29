@@ -1,4 +1,3 @@
-#![feature(iter_array_chunks)]
 pub mod blas;
 pub mod bluenoise_plugin;
 pub mod debug_camera;

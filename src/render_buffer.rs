@@ -1,7 +1,7 @@
 use ash::vk;
 use gpu_allocator::{
-    vulkan::{AllocationCreateDesc, AllocationScheme},
     MemoryLocation,
+    vulkan::{AllocationCreateDesc, AllocationScheme},
 };
 
 use crate::render_device::RenderDevice;

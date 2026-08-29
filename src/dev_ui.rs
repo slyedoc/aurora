@@ -10,10 +10,8 @@ use bevy::{
     window::PrimaryWindow,
     winit::{DisplayHandleWrapper, RawWinitWindowEvent, WINIT_WINDOWS},
 };
-use egui::{emath, Context, PlatformOutput, RawInput, ViewportId};
-use egui_ash_renderer::{
-    allocator::GpuAllocator, DynamicRendering, Options, RenderMode, Renderer,
-};
+use egui::{Context, PlatformOutput, RawInput, ViewportId, emath};
+use egui_ash_renderer::{DynamicRendering, Options, RenderMode, Renderer, allocator::GpuAllocator};
 
 use crate::{extract::Extract, ray_render_plugin::TeardownSchedule, render_device::RenderDevice};
 

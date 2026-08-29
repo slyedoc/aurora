@@ -6,7 +6,7 @@ use bevy::{
     asset::{Asset, AssetApp, AssetEvent, Assets, Handle},
     ecs::{
         message::{MessageReader, MessageWriter},
-        system::{lifetimeless::SRes, Res},
+        system::{Res, lifetimeless::SRes},
     },
     reflect::TypePath,
 };

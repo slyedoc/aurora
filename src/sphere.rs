@@ -2,7 +2,7 @@ use ash::vk;
 use bevy::{prelude::*, render::RenderApp};
 
 use crate::{
-    blas::{allocate_acceleration_structure, AccelerationStructure},
+    blas::{AccelerationStructure, allocate_acceleration_structure},
     extract::Extract,
     ray_render_plugin::ExtractedEntity,
     render_buffer::{Buffer, BufferProvider},
@@ -177,6 +177,12 @@ fn extract_spheres(
     >,
 ) {
     for (sphere, mat, t, gt) in meshes.iter() {
-        commands.spawn((ExtractedEntity, sphere.clone(), mat.clone(), t.clone(), gt.clone()));
+        commands.spawn((
+            ExtractedEntity,
+            sphere.clone(),
+            mat.clone(),
+            t.clone(),
+            gt.clone(),
+        ));
     }
 }

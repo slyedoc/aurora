@@ -106,12 +106,12 @@ fn setup(
                 continue;
             }
 
-            let choose_mat: f32 = rng.gen();
+            let choose_mat: f32 = rng.r#gen();
             let mut material = StandardMaterial::default();
 
             if choose_mat < 0.7 {
                 // lambertian
-                material.base_color = Color::linear_rgb(rng.gen(), rng.gen(), rng.gen());
+                material.base_color = Color::linear_rgb(rng.r#gen(), rng.r#gen(), rng.r#gen());
             } else if choose_mat < 0.85 {
                 // mirror
                 material.base_color = Color::WHITE;
@@ -121,21 +121,21 @@ fn setup(
                 // glass
                 material.base_color = Color::WHITE;
                 material.perceptual_roughness = 0.0;
-                material.ior = 1.01 + 0.15 * rng.gen::<f32>();
+                material.ior = 1.01 + 0.15 * rng.r#gen::<f32>();
                 material.specular_transmission = 1.0;
             } else {
                 // light source
-                material.emissive = 50.0 * LinearRgba::rgb(rng.gen(), rng.gen(), rng.gen());
+                material.emissive = 50.0 * LinearRgba::rgb(rng.r#gen(), rng.r#gen(), rng.r#gen());
             }
 
             let mut entity_builder = commands.spawn((
                 Transform::from_translation(Vec3::new(xf, scale / 2.0, yf))
                     .with_scale(Vec3::splat(scale))
-                    .with_rotation(Quat::from_rotation_y(rng.gen::<f32>() * 2.0 * PI)),
+                    .with_rotation(Quat::from_rotation_y(rng.r#gen::<f32>() * 2.0 * PI)),
                 MeshMaterial3d(materials.add(material)),
             ));
 
-            let choose_shape: f32 = rng.gen();
+            let choose_shape: f32 = rng.r#gen();
             if choose_shape < 0.9 {
                 entity_builder.insert(Sphere);
             } else {

@@ -4,7 +4,11 @@ use bevy::{
     app::App,
     asset::{Asset, AssetEvent, AssetId, Assets, Handle},
     ecs::{
-        message::MessageReader, resource::Resource, schedule::IntoScheduleConfigs, system::{Res, ResMut, StaticSystemParam, SystemParam, SystemParamItem}, world::{Mut, World}
+        message::MessageReader,
+        resource::Resource,
+        schedule::IntoScheduleConfigs,
+        system::{Res, ResMut, StaticSystemParam, SystemParam, SystemParamItem},
+        world::{Mut, World},
     },
     prelude::{Deref, DerefMut},
     render::{ExtractSchedule, RenderApp},

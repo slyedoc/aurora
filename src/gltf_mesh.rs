@@ -1,21 +1,17 @@
 use std::collections::HashMap;
 
 use ash::vk;
-use bevy::{
-    asset::AssetLoader,
-    prelude::*,
-    render::RenderApp, tasks::ConditionalSendFuture,
-};
+use bevy::{asset::AssetLoader, prelude::*, render::RenderApp, tasks::ConditionalSendFuture};
 use thiserror::Error;
 
 use crate::{
-    blas::{build_blas_from_buffers, GeometryDescr, RTXMaterial, Vertex, BLAS},
+    blas::{BLAS, GeometryDescr, RTXMaterial, Vertex, build_blas_from_buffers},
     extract::Extract,
     ray_render_plugin::ExtractedEntity,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
-    render_texture::{load_texture_from_bytes, padd_pixel_bytes_rgba_unorm, RenderTexture},
+    render_texture::{RenderTexture, load_texture_from_bytes, padd_pixel_bytes_rgba_unorm},
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
 
@@ -54,8 +50,7 @@ impl GltfModel {
     }
 }
 
-#[derive(Default)]
-#[derive(TypePath)]
+#[derive(Default, TypePath)]
 pub struct GltfLoader;
 
 #[non_exhaustive]

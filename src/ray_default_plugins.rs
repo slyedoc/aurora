@@ -12,7 +12,7 @@ impl PluginGroup for RayDefaultPlugins {
             .add(bevy::diagnostic::FrameCountPlugin)
             .add(bevy::time::TimePlugin)
             .add(bevy::transform::TransformPlugin)
-//            .add(bevy::hierarchy::HierarchyPlugin)
+            //            .add(bevy::hierarchy::HierarchyPlugin)
             .add(bevy::diagnostic::DiagnosticsPlugin)
             .add(bevy::input::InputPlugin)
             .add(bevy::window::WindowPlugin {

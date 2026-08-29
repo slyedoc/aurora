@@ -1,10 +1,10 @@
 use bevy::{
     prelude::*,
-    render::{mesh::Indices, RenderApp},
+    render::{RenderApp, mesh::Indices},
 };
 
 use crate::{
-    blas::{build_blas_from_buffers, GeometryDescr, Vertex, BLAS},
+    blas::{BLAS, GeometryDescr, Vertex, build_blas_from_buffers},
     extract::Extract,
     ray_render_plugin::ExtractedEntity,
     render_buffer::BufferProvider,
@@ -95,7 +95,13 @@ fn extract_meshes(
     >,
 ) {
     for (mesh, mat, t, gt) in meshes.iter() {
-        commands.spawn((ExtractedEntity, mesh.clone(), mat.clone(), t.clone(), gt.clone()));
+        commands.spawn((
+            ExtractedEntity,
+            mesh.clone(),
+            mat.clone(),
+            t.clone(),
+            gt.clone(),
+        ));
     }
 }
 

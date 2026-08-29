@@ -1,7 +1,7 @@
 use crate::{
     ray_render_plugin::TeardownSchedule,
     render_device::RenderDevice,
-    render_texture::{load_texture_from_bytes, RenderTexture},
+    render_texture::{RenderTexture, load_texture_from_bytes},
 };
 use ash::vk;
 use bevy::{prelude::*, render::RenderApp};

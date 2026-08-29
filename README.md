@@ -9,8 +9,7 @@ from https://hugopeters.me/public/models.zip. Extract them and put them in `./as
 
 #### Important
 
-I'm currently tracking the main branch of Bevy which includes a patch to make `egui_winit` work.
-Once ~~[The PR](https://github.com/bevyengine/bevy/pull/15884) is merged~~ 0.16 is released I can use a stable version.
+This fork targets **Bevy 0.19**, Rust edition 2024, on the stable toolchain (see `rust-toolchain.toml`).
 
 ## Required packages
 

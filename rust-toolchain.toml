@@ -1,3 +1,2 @@
-# Nightly required for edition = "2024"
 [toolchain]
-channel = "nightly"
+channel = "stable"
