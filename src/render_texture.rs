@@ -39,7 +39,27 @@ impl VulkanAsset for bevy::prelude::Image {
         &self,
         _param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        Some(self.clone())
+        // The upload path knows RGBA8 and RGBA32F. Anything else (RGB / grey / 16-bit PNGs,
+        // which scene textures frequently are) is converted here, on the main thread's copy.
+        let bytes_per_pixel = self.data.as_ref().map(|d| {
+            d.len()
+                / (self.texture_descriptor.size.width as usize
+                    * self.texture_descriptor.size.height as usize)
+                    .max(1)
+        });
+        if matches!(bytes_per_pixel, Some(4) | Some(16)) {
+            return Some(self.clone());
+        }
+        match self.convert(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb) {
+            Some(converted) => Some(converted),
+            None => {
+                log::warn!(
+                    "texture {:?} could not be converted to RGBA8; skipping",
+                    self.texture_descriptor.format
+                );
+                None
+            }
+        }
     }
 
     fn prepare_asset(

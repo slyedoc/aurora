@@ -1,0 +1,18 @@
+# The `.cluster_mesh` wire format (read / write / flat bake / bevy asset loader) on its own, so the
+# offline importers in aurora_files can depend on it without pulling the Vulkan renderer.
+[package]
+name = "aurora_cluster_mesh"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [
+    "std",
+    "bevy_asset",
+    "bevy_mesh",
+] }
+bytemuck = { version = "1.14.3", features = ["derive"] }
+# 0.13 for byte-identity with the shipped files.
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "frame"] }
+thiserror = "1.0.57"

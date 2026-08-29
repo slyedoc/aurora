@@ -40,6 +40,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);
         group = group.add(crate::bluenoise_plugin::BlueNoisePlugin);
+        group = group.add(crate::bsn::BsnPlugin);
 
         group
     }

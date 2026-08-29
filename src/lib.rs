@@ -1,4 +1,6 @@
 pub mod blas;
+pub mod bsn;
+pub use aurora_cluster_mesh as cluster_mesh;
 pub mod bluenoise_plugin;
 pub mod debug_camera;
 pub mod dev_shaders;
