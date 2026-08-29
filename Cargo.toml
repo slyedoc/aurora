@@ -16,14 +16,54 @@ opt-level = 3
 [dependencies]
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
-bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", features = ["file_watcher", "hdr"] }
+# No default features: this crate is its own renderer. `bevy_render`/`bevy_pbr` stay
+# only for the `RenderApp`/`PipelinedRenderingPlugin` labels and `StandardMaterial`
+# (the material asset the BLAS/TLAS builders consume) -- nothing wgpu-side ever runs.
+# UI is `bevy_feathers_core`: feathers/bevy_ui/bevy_text WITHOUT `bevy_ui_render`,
+# so the bevy_ui node tree is laid out by bevy and rasterized by this crate.
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [
+    # app / platform
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "bevy_log",
+    "bevy_state",
+    "reflect_auto_register",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "custom_cursor",
+    "bevy_window",
+    "bevy_audio",
+    # assets
+    "bevy_asset",
+    "file_watcher",
+    "scene",
+    "bevy_image",
+    "hdr",
+    "png",
+    "bevy_mesh",
+    # camera + material types (pull bevy_render, see above)
+    "bevy_camera",
+    "bevy_render",
+    "bevy_pbr",
+    # ui stack, render-free
+    "bevy_text",
+    "default_font",
+    "bevy_ui",
+    "bevy_ui_widgets",
+    "bevy_input_focus",
+    "bevy_picking",
+    "ui_picking",
+    "bevy_feathers_core",
+] }
 bytemuck = "1.14.3"
 crossbeam = "0.8.4"
 egui = "0.35.0"
 egui-ash-renderer = {version = "0.12.0", features = ["gpu-allocator"] }
 egui-winit = "0.35.0"
 glam = { version = "0.33.0" }
-gltf = "1.4.1"
+gltf = { version = "1.4.1", features = ["KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
 gpu-allocator = "0.28.0"
 #gpu-allocator = { git = "https://github.com/Traverse-Research/gpu-allocator.git", branch = "main" }
 half = "2.4.1"
