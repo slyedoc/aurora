@@ -152,7 +152,7 @@ impl Plugin for DevUIPlugin {
         };
 
         app.world_mut()
-            .insert_non_send_resource(DevUIWorldState { egui_winit });
+            .insert_non_send(DevUIWorldState { egui_winit });
         app.world_mut().insert_resource(platform_output.clone());
         app.add_systems(Update, (handle_input, handle_output));
 
