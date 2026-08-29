@@ -77,7 +77,11 @@ pub struct VulkanAssets<A: VulkanAsset>(HashMap<AssetId<A>, VulkanAssetLoadingSt
 
 impl<A: VulkanAsset> VulkanAssets<A> {
     pub fn get(&self, handle: &Handle<A>) -> Option<&A::PreparedAsset> {
-        self.0.get(&handle.id()).map_or(None, |state| match state {
+        self.get_by_id(handle.id())
+    }
+
+    pub fn get_by_id(&self, id: AssetId<A>) -> Option<&A::PreparedAsset> {
+        self.0.get(&id).map_or(None, |state| match state {
             VulkanAssetLoadingState::Loading => None,
             VulkanAssetLoadingState::Loaded(asset) => Some(asset),
         })

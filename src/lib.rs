@@ -18,6 +18,7 @@ pub mod shader;
 pub mod sphere;
 pub mod swapchain;
 pub mod tlas_builder;
+pub mod ui_render;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;

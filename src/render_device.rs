@@ -464,6 +464,7 @@ unsafe fn create_logical_device(
         let mut features_indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
             .descriptor_binding_partially_bound(true)
             .runtime_descriptor_array(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_storage_image_update_after_bind(true)
             .descriptor_binding_variable_descriptor_count(true);

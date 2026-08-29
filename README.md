@@ -54,6 +54,11 @@ Besides the rust toolchain, you will need to:
 
 run `cargo run --example` to get a list of available examples.
 
+`cargo run --example feathers_ui` shows `bevy_feathers` widgets (buttons, checkbox, toggle,
+slider, text) drawn by this crate's own Vulkan UI pass (`src/ui_render.rs`): the app uses the
+`bevy_feathers_core` feature, so bevy lays out and picks the UI and no `bevy_ui_render`/wgpu
+code runs.
+
 This rendering backend integrates seamlessly with Bevy, as a result, the code needed to run a simple scene is extremely simple:
 
 ```rust

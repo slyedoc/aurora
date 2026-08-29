@@ -447,6 +447,7 @@ fn render_frame(
         Option<ResMut<crate::dev_ui::DevUIState>>,
         Option<Res<crate::dev_ui::DevUIWorldStateUpdate>>,
         Option<Res<crate::dev_ui::DevUIPlatformOutput>>,
+        crate::ui_render::UiDrawParams,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -470,6 +471,7 @@ fn render_frame(
         Some(mut dev_ui_state),
         Some(dev_ui_update),
         Some(dev_ui_platform_output),
+        mut ui,
     ) = dev_ui_stuff
     else {
         return;
@@ -743,6 +745,15 @@ fn render_frame(
             render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
         }
 
+        // bevy_ui / feathers, drawn over the scene and under the egui dev ui
+        crate::ui_render::draw_ui(
+            &render_device,
+            cmd_buffer,
+            swapchain.swapchain_extent,
+            swapchain.frame_count % 2,
+            &mut ui,
+        );
+
         // render the egui dev ui
         let raw_input = dev_ui_update.raw_input.clone();
 
@@ -810,7 +821,7 @@ fn render_frame(
     }
 }
 
-fn on_shutdown(world: &mut World) {
+pub(crate) fn on_shutdown(world: &mut World) {
     let render_device = world
         .remove_resource::<crate::render_device::RenderDevice>()
         .unwrap();
