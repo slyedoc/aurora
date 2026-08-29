@@ -1,5 +1,5 @@
 [package]
-name = "bevy_vulkan"
+name = "bevy_aurora"
 version = "0.1.0"
 edition = "2024"
 
@@ -75,7 +75,7 @@ shaderc = "0.8.3"
 thiserror = "1.0.57"
 
 
-# Redirect every bevy_* crate to the fork branch carrying render-free feathers
+# Redirect every bevy_* crate to the fork branch `aurora`: upstream main + render-free feathers
 # (`bevy_feathers_core`), the .bsn asset loader and free_camera tweaks.
 [patch."https://github.com/bevyengine/bevy"]
-bevy = { git = "https://github.com/slyedoc/bevy", branch = "bevy_vulkan" }
+bevy = { git = "https://github.com/slyedoc/bevy", branch = "aurora" }

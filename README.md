@@ -1,6 +1,7 @@
-## Raytracing in Bevy (WIP 🔨)
+## Aurora — hardware ray tracing for Bevy on raw Vulkan (WIP 🔨)
 
-This is a custom rendering backend for Bevy leverages hardware raytracing using vulkan.
+`bevy_aurora` is a custom rendering backend for Bevy that leverages hardware raytracing using Vulkan
+(ash, no wgpu). It started as a fork of [HugoPeters1024/bevy_vulkan](https://github.com/HugoPeters1024/bevy_vulkan).
 You will need a GPU that supports `VK_KHR_ray_tracing`. A non exhaustive list of supported device
 can be found on [gpuinfo.org](https://vulkan.gpuinfo.org/listdevicescoverage.php?extension=VK_KHR_ray_tracing&platform=all)
 
@@ -9,7 +10,8 @@ from https://hugopeters.me/public/models.zip. Extract them and put them in `./as
 
 #### Important
 
-This fork targets **Bevy 0.19**, Rust edition 2024, on the stable toolchain (see `rust-toolchain.toml`).
+Targets the `aurora` branch of [slyedoc/bevy](https://github.com/slyedoc/bevy/tree/aurora) (upstream main + render-free
+`bevy_feathers`, the `.bsn` loader and `bevy_feathers_inspector`), Rust edition 2024, stable toolchain.
 
 ## Required packages
 
@@ -67,7 +69,7 @@ This rendering backend integrates seamlessly with Bevy, as a result, the code ne
 
 ```rust
 use bevy::prelude::*;
-use bevy_vulkan::{
+use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,

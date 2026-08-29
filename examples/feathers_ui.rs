@@ -15,7 +15,7 @@ use bevy::{
     ui::Checked,
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
-use bevy_vulkan::{
+use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,

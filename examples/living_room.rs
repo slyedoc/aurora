@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy_vulkan::{
+use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,

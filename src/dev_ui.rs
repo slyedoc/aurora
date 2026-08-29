@@ -121,7 +121,7 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                caption("bevy_vulkan  (F2: panel, F1: world inspector)"),
+                caption("aurora  (F2: panel, F1: world inspector)"),
                 (caption("fps: -") DevUIStats),
                 (
                     Node {
