@@ -56,12 +56,10 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "bevy_picking",
     "ui_picking",
     "bevy_feathers_core",
+    "experimental_bevy_feathers_inspector",
 ] }
 bytemuck = "1.14.3"
 crossbeam = "0.8.4"
-egui = "0.35.0"
-egui-ash-renderer = {version = "0.12.0", features = ["gpu-allocator"] }
-egui-winit = "0.35.0"
 glam = { version = "0.33.0" }
 gltf = { version = "1.4.1", features = ["KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
 gpu-allocator = "0.28.0"
@@ -75,7 +73,6 @@ raw-window-handle = "0.6.2"
 rayon = "1.10.0"
 shaderc = "0.8.3"
 thiserror = "1.0.57"
-winit = "0.30.5"
 
 
 # Redirect every bevy_* crate to the fork branch carrying render-free feathers

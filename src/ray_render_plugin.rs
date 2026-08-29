@@ -443,10 +443,7 @@ fn render_frame(
     window: Res<ExtractedWindow>,
     swapchain: Option<ResMut<crate::swapchain::Swapchain>>,
     dev_ui_stuff: (
-        Option<ResMut<crate::dev_ui::DevUI>>,
-        Option<ResMut<crate::dev_ui::DevUIState>>,
-        Option<Res<crate::dev_ui::DevUIWorldStateUpdate>>,
-        Option<Res<crate::dev_ui::DevUIPlatformOutput>>,
+        Option<Res<crate::dev_ui::DevUIState>>,
         crate::ui_render::UiDrawParams,
     ),
     mut frame: ResMut<Frame>,
@@ -459,23 +456,13 @@ fn render_frame(
     sbt: Res<SBT>,
     camera: Query<(&Projection, &GlobalTransform), With<Camera>>,
     mut tick: Local<u32>,
-    time: Res<Time>,
-    mut fps_runnig_avg: Local<f32>,
 ) {
     let Some(mut swapchain) = swapchain else {
         return;
     };
 
-    let (
-        Some(mut dev_ui),
-        Some(mut dev_ui_state),
-        Some(dev_ui_update),
-        Some(dev_ui_platform_output),
-        mut ui,
-    ) = dev_ui_stuff
-    else {
-        return;
-    };
+    let (dev_ui_state, mut ui) = dev_ui_stuff;
+    let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
 
     *tick += 1;
     if !render_config.accumulate {
@@ -745,7 +732,7 @@ fn render_frame(
             render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
         }
 
-        // bevy_ui / feathers, drawn over the scene and under the egui dev ui
+        // bevy_ui / feathers (including the dev panel), drawn over the scene
         crate::ui_render::draw_ui(
             &render_device,
             cmd_buffer,
@@ -753,57 +740,6 @@ fn render_frame(
             swapchain.frame_count % 2,
             &mut ui,
         );
-
-        // render the egui dev ui
-        let raw_input = dev_ui_update.raw_input.clone();
-
-        let egui::FullOutput {
-            platform_output,
-            textures_delta,
-            shapes,
-            pixels_per_point,
-            ..
-        } = dev_ui.egui_ctx.run_ui(raw_input, |ctx| {
-            dev_ui_state.ticks = *tick as usize;
-            // no idea why the running average starts at inf.
-            if *fps_runnig_avg > 100000.0 {
-                *fps_runnig_avg = 0.0;
-            }
-            *fps_runnig_avg = 0.95 * *fps_runnig_avg + 0.05 * (1.0 / time.delta_secs());
-            dev_ui_state.fps = *fps_runnig_avg;
-            dev_ui_state.render(ctx);
-        });
-
-        // send the platform output to the main app for processing
-        {
-            let mut platform_output_slot = dev_ui_platform_output.platform_output.lock().unwrap();
-            *platform_output_slot = Some(platform_output);
-        }
-
-        dev_ui.renderer.free_textures(&textures_delta.free).unwrap();
-        if !textures_delta.set.is_empty() {
-            let queue = render_device.queue.lock().unwrap();
-            dev_ui
-                .renderer
-                .set_textures(
-                    *queue,
-                    render_device.command_pool,
-                    textures_delta.set.as_slice(),
-                )
-                .expect("Failed to update texture");
-        }
-
-        let clipped_primitives = dev_ui.egui_ctx.tessellate(shapes, pixels_per_point);
-
-        dev_ui
-            .renderer
-            .cmd_draw(
-                cmd_buffer,
-                swapchain.swapchain_extent,
-                pixels_per_point,
-                &clipped_primitives,
-            )
-            .unwrap();
 
         render_device.cmd_end_rendering(cmd_buffer);
 

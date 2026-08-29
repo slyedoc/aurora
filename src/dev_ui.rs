@@ -1,43 +1,55 @@
-use std::{
-    ops::{Deref, RangeInclusive},
-    sync::{Arc, Mutex},
-};
+//! The dev panel: a feathers inspector over the renderer's tunables.
+//!
+//! [`DevUIState`] is a reflected main-world resource; `bevy_feathers_inspector` generates the
+//! sliders from its `#[reflect(@range)]` attributes and writes edits back through reflection.
+//! The render world gets a copy every frame through the extract schedule and reads the tunables
+//! into the frame uniform. Drawn by [`crate::ui_render`], so no wgpu / egui anywhere.
+//!
+//! Keys: `F2` toggles this panel, `F1` the world inspector.
 
-use ash::vk;
+use std::any::TypeId;
+
 use bevy::{
+    feathers::{
+        FeathersCorePlugin, FeathersPlugins,
+        dark_theme::create_dark_theme,
+        display::caption,
+        theme::{ThemeBackgroundColor, UiTheme},
+        tokens,
+    },
+    feathers_inspector::{
+        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, WorldInspectorPlugin,
+        build_resource_inspector,
+    },
     prelude::*,
     render::RenderApp,
-    window::PrimaryWindow,
-    winit::{DisplayHandleWrapper, RawWinitWindowEvent, WINIT_WINDOWS},
+    ui::Display,
 };
-use egui::{Context, PlatformOutput, RawInput, ViewportId, emath};
-use egui_ash_renderer::{DynamicRendering, Options, RenderMode, Renderer, allocator::GpuAllocator};
 
-use crate::{extract::Extract, ray_render_plugin::TeardownSchedule, render_device::RenderDevice};
+use crate::{extract::Extract, ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
 
-pub struct DevUIWorldState {
-    pub egui_winit: egui_winit::State,
-}
-
-#[derive(Clone, Resource)]
+/// Renderer tunables edited from the dev panel. Lives in the main world; a copy is extracted
+/// into the render world each frame.
+#[derive(Resource, Reflect, Clone, Debug)]
+#[reflect(Resource, Default)]
 pub struct DevUIState {
-    pub hidden: bool,
-    pub ticks: usize,
-    pub fps: f32,
+    #[reflect(@1.5..=3.0_f32)]
     pub gamma: f32,
+    #[reflect(@0.0..=5.0_f32)]
     pub exposure: f32,
+    #[reflect(@0.0..=0.02_f32)]
     pub aperture: f32,
+    #[reflect(@0.0..=0.2_f32)]
     pub foginess: f32,
+    #[reflect(@-1.0..=1.0_f32)]
     pub fog_scatter: f32,
+    #[reflect(@0.0..=1.0_f32)]
     pub sky_brightness: f32,
 }
 
 impl Default for DevUIState {
     fn default() -> Self {
         Self {
-            hidden: false,
-            ticks: 0,
-            fps: 0.0,
             gamma: 2.4,
             exposure: 1.0,
             aperture: 0.008,
@@ -48,179 +60,127 @@ impl Default for DevUIState {
     }
 }
 
-#[derive(Resource)]
-pub struct DevUI {
-    pub egui_ctx: Context,
-    pub renderer: Renderer<GpuAllocator>,
-}
+/// The panel root; `F2` flips its `Display`.
+#[derive(Component, Default, Clone)]
+struct DevUIPanel;
 
-#[derive(Resource, Clone, Default)]
-pub struct DevUIWorldStateUpdate {
-    pub raw_input: RawInput,
-}
+/// The live stats line (fps, accumulation ticks).
+#[derive(Component, Default, Clone)]
+struct DevUIStats;
 
-#[derive(Resource, Clone)]
-// the output generated from rendering the egui window
-// set by the rendering app, consumed by the main app.
-pub struct DevUIPlatformOutput {
-    pub platform_output: Arc<Mutex<Option<PlatformOutput>>>,
-}
-
-impl DevUIState {
-    pub fn render(&mut self, ctx: &egui::Context) {
-        if self.hidden {
-            return;
-        }
-
-        egui::Window::new("Dev UI").resizable(true).show(ctx, |ui| {
-            ui.label(format!("tick: {}", self.ticks));
-            ui.label(format!("fps: {:.2}", self.fps));
-            egui::CollapsingHeader::new("Camera")
-                .open(Some(true))
-                .show(ui, |ui| {
-                    Self::slider(ui, "gamma", &mut self.gamma, 1.5..=3.0);
-                    Self::slider(ui, "exposure", &mut self.exposure, 0.0..=5.0);
-                    Self::slider(ui, "aperture", &mut self.aperture, 0.0..=0.02);
-                });
-            egui::CollapsingHeader::new("Environment")
-                .open(Some(true))
-                .show(ui, |ui| {
-                    Self::slider(ui, "foginess", &mut self.foginess, 0.0..=0.2);
-                    Self::slider(ui, "fog scatter", &mut self.fog_scatter, -1.0..=1.0);
-                    Self::slider(ui, "sky_brightness", &mut self.sky_brightness, 0.0..=1.0);
-                });
-        });
-    }
-
-    fn slider<Num: emath::Numeric>(
-        ui: &mut egui::Ui,
-        text: impl Into<egui::WidgetText>,
-        value: &mut Num,
-        range: RangeInclusive<Num>,
-    ) {
-        ui.add(
-            egui::Slider::new(value, range)
-                .text(text)
-                .text_color(egui::Color32::LIGHT_BLUE),
-        );
-    }
-}
+/// The node the resource inspector is built under.
+#[derive(Component, Default, Clone)]
+struct DevUIInspectorHost;
 
 pub struct DevUIPlugin;
 
 impl Plugin for DevUIPlugin {
     fn build(&self, app: &mut App) {
-        let render_app = app.get_sub_app(RenderApp).unwrap();
-        let render_device = render_app.world().get_resource::<RenderDevice>().unwrap();
+        // FeathersCorePlugin inits an EMPTY UiTheme (every token resolves to magenta), so
+        // decide on the theme before it runs: keep the app's own theme if it set one.
+        if !app.world().contains_resource::<UiTheme>() {
+            app.insert_resource(UiTheme(create_dark_theme()));
+        }
+        if !app.is_plugin_added::<UiRenderPlugin>() {
+            app.add_plugins(UiRenderPlugin);
+        }
+        if !app.is_plugin_added::<FeathersCorePlugin>() {
+            app.add_plugins(FeathersPlugins);
+        }
+        if !app.is_plugin_added::<DefaultInspectorWidgetsPlugin>() {
+            app.add_plugins(FeathersInspectorPlugins);
+        }
+        if !app.is_plugin_added::<WorldInspectorPlugin>() {
+            app.add_plugins(WorldInspectorPlugin::new().with_toggle_key(KeyCode::F1));
+        }
 
-        let display_handle = app.world().get_resource::<DisplayHandleWrapper>().unwrap();
+        app.register_type::<DevUIState>();
+        app.init_resource::<DevUIState>();
+        app.add_systems(Startup, spawn_panel);
+        app.add_systems(Update, (toggle_panel, update_stats));
 
-        let egui_ctx = egui::Context::default();
-
-        let egui_winit = egui_winit::State::new(
-            egui_ctx.clone(),
-            ViewportId::ROOT,
-            display_handle.deref(),
-            None,
-            None,
-            None,
-        );
-
-        // We won't outlive the render device, so this borrow is okay (tm).
-        let allocator = {
-            let state = render_device.allocator_state.lock().unwrap();
-            state.unchecked_borrow_allocator()
-        };
-
-        let renderer = Renderer::with_gpu_allocator(
-            allocator,
-            render_device.device.clone(),
-            RenderMode::DynamicRendering(DynamicRendering {
-                color_attachment_format: vk::Format::B8G8R8A8_UNORM,
-                depth_attachment_format: None,
-                stencil_attachment_format: None,
-            }),
-            Options {
-                srgb_framebuffer: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let platform_output = DevUIPlatformOutput {
-            platform_output: Arc::new(Mutex::new(None)),
-        };
-
-        app.world_mut()
-            .insert_non_send(DevUIWorldState { egui_winit });
-        app.world_mut().insert_resource(platform_output.clone());
-        app.add_systems(Update, (handle_input, handle_output));
-
-        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
-        render_app.world_mut().init_resource::<DevUIState>();
-        render_app
-            .world_mut()
-            .init_resource::<DevUIWorldStateUpdate>();
-        render_app
-            .world_mut()
-            .insert_resource(DevUI { egui_ctx, renderer });
-        render_app.world_mut().insert_resource(platform_output);
-        render_app.add_systems(ExtractSchedule, extract);
-        render_app.add_systems(TeardownSchedule, cleanup);
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app.init_resource::<DevUIState>();
+        render_app.add_systems(ExtractSchedule, extract_dev_ui_state);
     }
 }
 
-fn handle_input(
-    mut commands: Commands,
-    mut dev_ui_world: NonSendMut<DevUIWorldState>,
-    windows: Query<Entity, With<PrimaryWindow>>,
-    mut winit_events: MessageReader<RawWinitWindowEvent>,
-) {
-    if let Ok(window) = windows.single() {
-        // WinitWindows is no longer a NonSend resource; it lives in a thread-local.
-        WINIT_WINDOWS.with_borrow(|winit_windows| {
-            let window = winit_windows.get_window(window).unwrap();
-            let raw_input = dev_ui_world.egui_winit.take_egui_input(window);
-            commands.insert_resource(DevUIWorldStateUpdate { raw_input });
-
-            for ev in winit_events.read() {
-                if ev.window_id == window.id() {
-                    let _ = dev_ui_world.egui_winit.on_window_event(&window, &ev.event);
-                }
+fn spawn_panel(world: &mut World) {
+    let panel = world
+        .spawn_scene(bsn! {
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(16),
+                top: px(16),
+                width: px(340),
+                padding: UiRect::all(px(10)),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(6),
+                border_radius: BorderRadius::all(px(6)),
             }
-        });
-    }
+            ThemeBackgroundColor(tokens::WINDOW_BG)
+            DevUIPanel
+            Children [
+                caption("bevy_vulkan  (F2: panel, F1: world inspector)"),
+                (caption("fps: -") DevUIStats),
+                (
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        align_self: AlignSelf::Stretch,
+                    }
+                    DevUIInspectorHost
+                ),
+            ]
+        })
+        .expect("dev panel spawns")
+        .id();
+    world.flush();
+
+    let host = world
+        .query_filtered::<Entity, With<DevUIInspectorHost>>()
+        .iter(world)
+        .find(|_| true)
+        .unwrap_or(panel);
+    build_resource_inspector(world, TypeId::of::<DevUIState>(), host);
 }
 
-fn extract(
-    mut commands: Commands,
-    mut ui_state: ResMut<DevUIState>,
-    keyboard: Extract<Res<ButtonInput<KeyCode>>>,
-    world_state: Extract<Res<DevUIWorldStateUpdate>>,
+fn toggle_panel(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut panels: Query<&mut Node, With<DevUIPanel>>,
 ) {
-    if keyboard.just_pressed(KeyCode::Tab) {
-        ui_state.hidden = !ui_state.hidden;
+    if keyboard.just_pressed(KeyCode::F2) {
+        for mut node in &mut panels {
+            node.display = if node.display == Display::None {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
     }
-    commands.insert_resource(world_state.clone());
 }
 
-fn handle_output(
-    mut dev_ui_world: NonSendMut<DevUIWorldState>,
-    windows: Query<Entity, With<PrimaryWindow>>,
-    platform_output: Res<DevUIPlatformOutput>,
+fn update_stats(
+    time: Res<Time>,
+    render_config: Res<RenderConfig>,
+    mut stats: Query<&mut Text, With<DevUIStats>>,
+    mut fps_avg: Local<f32>,
+    mut ticks: Local<u32>,
 ) {
-    if let Ok(window) = windows.single() {
-        WINIT_WINDOWS.with_borrow(|winit_windows| {
-            let window = winit_windows.get_window(window).unwrap();
-            if let Some(platform_output) = platform_output.platform_output.lock().unwrap().take() {
-                dev_ui_world
-                    .egui_winit
-                    .handle_platform_output(window, platform_output);
-            }
-        });
+    let dt = time.delta_secs();
+    if dt > 0.0 {
+        *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
+    }
+    // Mirrors the render world's accumulation counter: counts while accumulating, else 0.
+    *ticks = if render_config.accumulate {
+        *ticks + 1
+    } else {
+        0
+    };
+    for mut text in &mut stats {
+        text.0 = format!("fps: {:.1}    ticks: {}", *fps_avg, *ticks);
     }
 }
 
-fn cleanup(world: &mut World) {
-    world.remove_resource::<DevUI>().unwrap();
+fn extract_dev_ui_state(mut commands: Commands, state: Extract<Res<DevUIState>>) {
+    commands.insert_resource(state.clone());
 }

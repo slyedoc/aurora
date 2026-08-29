@@ -59,6 +59,10 @@ slider, text) drawn by this crate's own Vulkan UI pass (`src/ui_render.rs`): the
 `bevy_feathers_core` feature, so bevy lays out and picks the UI and no `bevy_ui_render`/wgpu
 code runs.
 
+Every example has the dev panel (`DevUIPlugin`): a `bevy_feathers_inspector` card over the
+renderer's tunables (gamma, exposure, aperture, fog, sky) plus fps. `F2` toggles it, `F1` opens
+the world inspector, `Space` toggles accumulation.
+
 This rendering backend integrates seamlessly with Bevy, as a result, the code needed to run a simple scene is extremely simple:
 
 ```rust
