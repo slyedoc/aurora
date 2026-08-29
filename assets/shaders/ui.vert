@@ -17,6 +17,12 @@ layout(location = 5) flat out vec4 out_radius_y;
 layout(location = 6) flat out vec4 out_border;
 layout(location = 7) flat out vec2 out_size;
 layout(location = 8) out vec2 out_point;
+layout(location = 9) flat out vec2 out_g_start;
+layout(location = 10) flat out vec2 out_g_dir;
+layout(location = 11) flat out vec4 out_start_color;
+layout(location = 12) flat out vec4 out_end_color;
+layout(location = 13) flat out vec3 out_g_lens;   // start_len, end_len, hint
+layout(location = 14) flat out uint out_color_space;
 
 void main() {
   UiVertex v = pc.vertices.v[gl_VertexIndex];
@@ -32,4 +38,10 @@ void main() {
   out_border = v.border;
   out_size = v.size;
   out_point = v.point;
+  out_g_start = v.g_start;
+  out_g_dir = v.g_dir;
+  out_start_color = v.start_color;
+  out_end_color = v.end_color;
+  out_g_lens = vec3(v.start_len, v.end_len, v.hint);
+  out_color_space = v.color_space;
 }

@@ -8,8 +8,13 @@
 //! shader. Textures (`ImageNode` images and glyph atlases) are plain `Image` assets, which
 //! [`crate::render_texture`] already uploads and registers in the bindless set.
 //!
-//! Not yet drawn: `BackgroundGradient` / `BorderGradient`, `BoxShadow`, text shadows and
-//! decorations, sliced / tiled image modes (drawn stretched), `OuterColor`.
+//! Gradients (`BackgroundGradient` / `BorderGradient`) are a port of `gradient.wesl`: each color
+//! stop pair becomes a segment quad, interpolated in the gradient's color space by the same
+//! fragment shader — the color space is a per-vertex value here instead of a pipeline
+//! specialization.
+//!
+//! Not yet drawn: `BoxShadow`, text shadows and decorations, sliced / tiled image modes (drawn
+//! stretched), `OuterColor`.
 
 use ash::vk;
 use bevy::{
@@ -17,24 +22,28 @@ use bevy::{
     camera::{
         Camera, CameraPlugin, RenderTarget, RenderTargetInfo, visibility::InheritedVisibility,
     },
-    color::LinearRgba,
+    color::{Hsla, Hsva, LinearRgba, Okhsla, Oklaba, Oklcha, Srgba},
     ecs::system::{SystemParam, lifetimeless::SRes},
     image::{Image, TextureAtlasLayout, TextureAtlasPlugin},
     input_focus::{InputDispatchPlugin, InputFocusPlugin},
-    math::{Affine2, Rect, Vec2},
+    math::{Affine2, FloatOrd, Rect, Vec2},
     picking::DefaultPickingPlugins,
     prelude::*,
     render::RenderApp,
     sprite::BorderRect,
     text::{ComputedTextBlock, PositionedGlyph, TextColor, TextLayoutInfo, TextPlugin},
     ui::{
-        BackgroundColor, BorderColor, CalculatedClip, ComputedNode, ComputedStackIndex, Display,
-        Node, Outline, ResolvedBorderRadius, UiGlobalTransform, UiPlugin, UiSystems, VisualBox,
+        BackgroundColor, BackgroundGradient, BorderColor, BorderGradient, CalculatedClip,
+        ColorStop, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo, ConicGradient,
+        Display, Gradient, InterpolationColorSpace, LinearGradient, Node, Outline, RadialGradient,
+        ResolvedBorderRadius, UiGlobalTransform, UiPlugin, UiSystems, Val, VisualBox,
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
     },
     ui_widgets::UiWidgetsPlugins,
     window::{PrimaryWindow, WindowRef},
 };
+
+use std::f32::consts::{FRAC_PI_2, TAU};
 
 use crate::{
     extract::Extract,
@@ -48,18 +57,26 @@ use crate::{
 pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     pub const TEXTURED: u32 = 1;
+    pub const RADIAL: u32 = 16;
+    pub const FILL_START: u32 = 32;
+    pub const FILL_END: u32 = 64;
+    pub const CONIC: u32 = 128;
     pub const BORDER_LEFT: u32 = 256;
     pub const BORDER_TOP: u32 = 512;
     pub const BORDER_RIGHT: u32 = 1024;
     pub const BORDER_BOTTOM: u32 = 2048;
     pub const BORDER_ALL: u32 = BORDER_LEFT | BORDER_TOP | BORDER_RIGHT | BORDER_BOTTOM;
     pub const INVERT: u32 = 4096;
+    /// This crate's own: the fragment color comes from the gradient fields.
+    pub const GRADIENT: u32 = 8192;
 }
 
 /// Z offsets within a stack index; same values as `bevy_ui_render::stack_z_offsets`.
 mod z_offsets {
     pub const BACKGROUND_COLOR: f32 = 0.0;
     pub const BORDER: f32 = 0.01;
+    pub const GRADIENT: f32 = 0.02;
+    pub const BORDER_GRADIENT: f32 = 0.03;
     pub const IMAGE: f32 = 0.04;
     pub const TEXT: f32 = 0.06;
 }
@@ -85,6 +102,38 @@ pub struct UiVertex {
     pub border: [f32; 4],
     pub size: [f32; 2],
     pub point: [f32; 2],
+    // gradient segment (flags & GRADIENT); colors are in `color_space`
+    pub g_start: [f32; 2],
+    pub g_dir: [f32; 2],
+    pub start_color: [f32; 4],
+    pub end_color: [f32; 4],
+    pub start_len: f32,
+    pub end_len: f32,
+    pub hint: f32,
+    pub color_space: u32,
+}
+
+impl UiVertex {
+    pub const ZERO: UiVertex = UiVertex {
+        position: [0.0; 2],
+        uv: [0.0; 2],
+        color: [0.0; 4],
+        flags: 0,
+        tex_index: 0,
+        radius_x: [0.0; 4],
+        radius_y: [0.0; 4],
+        border: [0.0; 4],
+        size: [0.0; 2],
+        point: [0.0; 2],
+        g_start: [0.0; 2],
+        g_dir: [0.0; 2],
+        start_color: [0.0; 4],
+        end_color: [0.0; 4],
+        start_len: 0.0,
+        end_len: 0.0,
+        hint: 0.0,
+        color_space: 0,
+    };
 }
 
 #[repr(C)]
@@ -399,6 +448,22 @@ pub enum UiItem {
         size: Vec2,
         uvs: [Vec2; 4],
     },
+    /// A whole gradient; drawn as one segment quad per pair of adjacent stops.
+    Gradient {
+        size: Vec2,
+        border_radius: [[f32; 4]; 2],
+        border: [f32; 4],
+        /// Border edge flags (for `BorderGradient`) plus `RADIAL` / `CONIC`.
+        flags: u32,
+        /// Start point (node-local, centered) — linear: the corner the line starts at,
+        /// radial / conic: the center.
+        g_start: Vec2,
+        /// Linear: unit direction; radial: (x/y ratio, _); conic: (start angle, _).
+        g_dir: Vec2,
+        /// (color, distance along the gradient in physical pixels, hint) — resolved stops.
+        stops: Vec<(LinearRgba, f32, f32)>,
+        color_space: InterpolationColorSpace,
+    },
 }
 
 /// The extracted UI for this frame, rebuilt from scratch every extract.
@@ -415,10 +480,13 @@ type UiNodeQuery = (
     &'static ComputedStackIndex,
     &'static UiGlobalTransform,
     &'static InheritedVisibility,
+    &'static ComputedUiRenderTargetInfo,
     Option<&'static CalculatedClip>,
     Option<&'static BackgroundColor>,
     Option<&'static BorderColor>,
     Option<&'static Outline>,
+    Option<&'static BackgroundGradient>,
+    Option<&'static BorderGradient>,
     Option<(&'static ImageNode, &'static ImageNodeSize)>,
     Option<(
         &'static ComputedTextBlock,
@@ -457,10 +525,13 @@ fn extract_ui(
         stack_index,
         transform,
         inherited_visibility,
+        target,
         clip,
         background_color,
         border_color,
         outline,
+        background_gradient,
+        border_gradient,
         image_node,
         text,
     ) in nodes.iter()
@@ -490,6 +561,34 @@ fn extract_ui(
                     flags: shader_flags::UNTEXTURED,
                 },
             });
+        }
+
+        // Gradients: one item per gradient, backgrounds first then border gradients.
+        for (gradients, border_flags, z_offset) in [
+            (background_gradient.map(|g| &g.0), 0, z_offsets::GRADIENT),
+            (
+                border_gradient.map(|g| &g.0),
+                shader_flags::BORDER_ALL,
+                z_offsets::BORDER_GRADIENT,
+            ),
+        ] {
+            let Some(gradients) = gradients else {
+                continue;
+            };
+            if uinode.is_empty() {
+                continue;
+            }
+            for gradient in gradients {
+                if let Some(item) = extract_gradient(gradient, uinode, target, border_flags) {
+                    quads.push(UiQuad {
+                        z: z(z_offset),
+                        image: None,
+                        clip: clip.cloned(),
+                        transform,
+                        item,
+                    });
+                }
+            }
         }
 
         // Image
@@ -667,6 +766,313 @@ fn rect_uvs(mut rect: Rect, extent: Vec2, flip_x: bool, flip_y: bool) -> [Vec2; 
         Vec2::new(rect.min.x, rect.max.y),
     ]
     .map(|uv| uv / extent)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gradients (port of bevy_ui_render::gradient)
+// ---------------------------------------------------------------------------------------------
+
+/// Resolves one `Gradient` on a node into a [`UiItem::Gradient`].
+fn extract_gradient(
+    gradient: &Gradient,
+    uinode: &ComputedNode,
+    target: &ComputedUiRenderTargetInfo,
+    border_flags: u32,
+) -> Option<UiItem> {
+    if gradient.is_empty() {
+        return None;
+    }
+    let size = uinode.size();
+    let scale_factor = target.scale_factor();
+    let target_size = target.physical_size().as_vec2();
+    let corner_points = QUAD_VERTEX_POSITIONS.map(|p| p * size);
+    let mut scratch = Vec::new();
+
+    let linear = |angle: f32, stops: &[ColorStop]| {
+        let length = compute_gradient_line_length(angle, size);
+        let stops = compute_color_stops(
+            stops,
+            scale_factor,
+            length,
+            target_size,
+            &mut Vec::new(),
+            uinode.em_size,
+            uinode.rem_size,
+        );
+        let corner_index = (angle - FRAC_PI_2).rem_euclid(TAU) / FRAC_PI_2;
+        (
+            corner_points[(corner_index as usize).min(3)],
+            Vec2::new(angle.sin(), -angle.cos()),
+            0,
+            stops,
+        )
+    };
+
+    let (g_start, g_dir, g_flags, stops, color_space) = if let Some(color) = gradient.get_single() {
+        let (s, d, f, stops) = linear(
+            0.0,
+            &[
+                ColorStop::new(color, Val::Percent(0.0)),
+                ColorStop::new(color, Val::Percent(100.0)),
+            ],
+        );
+        (s, d, f, stops, gradient.get_color_space())
+    } else {
+        match gradient {
+            Gradient::Linear(LinearGradient {
+                color_space,
+                angle,
+                stops,
+            }) => {
+                let (s, d, f, stops) = linear(*angle, stops);
+                (s, d, f, stops, *color_space)
+            }
+            Gradient::Radial(RadialGradient {
+                color_space,
+                position,
+                shape,
+                stops,
+            }) => {
+                let center = position.resolve(
+                    scale_factor,
+                    size,
+                    target_size,
+                    uinode.em_size,
+                    uinode.rem_size,
+                );
+                let shape_size = shape.resolve(
+                    center,
+                    scale_factor,
+                    size,
+                    target_size,
+                    uinode.em_size,
+                    uinode.rem_size,
+                );
+                let stops = compute_color_stops(
+                    stops,
+                    scale_factor,
+                    shape_size.x,
+                    target_size,
+                    &mut scratch,
+                    uinode.em_size,
+                    uinode.rem_size,
+                );
+                let ratio = if shape_size.y != 0. {
+                    shape_size.x / shape_size.y
+                } else {
+                    1.
+                };
+                (
+                    center,
+                    Vec2::splat(ratio),
+                    shader_flags::RADIAL,
+                    stops,
+                    *color_space,
+                )
+            }
+            Gradient::Conic(ConicGradient {
+                color_space,
+                start,
+                position,
+                stops,
+            }) => {
+                let center = position.resolve(
+                    scale_factor,
+                    size,
+                    target_size,
+                    uinode.em_size,
+                    uinode.rem_size,
+                );
+                scratch.extend(stops.iter().filter_map(|stop| {
+                    stop.angle
+                        .map(|angle| (stop.color.to_linear(), angle.clamp(0., TAU), stop.hint))
+                }));
+                scratch.sort_by_key(|(_, angle, _)| FloatOrd(*angle));
+                let mut sorted = scratch.drain(..);
+                let mut resolved: Vec<_> = stops
+                    .iter()
+                    .map(|stop| {
+                        if stop.angle.is_none() {
+                            (stop.color.to_linear(), f32::NAN, stop.hint)
+                        } else {
+                            sorted.next().unwrap()
+                        }
+                    })
+                    .collect();
+                drop(sorted);
+                interpolate_color_stops(&mut resolved, 0., TAU);
+                (
+                    center,
+                    Vec2::new(*start, 0.),
+                    shader_flags::CONIC,
+                    resolved,
+                    *color_space,
+                )
+            }
+        }
+    };
+
+    if stops.len() < 2 {
+        return None;
+    }
+
+    Some(UiItem::Gradient {
+        size,
+        border_radius: uinode.border_radius().into(),
+        border: border_array(uinode.border()),
+        flags: border_flags | g_flags,
+        g_start,
+        g_dir,
+        stops,
+        color_space,
+    })
+}
+
+/// Length of the gradient line for a linear gradient at `angle` across a box of `size`.
+fn compute_gradient_line_length(angle: f32, size: Vec2) -> f32 {
+    let center = 0.5 * size;
+    let v = Vec2::new(angle.sin(), -angle.cos());
+
+    let (pos_corner, neg_corner) = if v.x >= 0.0 && v.y <= 0.0 {
+        (size.with_y(0.), size.with_x(0.))
+    } else if v.x >= 0.0 && v.y > 0.0 {
+        (size, Vec2::ZERO)
+    } else if v.x < 0.0 && v.y <= 0.0 {
+        (Vec2::ZERO, size)
+    } else {
+        (size.with_x(0.), size.with_y(0.))
+    };
+
+    let t_pos = (pos_corner - center).dot(v);
+    let t_neg = (neg_corner - center).dot(v);
+
+    (t_pos - t_neg).abs()
+}
+
+/// Fills in the positions of `Auto` stops (NaN) by spreading them evenly between neighbours.
+fn interpolate_color_stops(stops: &mut [(LinearRgba, f32, f32)], min: f32, max: f32) {
+    if stops[0].1.is_nan() {
+        stops[0].1 = min;
+    }
+    if stops.last().unwrap().1.is_nan() {
+        stops.last_mut().unwrap().1 = max;
+    }
+
+    let mut i = 1;
+    while i < stops.len() - 1 {
+        if stops[i].1.is_nan() {
+            let start = i;
+            let mut end = i + 1;
+            while end < stops.len() - 1 && stops[end].1.is_nan() {
+                end += 1;
+            }
+            let start_point = stops[start - 1].1;
+            let end_point = stops[end].1;
+            let steps = end - start;
+            let step = (end_point - start_point) / (steps + 1) as f32;
+            for j in 0..steps {
+                stops[i + j].1 = start_point + step * (j + 1) as f32;
+            }
+            i = end;
+        }
+        i += 1;
+    }
+}
+
+/// Resolves stop positions to physical distances along a gradient of `length` pixels.
+fn compute_color_stops(
+    stops: &[ColorStop],
+    scale_factor: f32,
+    length: f32,
+    target_size: Vec2,
+    scratch: &mut Vec<(LinearRgba, f32, f32)>,
+    em_size: bevy::text::EmSize,
+    rem_size: bevy::text::RemSize,
+) -> Vec<(LinearRgba, f32, f32)> {
+    scratch.clear();
+    scratch.extend(stops.iter().filter_map(|stop| {
+        stop.point
+            .resolve(scale_factor, length, target_size, em_size, rem_size)
+            .ok()
+            .map(|physical_point| (stop.color.to_linear(), physical_point, stop.hint))
+    }));
+    scratch.sort_by_key(|(_, point, _)| FloatOrd(*point));
+
+    let min = scratch
+        .first()
+        .map(|(_, min, _)| *min)
+        .unwrap_or(0.)
+        .min(0.);
+    let max = scratch
+        .last()
+        .map(|(_, max, _)| *max)
+        .unwrap_or(length)
+        .max(length);
+
+    let mut sorted = scratch.drain(..);
+    let mut resolved: Vec<_> = stops
+        .iter()
+        .map(|stop| {
+            if stop.point == Val::Auto {
+                (stop.color.to_linear(), f32::NAN, stop.hint)
+            } else {
+                sorted.next().unwrap()
+            }
+        })
+        .collect();
+    drop(sorted);
+
+    interpolate_color_stops(&mut resolved, min, max);
+    resolved
+}
+
+/// Index the fragment shader switches on; must align with the `CS_*` constants in `ui.frag`.
+fn color_space_index(space: InterpolationColorSpace) -> u32 {
+    match space {
+        InterpolationColorSpace::LinearRgba => 0,
+        InterpolationColorSpace::Srgba => 1,
+        InterpolationColorSpace::Oklaba => 2,
+        InterpolationColorSpace::Oklcha => 3,
+        InterpolationColorSpace::OklchaLong => 4,
+        InterpolationColorSpace::Okhsla => 5,
+        InterpolationColorSpace::OkhslaLong => 6,
+        InterpolationColorSpace::Hsla => 7,
+        InterpolationColorSpace::HslaLong => 8,
+        InterpolationColorSpace::Hsva => 9,
+        InterpolationColorSpace::HsvaLong => 10,
+    }
+}
+
+/// Converts a stop color into the gradient's interpolation space; hues are normalized to
+/// `[0, 1)` for the shader.
+fn convert_color_to_space(color: LinearRgba, space: InterpolationColorSpace) -> [f32; 4] {
+    match space {
+        InterpolationColorSpace::Oklaba => {
+            let c: Oklaba = color.into();
+            [c.lightness, c.a, c.b, c.alpha]
+        }
+        InterpolationColorSpace::Oklcha | InterpolationColorSpace::OklchaLong => {
+            let c: Oklcha = color.into();
+            [c.lightness, c.chroma, c.hue / 360., c.alpha]
+        }
+        InterpolationColorSpace::Okhsla | InterpolationColorSpace::OkhslaLong => {
+            let c: Okhsla = color.into();
+            [c.hue / 360., c.saturation, c.lightness, c.alpha]
+        }
+        InterpolationColorSpace::Srgba => {
+            let c: Srgba = color.into();
+            [c.red, c.green, c.blue, c.alpha]
+        }
+        InterpolationColorSpace::LinearRgba => color.to_f32_array(),
+        InterpolationColorSpace::Hsla | InterpolationColorSpace::HslaLong => {
+            let c: Hsla = color.into();
+            [c.hue / 360., c.saturation, c.lightness, c.alpha]
+        }
+        InterpolationColorSpace::Hsva | InterpolationColorSpace::HsvaLong => {
+            let c: Hsva = color.into();
+            [c.hue / 360., c.saturation, c.value, c.alpha]
+        }
+    }
 }
 
 struct ImageQuad {
@@ -965,6 +1371,7 @@ pub unsafe fn draw_ui(
                     border: *border,
                     size: (*size).into(),
                     point: point.into(),
+                    ..UiVertex::ZERO
                 });
             }
             UiItem::Glyph {
@@ -991,12 +1398,81 @@ pub unsafe fn draw_ui(
                     color: *color,
                     flags: shader_flags::TEXTURED,
                     tex_index,
-                    radius_x: [0.0; 4],
-                    radius_y: [0.0; 4],
-                    border: [0.0; 4],
                     size: (*size).into(),
-                    point: [0.0; 2],
+                    ..UiVertex::ZERO
                 });
+            }
+            UiItem::Gradient {
+                size,
+                border_radius,
+                border,
+                flags,
+                g_start,
+                g_dir,
+                stops,
+                color_space,
+            } => {
+                let points = QUAD_VERTEX_POSITIONS.map(|p| p * *size);
+                let positions = points.map(|p| quad.transform.transform_point2(p));
+                let polygon = clip_polygon(
+                    quad.clip.as_ref(),
+                    &[
+                        (positions[0], points[0]),
+                        (positions[1], points[1]),
+                        (positions[2], points[2]),
+                        (positions[3], points[3]),
+                    ],
+                    Vec2::lerp,
+                );
+                if polygon.is_empty() {
+                    continue;
+                }
+                let flags = *flags | shader_flags::GRADIENT;
+                let space = color_space_index(*color_space);
+
+                // One segment per adjacent stop pair (bevy_ui_render::prepare_gradient).
+                let mut segment_count = 0;
+                for stop_index in 0..stops.len() - 1 {
+                    let mut start_stop = stops[stop_index];
+                    let end_stop = stops[stop_index + 1];
+                    if start_stop.1 == end_stop.1 {
+                        if stop_index == stops.len() - 2 {
+                            if 0 < segment_count {
+                                start_stop.0 = LinearRgba::NONE;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    let start_color = convert_color_to_space(start_stop.0, *color_space);
+                    let end_color = convert_color_to_space(end_stop.0, *color_space);
+                    let mut stop_flags = flags;
+                    if 0. < start_stop.1 && (stop_index == 0 || segment_count == 0) {
+                        stop_flags |= shader_flags::FILL_START;
+                    }
+                    if stop_index == stops.len() - 2 {
+                        stop_flags |= shader_flags::FILL_END;
+                    }
+                    push_fan(vertices, &polygon, |(position, point)| UiVertex {
+                        position: position.into(),
+                        flags: stop_flags,
+                        radius_x: border_radius[0],
+                        radius_y: border_radius[1],
+                        border: *border,
+                        size: (*size).into(),
+                        point: point.into(),
+                        g_start: (*g_start).into(),
+                        g_dir: (*g_dir).into(),
+                        start_color,
+                        end_color,
+                        start_len: start_stop.1,
+                        end_len: end_stop.1,
+                        hint: start_stop.2,
+                        color_space: space,
+                        ..UiVertex::ZERO
+                    });
+                    segment_count += 1;
+                }
             }
         }
     }

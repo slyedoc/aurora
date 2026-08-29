@@ -1,8 +1,11 @@
 #version 460
 #extension GL_EXT_nonuniform_qualifier : enable
 
-// Port of bevy_ui_render's `ui.wesl`: rounded-box SDF backgrounds and borders,
-// textured quads (images, glyph atlases) through this crate's bindless set.
+// Port of bevy_ui_render's `ui.wesl` + `gradient.wesl`: rounded-box SDF backgrounds and
+// borders, textured quads (images, glyph atlases) through this crate's bindless set, and
+// linear / radial / conic gradient segments interpolated in a per-vertex color space.
+
+#include "ui_color.glsl"
 
 layout(set = 0, binding = 200) uniform sampler2D textures[];
 
@@ -15,11 +18,22 @@ layout(location = 5) flat in vec4 in_radius_y;
 layout(location = 6) flat in vec4 in_border;
 layout(location = 7) flat in vec2 in_size;
 layout(location = 8) in vec2 in_point;
+layout(location = 9) flat in vec2 in_g_start;
+layout(location = 10) flat in vec2 in_g_dir;
+layout(location = 11) flat in vec4 in_start_color;
+layout(location = 12) flat in vec4 in_end_color;
+layout(location = 13) flat in vec3 in_g_lens;   // start_len, end_len, hint
+layout(location = 14) flat in uint in_color_space;
 
 layout(location = 0) out vec4 out_color;
 
 const uint TEXTURED = 1u;
 // must align with `ui_render::shader_flags`
+const uint RADIAL = 16u;
+const uint FILL_START = 32u;
+const uint FILL_END = 64u;
+const uint CONIC = 128u;
+const uint GRADIENT = 8192u;
 const uint BORDER_LEFT = 256u;
 const uint BORDER_TOP = 512u;
 const uint BORDER_RIGHT = 1024u;
@@ -133,22 +147,134 @@ vec4 draw_uinode_background(vec4 color, vec2 point, vec2 size, vec4 rx, vec4 ry,
   return vec4(color.rgb, clamp(color.a * t, 0.0, 1.0));
 }
 
-// The swapchain is UNORM, so linear colors from bevy get encoded here.
-vec3 linear_to_srgb(vec3 c) {
-  vec3 lo = 12.92 * c;
-  vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-  return mix(lo, hi, step(vec3(0.0031308), c));
+// ---- gradients (port of gradient.wesl) ----
+
+// must align with `ui_render::color_space_index`
+const uint CS_LINEAR_RGBA = 0u;
+const uint CS_SRGBA = 1u;
+const uint CS_OKLABA = 2u;
+const uint CS_OKLCHA = 3u;
+const uint CS_OKLCHA_LONG = 4u;
+const uint CS_OKHSLA = 5u;
+const uint CS_OKHSLA_LONG = 6u;
+const uint CS_HSLA = 7u;
+const uint CS_HSLA_LONG = 8u;
+const uint CS_HSVA = 9u;
+const uint CS_HSVA_LONG = 10u;
+
+// Distance in gradient space from the start of the gradient to `point`.
+float linear_distance(vec2 point, vec2 g_start, vec2 g_dir) {
+  return dot(point - g_start, g_dir);
+}
+
+float radial_distance(vec2 point, vec2 center, float ratio) {
+  vec2 d = point - center;
+  return length(vec2(d.x, d.y * ratio));
+}
+
+float conic_distance(float start, vec2 point, vec2 center) {
+  vec2 d = point - center;
+  float angle = atan(-d.x, d.y) + UI_PI;
+  return mod(mod(angle - start, UI_PI_2) + UI_PI_2, UI_PI_2);
+}
+
+// Mix in the interpolation color space.
+vec3 mix_colors(vec3 a, vec3 b, float t, uint space) {
+  switch (space) {
+    case CS_OKLCHA: return mix_oklch(a, b, t);
+    case CS_OKLCHA_LONG: return mix_oklch_long(a, b, t);
+    case CS_HSVA: return mix_hsv(a, b, t);
+    case CS_HSVA_LONG: return mix_hsv_long(a, b, t);
+    case CS_HSLA: return mix_hue_short(a, b, t);
+    case CS_HSLA_LONG: return mix_hue_long(a, b, t);
+    case CS_OKHSLA: return mix_hue_short(a, b, t);
+    case CS_OKHSLA_LONG: return mix_hue_long(a, b, t);
+    // linear rgba, oklab and srgba just lerp
+    default: return mix(a, b, t);
+  }
+}
+
+// Convert from the interpolation color space to linear rgba.
+vec4 convert_to_linear_rgba(vec4 color, uint space) {
+  vec3 rgb;
+  switch (space) {
+    case CS_OKLCHA: case CS_OKLCHA_LONG: rgb = oklch_to_linear_rgb(color.xyz); break;
+    case CS_OKHSLA: case CS_OKHSLA_LONG: rgb = okhsl_to_linear_rgb(color.xyz); break;
+    case CS_HSVA: case CS_HSVA_LONG: rgb = hsv_to_linear_rgb(color.xyz); break;
+    case CS_HSLA: case CS_HSLA_LONG: rgb = hsl_to_linear_rgb(color.xyz); break;
+    case CS_OKLABA: rgb = oklab_to_linear_rgb(color.xyz); break;
+    case CS_SRGBA: rgb = srgb_to_linear_rgb(color.xyz); break;
+    default: rgb = color.rgb; break;
+  }
+  return vec4(rgb, color.a);
+}
+
+vec4 interpolate_gradient(
+  float dist, vec4 start_color, float start_distance, vec4 end_color, float end_distance,
+  float hint, uint flags, uint space
+) {
+  if (start_distance == end_distance) {
+    if (dist <= start_distance && enabled(flags, FILL_START)) {
+      return convert_to_linear_rgba(start_color, space);
+    }
+    if (start_distance <= dist && enabled(flags, FILL_END)) {
+      return convert_to_linear_rgba(end_color, space);
+    }
+    return vec4(0.0);
+  }
+
+  float t = (dist - start_distance) / (end_distance - start_distance);
+
+  if (t < 0.0) {
+    if (enabled(flags, FILL_START)) {
+      return convert_to_linear_rgba(start_color, space);
+    }
+    return vec4(0.0);
+  }
+  if (1.0 < t) {
+    if (enabled(flags, FILL_END)) {
+      return convert_to_linear_rgba(end_color, space);
+    }
+    return vec4(0.0);
+  }
+
+  if (t < hint) {
+    t = 0.5 * t / hint;
+  } else {
+    t = 0.5 * (1.0 + (t - hint) / (1.0 - hint));
+  }
+
+  return convert_to_linear_rgba(
+    vec4(mix_colors(start_color.xyz, end_color.xyz, t, space), mix(start_color.a, end_color.a, t)),
+    space
+  );
 }
 
 void main() {
-  vec4 color = in_color;
+  vec4 color;
+  if (enabled(in_flags, GRADIENT)) {
+    float g_distance;
+    if (enabled(in_flags, RADIAL)) {
+      g_distance = radial_distance(in_point, in_g_start, in_g_dir.x);
+    } else if (enabled(in_flags, CONIC)) {
+      g_distance = conic_distance(in_g_dir.x, in_point, in_g_start);
+    } else {
+      g_distance = linear_distance(in_point, in_g_start, in_g_dir);
+    }
+    color = interpolate_gradient(
+      g_distance, in_start_color, in_g_lens.x, in_end_color, in_g_lens.y, in_g_lens.z,
+      in_flags, in_color_space
+    );
+  } else {
+    color = in_color;
+  }
+
+  // The swapchain is UNORM, so linear colors from bevy get encoded here.
+  color = vec4(linear_rgb_to_srgb(color.rgb), color.a);
   if (enabled(in_flags, TEXTURED)) {
     // Image bytes are already sRGB encoded (loaded as UNORM); glyph atlases are
     // white alpha masks. Apply them after encoding the tint.
-    vec4 texel = texture(textures[nonuniformEXT(in_tex)], in_uv);
-    color = vec4(linear_to_srgb(color.rgb), color.a) * texel;
-  } else {
-    color = vec4(linear_to_srgb(color.rgb), color.a);
+    color *= texture(textures[nonuniformEXT(in_tex)], in_uv);
   }
 
   if (enabled(in_flags, BORDER_ANY)) {
