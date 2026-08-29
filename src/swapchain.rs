@@ -98,10 +98,15 @@ impl Swapchain {
                 .get_physical_device_surface_formats(self.device.physical_device, self.surface)
                 .unwrap();
 
+            // Every graphics pipeline in this crate (post-process, egui, bevy_ui) is created
+            // against B8G8R8A8_UNORM, so prefer that; fall back to the RGBA twin.
             let surface_format = formats
                 .iter()
-                .find(|f| {
-                    f.format == vk::Format::B8G8R8A8_UNORM || f.format == vk::Format::R8G8B8A8_UNORM
+                .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
+                .or_else(|| {
+                    formats
+                        .iter()
+                        .find(|f| f.format == vk::Format::R8G8B8A8_UNORM)
                 })
                 .unwrap_or(&formats[0]);
 
