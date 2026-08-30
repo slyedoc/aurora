@@ -68,6 +68,12 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   vec3 sky_ground;
   // Entries in the emissive-triangle light table (0 = no light NEE / MIS).
   uint light_entries;
+  // ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
+  uint restir_candidates;
+  // Light-table generation; reservoirs from another generation are dropped.
+  uint light_epoch;
+  // Cap on temporal history, in candidate-samples.
+  float restir_m_clamp;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
@@ -123,6 +129,26 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Li
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer SlotToLight {
   uint data[];
+};
+
+// One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.
+struct Reservoir {
+  // Winning light-table entry and its (su, sv) triangle sample, packed as 2xf16.
+  uint y;
+  uint uv_pk;
+  // Unbiased contribution weight (0 after an occluded visibility ray) and history length.
+  float W;
+  float M;
+  // Validation: the light-table generation, the shading normal (oct, 2xf16), the view
+  // depth (clip w) and the frame that wrote the reservoir.
+  uint epoch;
+  uint normal_pk;
+  float depth;
+  uint frame;
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) buffer ReservoirData {
+  Reservoir data[];
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightsHeader {
@@ -197,6 +223,9 @@ struct PushConstants {
   LightsHeader lights;
   // This frame's instance rows (same layout as prev_instances), for light transforms.
   PrevInstances cur_instances;
+  // ReSTIR DI reservoirs: last frame's (read) and this frame's (written).
+  ReservoirData reservoirs_prev;
+  ReservoirData reservoirs_cur;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

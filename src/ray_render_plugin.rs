@@ -87,6 +87,12 @@ pub struct UniformData {
     sky_ground: [f32; 3],
     /// Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     light_entries: u32,
+    /// ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
+    restir_candidates: u32,
+    /// Light-table generation; reservoirs from another generation are dropped.
+    light_epoch: u32,
+    /// Cap on temporal history, in candidate-samples.
+    restir_m_clamp: f32,
 }
 
 #[repr(C)]
@@ -326,6 +332,7 @@ fn render_frame(
         Res<crate::compute::ComputeModules>,
         Res<SBT>,
         ResMut<crate::lights::LightManager>,
+        ResMut<crate::restir::RestirState>,
     ),
     camera: Query<
         (
@@ -346,7 +353,7 @@ fn render_frame(
     let Some(mut swapchain) = swapchain else {
         return;
     };
-    let (mut transforms, modules, sbt, mut lights) = gpu;
+    let (mut transforms, modules, sbt, mut lights, mut restir) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
     let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
@@ -495,6 +502,15 @@ fn render_frame(
             } else {
                 0
             },
+            // Accumulation stays the uncorrelated reference estimator.
+            restir_candidates: if dev_ui_state.restir && !render_config.accumulate {
+                dev_ui_state.restir_candidates.clamp(1, 32)
+            } else {
+                0
+            },
+            light_epoch: lights.epoch,
+            restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
+                .max(1.0),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
@@ -625,6 +641,8 @@ fn render_frame(
                     rtx_pipeline.pipeline,
                 );
 
+                let (reservoirs_prev, reservoirs_cur) =
+                    restir.ensure(&render_device, cmd_buffer, trace_extent, *frame_counter);
                 let push_constants = RaytracingPushConstants {
                     uniform_buffer: frame.uniform_buffer.address,
                     material_buffer: tlas.material_address(),
@@ -642,6 +660,8 @@ fn render_frame(
                     prev_instances: tlas.prev_instances_address(),
                     lights: lights.header_address(),
                     instances: tlas.instances_address(),
+                    reservoirs_prev,
+                    reservoirs_cur,
                 };
 
                 render_device.cmd_push_constants(

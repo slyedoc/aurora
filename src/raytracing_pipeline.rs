@@ -62,6 +62,9 @@ pub struct RaytracingPushConstants {
     pub lights: u64,
     /// This frame's instance rows, for light-sample transforms.
     pub instances: u64,
+    /// ReSTIR DI reservoirs: last frame's and this frame's (`restir`).
+    pub reservoirs_prev: u64,
+    pub reservoirs_cur: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {

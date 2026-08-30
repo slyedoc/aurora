@@ -109,6 +109,8 @@ pub struct LightManager {
     logged: (u32, u32),
     /// Entries the frame uniform may expose (0 while the table is empty / not built).
     pub active_entries: u32,
+    /// Bumped on every rebuild; reservoirs remember it so stale entry ids are dropped.
+    pub epoch: u32,
 }
 
 impl LightManager {
@@ -128,6 +130,7 @@ impl LightManager {
             warned_module: false,
             logged: (0, 0),
             active_entries: 0,
+            epoch: 1,
         }
     }
 
@@ -373,6 +376,7 @@ fn prepare_lights(
     lights.dirty = waiting;
 
     lights.destroy_buffers(&render_device);
+    lights.epoch = lights.epoch.wrapping_add(1).max(1);
     lights.entry_count = entry_base;
     lights.linst_count = linsts.len() as u32;
     lights.active_entries = entry_base;

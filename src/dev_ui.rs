@@ -72,6 +72,15 @@ pub struct DevUIState {
     /// Next-event estimation for emissive triangles (off = BRDF sampling only, the
     /// reference estimator).
     pub light_nee: bool,
+    /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse). Off while
+    /// accumulating, so Space stays the uncorrelated reference.
+    pub restir: bool,
+    /// Initial light candidates per pixel.
+    #[reflect(@1.0..=32.0_f32)]
+    pub restir_candidates: u32,
+    /// Temporal history cap, in multiples of the candidate count.
+    #[reflect(@0.0..=64.0_f32)]
+    pub restir_history: f32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -92,6 +101,9 @@ impl Default for DevUIState {
             dlss_max_bounces: 8,
             vignette: 0.0,
             light_nee: true,
+            restir: true,
+            restir_candidates: 8,
+            restir_history: 20.0,
             dlss: AuroraDlss::from_env(),
         }
     }
