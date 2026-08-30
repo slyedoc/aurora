@@ -43,6 +43,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
+        group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::sbt::SBTPlugin);
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);

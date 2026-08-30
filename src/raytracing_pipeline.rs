@@ -65,6 +65,8 @@ pub struct RaytracingPushConstants {
     /// ReSTIR DI reservoirs: last frame's and this frame's (`restir`).
     pub reservoirs_prev: u64,
     pub reservoirs_cur: u64,
+    /// Radiance-cache entries (`sharc`; 0 until first enabled).
+    pub sharc: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {

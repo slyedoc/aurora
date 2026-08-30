@@ -81,6 +81,12 @@ pub struct DevUIState {
     /// Temporal history cap, in multiples of the candidate count.
     #[reflect(@0.0..=64.0_f32)]
     pub restir_history: f32,
+    /// Radiance cache: paths terminate into converged voxels from bounce 2 on. Biased by
+    /// construction; off while accumulating.
+    pub sharc: bool,
+    /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
+    #[reflect(@0.05..=2.0_f32)]
+    pub sharc_voxel: f32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -104,6 +110,8 @@ impl Default for DevUIState {
             restir: true,
             restir_candidates: 8,
             restir_history: 20.0,
+            sharc: true,
+            sharc_voxel: 0.25,
             dlss: AuroraDlss::from_env(),
         }
     }

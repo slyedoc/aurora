@@ -126,6 +126,65 @@ float lightTrianglePdf(LightInstance li, const uint tri, const float p_pick, con
   return p_pick * t * t / (cos_l * 0.5 * area2);
 }
 
+// ---- Radiance cache (SHaRC-style; see src/sharc.rs) ---------------------------------------
+
+// Must match SHARC_ENTRIES in src/sharc.rs.
+const uint SHARC_ENTRIES = 1u << 20;
+
+// Voxel key: position quantized at a distance-scaled size, level, dominant face normal.
+uvec4 sharcKey(const vec3 pos, const vec3 n, const vec3 cam) {
+  const float d = max(length(pos - cam), 1.0e-3);
+  const float level = floor(log2(max(d / 8.0, 1.0)));
+  const float s = max(pc.uniforms.sharc_voxel, 1.0e-3) * exp2(level);
+  const ivec3 c = ivec3(floor(pos / s));
+  uint axis = abs(n.x) > abs(n.y) ? (abs(n.x) > abs(n.z) ? 0u : 2u)
+                                  : (abs(n.y) > abs(n.z) ? 1u : 2u);
+  axis = axis * 2u + (n[axis] < 0.0 ? 1u : 0u);
+  return uvec4(uint(c.x), uint(c.y), uint(c.z), (uint(level) << 3) | axis);
+}
+
+uint sharcHash(const uvec4 k) {
+  uint h = k.x * 0x8da6b343u ^ k.y * 0xd8163841u ^ k.z * 0xcb1ab31fu ^ k.w * 0x165667b1u;
+  h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+  return h;
+}
+
+// Find-or-insert the entry for a voxel key: linear probe with a tag compare, claiming an
+// empty slot atomically. Returns ~0 when the neighbourhood is full (the path just traces on).
+uint sharcSlot(const vec3 pos, const vec3 n, const vec3 cam) {
+  const uvec4 key = sharcKey(pos, n, cam);
+  const uint h = sharcHash(key);
+  const uint tag = (sharcHash(key.wxyz) | 1u);
+  for (uint i = 0u; i < 8u; i++) {
+    const uint slot = (h + i) & (SHARC_ENTRIES - 1u);
+    const uint t = pc.sharc.data[slot].tag;
+    if (t == tag) { return slot; }
+    if (t == 0u) {
+      const uint prev = atomicCompSwap(pc.sharc.data[slot].tag, 0u, tag);
+      if (prev == 0u || prev == tag) { return slot; }
+    }
+  }
+  return 0xFFFFFFFFu;
+}
+
+// The resolved radiance, if the entry has folded in enough samples to be trusted.
+bool sharcQuery(const uint slot, out vec3 radiance) {
+  radiance = vec3(uintBitsToFloat(pc.sharc.data[slot].res_r),
+                  uintBitsToFloat(pc.sharc.data[slot].res_g),
+                  uintBitsToFloat(pc.sharc.data[slot].res_b));
+  return uintBitsToFloat(pc.sharc.data[slot].conf) >= 8.0;
+}
+
+// One path sample of the voxel's outgoing radiance (nits, fixed point at 1 nit).
+void sharcDeposit(const uint slot, const vec3 radiance) {
+  const vec3 r = clamp(radiance, vec3(0.0), vec3(1.0e6));
+  atomicAdd(pc.sharc.data[slot].acc_r, uint(r.r));
+  atomicAdd(pc.sharc.data[slot].acc_g, uint(r.g));
+  atomicAdd(pc.sharc.data[slot].acc_b, uint(r.b));
+  atomicAdd(pc.sharc.data[slot].acc_n, 1u);
+  pc.sharc.data[slot].frame = pc.uniforms.frame;
+}
+
 // Entry from the power CDF at cumulative value x, and its pick probability.
 uint lightsPickEntry(const float x, out float p_pick) {
   uint lo = 0u, hi = pc.lights.entry_count - 1u;
@@ -246,6 +305,13 @@ void main() {
     // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
     // camera ray and delta continuations): the MIS partner of light-table sampling.
     float prev_pdf = 0.0;
+    // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
+    // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
+    // once the path ends.
+    uint sh_slot[4];
+    vec3 sh_mask[4];
+    vec3 sh_acc[4];
+    uint sh_n = 0u;
 
     for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
       payload.want_sun = want_sun ? 1u : 0u;
@@ -404,6 +470,30 @@ void main() {
       const DisneyMaterial disney_mat = DisneyMaterial(
         payload.color.rgb, metallic, roughness
       );
+
+      // Radiance cache: diffuse-ish vertices past the primary hit take part. From bounce
+      // 2 on, a converged voxel ends the path with its cached outgoing radiance; every
+      // participating vertex is also recorded as an update target, so the cache keeps
+      // learning from the paths that do get traced (including ones that end in a query).
+      if (pc.uniforms.sharc != 0u && bounce_idx > 0
+          && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
+        const uint slot = sharcSlot(origin, world_normal, initial_origin);
+        if (slot != 0xFFFFFFFFu) {
+          if (bounce_idx >= 2) {
+            vec3 cached;
+            if (sharcQuery(slot, cached)) {
+              acc += mask * cached;
+              break;
+            }
+          }
+          if (sh_n < 4u) {
+            sh_slot[sh_n] = slot;
+            sh_mask[sh_n] = mask;
+            sh_acc[sh_n] = acc;
+            sh_n++;
+          }
+        }
+      }
 
       // Direct light from the emissive-triangle table. At the primary vertex of sample 0
       // this is ReSTIR DI (RIS over the CDF candidates, temporal reservoir reuse across
@@ -599,6 +689,18 @@ void main() {
       if (brdf.a > 0.0001) {
         mask *= brdf.rgb / brdf.a;
       }
+    }
+
+    // The path ended: everything gathered after each cache vertex, divided by its mask
+    // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
+    // darkness is learned too).
+    for (uint si = 0u; si < sh_n; si++) {
+      const vec3 delta = max(acc - sh_acc[si], vec3(0.0));
+      const vec3 m = sh_mask[si];
+      sharcDeposit(sh_slot[si], vec3(
+        m.r > 1.0e-6 ? delta.r / m.r : 0.0,
+        m.g > 1.0e-6 ? delta.g / m.g : 0.0,
+        m.b > 1.0e-6 ? delta.b / m.b : 0.0));
     }
   }
 

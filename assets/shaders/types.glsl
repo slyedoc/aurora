@@ -74,6 +74,10 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint light_epoch;
   // Cap on temporal history, in candidate-samples.
   float restir_m_clamp;
+  // Radiance cache: 0 = off (also while accumulating); else paths may terminate into it.
+  uint sharc;
+  // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
+  float sharc_voxel;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
@@ -129,6 +133,27 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Li
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer SlotToLight {
   uint data[];
+};
+
+// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 48 bytes; resolved
+// values are f32 bit patterns in uints.
+struct SharcEntry {
+  uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
+  uint frame;    // Last frame the entry was deposited into or queried.
+  uint acc_r;    // Fixed-point (1 nit) radiance accumulated this frame.
+  uint acc_g;
+  uint acc_b;
+  uint acc_n;    // Samples accumulated this frame.
+  uint res_r;    // Resolved radiance (f32 bits).
+  uint res_g;
+  uint res_b;
+  uint conf;     // Confidence: samples folded in (f32 bits).
+  uint pad0;
+  uint pad1;
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) buffer SharcData {
+  SharcEntry data[];
 };
 
 // One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.
@@ -226,6 +251,8 @@ struct PushConstants {
   // ReSTIR DI reservoirs: last frame's (read) and this frame's (written).
   ReservoirData reservoirs_prev;
   ReservoirData reservoirs_cur;
+  // Radiance-cache entries (valid whenever uniforms.sharc != 0).
+  SharcData sharc;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

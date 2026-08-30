@@ -23,6 +23,7 @@ pub mod render_env;
 pub mod restir;
 pub mod render_texture;
 pub mod sbt;
+pub mod sharc;
 pub mod shader;
 pub mod sky;
 pub mod sphere;

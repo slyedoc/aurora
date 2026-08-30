@@ -93,6 +93,10 @@ pub struct UniformData {
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
+    /// Radiance cache: 0 = off (also while accumulating).
+    sharc: u32,
+    /// Base cache voxel size (meters) at the camera.
+    sharc_voxel: f32,
 }
 
 #[repr(C)]
@@ -333,6 +337,7 @@ fn render_frame(
         Res<SBT>,
         ResMut<crate::lights::LightManager>,
         ResMut<crate::restir::RestirState>,
+        ResMut<crate::sharc::SharcState>,
     ),
     camera: Query<
         (
@@ -353,7 +358,7 @@ fn render_frame(
     let Some(mut swapchain) = swapchain else {
         return;
     };
-    let (mut transforms, modules, sbt, mut lights, mut restir) = gpu;
+    let (mut transforms, modules, sbt, mut lights, mut restir, mut sharc) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
     let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
@@ -511,6 +516,8 @@ fn render_frame(
             light_epoch: lights.epoch,
             restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
                 .max(1.0),
+            sharc: (dev_ui_state.sharc && !render_config.accumulate) as u32,
+            sharc_voxel: dev_ui_state.sharc_voxel.max(0.01),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
@@ -555,6 +562,14 @@ fn render_frame(
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).
         lights.record(&render_device, cmd_buffer, &modules, &tlas);
+        // The radiance cache's per-frame resolve (and its first-use allocation).
+        sharc.record(
+            &render_device,
+            cmd_buffer,
+            &modules,
+            *frame_counter,
+            dev_ui_state.sharc && !render_config.accumulate,
+        );
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
@@ -662,6 +677,7 @@ fn render_frame(
                     instances: tlas.instances_address(),
                     reservoirs_prev,
                     reservoirs_cur,
+                    sharc: sharc.address(),
                 };
 
                 render_device.cmd_push_constants(
