@@ -45,9 +45,12 @@ vec3 applyVignette(vec3 color) {
 void main() {
   vec4 accBuffer = texture(test, in_UV);
   // The DLSS output is a resolved colour; the accumulation target carries its sample count in .a.
-  vec3 color = uniforms.dlss != 0 ? accBuffer.rgb : accBuffer.rgb / accBuffer.a;
+  // The DLSS output is already exposed (the raygen applies it before reconstruction); the
+  // accumulation target is raw radiance with its sample count in .a.
+  const bool dlss = uniforms.dlss != 0;
+  vec3 color = dlss ? accBuffer.rgb : accBuffer.rgb / accBuffer.a;
   color = pow(color, vec3(1.0/uniforms.gamma));
-  color = vec3(1.0) - exp(-color * uniforms.exposure);
+  color = vec3(1.0) - exp(-color * (dlss ? 1.0 : uniforms.exposure));
 
   color = acesFilm(color);
   color = applyVignette(color);

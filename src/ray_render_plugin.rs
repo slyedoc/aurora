@@ -39,7 +39,9 @@ impl Default for RenderConfig {
             postprocess_pipeline: Default::default(),
             skydome: Default::default(),
             sky_color: Vec4::splat(1.0),
-            accumulate: Default::default(),
+            // `AURORA_ACCUMULATE=1` starts with accumulation on (Space toggles it) -- a
+            // converged reference for headless comparisons.
+            accumulate: std::env::var_os("AURORA_ACCUMULATE").is_some(),
             pull_focus: Default::default(),
         }
     }
