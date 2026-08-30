@@ -44,7 +44,9 @@ impl AssetLoader for ShaderLoader {
     type Error = ShaderLoaderError;
 
     fn extensions(&self) -> &[&str] {
-        &["vert", "frag", "comp", "rgen", "rint", "rchit", "rmiss", "slang"]
+        &[
+            "vert", "frag", "comp", "rgen", "rint", "rchit", "rmiss", "slang",
+        ]
     }
 
     fn load(

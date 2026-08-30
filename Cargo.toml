@@ -19,9 +19,10 @@ opt-level = 3
 [dependencies]
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
-# No default features: this crate is its own renderer. `bevy_render`/`bevy_pbr` stay
-# only for the `RenderApp`/`PipelinedRenderingPlugin` labels and `StandardMaterial`
-# (the material asset the BLAS/TLAS builders consume) -- nothing wgpu-side ever runs.
+# No default features: this crate is its own renderer, in one world (no render sub-app,
+# no pipelined rendering). `bevy_render`/`bevy_pbr` stay only for `StandardMaterial` (the
+# material asset the BLAS/TLAS builders consume, and the `.bsn` vocabulary) -- nothing
+# wgpu-side ever runs. Dropping them means an aurora material type + a `.bsn` migration.
 # UI is `bevy_feathers_core`: feathers/bevy_ui/bevy_text WITHOUT `bevy_ui_render`,
 # so the bevy_ui node tree is laid out by bevy and rasterized by this crate.
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [

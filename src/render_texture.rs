@@ -201,7 +201,8 @@ pub fn load_texture_from_bytes(
         .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
         device.ext_sync2.cmd_pipeline_barrier2(
             cmd_buffer,
-            &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_transfer)),
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&to_transfer)),
         );
         let copy_region = vk_init::buffer_image_copy(width, height);
         device.device.cmd_copy_buffer_to_image(

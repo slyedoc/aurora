@@ -1,4 +1,3 @@
-
 use ash::vk;
 use bevy::{
     asset::Asset,
@@ -476,9 +475,12 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             }
             let copy = vk::BufferCopy::default().size(*size);
             unsafe {
-                render_device
-                    .device
-                    .cmd_copy_buffer(cmd_buffer, *src, *dst, std::slice::from_ref(&copy))
+                render_device.device.cmd_copy_buffer(
+                    cmd_buffer,
+                    *src,
+                    *dst,
+                    std::slice::from_ref(&copy),
+                )
             };
         }
     });
@@ -643,10 +645,11 @@ fn build_chunk(
                 })
         })
         .collect();
-    let build_ranges: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
-        per_mesh.iter().map(|(_, _, ranges)| ranges.as_slice()).collect();
-    let handles: Vec<vk::AccelerationStructureKHR> =
-        structures.iter().map(|s| s.handle).collect();
+    let build_ranges: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> = per_mesh
+        .iter()
+        .map(|(_, _, ranges)| ranges.as_slice())
+        .collect();
+    let handles: Vec<vk::AccelerationStructureKHR> = structures.iter().map(|s| s.handle).collect();
 
     let query_pool = unsafe {
         render_device.device.create_query_pool(
@@ -662,11 +665,9 @@ fn build_chunk(
         render_device
             .device
             .cmd_reset_query_pool(cmd_buffer, query_pool, 0, n as u32);
-        render_device.ext_acc_struct.cmd_build_acceleration_structures(
-            cmd_buffer,
-            &build_infos,
-            &build_ranges,
-        );
+        render_device
+            .ext_acc_struct
+            .cmd_build_acceleration_structures(cmd_buffer, &build_infos, &build_ranges);
         // Builds must land before the compacted-size query reads them.
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)

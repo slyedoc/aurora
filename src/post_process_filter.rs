@@ -1,10 +1,7 @@
 use ash::vk;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
-use crate::{
-    ray_render_plugin::MainWorld,
-    vulkan_asset::{VulkanAsset, VulkanAssetExt},
-};
+use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
 #[derive(Asset, TypePath, Debug, Clone)]
 pub struct PostProcessFilter {
@@ -23,29 +20,19 @@ pub struct CompiledPostProcessFilter {
 
 impl VulkanAsset for PostProcessFilter {
     type ExtractedAsset = (crate::shader::Shader, crate::shader::Shader);
-    type ExtractParam = SRes<MainWorld>;
+    type ExtractParam = SRes<Assets<crate::shader::Shader>>;
     type PreparedAsset = CompiledPostProcessFilter;
 
     fn extract_asset(
         &self,
         param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let Some(vertex_shader) = param
-            .0
-            .get_resource::<Assets<crate::shader::Shader>>()
-            .unwrap()
-            .get(&self.vertex_shader)
-        else {
+        let Some(vertex_shader) = param.get(&self.vertex_shader) else {
             log::warn!("Vertex shader not ready yet");
             return None;
         };
 
-        let Some(fragment_shader) = param
-            .0
-            .get_resource::<Assets<crate::shader::Shader>>()
-            .unwrap()
-            .get(&self.fragment_shader)
-        else {
+        let Some(fragment_shader) = param.get(&self.fragment_shader) else {
             log::warn!("Fragment shader not ready yet");
             return None;
         };

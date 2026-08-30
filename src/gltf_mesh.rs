@@ -431,4 +431,3 @@ fn load_gltf_texture(
         image.height,
     ))
 }
-

@@ -1,6 +1,6 @@
 use crate::{
     gltf_mesh::GltfModel,
-    ray_render_plugin::{Render, RenderConfig, RenderSet, TeardownSchedule},
+    ray_render_plugin::{RenderConfig, RenderSet, TeardownSchedule, on_shutdown},
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -9,7 +9,7 @@ use crate::{
     vulkan_asset::{VulkanAssetLoadingState, VulkanAssets, poll_for_asset},
 };
 use ash::vk;
-use bevy::{prelude::*, render::RenderApp};
+use bevy::prelude::*;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -186,15 +186,14 @@ pub struct SBTPlugin;
 
 impl Plugin for SBTPlugin {
     fn build(&self, app: &mut App) {
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<SBT>();
-        render_app.add_systems(
-            Render,
+        app.init_resource::<SBT>();
+        app.add_systems(
+            Last,
             update_sbt
                 .in_set(RenderSet::Prepare)
                 .after(poll_for_asset::<RaytracingPipeline>)
                 .after(prepare_instances),
         );
-        render_app.add_systems(TeardownSchedule, cleanup_sbt);
+        app.add_systems(TeardownSchedule, cleanup_sbt.before(on_shutdown));
     }
 }

@@ -10,14 +10,12 @@ use bevy::{
         system::{Res, ResMut, StaticSystemParam, SystemParam, SystemParamItem},
         world::{Mut, World},
     },
-    prelude::{Deref, DerefMut},
-    render::{ExtractSchedule, RenderApp},
+    prelude::{Deref, DerefMut, Last},
 };
 use crossbeam::channel::{Receiver, Sender};
 
 use crate::{
-    extract::Extract,
-    ray_render_plugin::{Render, RenderSet, TeardownSchedule},
+    ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_device::RenderDevice,
 };
 
@@ -126,8 +124,8 @@ impl<A: VulkanAsset> Default for VulkanAssets<A> {
 }
 
 fn extract_vulkan_asset<A: VulkanAsset>(
-    mut asset_events: Extract<MessageReader<AssetEvent<A>>>,
-    assets: Extract<Res<Assets<A>>>,
+    mut asset_events: MessageReader<AssetEvent<A>>,
+    assets: Res<Assets<A>>,
     mut render_assets: ResMut<VulkanAssets<A>>,
     comms: Res<VulkanAssetComms<A>>,
     param: StaticSystemParam<A::ExtractParam>,
@@ -216,7 +214,7 @@ pub fn poll_for_asset<A: VulkanAsset>(
     }
 }
 
-fn on_shutdown<A: VulkanAsset>(world: &mut World) {
+fn on_shutdown_asset<A: VulkanAsset>(world: &mut World) {
     world.remove_resource::<VulkanAssetComms<A>>();
     world.resource_scope(|world, mut assets: Mut<VulkanAssets<A>>| {
         let render_device = world.get_resource::<RenderDevice>().unwrap();
@@ -237,16 +235,16 @@ pub trait VulkanAssetExt {
 
 impl VulkanAssetExt for App {
     fn init_vulkan_asset<A: VulkanAsset>(&mut self) {
-        let render_app = self.get_sub_app_mut(RenderApp).unwrap();
-        let render_device = render_app
-            .world()
-            .get_resource::<RenderDevice>()
-            .unwrap()
-            .clone();
-        render_app.insert_resource(VulkanAssetComms::<A>::new(render_device));
-        render_app.init_resource::<VulkanAssets<A>>();
-        render_app.add_systems(ExtractSchedule, extract_vulkan_asset::<A>);
-        render_app.add_systems(Render, poll_for_asset::<A>.in_set(RenderSet::Prepare));
-        render_app.add_systems(TeardownSchedule, on_shutdown::<A>);
+        let render_device = self.world().resource::<RenderDevice>().clone();
+        self.insert_resource(VulkanAssetComms::<A>::new(render_device));
+        self.init_resource::<VulkanAssets<A>>();
+        self.add_systems(
+            Last,
+            (
+                extract_vulkan_asset::<A>.in_set(RenderSet::Extract),
+                poll_for_asset::<A>.in_set(RenderSet::Prepare),
+            ),
+        );
+        self.add_systems(TeardownSchedule, on_shutdown_asset::<A>.before(on_shutdown));
     }
 }

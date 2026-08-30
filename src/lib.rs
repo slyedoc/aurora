@@ -1,13 +1,12 @@
 pub mod assets;
 pub mod blas;
-pub mod compute;
 pub mod bsn;
+pub mod compute;
 pub use aurora_cluster_mesh as cluster_mesh;
 pub mod bluenoise_plugin;
 pub mod debug_camera;
 pub mod dev_shaders;
 pub mod dev_ui;
-pub mod extract;
 pub mod gltf_mesh;
 pub mod gpu_transform;
 pub mod post_process_filter;

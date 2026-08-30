@@ -13,7 +13,6 @@ use bevy::{
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
-    ray_render_plugin::MainWorld,
     shader::Shader,
     vk_utils,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
@@ -59,17 +58,14 @@ pub struct RaytracingPushConstants {
 
 impl VulkanAsset for RaytracingPipeline {
     type ExtractedAsset = (Shader, Shader, Shader, Shader, Shader);
-    type ExtractParam = SRes<MainWorld>;
+    type ExtractParam = SRes<Assets<crate::shader::Shader>>;
     type PreparedAsset = CompiledRaytracingPipeline;
 
     fn extract_asset(
         &self,
         param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let shaders = param
-            .0
-            .get_resource::<Assets<crate::shader::Shader>>()
-            .unwrap();
+        let shaders: &Assets<crate::shader::Shader> = &**param;
 
         let Some(raygen_shader) = shaders.get(&self.raygen_shader) else {
             log::warn!("Raygen shader not ready yet");

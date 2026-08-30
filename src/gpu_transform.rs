@@ -27,7 +27,6 @@ use bevy::{
         observer::On,
     },
     prelude::*,
-    render::{ExtractSchedule, RenderApp},
     transform::TransformSystems,
 };
 use bytemuck::{Pod, Zeroable};
@@ -35,11 +34,10 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     assets::aurora_asset,
     compute::{
-        ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier,
-        record_dispatch, record_dispatch_indirect,
+        ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
+        record_dispatch_indirect,
     },
-    extract::Extract,
-    ray_render_plugin::TeardownSchedule,
+    ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
 };
@@ -157,7 +155,7 @@ struct PropagateParams {
     node_count: u32,
 }
 
-// ---- main world: slots ----------------------------------------------------------------------
+// ---- slots ----------------------------------------------------------------------------------
 
 /// This entity's slot in the GPU node table. Assigned to every `Transform` entity in
 /// `PostUpdate`; freed (and recycled) when the component or entity goes away.
@@ -205,7 +203,7 @@ fn free_gpu_node(
     }
 }
 
-// ---- render world: the table ----------------------------------------------------------------
+// ---- the table ------------------------------------------------------------------------------
 
 #[derive(Resource)]
 pub struct GpuTransforms {
@@ -314,7 +312,12 @@ impl GpuTransforms {
 
     /// Write a node's whole child chain: `first_child[parent]` plus each slotted child's
     /// `next_sibling`, `NO_NODE`-terminated. Unslotted children are skipped.
-    fn push_chain(&mut self, parent_slot: u32, children: Option<&Children>, nodes: &Query<&GpuNode>) {
+    fn push_chain(
+        &mut self,
+        parent_slot: u32,
+        children: Option<&Children>,
+        nodes: &Query<&GpuNode>,
+    ) {
         let mut head = NO_NODE;
         let mut prev: Option<u32> = None;
         for child in children.into_iter().flat_map(|c| c.iter()) {
@@ -479,13 +482,8 @@ impl GpuTransforms {
 
         // Frontier header reset; the scatters and the seed are mutually independent.
         unsafe {
-            rd.device.cmd_fill_buffer(
-                cmd,
-                self.frontier_buf.handle,
-                0,
-                FRONTIER_HEADER * 4,
-                0,
-            );
+            rd.device
+                .cmd_fill_buffer(cmd, self.frontier_buf.handle, 0, FRONTIER_HEADER * 4, 0);
         }
         memory_barrier(
             rd,
@@ -665,25 +663,23 @@ type ChangedNodes = Or<(Changed<Transform>, Changed<ChildOf>, Added<GpuNode>)>;
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn extract_transforms(
     mut table: ResMut<GpuTransforms>,
-    slots: Extract<Res<GpuNodeSlots>>,
-    changed: Extract<
-        Query<
-            (
-                Ref<Transform>,
-                Option<Ref<ChildOf>>,
-                Ref<GpuNode>,
-                Option<&Children>,
-            ),
-            ChangedNodes,
-        >,
+    slots: Res<GpuNodeSlots>,
+    changed: Query<
+        (
+            Ref<Transform>,
+            Option<Ref<ChildOf>>,
+            Ref<GpuNode>,
+            Option<&Children>,
+        ),
+        ChangedNodes,
     >,
-    nodes: Extract<Query<&GpuNode>>,
-    children_changed: Extract<Query<(Ref<GpuNode>, &Children), Changed<Children>>>,
-    mut children_removed: Extract<RemovedComponents<Children>>,
-    mut child_of_removed: Extract<RemovedComponents<ChildOf>>,
-    has_children: Extract<Query<(), With<Children>>>,
-    has_child_of: Extract<Query<(), With<ChildOf>>>,
-    with_transform: Extract<Query<(&Transform, &GpuNode)>>,
+    nodes: Query<&GpuNode>,
+    children_changed: Query<(Ref<GpuNode>, &Children), Changed<Children>>,
+    mut children_removed: RemovedComponents<Children>,
+    mut child_of_removed: RemovedComponents<ChildOf>,
+    has_children: Query<(), With<Children>>,
+    has_child_of: Query<(), With<ChildOf>>,
+    with_transform: Query<(&Transform, &GpuNode)>,
 ) {
     let table = &mut *table;
     table.node_count = slots.count();
@@ -769,9 +765,8 @@ impl Plugin for GpuTransformPlugin {
             ],
         ));
 
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.insert_resource(GpuTransforms::new(module));
-        render_app.add_systems(ExtractSchedule, extract_transforms);
-        render_app.add_systems(TeardownSchedule, cleanup);
+        app.insert_resource(GpuTransforms::new(module));
+        app.add_systems(Last, extract_transforms.in_set(RenderSet::Extract));
+        app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }
 }

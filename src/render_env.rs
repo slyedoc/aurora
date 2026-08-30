@@ -1,10 +1,10 @@
 use crate::{
-    ray_render_plugin::TeardownSchedule,
+    ray_render_plugin::{TeardownSchedule, on_shutdown},
     render_device::RenderDevice,
     render_texture::{RenderTexture, load_texture_from_bytes},
 };
 use ash::vk;
-use bevy::{prelude::*, render::RenderApp};
+use bevy::prelude::*;
 
 pub const WHITE_TEXTURE_IDX: u32 = 0;
 pub const DEFAULT_NORMAL_TEXTURE_IDX: u32 = 1;
@@ -19,8 +19,7 @@ pub struct RenderEnvPlugin;
 
 impl Plugin for RenderEnvPlugin {
     fn build(&self, app: &mut App) {
-        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
-        let device = render_app.world().get_resource::<RenderDevice>().unwrap();
+        let device = app.world().resource::<RenderDevice>();
         let white_texture = load_texture_from_bytes(
             device,
             vk::Format::R8G8B8A8_UNORM,
@@ -50,11 +49,11 @@ impl Plugin for RenderEnvPlugin {
             "default normal texture must be index 1"
         );
 
-        render_app.world_mut().insert_resource(RenderEnv {
+        app.insert_resource(RenderEnv {
             white_texture,
             default_normal_texture,
         });
-        render_app.add_systems(TeardownSchedule, cleanup);
+        app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }
 }
 

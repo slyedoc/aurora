@@ -1,7 +1,4 @@
-use bevy::{
-    prelude::*,
-    render::mesh::Indices,
-};
+use bevy::{mesh::Indices, prelude::*};
 
 use crate::{
     blas::{BLAS, BlasBuildInput, GeometryDescr, Vertex, build_blas_batch},
@@ -27,7 +24,9 @@ impl VulkanAsset for Mesh {
         asset: Self::ExtractedAsset,
         render_device: &crate::render_device::RenderDevice,
     ) -> Self::PreparedAsset {
-        Self::prepare_batch(vec![asset], render_device).pop().unwrap()
+        Self::prepare_batch(vec![asset], render_device)
+            .pop()
+            .unwrap()
     }
 
     /// Packs every mesh's vertex streams in parallel, then builds all their BLASes with a
@@ -135,6 +134,5 @@ impl Plugin for VulkanMeshPlugin {
         app.init_vulkan_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
         app.init_vulkan_asset::<StandardMaterial>();
-
     }
 }

@@ -1,9 +1,9 @@
 use ash::vk;
 
-use bevy::{prelude::*, render::RenderApp};
+use bevy::prelude::*;
 
 use crate::{
-    ray_render_plugin::TeardownSchedule,
+    ray_render_plugin::{TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_texture::padd_pixel_bytes_rgba_unorm,
@@ -16,8 +16,7 @@ pub struct BlueNoiseBuffer(pub Buffer<u8>);
 
 impl Plugin for BlueNoisePlugin {
     fn build(&self, app: &mut App) {
-        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
-        let render_device = render_app.world().get_resource::<RenderDevice>().unwrap();
+        let render_device = app.world().resource::<RenderDevice>();
         let mut bluenoise_buffer_host = render_device
             .create_host_buffer(64 * 128 * 128 * 2, vk::BufferUsageFlags::TRANSFER_SRC);
         let mut bluenoise_data = render_device.map_buffer(&mut bluenoise_buffer_host);
@@ -64,8 +63,8 @@ impl Plugin for BlueNoisePlugin {
         render_device
             .destroyer
             .destroy_buffer(bluenoise_buffer_host.handle);
-        render_app.insert_resource(BlueNoiseBuffer(bluenoise_buffer_device));
-        render_app.add_systems(TeardownSchedule, cleanup);
+        app.insert_resource(BlueNoiseBuffer(bluenoise_buffer_device));
+        app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }
 }
 

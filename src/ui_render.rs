@@ -30,7 +30,6 @@ use bevy::{
     math::{Affine2, FloatOrd, Rect, Vec2},
     picking::DefaultPickingPlugins,
     prelude::*,
-    render::RenderApp,
     sprite::BorderRect,
     text::{ComputedTextBlock, PositionedGlyph, TextColor, TextLayoutInfo, TextPlugin},
     ui::{
@@ -48,8 +47,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use crate::{
     assets::aurora_asset,
-    extract::Extract,
-    ray_render_plugin::{MainWorld, TeardownSchedule},
+    ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
@@ -165,17 +163,14 @@ pub struct CompiledUiPipeline {
 
 impl VulkanAsset for UiPipeline {
     type ExtractedAsset = (crate::shader::Shader, crate::shader::Shader);
-    type ExtractParam = SRes<MainWorld>;
+    type ExtractParam = SRes<Assets<crate::shader::Shader>>;
     type PreparedAsset = CompiledUiPipeline;
 
     fn extract_asset(
         &self,
         param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let shaders = param
-            .0
-            .get_resource::<Assets<crate::shader::Shader>>()
-            .unwrap();
+        let shaders: &Assets<crate::shader::Shader> = &**param;
         let Some(vertex_shader) = shaders.get(&self.vertex_shader) else {
             log::warn!("UI vertex shader not ready yet");
             return None;
@@ -313,7 +308,7 @@ fn propagate_modified(
 // Plugin
 // ---------------------------------------------------------------------------------------------
 
-/// Which pipeline draws the UI. Lives in the main world, extracted every frame.
+/// Which pipeline draws the UI.
 #[derive(Resource, Clone)]
 pub struct UiRenderConfig {
     pub pipeline: Handle<UiPipeline>,
@@ -375,11 +370,10 @@ impl Plugin for UiRenderPlugin {
         };
         app.insert_resource(config);
 
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<ExtractedUi>();
-        render_app.init_resource::<UiVertexBuffers>();
-        render_app.add_systems(ExtractSchedule, extract_ui);
-        render_app.add_systems(
+        app.init_resource::<ExtractedUi>();
+        app.init_resource::<UiVertexBuffers>();
+        app.add_systems(Last, extract_ui.in_set(RenderSet::Extract));
+        app.add_systems(
             TeardownSchedule,
             cleanup_ui.before(crate::ray_render_plugin::on_shutdown),
         );
@@ -499,20 +493,14 @@ type UiNodeQuery = (
 
 fn extract_ui(
     mut extracted: ResMut<ExtractedUi>,
-    mut commands: Commands,
-    config: Extract<Option<Res<UiRenderConfig>>>,
-    images: Extract<Res<Assets<Image>>>,
-    texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
-    text_colors: Extract<Query<&TextColor>>,
-    windows: Extract<Query<&Window, With<PrimaryWindow>>>,
-    nodes: Extract<Query<UiNodeQuery>>,
-    all_nodes: Extract<Query<(&ComputedNode, Option<&InheritedVisibility>)>>,
+    images: Res<Assets<Image>>,
+    texture_atlases: Res<Assets<TextureAtlasLayout>>,
+    text_colors: Query<&TextColor>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    nodes: Query<UiNodeQuery>,
+    all_nodes: Query<(&ComputedNode, Option<&InheritedVisibility>)>,
     mut diag_tick: Local<u32>,
 ) {
-    if let Some(config) = config.as_ref() {
-        commands.insert_resource((**config).clone());
-    }
-
     extracted.window_size = windows
         .iter()
         .next()
@@ -1284,7 +1272,7 @@ pub struct UiVertexBuffers {
     buffers: [Buffer<UiVertex>; 2],
 }
 
-/// Everything [`draw_ui`] needs from the render world.
+/// Everything [`draw_ui`] needs.
 #[derive(SystemParam)]
 pub struct UiDrawParams<'w, 's> {
     extracted: Res<'w, ExtractedUi>,
@@ -1309,7 +1297,7 @@ pub unsafe fn draw_ui(
     let diag = *params.diag_tick % 120 == 1;
     let Some(config) = params.config.as_ref() else {
         if diag {
-            log::debug!("ui draw: no UiRenderConfig in render world");
+            log::debug!("ui draw: no UiRenderConfig");
         }
         return;
     };

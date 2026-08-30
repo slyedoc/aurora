@@ -15,7 +15,6 @@ use bevy::{
 };
 
 use crate::{
-    ray_render_plugin::MainWorld,
     render_device::RenderDevice,
     shader::Shader,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
@@ -63,14 +62,14 @@ impl CompiledComputeModule {
 
 impl VulkanAsset for ComputeModule {
     type ExtractedAsset = (Shader, Vec<String>);
-    type ExtractParam = SRes<MainWorld>;
+    type ExtractParam = SRes<Assets<Shader>>;
     type PreparedAsset = CompiledComputeModule;
 
     fn extract_asset(
         &self,
         param: &mut SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let shaders = param.0.get_resource::<Assets<Shader>>().unwrap();
+        let shaders: &Assets<crate::shader::Shader> = &**param;
         let shader = shaders.get(&self.shader)?;
         shader.spirv.as_ref()?;
         Some((shader.clone(), self.entry_points.clone()))
@@ -135,7 +134,11 @@ impl VulkanAsset for ComputeModule {
             handles.len()
         );
         // Pipelines hold no reference to the module once created.
-        unsafe { render_device.device.destroy_shader_module(shader_module, None) };
+        unsafe {
+            render_device
+                .device
+                .destroy_shader_module(shader_module, None)
+        };
         CompiledComputeModule {
             pipeline_layout,
             pipelines: entry_points.into_iter().zip(handles).collect(),

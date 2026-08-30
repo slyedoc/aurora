@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use bevy::window::RawHandleWrapper;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::ray_render_plugin::ExtractedWindow;
+use crate::ray_render_plugin::RenderWindow;
 use crate::render_device::RenderDevice;
 
 const FRAMES_IN_FLIGHT: usize = 1;
@@ -85,7 +85,7 @@ impl Swapchain {
         }
     }
 
-    pub unsafe fn on_resize(&mut self, window: &ExtractedWindow) {
+    pub unsafe fn on_resize(&mut self, window: &RenderWindow) {
         unsafe {
             {
                 let queue = self.device.queue.lock().unwrap();
@@ -233,7 +233,7 @@ impl Swapchain {
 
     pub unsafe fn aquire_next_image(
         &mut self,
-        window: &ExtractedWindow,
+        window: &RenderWindow,
     ) -> (vk::Image, vk::ImageView) {
         unsafe {
             if self.swapchain == vk::SwapchainKHR::null() {
@@ -280,7 +280,7 @@ impl Swapchain {
 
     pub unsafe fn submit_presentation(
         &mut self,
-        window: &ExtractedWindow,
+        window: &RenderWindow,
         cmd_buffer: vk::CommandBuffer,
     ) {
         unsafe {

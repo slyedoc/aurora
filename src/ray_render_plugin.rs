@@ -1,8 +1,7 @@
 use bevy::{
-    app::{AppExit, SubApp},
-    ecs::schedule::ScheduleLabel,
+    app::AppExit,
+    ecs::{message::Messages, schedule::ScheduleLabel},
     prelude::*,
-    render::RenderApp,
     window::{RawHandleWrapperHolder, WindowCloseRequested},
     winit::DisplayHandleWrapper,
 };
@@ -12,7 +11,6 @@ use ash::vk;
 
 use crate::{
     bluenoise_plugin::BlueNoiseBuffer,
-    extract::Extract,
     post_process_filter::PostProcessFilter,
     raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants},
     render_buffer::{Buffer, BufferProvider},
@@ -69,248 +67,116 @@ pub struct FocusData {
     focal_distance: f32,
 }
 
-fn close_when_requested(
-    mut commands: Commands,
-    mut closed: MessageReader<WindowCloseRequested>,
-    killswitch: Res<WorldToRenderKillSwitch>,
-    mut waiting_state: Local<Option<WindowCloseRequested>>,
-) {
-    match waiting_state.as_ref() {
-        None => {
-            if let Some(close_event) = closed.read().next() {
-                log::info!("Window close requested, sending killswitch to RenderApp");
-                killswitch.send_req_close.send(()).unwrap();
-                *waiting_state = Some(close_event.clone());
-            }
-        }
-        Some(close_event) => {
-            log::info!("Waiting for RenderApp to close...");
-            killswitch.recv_res_close.recv().unwrap();
-            log::info!("RenderApp has closed, continuing with main app");
-            commands.entity(close_event.window).despawn();
-        }
-    }
-}
-
 fn handle_input(keyboard: Res<ButtonInput<KeyCode>>, mut render_config: ResMut<RenderConfig>) {
     if keyboard.just_pressed(KeyCode::Space) {
         render_config.accumulate = !render_config.accumulate;
     }
 }
 
-fn shutdown_render_app(world: &mut World) {
-    world.resource_scope(|world, killswitch: Mut<RenderToWorldKillSwitch>| {
-        if killswitch.recv_req_close.try_recv().is_ok() {
-            log::info!("Received killswitch, shutting down RenderApp");
-            let render_device = world.get_resource::<RenderDevice>().unwrap();
-            {
-                let queue = render_device.queue.lock().unwrap();
-                unsafe { render_device.queue_wait_idle(*queue).unwrap() };
-            }
-            world.run_schedule(TeardownSchedule);
-            log::info!("RenderApp has shut down, sending ack to main app");
-            killswitch.send_res_close.send(()).unwrap();
-        }
-    });
-}
-
+/// The renderer's teardown: every plugin that owns Vulkan objects destroys them here, and
+/// [`on_shutdown`] (ordered last) drops the device. Run once by [`shutdown`].
 #[derive(ScheduleLabel, PartialEq, Eq, Debug, Clone, Hash)]
 pub struct TeardownSchedule;
 
-#[derive(ScheduleLabel, Debug, Hash, PartialEq, Eq, Clone)]
-pub struct Render;
-
+/// The frame's stages, chained in [`Last`] after the simulation. One world: the systems in
+/// [`RenderSet::Extract`] read the ECS directly (transform deltas, instance changes, UI quads,
+/// asset events), [`RenderSet::Prepare`] consumes the asset worker's results, and
+/// [`RenderSet::Render`] waits for the previous frame, records, and submits.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderSet {
     Shutdown,
-    ExtractCommands,
+    Extract,
     Prepare,
     Render,
-    Cleanup,
-}
-
-impl Render {
-    fn base_schedule() -> Schedule {
-        let active = |world: &World| world.get_resource::<RenderDevice>().is_some();
-
-        let mut schedule = Schedule::new(Self);
-        schedule.configure_sets(
-            (
-                RenderSet::Shutdown,
-                RenderSet::ExtractCommands.run_if(active),
-                RenderSet::Prepare.run_if(active),
-                RenderSet::Render.run_if(active),
-                RenderSet::Cleanup,
-            )
-                .chain(),
-        );
-
-        schedule.add_systems(
-            (
-                ApplyDeferred.in_set(RenderSet::Shutdown),
-                ApplyDeferred.in_set(RenderSet::ExtractCommands),
-                ApplyDeferred.in_set(RenderSet::Prepare),
-                ApplyDeferred.in_set(RenderSet::Render),
-                ApplyDeferred.in_set(RenderSet::Cleanup),
-            )
-                .chain(),
-        );
-
-        schedule
-    }
 }
 
 pub struct RayRenderPlugin;
 
-#[derive(Resource)]
-struct WorldToRenderKillSwitch {
-    send_req_close: crossbeam::channel::Sender<()>,
-    recv_res_close: crossbeam::channel::Receiver<()>,
-}
-
-#[derive(Resource)]
-struct RenderToWorldKillSwitch {
-    send_res_close: crossbeam::channel::Sender<()>,
-    recv_req_close: crossbeam::channel::Receiver<()>,
-}
-
 impl Plugin for RayRenderPlugin {
     fn build(&self, app: &mut App) {
-        let (send_req_close, recv_req_close) = crossbeam::channel::unbounded();
-        let (send_res_close, recv_res_close) = crossbeam::channel::unbounded();
-
-        app.world_mut().insert_resource(WorldToRenderKillSwitch {
-            send_req_close,
-            recv_res_close,
-        });
-
-        app.add_systems(
-            Update,
-            (close_when_requested, handle_input, set_focus_pulling),
-        );
-
-        let mut render_app = SubApp::new();
-        render_app.update_schedule = Some(Render.intern());
-
-        render_app
-            .world_mut()
-            .insert_resource(RenderToWorldKillSwitch {
-                send_res_close,
-                recv_req_close,
-            });
-        render_app.world_mut().init_resource::<RenderConfig>();
-
-        let display_handle = app.world().get_resource::<DisplayHandleWrapper>().unwrap();
-
+        let display_handle = app.world().resource::<DisplayHandleWrapper>();
         let render_device = unsafe {
             crate::render_device::RenderDevice::from_display(
                 &display_handle.0.display_handle().unwrap(),
             )
         };
-
         let sphere_blas = unsafe { crate::sphere::SphereBLAS::new(&render_device) };
+        app.insert_resource(render_device);
+        app.insert_resource(sphere_blas);
+        app.init_resource::<Frame>();
+        app.init_resource::<RenderConfig>();
 
-        render_app.add_message::<AppExit>();
-        render_app.insert_resource(sphere_blas);
-        render_app.insert_resource(render_device.clone());
-        render_app.init_resource::<Frame>();
+        let mut teardown = Schedule::new(TeardownSchedule);
+        teardown.add_systems(on_shutdown);
+        app.add_schedule(teardown);
 
-        app.init_resource::<ScratchMainWorld>();
-
-        let extract_schedule = Schedule::new(ExtractSchedule);
-        let mut teardown_schedule = Schedule::new(TeardownSchedule);
-        teardown_schedule.add_systems(on_shutdown);
-
-        render_app.add_schedule(extract_schedule);
-        render_app.add_schedule(teardown_schedule);
-        render_app.add_schedule(Render::base_schedule());
-
-        render_app.add_systems(
-            Render,
-            apply_extract_commands.in_set(RenderSet::ExtractCommands),
-        );
-
-        render_app.add_systems(
-            ExtractSchedule,
-            (extract_time, extract_primary_window, extract_render_config),
-        );
-        render_app.add_systems(
-            Render,
+        app.configure_sets(
+            Last,
             (
-                (render_frame).in_set(RenderSet::Render),
-                (despawn_extracted_entities).in_set(RenderSet::Cleanup),
-                (shutdown_render_app,).in_set(RenderSet::Shutdown),
+                RenderSet::Shutdown,
+                RenderSet::Extract.run_if(run_if_render_device_exists),
+                RenderSet::Prepare.run_if(run_if_render_device_exists),
+                RenderSet::Render.run_if(run_if_render_device_exists),
             )
-                .run_if(run_if_render_device_exists),
+                .chain(),
         );
-
-        render_app.set_extract(|main_world, render_world| {
-            extract(main_world, render_world);
-        });
-        app.insert_sub_app(RenderApp, render_app);
+        app.add_systems(Update, (handle_input, set_focus_pulling));
+        app.add_systems(
+            Last,
+            (
+                shutdown.in_set(RenderSet::Shutdown),
+                update_render_window.in_set(RenderSet::Extract),
+                render_frame.in_set(RenderSet::Render),
+            ),
+        );
     }
 }
 
-/// Marks an entity that was spawned into the render world by the extract schedule.
-///
-/// These are re-extracted from scratch every frame, so they are despawned during
-/// [`RenderSet::Cleanup`]. This used to be a blanket `World::clear_entities`, but resources are
-/// stored as components now, so clearing every entity would wipe the render world's resources too.
-#[derive(Component)]
-pub struct ExtractedEntity;
-
-fn despawn_extracted_entities(
-    mut commands: Commands,
-    extracted: Query<Entity, With<ExtractedEntity>>,
-) {
-    for entity in extracted.iter() {
-        commands.entity(entity).despawn();
+/// Tears the renderer down (queue idle, then [`TeardownSchedule`]) when the window is closing
+/// or the app is exiting, and only then closes the window: the swapchain has to go before its
+/// surface does. Messages are peeked, not consumed, so bevy's own exit handling still sees them.
+fn shutdown(world: &mut World) {
+    if !world.contains_resource::<RenderDevice>() {
+        return;
+    }
+    let closing: Vec<Entity> = {
+        let messages = world.resource::<Messages<WindowCloseRequested>>();
+        messages
+            .get_cursor()
+            .read(messages)
+            .map(|m| m.window)
+            .collect()
+    };
+    let exiting = {
+        let messages = world.resource::<Messages<AppExit>>();
+        messages.get_cursor().read(messages).next().is_some()
+    };
+    if closing.is_empty() && !exiting {
+        return;
+    }
+    log::info!("Shutting down the renderer");
+    {
+        let render_device = world.resource::<RenderDevice>();
+        let queue = render_device.queue.lock().unwrap();
+        unsafe { render_device.queue_wait_idle(*queue).unwrap() };
+    }
+    world.run_schedule(TeardownSchedule);
+    for window in closing {
+        if let Ok(entity) = world.get_entity_mut(window) {
+            entity.despawn();
+        }
     }
 }
 
-#[derive(Resource, Default)]
-struct ScratchMainWorld(World);
-
-#[derive(Resource, Default, Deref, DerefMut)]
-pub struct MainWorld(pub World);
-
-fn extract(main_world: &mut World, render_world: &mut World) {
-    // temporarily add the app world to the render world as a resource
-    let scratch_world = main_world.remove_resource::<ScratchMainWorld>().unwrap();
-    let inserted_world = std::mem::replace(main_world, scratch_world.0);
-    render_world.insert_resource(MainWorld(inserted_world));
-
-    // If the render device is gone, then the render app should be shut down
-    if render_world.get_resource::<RenderDevice>().is_some() {
-        render_world.run_schedule(ExtractSchedule);
-    }
-
-    // move the app world back, as if nothing happened.
-    let inserted_world = render_world.remove_resource::<MainWorld>().unwrap();
-    let scratch_world = std::mem::replace(main_world, inserted_world.0);
-    main_world.insert_resource(ScratchMainWorld(scratch_world));
-}
-
-/// Applies the commands from the extract schedule. This happens during
-/// the render schedule rather than during extraction to allow the commands to run in parallel with the
-/// main app when pipelined rendering is enabled.
-fn apply_extract_commands(render_world: &mut World) {
-    render_world.resource_scope(|render_world, mut schedules: Mut<Schedules>| {
-        schedules
-            .get_mut(ExtractSchedule)
-            .unwrap()
-            .apply_deferred(render_world);
-    });
-}
-
+/// The primary window's size, as the frame and the swapchain see it.
 #[derive(Resource)]
-pub struct ExtractedWindow {
+pub struct RenderWindow {
     pub width: u32,
     pub height: u32,
 }
 
-fn extract_primary_window(
-    windows: Extract<Query<(&Window, &RawHandleWrapperHolder)>>,
+fn update_render_window(
+    windows: Query<(&Window, &RawHandleWrapperHolder)>,
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     swapchain: Option<Res<crate::swapchain::Swapchain>>,
@@ -329,40 +195,10 @@ fn extract_primary_window(
         }
     }
 
-    commands.insert_resource(ExtractedWindow {
+    commands.insert_resource(RenderWindow {
         width: window.resolution.width().max(1.0) as u32,
         height: window.resolution.height().max(1.0) as u32,
     });
-}
-
-fn extract_render_config(
-    mut commands: Commands,
-    render_config: Extract<Res<RenderConfig>>,
-    cameras: Extract<
-        Query<(
-            &Camera,
-            &Camera3d,
-            &Projection,
-            &Transform,
-            &GlobalTransform,
-        )>,
-    >,
-) {
-    commands.insert_resource(render_config.clone());
-    for (camera, camera3d, projection, transform, global_transform) in cameras.iter() {
-        commands.spawn((
-            ExtractedEntity,
-            camera.clone(),
-            camera3d.clone(),
-            projection.clone(),
-            transform.clone(),
-            global_transform.clone(),
-        ));
-    }
-}
-
-fn extract_time(mut commands: Commands, time: Extract<Res<Time>>) {
-    commands.insert_resource(time.clone());
 }
 
 fn set_focus_pulling(
@@ -440,7 +276,7 @@ impl RenderFrameBuffers {
 
 fn render_frame(
     render_device: Res<crate::render_device::RenderDevice>,
-    window: Res<ExtractedWindow>,
+    window: Res<RenderWindow>,
     swapchain: Option<ResMut<crate::swapchain::Swapchain>>,
     dev_ui_stuff: (
         Option<Res<crate::dev_ui::DevUIState>>,
@@ -456,7 +292,7 @@ fn render_frame(
     mut transforms: ResMut<crate::gpu_transform::GpuTransforms>,
     modules: Res<crate::compute::ComputeModules>,
     sbt: Res<SBT>,
-    camera: Query<(&Projection, &GlobalTransform), With<Camera>>,
+    camera: Query<(&Projection, &GlobalTransform), With<Camera3d>>,
     mut tick: Local<u32>,
 ) {
     let Some(mut swapchain) = swapchain else {
@@ -575,7 +411,13 @@ fn render_frame(
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place -- all inside this command buffer.
         let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
-        tlas.record(&render_device, cmd_buffer, &modules, &transforms, world_changed);
+        tlas.record(
+            &render_device,
+            cmd_buffer,
+            &modules,
+            &transforms,
+            world_changed,
+        );
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()

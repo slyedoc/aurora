@@ -20,7 +20,6 @@ use bevy::{
     camera::visibility::InheritedVisibility,
     ecs::{lifecycle::Remove, observer::On, query::Has},
     prelude::*,
-    render::{ExtractSchedule, RenderApp},
 };
 use bytemuck::{Pod, Zeroable};
 
@@ -28,10 +27,9 @@ use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
-    extract::Extract,
     gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::{GpuNode, GpuTransforms, ensure_staging, upload_slice},
-    ray_render_plugin::{Render, RenderSet, TeardownSchedule},
+    ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     sphere::{Sphere, SphereBLAS},
@@ -76,7 +74,7 @@ struct GatherInstancesParams {
     pad: u32,
 }
 
-// ---- main world: slots ----------------------------------------------------------------------
+// ---- slots ----------------------------------------------------------------------------------
 
 /// This entity's slot in the GPU instance table.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +125,7 @@ fn clear_freed(mut slots: ResMut<GpuInstanceSlots>) {
     slots.freed.clear();
 }
 
-// ---- render world ---------------------------------------------------------------------------
+// ---- the table ------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
 enum Geometry {
@@ -235,8 +233,7 @@ impl MaterialArena {
             let stride = std::mem::size_of::<RTXMaterial>() as u64;
             for (off, len) in self.dirty.drain(..) {
                 let n = len as usize;
-                dst[cursor..cursor + n]
-                    .copy_from_slice(&self.data[off as usize..off as usize + n]);
+                dst[cursor..cursor + n].copy_from_slice(&self.data[off as usize..off as usize + n]);
                 regions.push(
                     vk::BufferCopy::default()
                         .src_offset(cursor as u64 * stride)
@@ -536,11 +533,10 @@ impl TLAS {
             .unwrap();
             self.handle_size = build_size.acceleration_structure_size;
             self.acceleration_structure.address = unsafe {
-                rd.ext_acc_struct
-                    .get_acceleration_structure_device_address(
-                        &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                            .acceleration_structure(self.acceleration_structure.handle),
-                    )
+                rd.ext_acc_struct.get_acceleration_structure_device_address(
+                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                        .acceleration_structure(self.acceleration_structure.handle),
+                )
             };
         }
         let scratch_size = build_size.build_scratch_size + self.scratch_alignment;
@@ -612,20 +608,18 @@ type ChangedInstances = Or<(
 #[allow(clippy::type_complexity)]
 fn extract_instances(
     mut tlas: ResMut<TLAS>,
-    slots: Extract<Res<GpuInstanceSlots>>,
-    changed: Extract<
-        Query<
-            (
-                &GpuInstance,
-                &GpuNode,
-                Option<&Mesh3d>,
-                Option<&GltfModelHandle>,
-                Has<Sphere>,
-                Option<&MeshMaterial3d<StandardMaterial>>,
-                Option<&InheritedVisibility>,
-            ),
-            ChangedInstances,
-        >,
+    slots: Res<GpuInstanceSlots>,
+    changed: Query<
+        (
+            &GpuInstance,
+            &GpuNode,
+            Option<&Mesh3d>,
+            Option<&GltfModelHandle>,
+            Has<Sphere>,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+            Option<&InheritedVisibility>,
+        ),
+        ChangedInstances,
     >,
 ) {
     tlas.count = slots.next;
@@ -782,18 +776,19 @@ impl Plugin for TLASBuilderPlugin {
             &["scatter_instances", "gather_instances"],
         ));
 
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.insert_resource(TLAS::new(module));
-        render_app.add_systems(ExtractSchedule, extract_instances);
-        render_app.add_systems(
-            Render,
-            prepare_instances
-                .in_set(RenderSet::Prepare)
-                .after(poll_for_asset::<Mesh>)
-                .after(poll_for_asset::<GltfModel>)
-                .after(poll_for_asset::<StandardMaterial>)
-                .after(poll_for_asset::<Image>),
+        app.insert_resource(TLAS::new(module));
+        app.add_systems(
+            Last,
+            (
+                extract_instances.in_set(RenderSet::Extract),
+                prepare_instances
+                    .in_set(RenderSet::Prepare)
+                    .after(poll_for_asset::<Mesh>)
+                    .after(poll_for_asset::<GltfModel>)
+                    .after(poll_for_asset::<StandardMaterial>)
+                    .after(poll_for_asset::<Image>),
+            ),
         );
-        render_app.add_systems(TeardownSchedule, cleanup_tlas);
+        app.add_systems(TeardownSchedule, cleanup_tlas.before(on_shutdown));
     }
 }

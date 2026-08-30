@@ -2,7 +2,7 @@
 //!
 //! [`DevUIState`] is a reflected main-world resource; `bevy_feathers_inspector` generates the
 //! sliders from its `#[reflect(@range)]` attributes and writes edits back through reflection.
-//! The render world gets a copy every frame through the extract schedule and reads the tunables
+//! The frame reads the tunables straight from the resource
 //! into the frame uniform. Drawn by [`crate::ui_render`], so no wgpu / egui anywhere.
 //!
 //! Keys: `F2` toggles this panel, `F1` the world inspector.
@@ -22,14 +22,12 @@ use bevy::{
         build_resource_inspector,
     },
     prelude::*,
-    render::RenderApp,
     ui::Display,
 };
 
-use crate::{extract::Extract, ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
+use crate::{ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
 
-/// Renderer tunables edited from the dev panel. Lives in the main world; a copy is extracted
-/// into the render world each frame.
+/// Renderer tunables edited from the dev panel; the frame reads them directly.
 #[derive(Resource, Reflect, Clone, Debug)]
 #[reflect(Resource, Default)]
 pub struct DevUIState {
@@ -98,10 +96,6 @@ impl Plugin for DevUIPlugin {
         app.init_resource::<DevUIState>();
         app.add_systems(Startup, spawn_panel);
         app.add_systems(Update, (toggle_panel, update_stats));
-
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<DevUIState>();
-        render_app.add_systems(ExtractSchedule, extract_dev_ui_state);
     }
 }
 
@@ -170,7 +164,7 @@ fn update_stats(
     if dt > 0.0 {
         *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
     }
-    // Mirrors the render world's accumulation counter: counts while accumulating, else 0.
+    // Mirrors the frame's accumulation counter: counts while accumulating, else 0.
     *ticks = if render_config.accumulate {
         *ticks + 1
     } else {
@@ -179,8 +173,4 @@ fn update_stats(
     for mut text in &mut stats {
         text.0 = format!("fps: {:.1}    ticks: {}", *fps_avg, *ticks);
     }
-}
-
-fn extract_dev_ui_state(mut commands: Commands, state: Extract<Res<DevUIState>>) {
-    commands.insert_resource(state.clone());
 }

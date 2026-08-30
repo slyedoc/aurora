@@ -28,8 +28,6 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(bevy::winit::WinitPlugin::default());
         group = group.add(bevy::audio::AudioPlugin::default());
 
-        group = group.add(bevy::render::pipelined_rendering::PipelinedRenderingPlugin);
-
         group = group.add(crate::ray_render_plugin::RayRenderPlugin);
         group = group.add(crate::render_env::RenderEnvPlugin);
         group = group.add(crate::post_process_filter::PostProcessFilterPlugin);
