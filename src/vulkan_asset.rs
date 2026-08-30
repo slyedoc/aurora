@@ -35,8 +35,23 @@ pub trait VulkanAsset: Asset + Clone + Send + Sync + 'static {
         asset: Self::ExtractedAsset,
         render_device: &RenderDevice,
     ) -> Self::PreparedAsset;
+
+    /// Prepares everything queued since the worker last woke, in order. Override when a batch
+    /// can share GPU submissions (BLAS builds do); the default is one-at-a-time.
+    fn prepare_batch(
+        assets: Vec<Self::ExtractedAsset>,
+        render_device: &RenderDevice,
+    ) -> Vec<Self::PreparedAsset> {
+        assets
+            .into_iter()
+            .map(|asset| Self::prepare_asset(asset, render_device))
+            .collect()
+    }
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset);
 }
+
+/// Upper bound on assets prepared per worker wake-up.
+const MAX_PREPARE_BATCH: usize = 1024;
 
 #[derive(Resource)]
 pub struct VulkanAssetComms<A: VulkanAsset> {
@@ -56,9 +71,25 @@ impl<A: VulkanAsset> VulkanAssetComms<A> {
         };
 
         std::thread::spawn(move || {
-            while let Ok((id, asset)) = recv_work.recv() {
-                if let Err(_) = send_result.send((id, A::prepare_asset(asset, &render_device))) {
-                    break;
+            // Drain whatever piled up while the previous batch was on the GPU, so a scene of
+            // thousands of small meshes goes through a few batched submissions instead of a
+            // per-mesh submit-and-wait that has to take turns with the frame loop.
+            while let Ok(first) = recv_work.recv() {
+                let mut ids = vec![first.0];
+                let mut assets = vec![first.1];
+                while let Ok((id, asset)) = recv_work.try_recv() {
+                    ids.push(id);
+                    assets.push(asset);
+                    if ids.len() >= MAX_PREPARE_BATCH {
+                        break;
+                    }
+                }
+                let prepared = A::prepare_batch(assets, &render_device);
+                debug_assert_eq!(prepared.len(), ids.len());
+                for item in ids.into_iter().zip(prepared) {
+                    if send_result.send(item).is_err() {
+                        return;
+                    }
                 }
             }
         });

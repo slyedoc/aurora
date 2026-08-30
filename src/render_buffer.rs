@@ -40,6 +40,10 @@ impl<T> BufferView<T> {
         self.ptr
     }
 
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
     pub fn copy_from_slice(&mut self, slice: &[T]) {
         let len = std::cmp::min(slice.len(), self.nr_elements as usize);
         unsafe {

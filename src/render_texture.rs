@@ -9,7 +9,7 @@ use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 use crate::{
     render_buffer::BufferProvider,
     render_device::RenderDevice,
-    vk_init, vk_utils,
+    vk_init,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
 
@@ -187,38 +187,42 @@ pub fn load_texture_from_bytes(
         state.register_image_allocation(image_handle, allocation);
     }
 
-    // Todo: figure out how to actually declare dependencies
-    // and use a single command buffer for all of this
-    device.run_transfer_commands(|cmd_buffer| {
-        vk_utils::transition_image_layout(
-            &device,
-            cmd_buffer,
+    // One submission: the barriers carry explicit transfer stages so the copy is ordered between
+    // the two layout transitions inside the command buffer.
+    device.run_transfer_commands(|cmd_buffer| unsafe {
+        let to_transfer = vk_init::layout_transition2(
             image_handle,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-    });
-
-    device.run_transfer_commands(|cmd_buffer| {
-        let copy_region = vk_init::buffer_image_copy(width, height);
-        unsafe {
-            device.device.cmd_copy_buffer_to_image(
-                cmd_buffer,
-                staging_buffer.handle,
-                image_handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&copy_region),
-            );
-        };
-    });
-
-    device.run_transfer_commands(|cmd_buffer| {
-        vk_utils::transition_image_layout(
-            &device,
+        )
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
+        device.ext_sync2.cmd_pipeline_barrier2(
             cmd_buffer,
+            &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_transfer)),
+        );
+        let copy_region = vk_init::buffer_image_copy(width, height);
+        device.device.cmd_copy_buffer_to_image(
+            cmd_buffer,
+            staging_buffer.handle,
+            image_handle,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            std::slice::from_ref(&copy_region),
+        );
+        let to_final = vk_init::layout_transition2(
             image_handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             desired_layout,
+        )
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::SHADER_READ);
+        device.ext_sync2.cmd_pipeline_barrier2(
+            cmd_buffer,
+            &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_final)),
         );
     });
 

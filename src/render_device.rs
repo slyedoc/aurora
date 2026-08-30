@@ -290,35 +290,50 @@ impl RenderDevice {
             .name(std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap())
     }
 
+    /// Records `f` into a one-shot command buffer, submits it, and blocks until it finishes.
+    ///
+    /// The pool is held only while recording (command pools are externally synchronized, and the
+    /// asset worker records concurrently with the render thread), and the queue only for the
+    /// submit itself -- never across the fence wait, which would stall frame submission behind
+    /// every asset upload.
     pub fn run_transfer_commands(&self, f: impl FnOnce(vk::CommandBuffer)) {
-        let queue = self.queue.lock().unwrap();
-        let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { self.device.create_fence(&fence_info, None) }.unwrap();
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(*transfer_command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd_buffer = unsafe { self.device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.begin_command_buffer(cmd_buffer, &begin_info) }.unwrap();
 
-        f(cmd_buffer);
+        let cmd_buffer = {
+            let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(*transfer_command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd_buffer =
+                unsafe { self.device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe { self.device.begin_command_buffer(cmd_buffer, &begin_info) }.unwrap();
 
-        unsafe { self.device.end_command_buffer(cmd_buffer) }.unwrap();
+            f(cmd_buffer);
 
-        unsafe { self.device.reset_fences(std::slice::from_ref(&fence)) }.unwrap();
+            unsafe { self.device.end_command_buffer(cmd_buffer) }.unwrap();
+            cmd_buffer
+        };
+
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
+        {
+            let queue = self.queue.lock().unwrap();
+            unsafe {
+                self.device
+                    .queue_submit(*queue, std::slice::from_ref(&submit_info), fence)
+                    .unwrap();
+            }
+        }
 
         unsafe {
             self.device
-                .queue_submit(*queue, std::slice::from_ref(&submit_info), fence)
-                .unwrap();
-            self.device
                 .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
                 .unwrap();
+            let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
             self.device
                 .free_command_buffers(*transfer_command_pool, std::slice::from_ref(&cmd_buffer));
             self.device.destroy_fence(fence, None);
