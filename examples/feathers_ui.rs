@@ -4,11 +4,9 @@
 
 use bevy::{
     feathers::{
-        FeathersPlugins,
         controls::{FeathersButton, FeathersCheckbox, FeathersSlider, FeathersToggleSwitch},
-        dark_theme::create_dark_theme,
         display::caption,
-        theme::{ThemeBackgroundColor, UiTheme},
+        theme::ThemeBackgroundColor,
         tokens,
     },
     prelude::*,
@@ -22,7 +20,6 @@ use bevy_aurora::{
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
-    ui_render::UiRenderPlugin,
 };
 
 #[derive(Resource, Default)]
@@ -35,10 +32,9 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(RayDefaultPlugins);
     app.add_plugins(DevShaderPlugin);
+    // DevUIPlugin brings the UI stack (UiRenderPlugin, FeathersPlugins) and the dark theme.
     app.add_plugins(DevUIPlugin);
     app.add_plugins(DebugCameraPlugin);
-    app.add_plugins((UiRenderPlugin, FeathersPlugins));
-    app.insert_resource(UiTheme(create_dark_theme()));
     app.init_resource::<Counter>();
     app.add_systems(Startup, (setup, panel.spawn()));
     app.add_systems(
