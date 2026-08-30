@@ -42,6 +42,20 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   float foginess;
   float fog_scatter;
   float sky_brightness;
+  // DLSS: camera matrices for depth / motion vectors, the sub-pixel jitter (pixels), and
+  // whether the guide images are bound this frame.
+  mat4 view;
+  mat4 view_proj;
+  mat4 prev_view_proj;
+  vec2 jitter;
+  uint dlss;
+  uint pad0;
+};
+
+// Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
+// the 3x4 transform (row-major).
+layout (buffer_reference, scalar, buffer_reference_align = 16) readonly buffer PrevInstances {
+  vec4 data[];
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) buffer restrict FocusData {
@@ -98,6 +112,8 @@ struct HitPayload {
   vec3 emission;
   vec4 surface_and_world_normal;
   vec3 absorption;
+  // Where this hit point was last frame (object motion for DLSS motion vectors).
+  vec3 prev_world_pos;
 };
 
 struct PushConstants {
@@ -106,6 +122,8 @@ struct PushConstants {
   BluenoiseData bluenoise;
   FocusData focus;
   uint skydome;
+  uint pad0;
+  PrevInstances prev_instances;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

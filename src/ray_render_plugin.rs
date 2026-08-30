@@ -30,6 +30,8 @@ pub struct RenderConfig {
     pub sky_color: Vec4,
     pub accumulate: bool,
     pub pull_focus: Option<(u32, u32)>,
+    /// DLSS Ray Reconstruction mode (`Off` traces at output resolution, no denoise).
+    pub dlss: crate::dlss::AuroraDlss,
 }
 
 impl Default for RenderConfig {
@@ -41,6 +43,12 @@ impl Default for RenderConfig {
             sky_color: Vec4::splat(1.0),
             accumulate: Default::default(),
             pull_focus: Default::default(),
+            // `AURORA_DLSS=dlaa|quality|balanced|performance|ultra-performance` picks the
+            // start-up mode; D cycles it at runtime.
+            dlss: std::env::var("AURORA_DLSS")
+                .ok()
+                .and_then(|s| crate::dlss::AuroraDlss::parse(&s))
+                .unwrap_or_default(),
         }
     }
 }
@@ -60,6 +68,14 @@ pub struct UniformData {
     foginess: f32,
     fog_scatter: f32,
     sky_brightness: f32,
+    // Flat arrays, not `Mat4`: the GLSL side is `scalar` layout (4-byte aligned), and glam's
+    // 16-byte alignment would pad here.
+    view: [f32; 16],
+    view_proj: [f32; 16],
+    prev_view_proj: [f32; 16],
+    jitter: [f32; 2],
+    dlss: u32,
+    pad0: u32,
 }
 
 #[repr(C)]
@@ -70,6 +86,11 @@ pub struct FocusData {
 fn handle_input(keyboard: Res<ButtonInput<KeyCode>>, mut render_config: ResMut<RenderConfig>) {
     if keyboard.just_pressed(KeyCode::Space) {
         render_config.accumulate = !render_config.accumulate;
+    }
+    // D cycles the DLSS mode.
+    if keyboard.just_pressed(KeyCode::KeyD) {
+        render_config.dlss = render_config.dlss.next();
+        log::info!("dlss: {}", render_config.dlss);
     }
 }
 
@@ -289,15 +310,24 @@ fn render_frame(
     postprocess_filters: Res<VulkanAssets<PostProcessFilter>>,
     bluenoise_buffer: Res<BlueNoiseBuffer>,
     mut tlas: ResMut<TLAS>,
-    mut transforms: ResMut<crate::gpu_transform::GpuTransforms>,
-    modules: Res<crate::compute::ComputeModules>,
-    sbt: Res<SBT>,
+    gpu: (
+        ResMut<crate::gpu_transform::GpuTransforms>,
+        Res<crate::compute::ComputeModules>,
+        Res<SBT>,
+    ),
     camera: Query<(&Projection, &GlobalTransform), With<Camera3d>>,
     mut tick: Local<u32>,
+    dlss_stuff: (
+        ResMut<crate::dlss::DlssState>,
+        Local<Option<Mat4>>,
+        Local<bool>,
+    ),
 ) {
     let Some(mut swapchain) = swapchain else {
         return;
     };
+    let (mut transforms, modules, sbt) = gpu;
+    let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
     let (dev_ui_state, mut ui) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
@@ -318,6 +348,27 @@ fn render_frame(
         Projection::Custom(_) => todo!("custom_projection"),
     };
     let inverse_projection = projection_matrix.inverse();
+    let view_matrix = inverse_view.inverse();
+    let view_proj = projection_matrix * view_matrix;
+    let last_view_proj = prev_view_proj.unwrap_or(view_proj);
+    *prev_view_proj = Some(view_proj);
+
+    // DLSS: settle the trace resolution and jitter before recording (feature creation, when
+    // the mode or window changed, submits and waits on its own).
+    let output_extent = swapchain.swapchain_extent;
+    let plan = dlss
+        .renderer
+        .as_mut()
+        .and_then(|r| r.prepare(&render_device, output_extent, render_config.dlss));
+    let dlss_reset = plan.is_some() && !*dlss_was_active;
+    *dlss_was_active = plan.is_some();
+    let trace_extent = plan.map_or(output_extent, |p| p.render);
+    // Set once the evaluate has been recorded this frame: only then does the blit read the
+    // DLSS output (before the RT pipeline is compiled nothing has written it).
+    let mut dlss_ran = false;
+    let rtx_ready = rtx_pipelines.get(&render_config.rtx_pipeline).is_some()
+        && sbt.data.address != 0
+        && tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null();
 
     // Ensure the uniform_buffer exists
     if frame.uniform_buffer.handle == vk::Buffer::null() {
@@ -377,6 +428,12 @@ fn render_frame(
             foginess: dev_ui_state.foginess,
             fog_scatter: dev_ui_state.fog_scatter,
             sky_brightness: dev_ui_state.sky_brightness,
+            view: view_matrix.to_cols_array(),
+            view_proj: view_proj.to_cols_array(),
+            prev_view_proj: last_view_proj.to_cols_array(),
+            jitter: plan.map_or([0.0; 2], |p| p.jitter),
+            dlss: (plan.is_some() && rtx_ready) as u32,
+            pad0: 0,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
@@ -433,20 +490,56 @@ fn render_frame(
                         &tlas.acceleration_structure.handle,
                     ));
 
-                let writes = [
+                let set = rtx_pipeline.descriptor_sets[swapchain.frame_count % 2];
+                let mut writes = vec![
                     vk::WriteDescriptorSet::default()
-                        .dst_set(rtx_pipeline.descriptor_sets[swapchain.frame_count % 2])
+                        .dst_set(set)
                         .dst_binding(0)
                         .descriptor_count(1)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(std::slice::from_ref(&render_target_main_binding)),
                     vk::WriteDescriptorSet::default()
-                        .dst_set(rtx_pipeline.descriptor_sets[swapchain.frame_count % 2])
+                        .dst_set(set)
                         .dst_binding(100)
                         .descriptor_count(1)
                         .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                         .push_next(&mut ac_binding),
                 ];
+                // DLSS guide images (partially bound: only written while DLSS is on).
+                let guide_infos: Vec<vk::DescriptorImageInfo> = dlss
+                    .renderer
+                    .as_ref()
+                    .filter(|_| plan.is_some())
+                    .and_then(|r| r.guide_views())
+                    .map(|g| {
+                        [
+                            g.normal_roughness,
+                            g.diffuse,
+                            g.specular,
+                            g.depth,
+                            g.spec_hit,
+                            g.motion,
+                            g.color,
+                        ]
+                        .into_iter()
+                        .map(|view| {
+                            vk::DescriptorImageInfo::default()
+                                .image_layout(vk::ImageLayout::GENERAL)
+                                .image_view(view)
+                        })
+                        .collect()
+                    })
+                    .unwrap_or_default();
+                for (i, info) in guide_infos.iter().enumerate() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(1 + i as u32)
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(std::slice::from_ref(info)),
+                    );
+                }
 
                 render_device.update_descriptor_sets(&writes, &[]);
 
@@ -480,6 +573,7 @@ fn render_frame(
                         }),
                     },
                     padding: [0; 1],
+                    prev_instances: tlas.prev_instances_address(),
                 };
 
                 render_device.cmd_push_constants(
@@ -490,16 +584,39 @@ fn render_frame(
                     bytemuck::cast_slice(&[push_constants]),
                 );
 
-                render_device.ext_rtx_pipeline.cmd_trace_rays(
-                    cmd_buffer,
-                    &sbt.raygen_region,
-                    &sbt.miss_region,
-                    &sbt.hit_region,
-                    &vk::StridedDeviceAddressRegionKHR::default(),
-                    swapchain.swapchain_extent.width,
-                    swapchain.swapchain_extent.height,
-                    1,
-                );
+                if let (Some(plan), Some(renderer)) = (plan, dlss.renderer.as_mut()) {
+                    renderer.record_pre_trace(&render_device, cmd_buffer);
+                    render_device.ext_rtx_pipeline.cmd_trace_rays(
+                        cmd_buffer,
+                        &sbt.raygen_region,
+                        &sbt.miss_region,
+                        &sbt.hit_region,
+                        &vk::StridedDeviceAddressRegionKHR::default(),
+                        plan.render.width,
+                        plan.render.height,
+                        1,
+                    );
+                    renderer.record_evaluate(
+                        &render_device,
+                        cmd_buffer,
+                        view_matrix,
+                        projection_matrix,
+                        plan.jitter,
+                        dlss_reset,
+                    );
+                    dlss_ran = true;
+                } else {
+                    render_device.ext_rtx_pipeline.cmd_trace_rays(
+                        cmd_buffer,
+                        &sbt.raygen_region,
+                        &sbt.miss_region,
+                        &sbt.hit_region,
+                        &vk::StridedDeviceAddressRegionKHR::default(),
+                        trace_extent.width,
+                        trace_extent.height,
+                        1,
+                    );
+                }
             }
         }
 
@@ -556,10 +673,17 @@ fn render_frame(
                 bytemuck::cast_slice(&[push_constants]),
             );
 
-            // Ensure the descriptor set is up to date
+            // Ensure the descriptor set is up to date: the DLSS output when it ran this
+            // frame, else the accumulation target.
+            let source_view = dlss
+                .renderer
+                .as_ref()
+                .filter(|_| dlss_ran)
+                .and_then(|r| r.output_view())
+                .unwrap_or(frame.render_frame_buffers.main.1);
             let render_target_main_binding = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::GENERAL)
-                .image_view(frame.render_frame_buffers.main.1)
+                .image_view(source_view)
                 .sampler(render_device.linear_sampler);
 
             let writes = [vk::WriteDescriptorSet::default()

@@ -9,6 +9,15 @@
 #include "disney.glsl"
 
 layout(set=0, binding=0, rgba32f) uniform restrict image2D render_target;
+// DLSS Ray Reconstruction guides, render resolution, written for the primary hit of sample 0
+// when uniforms.dlss != 0 (partially bound otherwise).
+layout(set=0, binding=1, rgba16f) uniform restrict writeonly image2D guide_normal_roughness;
+layout(set=0, binding=2, rgba8)   uniform restrict writeonly image2D guide_diffuse;
+layout(set=0, binding=3, rgba8)   uniform restrict writeonly image2D guide_specular;
+layout(set=0, binding=4, r32f)    uniform restrict writeonly image2D guide_depth;
+layout(set=0, binding=5, r32f)    uniform restrict writeonly image2D guide_spec_hit;
+layout(set=0, binding=6, rg16f)   uniform restrict writeonly image2D guide_motion;
+layout(set=0, binding=7, rgba16f) uniform restrict writeonly image2D dlss_color;
 layout(set=0, binding=100)        uniform accelerationStructureEXT topLevelAS;
 layout(set=1, binding=200)        uniform sampler2D textures[];
 
@@ -86,16 +95,32 @@ vec2 bnoiseBest(const uint sampleIdx) {
 void main() {
   initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.tick);
 
+  const ivec2 px = ivec2(gl_LaunchIDEXT.xy);
+  const bool dlss = pc.uniforms.dlss != 0;
+
   // wide screen
   if (float(gl_LaunchIDEXT.y) < gl_LaunchSizeEXT.y * 0.1 || float(gl_LaunchIDEXT.y) > gl_LaunchSizeEXT.y * 0.9) {
-    imageStore(render_target, ivec2(gl_LaunchIDEXT.xy), vec4(0.0));
+    if (dlss) {
+      imageStore(dlss_color, px, vec4(0.0, 0.0, 0.0, 1.0));
+      imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
+      imageStore(guide_diffuse, px, vec4(0.0));
+      imageStore(guide_specular, px, vec4(0.0));
+      imageStore(guide_depth, px, vec4(0.0));
+      imageStore(guide_spec_hit, px, vec4(0.0));
+      imageStore(guide_motion, px, vec4(0.0));
+    } else {
+      imageStore(render_target, px, vec4(0.0));
+    }
     return;
   }
 
   const float tmin = 0.0001;
   const float tmax = 1000.0;
 
-  const vec2 pixel_center = vec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - gl_LaunchIDEXT.y) + vec2(randf(), randf());
+  // DLSS: a known sub-pixel jitter (told to NGX) instead of the random one; the launch
+  // y is flipped into the NDC-up space here, so the image-space offset is +jitter.
+  const vec2 subpixel = dlss ? vec2(0.5 + pc.uniforms.jitter.x, 0.5 - pc.uniforms.jitter.y) : vec2(randf(), randf());
+  const vec2 pixel_center = vec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - gl_LaunchIDEXT.y) + subpixel;
   const vec2 inUV = pixel_center / vec2(gl_LaunchSizeEXT.xy);
   const vec2 d = inUV * 2.0 - 1.0;
 
@@ -128,6 +153,44 @@ void main() {
 
       const vec3 surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
       const vec3 world_normal = oct_to_float32x3(payload.surface_and_world_normal.zw);
+
+      // DLSS guides from sample 0's primary hit; the specular hit distance from its next hit.
+      if (dlss && sample_idx == 0) {
+        if (bounce_idx == 0) {
+          if (payload.t == 0.0) {
+            imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
+            imageStore(guide_diffuse, px, vec4(0.0));
+            imageStore(guide_specular, px, vec4(0.0));
+            imageStore(guide_depth, px, vec4(0.0));
+            imageStore(guide_motion, px, vec4(0.0));
+            imageStore(guide_spec_hit, px, vec4(0.0));
+          } else {
+            const float g_roughness = hitPayloadGetRoughness(payload);
+            const float g_metallic = hitPayloadGetMetallic(payload);
+            const vec3 hit_pos = origin + direction * payload.t;
+            const vec4 view_pos = pc.uniforms.view * vec4(hit_pos, 1.0);
+            const float linear_depth = max(-view_pos.z, 1.0e-4);
+            const vec3 albedo = clamp(payload.color.rgb, vec3(0.0), vec3(1.0));
+            imageStore(guide_normal_roughness, px, vec4(world_normal, clamp(g_roughness, 0.0, 1.0)));
+            imageStore(guide_diffuse, px, vec4(albedo * (1.0 - g_metallic), 1.0));
+            imageStore(guide_specular, px, vec4(mix(vec3(0.04), albedo, g_metallic), 1.0));
+            imageStore(guide_depth, px, vec4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0));
+            // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
+            const vec4 cur_clip = pc.uniforms.view_proj * vec4(hit_pos, 1.0);
+            const vec4 prev_clip = pc.uniforms.prev_view_proj * vec4(payload.prev_world_pos, 1.0);
+            vec2 motion = vec2(0.0);
+            if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
+              const vec2 cur_uv = (cur_clip.xy / cur_clip.w) * vec2(0.5, -0.5);
+              const vec2 prev_uv = (prev_clip.xy / prev_clip.w) * vec2(0.5, -0.5);
+              motion = clamp(cur_uv - prev_uv, vec2(-2.0), vec2(2.0));
+            }
+            imageStore(guide_motion, px, vec4(motion, 0.0, 0.0));
+            imageStore(guide_spec_hit, px, vec4(0.0));
+          }
+        } else if (bounce_idx == 1) {
+          imageStore(guide_spec_hit, px, vec4(min(payload.t, 1.0e7), 0.0, 0.0, 0.0));
+        }
+      }
       const float roughness = hitPayloadGetRoughness(payload);
       const float metallic = hitPayloadGetMetallic(payload);
       const float transmission = hitPayloadGetTransmission(payload);
@@ -248,8 +311,14 @@ void main() {
   }
 
 
-  vec4 prev = imageLoad(render_target, ivec2(gl_LaunchIDEXT.xy));
+  if (dlss) {
+    // Noisy HDR radiance for Ray Reconstruction; finite and inside f16 range.
+    const vec3 radiance = clamp(acc / SAMPLES, vec3(0.0), vec3(65504.0));
+    imageStore(dlss_color, px, vec4(radiance, 1.0));
+    return;
+  }
+  vec4 prev = imageLoad(render_target, px);
   if (pc.uniforms.accumulate == 0) { prev = vec4(0); }
-  imageStore(render_target, ivec2(gl_LaunchIDEXT.xy), vec4(acc / SAMPLES, 1) + prev);
+  imageStore(render_target, px, vec4(acc / SAMPLES, 1) + prev);
 }
 

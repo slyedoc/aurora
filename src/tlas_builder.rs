@@ -274,6 +274,9 @@ pub struct TLAS {
     // Device.
     capacity: u32,
     instances_buf: Buffer<u8>,
+    /// Last frame's instance array (copied before this frame's gather): the closest-hit
+    /// shaders reproject through its transforms for motion vectors.
+    prev_instances_buf: Buffer<u8>,
     instance_node_buf: Buffer<u32>,
     staging: Buffer<InstanceRecord>,
     rebuild: bool,
@@ -299,6 +302,7 @@ impl TLAS {
             materials: MaterialArena::default(),
             capacity: 0,
             instances_buf: Buffer::default(),
+            prev_instances_buf: Buffer::default(),
             instance_node_buf: Buffer::default(),
             staging: Buffer::default(),
             rebuild: false,
@@ -309,6 +313,11 @@ impl TLAS {
     /// Device address of the packed material buffer (`custom_index` indexes it).
     pub fn material_address(&self) -> u64 {
         self.materials.device.address
+    }
+
+    /// Device address of last frame's instance array (0 until the first frame).
+    pub fn prev_instances_address(&self) -> u64 {
+        self.prev_instances_buf.address
     }
 
     /// Number of SBT hit-group records the instances may reference.
@@ -340,16 +349,22 @@ impl TLAS {
         self.capacity = self.count.max(1024).next_power_of_two();
         log::debug!("GPU instance table: {} slots", self.capacity);
         rd.destroyer.destroy_buffer(self.instances_buf.handle);
+        rd.destroyer.destroy_buffer(self.prev_instances_buf.handle);
         rd.destroyer.destroy_buffer(self.instance_node_buf.handle);
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         self.instances_buf = rd.create_device_buffer(
             self.capacity as u64 * 64,
-            storage | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            storage
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
         );
+        self.prev_instances_buf = rd.create_device_buffer(self.capacity as u64 * 64, storage);
         self.instance_node_buf = rd.create_device_buffer(self.capacity as u64, storage);
         unsafe {
             rd.device
                 .cmd_fill_buffer(cmd, self.instances_buf.handle, 0, vk::WHOLE_SIZE, 0);
+            rd.device
+                .cmd_fill_buffer(cmd, self.prev_instances_buf.handle, 0, vk::WHOLE_SIZE, 0);
             rd.device.cmd_fill_buffer(
                 cmd,
                 self.instance_node_buf.handle,
@@ -401,6 +416,35 @@ impl TLAS {
             transfers = true;
         }
         transfers |= self.materials.upload(rd, cmd);
+
+        // Previous transforms for motion vectors: what the instances held when the last frame
+        // traced (before this frame's gather overwrites them).
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        unsafe {
+            let copy = vk::BufferCopy::default().size(self.count as u64 * 64);
+            rd.device.cmd_copy_buffer(
+                cmd,
+                self.instances_buf.handle,
+                self.prev_instances_buf.handle,
+                std::slice::from_ref(&copy),
+            );
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ,
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+        );
 
         if !self.records.is_empty() {
             ensure_staging(rd, &mut self.staging, self.records.len());
@@ -586,6 +630,7 @@ impl TLAS {
             self.acceleration_structure.buffer.handle,
             self.scratch_buffer.handle,
             self.instances_buf.handle,
+            self.prev_instances_buf.handle,
             self.instance_node_buf.handle,
             self.staging.handle,
             self.materials.device.handle,

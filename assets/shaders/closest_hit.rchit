@@ -113,6 +113,15 @@ void main() {
   const vec3 world_normal = normalize(mat3(gl_ObjectToWorldEXT) * TBN * texture_normal);
 
   payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);
+  {
+    // Object-space hit point through last frame's instance transform.
+    const vec4 p = vec4(gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT, 1.0);
+    const uint base = gl_InstanceID * 4;
+    const vec4 r0 = pc.prev_instances.data[base + 0];
+    const vec4 r1 = pc.prev_instances.data[base + 1];
+    const vec4 r2 = pc.prev_instances.data[base + 2];
+    payload.prev_world_pos = vec3(dot(r0, p), dot(r1, p), dot(r2, p));
+  }
   hitPayloadSetTransmission(payload, transmission);
   hitPayloadSetRoughness(payload, roughness);
   hitPayloadSetMetallic(payload, metallic);

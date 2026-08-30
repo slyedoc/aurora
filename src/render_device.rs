@@ -390,8 +390,20 @@ unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) ->
             .iter()
             .map(|raw_name| raw_name.as_ptr())
             .collect();
-        let instance_extensions =
-            ash_window::enumerate_required_extensions(display_handle.as_raw()).unwrap();
+        let mut instance_extensions: Vec<*const c_char> =
+            ash_window::enumerate_required_extensions(display_handle.as_raw())
+                .unwrap()
+                .to_vec();
+        // DLSS (NGX) asks for its own instance extensions; union them in.
+        let ngx_instance_extensions = crate::dlss::instance_extensions();
+        for ext in &ngx_instance_extensions {
+            if !instance_extensions
+                .iter()
+                .any(|p| CStr::from_ptr(*p) == ext.as_c_str())
+            {
+                instance_extensions.push(ext.as_ptr());
+            }
+        }
 
         println!("Instance extensions:");
         for extension_name in instance_extensions.iter() {
@@ -468,7 +480,7 @@ unsafe fn create_logical_device(
     queue_family_idx: u32,
 ) -> (ash::Device, Mutex<vk::Queue>) {
     unsafe {
-        let device_extensions = [
+        let mut device_extensions = vec![
             swapchain::NAME.as_ptr(),
             synchronization2::NAME.as_ptr(),
             maintenance4::NAME.as_ptr(),
@@ -478,6 +490,30 @@ unsafe fn create_logical_device(
             spirv_1_4::NAME.as_ptr(),
             descriptor_indexing::NAME.as_ptr(),
         ];
+        // DLSS (NGX) device extensions (VK_NVX_binary_import, VK_NVX_image_view_handle, ...):
+        // they must be present at vkCreateDevice, and a device without them still has to
+        // come up -- NGX then reports the feature unavailable.
+        let ngx_device_extensions =
+            crate::dlss::device_extensions(instance.handle(), physical_device);
+        let supported = instance
+            .enumerate_device_extension_properties(physical_device)
+            .unwrap_or_default();
+        for ext in &ngx_device_extensions {
+            let known = supported
+                .iter()
+                .any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == ext.as_c_str());
+            let listed = device_extensions
+                .iter()
+                .any(|p| CStr::from_ptr(*p) == ext.as_c_str());
+            if !known {
+                println!(
+                    "dlss: device lacks {} -- DLSS will be unavailable",
+                    ext.to_string_lossy()
+                );
+            } else if !listed {
+                device_extensions.push(ext.as_ptr());
+            }
+        }
 
         println!("Device extensions:");
         for extension_name in device_extensions.iter() {
@@ -574,6 +610,14 @@ fn create_descriptor_pool(device: &ash::Device) -> Mutex<vk::DescriptorPool> {
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             descriptor_count: MAX_BINDLESS_IMAGES,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: 256,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            descriptor_count: 16,
         },
     ];
 

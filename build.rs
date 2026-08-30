@@ -7,4 +7,29 @@ fn main() {
     if let Ok(sdk) = std::env::var("VULKAN_SDK") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{sdk}/lib");
     }
+    dlss();
+}
+
+// DLSS (NGX) link wiring, additive and guarded: `DLSS_SDK` must name a tree holding
+// `lib/Linux_x86_64/libnvsdk_ngx.a` (the only form of the NGX API on Linux -- a static
+// archive that dlopens the driver's `_nvngx.so` and the per-feature snippets). Without it
+// `cfg(dlss_ngx)` stays off and `src/dlss` compiles to a stub. The archive is named by
+// `#[link]` in `src/dlss/ngx.rs`, so this only supplies the search path.
+fn dlss() {
+    println!("cargo:rerun-if-env-changed=DLSS_SDK");
+    println!("cargo::rustc-check-cfg=cfg(dlss_ngx)");
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Ok(sdk) = std::env::var("DLSS_SDK") else {
+        println!("cargo:warning=DLSS_SDK unset -- DLSS compiles out");
+        return;
+    };
+    let lib_dir = format!("{sdk}/lib/Linux_x86_64");
+    if !std::path::Path::new(&format!("{lib_dir}/libnvsdk_ngx.a")).exists() {
+        println!("cargo:warning={lib_dir}/libnvsdk_ngx.a not found -- DLSS compiles out");
+        return;
+    }
+    println!("cargo:rustc-link-search=native={lib_dir}");
+    println!("cargo:rustc-cfg=dlss_ngx");
 }

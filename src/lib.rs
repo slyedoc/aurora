@@ -7,6 +7,7 @@ pub mod bluenoise_plugin;
 pub mod debug_camera;
 pub mod dev_shaders;
 pub mod dev_ui;
+pub mod dlss;
 pub mod gltf_mesh;
 pub mod gpu_transform;
 pub mod material;

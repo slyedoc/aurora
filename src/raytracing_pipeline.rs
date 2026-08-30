@@ -54,6 +54,8 @@ pub struct RaytracingPushConstants {
     pub focus_buffer: u64,
     pub sky_texture: u32,
     pub padding: [u32; 1],
+    /// Last frame's instance transforms (`tlas_builder`), for motion vectors.
+    pub prev_instances: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {
@@ -109,21 +111,48 @@ impl VulkanAsset for RaytracingPipeline {
         let (raygen_shader, miss_shader, hit_shader, sphere_intersection_shader, sphere_hit_shader) =
             asset;
 
-        let bindings = [
+        // 0: accumulation target; 1..=7: the DLSS guide images (normal+roughness, diffuse,
+        // specular, depth, specular hit distance, motion, colour) -- partially bound, only
+        // written when DLSS is on; 100: the TLAS.
+        let storage = |binding: u32| {
             vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
+                .binding(binding)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+        };
+        let bindings = [
+            storage(0),
+            storage(1),
+            storage(2),
+            storage(3),
+            storage(4),
+            storage(5),
+            storage(6),
+            storage(7),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(100)
                 .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
         ];
+        let binding_flags = [
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::empty(),
+        ];
+        let mut flags_info =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
 
-        let descriptor_set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let descriptor_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&bindings)
+            .push_next(&mut flags_info);
 
         let descriptor_set_layout = unsafe {
             render_device
