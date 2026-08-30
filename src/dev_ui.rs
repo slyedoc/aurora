@@ -49,6 +49,20 @@ pub struct DevUIState {
     /// and Ray Reconstruction alike.
     #[reflect(@0.0..=64.0_f32)]
     pub firefly_clamp: f32,
+    /// Paths per pixel per frame for the plain / accumulating path.
+    #[reflect(@1.0..=8.0_f32)]
+    pub samples: u32,
+    /// Maximum path length for the plain / accumulating path.
+    #[reflect(@1.0..=64.0_f32)]
+    pub max_bounces: u32,
+    /// Paths per pixel while Ray Reconstruction is on; RR is trained for 1 spp, so extra
+    /// samples mostly buy trace time.
+    #[reflect(@1.0..=4.0_f32)]
+    pub dlss_samples: u32,
+    /// Maximum path length while Ray Reconstruction is on. With the firefly clamp a short
+    /// path is all the denoiser needs.
+    #[reflect(@1.0..=64.0_f32)]
+    pub dlss_max_bounces: u32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -63,6 +77,10 @@ impl Default for DevUIState {
             fog_scatter: 0.9,
             sky_brightness: 1.0,
             firefly_clamp: 8.0,
+            samples: 2,
+            max_bounces: 64,
+            dlss_samples: 1,
+            dlss_max_bounces: 8,
             dlss: AuroraDlss::from_env(),
         }
     }
@@ -194,10 +212,17 @@ fn update_stats(
     mut stats: Query<&mut Text, With<DevUIStats>>,
     mut fps_avg: Local<f32>,
     mut ticks: Local<u32>,
+    mut since_log: Local<f32>,
 ) {
     let dt = time.delta_secs();
     if dt > 0.0 {
         *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
+    }
+    // Also to the log every 5 s, so headless / scripted runs get the number without the panel.
+    *since_log += dt;
+    if *since_log >= 5.0 {
+        *since_log = 0.0;
+        log::info!("fps: {:.1}", *fps_avg);
     }
     // Mirrors the frame's accumulation counter: counts while accumulating, else 0.
     *ticks = if render_config.accumulate {

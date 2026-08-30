@@ -74,6 +74,10 @@ pub struct UniformData {
     frame: u32,
     /// Indirect path contributions are clamped to this luminance (0 = off).
     radiance_clamp: f32,
+    /// Paths per pixel this frame and their maximum length (from [`DevUIState`], the DLSS
+    /// pair while Ray Reconstruction runs).
+    samples: u32,
+    max_bounces: u32,
 }
 
 #[repr(C)]
@@ -412,6 +416,7 @@ fn render_frame(
 
     // Update the uniform buffer
     {
+        let dlss_on = plan.is_some() && rtx_ready;
         let data = UniformData {
             sky_color: render_config.sky_color,
             inverse_view,
@@ -436,13 +441,25 @@ fn render_frame(
             view_proj: view_proj.to_cols_array(),
             prev_view_proj: last_view_proj.to_cols_array(),
             jitter: plan.map_or([0.0; 2], |p| p.jitter),
-            dlss: (plan.is_some() && rtx_ready) as u32,
+            dlss: dlss_on as u32,
             frame: *frame_counter,
             radiance_clamp: {
                 let sky = render_config.sky_color * dev_ui_state.sky_brightness;
                 let sky_luma = 0.2126 * sky.x + 0.7152 * sky.y + 0.0722 * sky.z;
                 dev_ui_state.firefly_clamp * sky_luma.max(1e-3)
             },
+            samples: if dlss_on {
+                dev_ui_state.dlss_samples
+            } else {
+                dev_ui_state.samples
+            }
+            .max(1),
+            max_bounces: if dlss_on {
+                dev_ui_state.dlss_max_bounces
+            } else {
+                dev_ui_state.max_bounces
+            }
+            .max(1),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
