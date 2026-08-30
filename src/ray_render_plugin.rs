@@ -72,6 +72,8 @@ pub struct UniformData {
     /// Free-running frame counter: the RNG seed while DLSS is on, so every frame's noise is
     /// new for the temporal denoiser (`tick` resets to 0 whenever accumulation is off).
     frame: u32,
+    /// Indirect path contributions are clamped to this luminance (0 = off).
+    radiance_clamp: f32,
 }
 
 #[repr(C)]
@@ -425,7 +427,7 @@ fn render_frame(
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
             gamma: dev_ui_state.gamma,
-            exposure: dev_ui_state.exposure,
+            exposure: dev_ui_state.exposure_ev.exp2(),
             aperture: dev_ui_state.aperture,
             foginess: dev_ui_state.foginess,
             fog_scatter: dev_ui_state.fog_scatter,
@@ -436,6 +438,11 @@ fn render_frame(
             jitter: plan.map_or([0.0; 2], |p| p.jitter),
             dlss: (plan.is_some() && rtx_ready) as u32,
             frame: *frame_counter,
+            radiance_clamp: {
+                let sky = render_config.sky_color * dev_ui_state.sky_brightness;
+                let sky_luma = 0.2126 * sky.x + 0.7152 * sky.y + 0.0722 * sky.z;
+                dev_ui_state.firefly_clamp * sky_luma.max(1e-3)
+            },
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);

@@ -33,8 +33,9 @@ use crate::{dlss::AuroraDlss, ray_render_plugin::RenderConfig, ui_render::UiRend
 pub struct DevUIState {
     #[reflect(@1.5..=3.0_f32)]
     pub gamma: f32,
-    #[reflect(@0.0..=5.0_f32)]
-    pub exposure: f32,
+    /// Exposure in stops: the frame is multiplied by `2^exposure_ev` before tonemapping.
+    #[reflect(@-20.0..=20.0_f32)]
+    pub exposure_ev: f32,
     #[reflect(@0.0..=0.02_f32)]
     pub aperture: f32,
     #[reflect(@0.0..=0.2_f32)]
@@ -43,6 +44,11 @@ pub struct DevUIState {
     pub fog_scatter: f32,
     #[reflect(@0.0..=1.0_f32)]
     pub sky_brightness: f32,
+    /// Firefly suppression: indirect contributions are clamped to this many times the sky's
+    /// luminance (0 = off). Biases bright indirect paths down; kills speckle for accumulation
+    /// and Ray Reconstruction alike.
+    #[reflect(@0.0..=64.0_f32)]
+    pub firefly_clamp: f32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -51,11 +57,12 @@ impl Default for DevUIState {
     fn default() -> Self {
         Self {
             gamma: 2.4,
-            exposure: 1.0,
+            exposure_ev: 0.0,
             aperture: 0.0,
             foginess: 0.001,
             fog_scatter: 0.9,
             sky_brightness: 1.0,
+            firefly_clamp: 8.0,
             dlss: AuroraDlss::from_env(),
         }
     }

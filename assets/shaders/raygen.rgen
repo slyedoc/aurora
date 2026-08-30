@@ -214,7 +214,13 @@ void main() {
 
       // hit an emitter
       if (payload.emission != vec3(0.0) || payload.t == 0.0) {
-        acc += mask * payload.emission;
+        vec3 contribution = mask * payload.emission;
+        // Firefly suppression: an indirect path that reaches an emitter far brighter than the
+        // sky would take hundreds of frames to average out; clamp its luminance instead.
+        if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
+          contribution *= min(1.0, pc.uniforms.radiance_clamp / max(luma(contribution), 1.0e-6));
+        }
+        acc += contribution;
         break;
       }
 

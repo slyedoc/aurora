@@ -24,7 +24,9 @@ void main() {
   vec2 uv = vec2(u, v);
   if (uv.x > 1.0) uv.x -= 1.0;
   if (uv.y > 1.0) uv.y -= 1.0;
-  payload.emission *= pow(texture(textures[pc.skydome], uv).rgb, vec3(2.2));
-  // prevent extreme bright spots causing high variance
-  payload.emission = clamp(payload.emission, vec3(0.0), vec3(300.0)) * pc.uniforms.sky_brightness;
+  // The skydome texel scales the sky colour; its extreme spots (the sun) are clamped RELATIVE
+  // to the sky so a physically bright sky colour (thousands of nits) passes through untouched
+  // -- a white fallback texel is exactly 1.0.
+  const vec3 texel = min(pow(texture(textures[pc.skydome], uv).rgb, vec3(2.2)), vec3(300.0));
+  payload.emission *= texel * pc.uniforms.sky_brightness;
 }

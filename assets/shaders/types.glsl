@@ -51,6 +51,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint dlss;
   // Free-running frame counter (RNG seed under DLSS; `tick` is 0 unless accumulating).
   uint frame;
+  // Firefly suppression: indirect path contributions are clamped to this luminance (0 = off).
+  float radiance_clamp;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
