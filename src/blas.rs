@@ -124,16 +124,65 @@ impl Default for RTXMaterial {
     }
 }
 
+/// An extracted `StandardMaterial`: the shader-side record plus the images its texture slots come
+/// from. The slots are resolved to bindless indices at TLAS update time, once the images have
+/// uploaded — so textures apply whenever they finish loading, without re-extracting the material.
+#[derive(Clone, Default)]
+pub struct StandardRtxMaterial {
+    pub material: RTXMaterial,
+    pub base_color_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
+    pub emissive_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
+    pub metallic_roughness_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
+    pub normal_map_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
+}
+
+impl StandardRtxMaterial {
+    /// The record with every texture slot filled from `textures` (or its fallback).
+    pub fn resolve(
+        &self,
+        render_device: &RenderDevice,
+        textures: &crate::vulkan_asset::VulkanAssets<bevy::image::Image>,
+    ) -> RTXMaterial {
+        let slot = |id: Option<bevy::asset::AssetId<bevy::image::Image>>, fallback: u32| {
+            id.and_then(|id| textures.get_by_id(id))
+                .map(|texture| render_device.register_bindless_texture(texture))
+                .unwrap_or(fallback)
+        };
+        RTXMaterial {
+            base_color_texture: slot(self.base_color_texture, WHITE_TEXTURE_IDX),
+            base_emissive_texture: slot(self.emissive_texture, WHITE_TEXTURE_IDX),
+            metallic_roughness_texture: slot(self.metallic_roughness_texture, WHITE_TEXTURE_IDX),
+            normal_texture: slot(self.normal_map_texture, DEFAULT_NORMAL_TEXTURE_IDX),
+            ..self.material
+        }
+    }
+}
+
 impl VulkanAsset for StandardMaterial {
-    type ExtractedAsset = RTXMaterial;
+    type ExtractedAsset = StandardRtxMaterial;
     type ExtractParam = ();
-    type PreparedAsset = RTXMaterial;
+    type PreparedAsset = StandardRtxMaterial;
 
     fn extract_asset(
         &self,
         _param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        Some(RTXMaterial::from_bevy_standard_material(self))
+        Some(StandardRtxMaterial {
+            material: RTXMaterial::from_bevy_standard_material(self),
+            base_color_texture: self
+                .base_color_texture
+                .as_ref()
+                .map(bevy::asset::Handle::id),
+            emissive_texture: self.emissive_texture.as_ref().map(bevy::asset::Handle::id),
+            metallic_roughness_texture: self
+                .metallic_roughness_texture
+                .as_ref()
+                .map(bevy::asset::Handle::id),
+            normal_map_texture: self
+                .normal_map_texture
+                .as_ref()
+                .map(bevy::asset::Handle::id),
+        })
     }
 
     fn prepare_asset(

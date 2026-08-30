@@ -211,6 +211,7 @@ pub fn update_tlas(
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
     materials: Res<VulkanAssets<StandardMaterial>>,
+    textures: Res<VulkanAssets<Image>>,
     mesh_components: Query<(Entity, &Mesh3d)>,
     gltf_components: Query<(Entity, &GltfModelHandle)>,
     material_components: Query<&MeshMaterial3d<StandardMaterial>>,
@@ -319,7 +320,12 @@ pub fn update_tlas(
             };
 
             let material_slice = if let Ok(material_handle) = material_components.get(*e) {
-                vec![materials.get(material_handle).cloned().unwrap_or_default()]
+                vec![
+                    materials
+                        .get(material_handle)
+                        .map(|material| material.resolve(&render_device, &textures))
+                        .unwrap_or_default(),
+                ]
             } else {
                 if let Some(gltf_materials) = mat_bundle {
                     gltf_materials.clone()
