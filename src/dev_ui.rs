@@ -103,7 +103,7 @@ impl Plugin for DevUIPlugin {
 }
 
 /// Keeps the panel's `dlss` field and the camera's [`AuroraDlss`] component equal: whichever
-/// side moved last (the panel, or D cycling the component) wins.
+/// side moved last (the panel, or F3 cycling the component) wins.
 fn sync_dlss_mode(
     mut state: ResMut<DevUIState>,
     mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,

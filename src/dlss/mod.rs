@@ -39,7 +39,7 @@ pub const AURORA_PROJECT_ID: &str = "a17b0d3e-5c42-4f9a-9d31-6b0e2f8c74d5";
 /// inspector edits it like anything else. Every non-`Off` mode is an NGX `PerfQuality` value:
 /// the render resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution.
 /// `Dlaa` is 1:1 (denoise + AA, no upscale). A camera spawned without one gets
-/// `$AURORA_DLSS` (or `Off`); D cycles it.
+/// `$AURORA_DLSS` (or `Off`); F3 cycles it.
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
@@ -197,12 +197,12 @@ fn default_mode(
     }
 }
 
-/// D cycles the DLSS mode on every 3D camera.
+/// F3 cycles the DLSS mode on every 3D camera (D is the free camera's strafe).
 fn cycle_mode(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,
 ) {
-    if keyboard.just_pressed(KeyCode::KeyD) {
+    if keyboard.just_pressed(KeyCode::F3) {
         for mut mode in &mut cameras {
             *mode = mode.next();
             log::info!("dlss: {}", *mode);
