@@ -36,11 +36,39 @@ impl VulkanAsset for Mesh {
             None => panic!("Mesh has no indices"),
         };
 
-        let attributes = asset.attributes().map(|(id, _)| id).collect::<Vec<_>>();
-        assert!(attributes.len() == 3);
-
-        let mut vertex_data = vec![0u8; asset.get_vertex_buffer_size()];
-        asset.write_packed_vertex_buffer_data(vertex_data.as_mut_slice().into());
+        // Pack exactly the three streams the shaders' `Vertex` (types.glsl) reads, whatever
+        // other attributes the mesh carries (tangents, joints, ...).
+        let positions = asset
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|a| a.as_float3())
+            .expect("mesh has no positions");
+        let normals: Vec<[f32; 3]> = match asset
+            .attribute(Mesh::ATTRIBUTE_NORMAL)
+            .and_then(|a| a.as_float3())
+        {
+            Some(n) if n.len() == vertex_count => n.to_vec(),
+            _ => {
+                let mut with_normals = asset.clone();
+                with_normals.compute_normals();
+                with_normals
+                    .attribute(Mesh::ATTRIBUTE_NORMAL)
+                    .and_then(|a| a.as_float3())
+                    .map(|n| n.to_vec())
+                    .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; vertex_count])
+            }
+        };
+        let uvs: Vec<[f32; 2]> = match asset.attribute(Mesh::ATTRIBUTE_UV_0) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x2(uv)) if uv.len() == vertex_count => {
+                uv.clone()
+            }
+            _ => vec![[0.0; 2]; vertex_count],
+        };
+        let mut vertex_floats: Vec<f32> = Vec::with_capacity(vertex_count * 8);
+        for i in 0..vertex_count {
+            vertex_floats.extend_from_slice(&positions[i]);
+            vertex_floats.extend_from_slice(&normals[i]);
+            vertex_floats.extend_from_slice(&uvs[i]);
+        }
         let index_data = asset.get_index_buffer_bytes().unwrap();
 
         let mut vertex_buffer_host = render_device.create_host_buffer::<Vertex>(
@@ -54,7 +82,7 @@ impl VulkanAsset for Mesh {
         );
 
         let mut vertex_view = render_device.map_buffer(&mut vertex_buffer_host);
-        vertex_view.copy_from_slice(bytemuck::cast_slice(&vertex_data));
+        vertex_view.copy_from_slice(bytemuck::cast_slice(&vertex_floats));
         let mut index_view = render_device.map_buffer(&mut index_buffer_host);
         index_view.copy_from_slice(bytemuck::cast_slice(&index_data));
 

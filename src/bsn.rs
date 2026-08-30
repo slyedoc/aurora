@@ -45,6 +45,9 @@ impl Plugin for BsnPlugin {
         app.register_type::<StandardMaterial>();
         app.register_asset_reflect::<StandardMaterial>();
         app.register_asset_reflect::<Mesh>();
+        app.register_asset_reflect::<Image>();
+        // `Name("…")` in a .bsn: the loader needs a String -> HashedStr conversion.
+        app.register_type_conversion::<String, bevy::ecs::name::HashedStr, _>(|s| Ok(s.into()));
         app.init_resource::<DefaultRaytracingMaterial>();
         app.add_systems(PostUpdate, (sync_raytracing_material, default_material));
     }
