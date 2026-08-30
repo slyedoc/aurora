@@ -94,7 +94,7 @@ pub struct RenderDeviceData {
     pub command_pool: vk::CommandPool,
     pub bindless_descriptor_set: vk::DescriptorSet,
     pub bindless_descriptor_set_layout: vk::DescriptorSetLayout,
-    pub bindless_descriptor_map: Mutex<HashMap<vk::ImageView, u32>>,
+    pub bindless_descriptor_map: Mutex<BindlessMap>,
     pub transfer_command_pool: Mutex<vk::CommandPool>,
     pub command_buffers: [vk::CommandBuffer; 2],
     pub descriptor_pool: Mutex<vk::DescriptorPool>,
@@ -113,6 +113,16 @@ impl std::ops::Deref for RenderDeviceData {
 
 #[derive(Resource, Deref)]
 pub struct RenderDevice(Arc<RenderDeviceData>);
+
+/// Bindless texture slots: view -> slot, plus recycled slots. Slots are only ever rebound, never
+/// cleared (the set is partially bound), so a recycled slot keeps a stale descriptor until its
+/// next registration — harmless, nothing samples an unregistered index.
+#[derive(Default)]
+pub struct BindlessMap {
+    pub by_view: HashMap<vk::ImageView, u32>,
+    pub free: Vec<u32>,
+    pub next: u32,
+}
 
 impl Clone for RenderDevice {
     fn clone(&self) -> Self {
@@ -175,7 +185,7 @@ impl RenderDevice {
                 command_pool,
                 bindless_descriptor_set,
                 bindless_descriptor_set_layout,
-                bindless_descriptor_map: Mutex::new(HashMap::new()),
+                bindless_descriptor_map: Mutex::new(BindlessMap::default()),
                 transfer_command_pool,
                 command_buffers,
                 descriptor_pool,
@@ -215,12 +225,16 @@ impl RenderDevice {
 
     pub fn register_bindless_texture(&self, texture: &RenderTexture) -> u32 {
         let mut map = self.bindless_descriptor_map.lock().unwrap();
-        if let Some(index) = map.get(&texture.image_view) {
+        if let Some(index) = map.by_view.get(&texture.image_view) {
             return *index;
         }
 
-        let index = map.len() as u32;
-        map.insert(texture.image_view, index);
+        let index = map.free.pop().unwrap_or_else(|| {
+            let index = map.next;
+            map.next += 1;
+            index
+        });
+        map.by_view.insert(texture.image_view, index);
 
         let descriptor_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -244,7 +258,17 @@ impl RenderDevice {
 
     pub fn get_bindless_texture_index(&self, texture: &RenderTexture) -> Option<u32> {
         let map = self.bindless_descriptor_map.lock().unwrap();
-        map.get(&texture.image_view).copied()
+        map.by_view.get(&texture.image_view).copied()
+    }
+
+    /// Forget a view's bindless slot before its deferred destruction. Vulkan reuses handle
+    /// values, so a destroyed view's entry would otherwise alias whatever gets created next
+    /// (the font atlas is re-created on every glyph-cache growth, so this bites early).
+    pub fn unregister_bindless_texture(&self, texture: &RenderTexture) {
+        let mut map = self.bindless_descriptor_map.lock().unwrap();
+        if let Some(index) = map.by_view.remove(&texture.image_view) {
+            map.free.push(index);
+        }
     }
 
     pub fn load_shader(

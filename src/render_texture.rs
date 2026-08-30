@@ -92,6 +92,7 @@ impl VulkanAsset for bevy::prelude::Image {
     }
 
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
+        render_device.unregister_bindless_texture(prepared_asset);
         render_device
             .destroyer
             .destroy_image_view(prepared_asset.image_view);
