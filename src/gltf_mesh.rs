@@ -1,17 +1,11 @@
 use std::collections::HashMap;
 
 use ash::vk;
-use bevy::{
-    asset::AssetLoader, camera::visibility::InheritedVisibility, prelude::*, render::RenderApp,
-    tasks::ConditionalSendFuture,
-};
+use bevy::{asset::AssetLoader, prelude::*, tasks::ConditionalSendFuture};
 use thiserror::Error;
 
 use crate::{
     blas::{BLAS, GeometryDescr, RTXMaterial, Vertex, build_blas_from_buffers},
-    extract::Extract,
-    ray_render_plugin::ExtractedEntity,
-    tlas_builder::RtxInstanceMask,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
@@ -26,9 +20,6 @@ impl Plugin for GltfPlugin {
         app.init_asset::<GltfModel>();
         app.init_asset_loader::<GltfLoader>();
         app.init_vulkan_asset::<GltfModel>();
-
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_systems(ExtractSchedule, extract_gltfs);
     }
 }
 
@@ -40,6 +31,7 @@ pub struct GltfModel {
 }
 
 #[derive(Component, Deref, Clone)]
+#[require(Transform, Visibility)]
 pub struct GltfModelHandle(pub Handle<GltfModel>);
 
 impl GltfModel {
@@ -440,24 +432,3 @@ fn load_gltf_texture(
     ))
 }
 
-fn extract_gltfs(
-    mut commands: Commands,
-    meshes: Extract<
-        Query<(
-            &GltfModelHandle,
-            &Transform,
-            &GlobalTransform,
-            Option<&InheritedVisibility>,
-        )>,
-    >,
-) {
-    for (mesh, t, gt, visibility) in meshes.iter() {
-        commands.spawn((
-            ExtractedEntity,
-            mesh.clone(),
-            t.clone(),
-            gt.clone(),
-            RtxInstanceMask::from_visibility(visibility),
-        ));
-    }
-}

@@ -1,25 +1,22 @@
 use ash::vk;
-use bevy::{camera::visibility::InheritedVisibility, prelude::*, render::RenderApp};
+use bevy::prelude::*;
 
 use crate::{
     blas::{AccelerationStructure, allocate_acceleration_structure},
-    extract::Extract,
-    ray_render_plugin::ExtractedEntity,
-    tlas_builder::RtxInstanceMask,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
 };
 
 #[derive(Component, Default, Clone)]
+#[require(Transform, Visibility)]
 pub struct Sphere;
 
 pub struct SpherePlugin;
 
 impl Plugin for SpherePlugin {
-    fn build(&self, app: &mut App) {
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_systems(ExtractSchedule, extract_spheres);
-    }
+    /// `Sphere` needs nothing registered: its BLAS is built with the device and its entities
+    /// go through the instance table like meshes.
+    fn build(&self, _app: &mut App) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,26 +163,3 @@ impl SphereBLAS {
     }
 }
 
-fn extract_spheres(
-    mut commands: Commands,
-    meshes: Extract<
-        Query<(
-            &Sphere,
-            &MeshMaterial3d<StandardMaterial>,
-            &Transform,
-            &GlobalTransform,
-            Option<&InheritedVisibility>,
-        )>,
-    >,
-) {
-    for (sphere, mat, t, gt, visibility) in meshes.iter() {
-        commands.spawn((
-            ExtractedEntity,
-            sphere.clone(),
-            mat.clone(),
-            t.clone(),
-            gt.clone(),
-            RtxInstanceMask::from_visibility(visibility),
-        ));
-    }
-}

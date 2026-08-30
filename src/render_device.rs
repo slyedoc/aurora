@@ -518,7 +518,11 @@ unsafe fn create_logical_device(
         let mut features_scalar_block =
             vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
 
+        // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`.
+        let core_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+
         let device_info = vk::DeviceCreateInfo::default()
+            .enabled_features(&core_features)
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_extensions)
             .push_next(&mut sync2_info)

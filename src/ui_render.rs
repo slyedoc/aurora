@@ -20,7 +20,8 @@ use ash::vk;
 use bevy::{
     asset::AssetId,
     camera::{
-        Camera, CameraPlugin, RenderTarget, RenderTargetInfo, visibility::InheritedVisibility,
+        Camera, CameraProjectionPlugin, ClearColor, RenderTarget, RenderTargetInfo,
+        visibility::{InheritedVisibility, VisibilityPropagatePlugin},
     },
     color::{Hsla, Hsva, LinearRgba, Okhsla, Oklaba, Oklcha, Srgba},
     ecs::system::{SystemParam, lifetimeless::SRes},
@@ -327,12 +328,12 @@ impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         // Only the pieces the app has not already added: several of these pull each
         // other in (TextPlugin adds TextureAtlasPlugin, for example).
-        if !app.is_plugin_added::<CameraPlugin>() {
-            // VisibilityPlugin (which propagates `InheritedVisibility` to UI nodes) also
-            // carries mesh-bounds systems that expect these assets to exist.
-            app.init_asset::<Mesh>();
-            app.init_asset::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>();
-            app.add_plugins(CameraPlugin);
+        if !app.is_plugin_added::<VisibilityPropagatePlugin>() {
+            // Propagation only (`Visibility` -> `InheritedVisibility`, which UI nodes read):
+            // the culling half of bevy's VisibilityPlugin has no job in a ray tracer, where
+            // the acceleration structure is the culling structure.
+            app.init_resource::<ClearColor>();
+            app.add_plugins((CameraProjectionPlugin, VisibilityPropagatePlugin));
         }
         if !app.is_plugin_added::<TextPlugin>() {
             app.add_plugins(TextPlugin);

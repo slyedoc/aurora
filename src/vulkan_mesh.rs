@@ -1,14 +1,10 @@
 use bevy::{
-    camera::visibility::InheritedVisibility,
     prelude::*,
-    render::{RenderApp, mesh::Indices},
+    render::mesh::Indices,
 };
 
 use crate::{
     blas::{BLAS, BlasBuildInput, GeometryDescr, Vertex, build_blas_batch},
-    extract::Extract,
-    ray_render_plugin::ExtractedEntity,
-    tlas_builder::RtxInstanceMask,
     render_buffer::BufferProvider,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
@@ -133,30 +129,6 @@ fn pack_vertex_streams(asset: Mesh) -> (Vec<f32>, Vec<u32>) {
 
 pub struct VulkanMeshPlugin;
 
-fn extract_meshes(
-    mut commands: Commands,
-    meshes: Extract<
-        Query<(
-            &Mesh3d,
-            &MeshMaterial3d<StandardMaterial>,
-            &Transform,
-            &GlobalTransform,
-            Option<&InheritedVisibility>,
-        )>,
-    >,
-) {
-    for (mesh, mat, t, gt, visibility) in meshes.iter() {
-        commands.spawn((
-            ExtractedEntity,
-            mesh.clone(),
-            mat.clone(),
-            t.clone(),
-            gt.clone(),
-            RtxInstanceMask::from_visibility(visibility),
-        ));
-    }
-}
-
 impl Plugin for VulkanMeshPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<Mesh>();
@@ -164,7 +136,5 @@ impl Plugin for VulkanMeshPlugin {
         app.init_asset::<StandardMaterial>();
         app.init_vulkan_asset::<StandardMaterial>();
 
-        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
-        render_app.add_systems(ExtractSchedule, extract_meshes);
     }
 }

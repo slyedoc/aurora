@@ -1,6 +1,7 @@
-//! Visibility → TLAS instance mask: the cube and the red sphere flip `Visibility` every three
-//! seconds. Hidden entities stay in the TLAS (same instance list, same topology) with a zero
-//! instance mask, so rays simply miss them.
+//! Visibility → TLAS instance mask, and GPU transform propagation: the yellow cube spins (its
+//! green child rides along through the hierarchy, propagated on the GPU) and, with the red
+//! sphere, flips `Visibility` every three seconds. Hidden entities stay in the TLAS (same
+//! instance list, same topology) with a zero instance mask, so rays simply miss them.
 
 use bevy::prelude::*;
 use bevy_aurora::{
@@ -22,7 +23,7 @@ fn main() {
     app.add_plugins(DevUIPlugin);
     app.add_plugins(DebugCameraPlugin);
     app.add_systems(Startup, setup);
-    app.add_systems(Update, blink);
+    app.add_systems(Update, (blink, spin));
     app.run();
 }
 
@@ -94,6 +95,13 @@ fn setup(
         })),
         Transform::from_xyz(2.5, 1.0, 0.0),
     ));
+}
+
+fn spin(time: Res<Time>, mut spinners: Query<&mut Transform, (With<Blinker>, With<Mesh3d>)>) {
+    for mut transform in &mut spinners {
+        transform.rotation = Quat::from_rotation_y(time.elapsed_secs());
+        transform.translation.x = (time.elapsed_secs() * 0.7).sin();
+    }
 }
 
 fn blink(time: Res<Time>, mut blinkers: Query<&mut Visibility, With<Blinker>>) {

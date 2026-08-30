@@ -453,6 +453,8 @@ fn render_frame(
     postprocess_filters: Res<VulkanAssets<PostProcessFilter>>,
     bluenoise_buffer: Res<BlueNoiseBuffer>,
     mut tlas: ResMut<TLAS>,
+    mut transforms: ResMut<crate::gpu_transform::GpuTransforms>,
+    modules: Res<crate::compute::ComputeModules>,
     sbt: Res<SBT>,
     camera: Query<(&Projection, &GlobalTransform), With<Camera>>,
     mut tick: Local<u32>,
@@ -569,9 +571,11 @@ fn render_frame(
             .render_frame_buffers
             .prepare(&render_device, &swapchain, cmd_buffer);
 
-        // The in-flight fence was waited in aquire_next_image, so the previous trace is done and
-        // the single TLAS can be rebuilt in place, inside this frame's command buffer.
-        tlas.record_build(&render_device, cmd_buffer);
+        // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
+        // propagate this frame's transform deltas on the GPU, refresh the instance table from
+        // them, and rebuild the single TLAS in place -- all inside this command buffer.
+        let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
+        tlas.record(&render_device, cmd_buffer, &modules, &transforms, world_changed);
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
@@ -624,7 +628,7 @@ fn render_frame(
 
                 let push_constants = RaytracingPushConstants {
                     uniform_buffer: frame.uniform_buffer.address,
-                    material_buffer: tlas.material_buffer.address,
+                    material_buffer: tlas.material_address(),
                     bluenoise_buffer2: bluenoise_buffer.0.address,
                     focus_buffer: frame.focus_data.address,
                     sky_texture: match &render_config.skydome {

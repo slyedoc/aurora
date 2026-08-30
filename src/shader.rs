@@ -13,6 +13,8 @@ pub enum ShaderLoaderError {
     Parse(#[from] std::string::FromUtf8Error),
     #[error("Could not compile shader: {0}")]
     Compile(#[from] shaderc::Error),
+    #[error("slangc failed for {path}:\n{stderr}")]
+    Slang { path: String, stderr: String },
 }
 
 #[derive(TypePath)]
@@ -42,7 +44,7 @@ impl AssetLoader for ShaderLoader {
     type Error = ShaderLoaderError;
 
     fn extensions(&self) -> &[&str] {
-        &["vert", "frag"]
+        &["vert", "frag", "comp", "rgen", "rint", "rchit", "rmiss", "slang"]
     }
 
     fn load(
@@ -65,6 +67,21 @@ impl AssetLoader for ShaderLoader {
                 return Ok(Shader {
                     path: load_context.path().path().to_str().unwrap().to_string(),
                     spirv: None,
+                    dependencies: Vec::new(),
+                });
+            }
+
+            if ext == "slang" {
+                let source_path = format!(
+                    "{}/{}",
+                    crate::assets::AURORA_ASSET_DIR,
+                    load_context.path().path().display()
+                );
+                let spirv = compile_slang(&source_path)?;
+                log::info!("Loaded shader: {path} (slang)");
+                return Ok(Shader {
+                    path: load_context.path().path().to_str().unwrap().to_string(),
+                    spirv: Some(spirv.into()),
                     dependencies: Vec::new(),
                 });
             }
@@ -141,6 +158,46 @@ impl AssetLoader for ShaderLoader {
             Ok(shader)
         })
     }
+}
+
+/// Compiles a `.slang` module to SPIR-V with the Vulkan SDK's `slangc` (`$VULKAN_SDK/bin`, else
+/// `PATH`). Every `[shader("...")]` entry point in the file lands in the one module under its
+/// own name, so a kernel file with several entries is one asset and one compile.
+///
+/// Slang is the engine's shader language going forward; the GLSL stages above are the legacy
+/// path. Modules reference buffers through raw pointers in push constants
+/// (`SPV_KHR_physical_storage_buffer`), so they need no descriptor sets.
+pub fn compile_slang(source_path: &str) -> Result<Vec<u8>, ShaderLoaderError> {
+    let slangc = std::env::var_os("VULKAN_SDK")
+        .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("slangc"));
+    // slangc has no stdout mode; round-trip through a per-process temp file.
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let out_dir = std::env::temp_dir().join("aurora-slang");
+    std::fs::create_dir_all(&out_dir)?;
+    let out_path = out_dir.join(format!(
+        "{}-{}.spv",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let output = std::process::Command::new(&slangc)
+        .arg(source_path)
+        .args(["-target", "spirv", "-profile", "spirv_1_6", "-O2"])
+        .arg("-fvk-use-entrypoint-name")
+        .arg("-o")
+        .arg(&out_path)
+        .output()?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(ShaderLoaderError::Slang {
+            path: source_path.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let spirv = std::fs::read(&out_path)?;
+    let _ = std::fs::remove_file(&out_path);
+    Ok(spirv)
 }
 
 pub struct ShaderPlugin;

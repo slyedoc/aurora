@@ -4,7 +4,7 @@ use crate::{
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    tlas_builder::{TLAS, update_tlas},
+    tlas_builder::{TLAS, prepare_instances},
     vk_utils,
     vulkan_asset::{VulkanAssetLoadingState, VulkanAssets, poll_for_asset},
 };
@@ -94,8 +94,8 @@ fn update_sbt(
         aligments.shader_group_base_alignment,
     );
 
-    // one extra for the sphere hit group
-    sbt.hit_region.size = sbt.hit_region.stride * (meshes.len() + gltf_meshes.len() + 1) as u64;
+    // Hit offsets are stable per mesh asset (0 is the sphere group), so size by their count.
+    sbt.hit_region.size = sbt.hit_region.stride * tlas.hit_offset_count().max(1) as u64;
 
     let total_size = sbt.raygen_region.size + sbt.miss_region.size + sbt.hit_region.size;
 
@@ -193,7 +193,7 @@ impl Plugin for SBTPlugin {
             update_sbt
                 .in_set(RenderSet::Prepare)
                 .after(poll_for_asset::<RaytracingPipeline>)
-                .after(update_tlas),
+                .after(prepare_instances),
         );
         render_app.add_systems(TeardownSchedule, cleanup_sbt);
     }

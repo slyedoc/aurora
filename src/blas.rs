@@ -157,18 +157,35 @@ impl StandardRtxMaterial {
         render_device: &RenderDevice,
         textures: &crate::vulkan_asset::VulkanAssets<bevy::image::Image>,
     ) -> RTXMaterial {
-        let slot = |id: Option<bevy::asset::AssetId<bevy::image::Image>>, fallback: u32| {
-            id.and_then(|id| textures.get_by_id(id))
-                .map(|texture| render_device.register_bindless_texture(texture))
-                .unwrap_or(fallback)
+        self.resolve_checked(render_device, textures).0
+    }
+
+    /// Like [`resolve`](Self::resolve), plus whether every referenced texture was found (a
+    /// `false` means a fallback stands in and the record is worth resolving again later).
+    pub fn resolve_checked(
+        &self,
+        render_device: &RenderDevice,
+        textures: &crate::vulkan_asset::VulkanAssets<bevy::image::Image>,
+    ) -> (RTXMaterial, bool) {
+        let mut complete = true;
+        let mut slot = |id: Option<bevy::asset::AssetId<bevy::image::Image>>, fallback: u32| {
+            let Some(id) = id else { return fallback };
+            match textures.get_by_id(id) {
+                Some(texture) => render_device.register_bindless_texture(texture),
+                None => {
+                    complete = false;
+                    fallback
+                }
+            }
         };
-        RTXMaterial {
+        let material = RTXMaterial {
             base_color_texture: slot(self.base_color_texture, WHITE_TEXTURE_IDX),
             base_emissive_texture: slot(self.emissive_texture, WHITE_TEXTURE_IDX),
             metallic_roughness_texture: slot(self.metallic_roughness_texture, WHITE_TEXTURE_IDX),
             normal_texture: slot(self.normal_map_texture, DEFAULT_NORMAL_TEXTURE_IDX),
             ..self.material
-        }
+        };
+        (material, complete)
     }
 }
 
