@@ -94,9 +94,9 @@ vec2 bnoiseBest(const uint sampleIdx) {
 }
 
 // The world-space corners of triangle `tri` of light instance `li`, through the live
-// TLAS instance row (3x4 row-major, as in prev_instances).
-void lightTriangleWorld(LightInstance li, const uint tri, out vec3 w0, out vec3 w1, out vec3 w2) {
-  uint g = 0u;
+// TLAS instance row (3x4 row-major, as in prev_instances); `g` gets the geometry index.
+void lightTriangleWorld(LightInstance li, const uint tri, out uint g, out vec3 w0, out vec3 w1, out vec3 w2) {
+  g = 0u;
   for (uint k = 1u; k < li.geom_count; k++) {
     if (li.geom_to_triangle.index_offsets[k] <= tri) { g = k; } else { break; }
   }
@@ -116,8 +116,9 @@ void lightTriangleWorld(LightInstance li, const uint tri, out vec3 w0, out vec3 
 // Solid-angle pdf of the light table picking direction onto triangle `tri` of `li` at
 // distance `t` along `dir` (for MIS against BRDF sampling). 0 when degenerate.
 float lightTrianglePdf(LightInstance li, const uint tri, const float p_pick, const float t, const vec3 dir) {
+  uint g;
   vec3 w0, w1, w2;
-  lightTriangleWorld(li, tri, w0, w1, w2);
+  lightTriangleWorld(li, tri, g, w0, w1, w2);
   const vec3 lng = cross(w1 - w0, w2 - w0);
   const float area2 = length(lng);
   if (area2 <= 0.0) { return 0.0; }
@@ -220,8 +221,9 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   dir = vec3(0.0);
   dist = 0.0;
   LightInstance li = pc.lights.linsts.data[li_idx];
+  uint g;
   vec3 w0, w1, w2;
-  lightTriangleWorld(li, e - li.entry_base, w0, w1, w2);
+  lightTriangleWorld(li, e - li.entry_base, g, w0, w1, w2);
   const vec3 lng = cross(w1 - w0, w2 - w0);
   const float area2 = length(lng);
   if (area2 <= 0.0) { return vec3(0.0); }
@@ -237,7 +239,10 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   const vec3 f = evalDisneyBRDF(v, n, dir, mat);
   p_area = p_pick / (0.5 * area2);
   pdf_solid = p_area * dist * dist / cos_l;
-  return f * NoL * li.emission * (cos_l / (dist * dist));
+  const vec3 emission = vec3(li.geom_emission.data[g * 3u + 0u],
+                             li.geom_emission.data[g * 3u + 1u],
+                             li.geom_emission.data[g * 3u + 2u]);
+  return f * NoL * emission * (cos_l / (dist * dist));
 }
 
 void main() {

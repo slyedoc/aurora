@@ -16,10 +16,8 @@ struct LightInst {
     uint slot;               // TLAS instance slot (world transform).
     uint entry_base;         // First entry in the global light table.
     uint tri_count;
-    float em_r;
-    float em_g;
-    float em_b;
-    float pad;
+    float* geom_emission;    // Per geometry: emitted radiance (3 floats each, nits).
+    uint64_t pad;
 };
 
 // VkAccelerationStructureInstanceKHR (as in instances.slang). 64 bytes.
@@ -98,7 +96,10 @@ void light_powers(uint3 gid: SV_DispatchThreadID) {
     float3 w1 = float3(dot(inst.t0, float4(p1, 1.0)), dot(inst.t1, float4(p1, 1.0)), dot(inst.t2, float4(p1, 1.0)));
     float3 w2 = float3(dot(inst.t0, float4(p2, 1.0)), dot(inst.t1, float4(p2, 1.0)), dot(inst.t2, float4(p2, 1.0)));
     let area = 0.5 * length(cross(w1 - w0, w2 - w0));
-    let lum = 0.2126 * li.em_r + 0.7152 * li.em_g + 0.0722 * li.em_b;
+    let em_r = li.geom_emission[g * 3 + 0];
+    let em_g = li.geom_emission[g * 3 + 1];
+    let em_b = li.geom_emission[g * 3 + 2];
+    let lum = 0.2126 * em_r + 0.7152 * em_g + 0.0722 * em_b;
     p.powers[e] = area * lum;
 }
 

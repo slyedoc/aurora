@@ -13,8 +13,11 @@
 //! slightly wrong rates). MIS against BRDF sampling looks an emissive hit up through
 //! `slot_to_linst` + the hit's global triangle index.
 //!
-//! glTF bundle emissives are not in the table (they still glow through BRDF hits, at full
-//! weight); animated cluster deformations are not accounted for either. Both are follow-ups.
+//! Sources are `Mesh3d` + emissive [`AuroraMaterial`] instances and `GltfModelHandle`
+//! instances whose bundle has emissive primitives (emission per geometry, from the glTF
+//! emissive factors). Animated cluster deformations are not accounted for (their BLAS-space
+//! positions are pre-deform); sphere emissives are not in the table. Both still glow through
+//! BRDF hits at full weight.
 
 use std::collections::HashMap;
 
@@ -27,6 +30,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     assets::aurora_asset,
     compute::{ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch},
+    gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::upload_slice,
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
@@ -49,8 +53,9 @@ struct LightInstGpu {
     slot: u32,
     entry_base: u32,
     tri_count: u32,
-    emission: [f32; 3],
-    pad: f32,
+    /// Address of this instance's per-geometry emission (3 floats each, nits).
+    geom_emission: u64,
+    pad: u64,
 }
 
 /// Must match `LightsHeader` in types.glsl / lights.slang. 48 bytes.
@@ -89,19 +94,29 @@ struct LightScanParams {
     pad: u32,
 }
 
+/// What an emissive instance's geometry and emission come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LightSource {
+    /// A `Mesh3d` with an emissive [`AuroraMaterial`] (one emission for every geometry).
+    Mesh(AssetId<Mesh>, AssetId<AuroraMaterial>),
+    /// A glTF bundle; emission per geometry from its materials, resolved once the BLAS is.
+    Gltf(AssetId<GltfModel>),
+}
+
 #[derive(Resource)]
 pub struct LightManager {
     module: Handle<ComputeModule>,
-    /// slot -> (material, mesh) for instances with an emissive material.
-    sources: HashMap<u32, (AssetId<AuroraMaterial>, AssetId<Mesh>)>,
-    /// Instances whose material asset had not loaded when they were seen.
-    pending: HashMap<u32, (AssetId<AuroraMaterial>, AssetId<Mesh>)>,
+    /// slot -> source for instances that may light the scene.
+    sources: HashMap<u32, LightSource>,
+    /// Mesh instances whose material asset had not loaded when they were seen.
+    pending: HashMap<u32, LightSource>,
     dirty: bool,
     // Device.
     header: Buffer<LightsHeaderGpu>,
     linsts: Buffer<LightInstGpu>,
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
+    emissions: Buffer<f32>,
     entry_count: u32,
     linst_count: u32,
     needs_power_pass: bool,
@@ -124,6 +139,7 @@ impl LightManager {
             linsts: Buffer::default(),
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
+            emissions: Buffer::default(),
             entry_count: 0,
             linst_count: 0,
             needs_power_pass: false,
@@ -145,6 +161,7 @@ impl LightManager {
             self.linsts.handle,
             self.slot_map.handle,
             self.cdf.handle,
+            self.emissions.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
         }
@@ -152,6 +169,7 @@ impl LightManager {
         self.linsts = Buffer::default();
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
+        self.emissions = Buffer::default();
     }
 
     /// Records the weight + CDF kernels into the frame command buffer. Call after
@@ -223,18 +241,33 @@ impl LightManager {
     }
 }
 
-/// Tracks which instances have an emissive material. Change-driven; a modified material
-/// asset triggers a full rescan (rare: panel edits, hot reloads).
+/// Tracks which instances may light the scene. Change-driven; a modified material asset
+/// triggers a full rescan (rare: panel edits, hot reloads).
 #[allow(clippy::type_complexity)]
 fn track_lights(
     mut lights: ResMut<LightManager>,
     materials: Res<Assets<AuroraMaterial>>,
     mut material_events: MessageReader<AssetEvent<AuroraMaterial>>,
     changed: Query<
-        (&GpuInstance, &Mesh3d, &AuroraMaterial3d),
-        Or<(Added<GpuInstance>, Changed<AuroraMaterial3d>, Changed<Mesh3d>)>,
+        (
+            &GpuInstance,
+            Option<&Mesh3d>,
+            Option<&GltfModelHandle>,
+            Option<&AuroraMaterial3d>,
+        ),
+        Or<(
+            Added<GpuInstance>,
+            Changed<AuroraMaterial3d>,
+            Changed<Mesh3d>,
+            Changed<GltfModelHandle>,
+        )>,
     >,
-    all: Query<(&GpuInstance, &Mesh3d, &AuroraMaterial3d)>,
+    all: Query<(
+        &GpuInstance,
+        Option<&Mesh3d>,
+        Option<&GltfModelHandle>,
+        Option<&AuroraMaterial3d>,
+    )>,
 ) {
     let mut rescan = false;
     for event in material_events.read() {
@@ -245,20 +278,35 @@ fn track_lights(
 
     let lights = &mut *lights;
     let consider = |slot: u32,
-                        mesh: AssetId<Mesh>,
-                        material: AssetId<AuroraMaterial>,
-                        sources: &mut HashMap<u32, (AssetId<AuroraMaterial>, AssetId<Mesh>)>,
-                        pending: &mut HashMap<u32, (AssetId<AuroraMaterial>, AssetId<Mesh>)>,
-                        dirty: &mut bool| {
-        let Some(asset) = materials.get(material) else {
-            pending.insert(slot, (material, mesh));
+                    mesh: Option<&Mesh3d>,
+                    gltf: Option<&GltfModelHandle>,
+                    material: Option<&AuroraMaterial3d>,
+                    sources: &mut HashMap<u32, LightSource>,
+                    pending: &mut HashMap<u32, LightSource>,
+                    dirty: &mut bool| {
+        // glTF bundles carry their own materials; whether any geometry is emissive is
+        // resolved against the prepared BLAS in prepare_lights.
+        if let Some(gltf) = gltf {
+            let source = LightSource::Gltf(gltf.0.id());
+            pending.remove(&slot);
+            if sources.insert(slot, source) != Some(source) {
+                *dirty = true;
+            }
+            return;
+        }
+        let (Some(mesh), Some(material)) = (mesh, material) else {
+            return;
+        };
+        let source = LightSource::Mesh(mesh.id(), material.0.id());
+        let Some(asset) = materials.get(&material.0) else {
+            pending.insert(slot, source);
             return;
         };
         let e = asset.emissive;
         let emissive = 0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0;
         pending.remove(&slot);
         if emissive {
-            if sources.insert(slot, (material, mesh)) != Some((material, mesh)) {
+            if sources.insert(slot, source) != Some(source) {
                 *dirty = true;
             }
         } else if sources.remove(&slot).is_some() {
@@ -267,22 +315,24 @@ fn track_lights(
     };
 
     if rescan {
-        for (instance, mesh, material) in all.iter() {
+        for (instance, mesh, gltf, material) in all.iter() {
             consider(
                 instance.0,
-                mesh.id(),
-                material.0.id(),
+                mesh,
+                gltf,
+                material,
                 &mut lights.sources,
                 &mut lights.pending,
                 &mut lights.dirty,
             );
         }
     } else {
-        for (instance, mesh, material) in changed.iter() {
+        for (instance, mesh, gltf, material) in changed.iter() {
             consider(
                 instance.0,
-                mesh.id(),
-                material.0.id(),
+                mesh,
+                gltf,
+                material,
                 &mut lights.sources,
                 &mut lights.pending,
                 &mut lights.dirty,
@@ -290,19 +340,27 @@ fn track_lights(
         }
     }
 
-    // Materials that had not loaded yet: retry until they have.
+    // Mesh materials that had not loaded yet: retry until they have.
     if !lights.pending.is_empty() {
-        let retry: Vec<(u32, (AssetId<AuroraMaterial>, AssetId<Mesh>))> =
+        let retry: Vec<(u32, LightSource)> =
             lights.pending.iter().map(|(s, v)| (*s, *v)).collect();
-        for (slot, (material, mesh)) in retry {
-            consider(
-                slot,
-                mesh,
-                material,
-                &mut lights.sources,
-                &mut lights.pending,
-                &mut lights.dirty,
-            );
+        for (slot, source) in retry {
+            let LightSource::Mesh(_, material) = source else {
+                continue;
+            };
+            let Some(asset) = materials.get(material) else {
+                continue;
+            };
+            let e = asset.emissive;
+            let emissive = 0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0;
+            lights.pending.remove(&slot);
+            if emissive {
+                if lights.sources.insert(slot, source) != Some(source) {
+                    lights.dirty = true;
+                }
+            } else if lights.sources.remove(&slot).is_some() {
+                lights.dirty = true;
+            }
         }
     }
 }
@@ -327,6 +385,7 @@ fn prepare_lights(
     render_device: Res<RenderDevice>,
     mut lights: ResMut<LightManager>,
     meshes: Res<VulkanAssets<Mesh>>,
+    gltf_meshes: Res<VulkanAssets<GltfModel>>,
     materials: Res<Assets<AuroraMaterial>>,
 ) {
     if !lights.dirty {
@@ -334,40 +393,77 @@ fn prepare_lights(
     }
 
     let mut linsts: Vec<LightInstGpu> = Vec::with_capacity(lights.sources.len());
+    // Per-geometry emissions, concatenated; each linst's geom_emission starts as a float
+    // offset into this and is rebased once the device buffer exists.
+    let mut emissions: Vec<f32> = Vec::new();
     let mut entry_base = 0u32;
     let mut max_slot = 0u32;
     let mut waiting = false;
     let mut slots: Vec<u32> = lights.sources.keys().copied().collect();
     slots.sort_unstable();
     for slot in slots {
-        let (material, mesh) = lights.sources[&slot];
-        let Some(blas) = meshes.get_by_id(mesh) else {
-            waiting = true;
-            continue;
-        };
-        // The emissive factor as the tracer multiplies it (linear radiance, nits).
-        let Some(emission) = materials
-            .get(material)
-            .map(|m| [m.emissive.red, m.emissive.green, m.emissive.blue])
-        else {
-            waiting = true;
-            continue;
-        };
+        let (blas, geom_emissions): (&crate::blas::BLAS, Vec<[f32; 3]>) =
+            match lights.sources[&slot] {
+                LightSource::Mesh(mesh, material) => {
+                    let Some(blas) = meshes.get_by_id(mesh) else {
+                        waiting = true;
+                        continue;
+                    };
+                    // The emissive factor as the tracer multiplies it (linear radiance, nits).
+                    let Some(emission) = materials
+                        .get(material)
+                        .map(|m| [m.emissive.red, m.emissive.green, m.emissive.blue])
+                    else {
+                        waiting = true;
+                        continue;
+                    };
+                    let geoms = (blas.geometry_to_index.nr_elements as usize).max(1);
+                    (blas, vec![emission; geoms])
+                }
+                LightSource::Gltf(gltf) => {
+                    let Some(blas) = gltf_meshes.get_by_id(gltf) else {
+                        waiting = true;
+                        continue;
+                    };
+                    let Some(bundle) = &blas.gltf_materials else {
+                        continue;
+                    };
+                    let geom_emissions: Vec<[f32; 3]> = bundle
+                        .iter()
+                        .map(|m| {
+                            let e = m.base_emissive_factor;
+                            [e[0], e[1], e[2]]
+                        })
+                        .collect();
+                    // A bundle with no emissive geometry lights nothing.
+                    if !geom_emissions
+                        .iter()
+                        .any(|e| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2] > 0.0)
+                    {
+                        continue;
+                    }
+                    (blas, geom_emissions)
+                }
+            };
         let tri_count = (blas.index_buffer.nr_elements / 3) as u32;
         if tri_count == 0 {
             continue;
+        }
+        let offset = emissions.len() as u64;
+        for e in &geom_emissions {
+            emissions.extend_from_slice(e);
         }
         linsts.push(LightInstGpu {
             verts: blas.vertex_buffer.address,
             indices: blas.index_buffer.address,
             geom_to_index: blas.geometry_to_index.address,
             geom_to_triangle: blas.geometry_to_triangle.address,
-            geom_count: (blas.geometry_to_index.nr_elements as u32).max(1),
+            geom_count: geom_emissions.len() as u32,
             slot,
             entry_base,
             tri_count,
-            emission,
-            pad: 0.0,
+            geom_emission: offset,
+            pad: 0,
         });
         entry_base += tri_count;
         max_slot = max_slot.max(slot);
@@ -395,6 +491,11 @@ fn prepare_lights(
     lights.slot_map = render_device.create_device_buffer(slot_map.len() as u64, storage);
     lights.cdf = render_device.create_device_buffer(entry_base as u64, storage);
     lights.header = render_device.create_device_buffer(1, storage);
+    lights.emissions = render_device.create_device_buffer(emissions.len() as u64, storage);
+    let mut linsts = linsts;
+    for li in &mut linsts {
+        li.geom_emission = lights.emissions.address + li.geom_emission * 4;
+    }
     let header = LightsHeaderGpu {
         entry_count: entry_base,
         linst_count: lights.linst_count,
@@ -409,6 +510,7 @@ fn prepare_lights(
         upload_slice(&render_device, cmd, &linsts, &lights.linsts);
         upload_slice(&render_device, cmd, &slot_map, &lights.slot_map);
         upload_slice(&render_device, cmd, &[header], &lights.header);
+        upload_slice(&render_device, cmd, &emissions, &lights.emissions);
     });
 }
 
@@ -435,6 +537,7 @@ impl Plugin for LightsPlugin {
                 prepare_lights
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<Mesh>)
+                    .after(poll_for_asset::<GltfModel>)
                     .after(poll_for_asset::<AuroraMaterial>),
             ),
         );

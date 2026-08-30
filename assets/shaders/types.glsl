@@ -106,6 +106,10 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Ge
   uint index_offsets[];
 };
 
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer FloatData {
+  float data[];
+};
+
 // ---- Emissive-triangle light table (src/lights.rs, lights.slang) --------------------------
 
 // One emissive instance: its BLAS streams, its TLAS slot (world transform), and the range
@@ -119,8 +123,9 @@ struct LightInstance {
   uint slot;
   uint entry_base;
   uint tri_count;
-  vec3 emission;
-  float pad;
+  // Per geometry: emitted radiance (3 floats each, nits).
+  FloatData geom_emission;
+  uvec2 pad2;
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightCdf {
