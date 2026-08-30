@@ -46,6 +46,7 @@ use bevy::{
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 use crate::{
+    assets::aurora_asset,
     extract::Extract,
     ray_render_plugin::{MainWorld, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
@@ -365,8 +366,8 @@ impl Plugin for UiRenderPlugin {
 
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();
         let pipeline = UiPipeline {
-            vertex_shader: asset_server.load("shaders/ui.vert"),
-            fragment_shader: asset_server.load("shaders/ui.frag"),
+            vertex_shader: asset_server.load(aurora_asset("shaders/ui.vert")),
+            fragment_shader: asset_server.load(aurora_asset("shaders/ui.frag")),
         };
         let config = UiRenderConfig {
             pipeline: asset_server.add(pipeline),

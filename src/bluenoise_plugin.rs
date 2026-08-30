@@ -22,10 +22,10 @@ impl Plugin for BlueNoisePlugin {
             .create_host_buffer(64 * 128 * 128 * 2, vk::BufferUsageFlags::TRANSFER_SRC);
         let mut bluenoise_data = render_device.map_buffer(&mut bluenoise_buffer_host);
         for texture_idx in 0..64 {
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
             let fname = format!(
-                "{}/assets/textures/bluenoise/stbn_vec2_2Dx1D_128x128x64_{}.png",
-                manifest_dir, texture_idx
+                "{}/textures/bluenoise/stbn_vec2_2Dx1D_128x128x64_{}.png",
+                crate::assets::AURORA_ASSET_DIR,
+                texture_idx
             );
             let decoder = png::Decoder::new(std::fs::File::open(fname).unwrap());
             let mut reader = decoder.read_info().unwrap();

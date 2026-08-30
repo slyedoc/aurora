@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod blas;
 pub mod bsn;
 pub use aurora_cluster_mesh as cluster_mesh;

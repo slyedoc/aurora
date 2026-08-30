@@ -6,6 +6,8 @@ impl PluginGroup for RayDefaultPlugins {
     fn build(self) -> PluginGroupBuilder {
         let mut group = PluginGroupBuilder::start::<Self>();
         group = group
+            // Before AssetPlugin: registers the `aurora://` source for the engine's own assets.
+            .add(crate::assets::AuroraAssetSourcePlugin)
             .add(bevy::log::LogPlugin::default())
             .add(bevy::app::TaskPoolPlugin::default())
             //.add(bevy::app::TypeRegistrationPlugin)

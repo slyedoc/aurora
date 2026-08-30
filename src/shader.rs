@@ -92,15 +92,16 @@ impl AssetLoader for ShaderLoader {
             let dependencies_copy = dependencies.clone();
 
             options.set_include_callback(move |fname, _type, _, _depth| {
-                let full_path = format!("./assets/shaders/{}", fname);
-                let Ok(contents) = read_to_string(full_path.clone()) else {
-                    return Err(format!("Failed to read shader include: {}", fname));
+                // Includes live next to the engine's shaders, wherever the crate is checked out.
+                let full_path = format!("{}/shaders/{}", crate::assets::AURORA_ASSET_DIR, fname);
+                let Ok(contents) = read_to_string(&full_path) else {
+                    return Err(format!("Failed to read shader include: {full_path}"));
                 };
 
                 dependencies_copy.borrow_mut().push(
                     load_context_copy
                         .borrow_mut()
-                        .load::<Shader>(format!("shaders/{}", fname)),
+                        .load::<Shader>(crate::assets::aurora_asset(&format!("shaders/{fname}"))),
                 );
 
                 Ok(shaderc::ResolvedInclude {
