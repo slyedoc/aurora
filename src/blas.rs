@@ -62,7 +62,7 @@ pub struct GeometryDescr {
     pub index_count: usize,
 }
 
-#[derive(TypePath, Asset, Debug, Clone, Copy)]
+#[derive(TypePath, Asset, Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct RTXMaterial {
     pub base_color_factor: [f32; 4],

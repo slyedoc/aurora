@@ -18,7 +18,10 @@ pub struct Swapchain {
     pub swapchain_extent: vk::Extent2D,
     pub current_image_idx: u32,
     pub image_available_semaphore: vk::Semaphore,
-    pub render_finished_semaphore: vk::Semaphore,
+    /// One per swapchain image, indexed by the acquired image: a present's wait on it is not
+    /// covered by the in-flight fence, so a single shared semaphore could be re-signaled while
+    /// still pending.
+    pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: [vk::Fence; FRAMES_IN_FLIGHT],
     pub resized: bool,
     pub frame_count: usize,
@@ -58,10 +61,6 @@ impl Swapchain {
                 .device
                 .create_semaphore(&semaphore_info, None)
                 .unwrap();
-            let render_finished_semaphore = device
-                .device
-                .create_semaphore(&semaphore_info, None)
-                .unwrap();
 
             let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             let mut in_flight_fences = [vk::Fence::null(); FRAMES_IN_FLIGHT];
@@ -77,7 +76,7 @@ impl Swapchain {
                 swapchain_image_views: Vec::new(),
                 swapchain_extent: vk::Extent2D::default(),
                 image_available_semaphore,
-                render_finished_semaphore,
+                render_finished_semaphores: Vec::new(),
                 current_image_idx: 0,
                 in_flight_fences,
                 resized: false,
@@ -192,6 +191,10 @@ impl Swapchain {
             for image_view in self.swapchain_image_views.drain(..) {
                 self.device.destroyer.destroy_image_view(image_view);
             }
+            // The queue is idle (above), so nothing still waits on these.
+            for semaphore in self.render_finished_semaphores.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
 
             self.swapchain_images = self
                 .device
@@ -206,6 +209,16 @@ impl Swapchain {
                     let view_info =
                         crate::vk_init::image_view_info(image.clone(), surface_format.format);
                     self.device.create_image_view(&view_info, None).unwrap()
+                })
+                .collect();
+
+            self.render_finished_semaphores = self
+                .swapchain_images
+                .iter()
+                .map(|_| {
+                    self.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap()
                 })
                 .collect();
 
@@ -227,18 +240,10 @@ impl Swapchain {
                 self.on_resize(window);
                 self.resized = true;
             }
-            self.current_image_idx = self
-                .device
-                .ext_swapchain
-                .acquire_next_image(
-                    self.swapchain,
-                    std::u64::MAX,
-                    self.image_available_semaphore,
-                    vk::Fence::null(),
-                )
-                .unwrap()
-                .0;
-
+            // Wait for the previous frame before acquiring: its submit is what waits on
+            // `image_available_semaphore`, and the semaphore may only be reused once that wait
+            // has completed. This is also the point after which the frame's resources (TLAS,
+            // instance buffers, per-frame command buffer) can be rewritten in place.
             self.device
                 .wait_for_fences(
                     std::slice::from_ref(
@@ -253,6 +258,18 @@ impl Swapchain {
                     &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
                 ))
                 .unwrap();
+
+            self.current_image_idx = self
+                .device
+                .ext_swapchain
+                .acquire_next_image(
+                    self.swapchain,
+                    std::u64::MAX,
+                    self.image_available_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap()
+                .0;
 
             return (
                 self.swapchain_images[self.current_image_idx as usize],
@@ -274,7 +291,9 @@ impl Swapchain {
                 .wait_dst_stage_mask(std::slice::from_ref(
                     &vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 ))
-                .signal_semaphores(std::slice::from_ref(&self.render_finished_semaphore));
+                .signal_semaphores(std::slice::from_ref(
+                    &self.render_finished_semaphores[self.current_image_idx as usize],
+                ));
 
             let queue = self.device.queue.lock().unwrap();
             self.device
@@ -286,7 +305,9 @@ impl Swapchain {
                 .unwrap();
 
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&self.render_finished_semaphore))
+                .wait_semaphores(std::slice::from_ref(
+                    &self.render_finished_semaphores[self.current_image_idx as usize],
+                ))
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&self.current_image_idx));
 
@@ -325,8 +346,9 @@ impl Drop for Swapchain {
 
             self.device
                 .destroy_semaphore(self.image_available_semaphore, None);
-            self.device
-                .destroy_semaphore(self.render_finished_semaphore, None);
+            for semaphore in self.render_finished_semaphores.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
             for fence in self.in_flight_fences.iter() {
                 self.device.destroy_fence(*fence, None);
             }

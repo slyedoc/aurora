@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 
 use ash::vk;
-use bevy::{asset::AssetLoader, prelude::*, render::RenderApp, tasks::ConditionalSendFuture};
+use bevy::{
+    asset::AssetLoader, camera::visibility::InheritedVisibility, prelude::*, render::RenderApp,
+    tasks::ConditionalSendFuture,
+};
 use thiserror::Error;
 
 use crate::{
     blas::{BLAS, GeometryDescr, RTXMaterial, Vertex, build_blas_from_buffers},
     extract::Extract,
     ray_render_plugin::ExtractedEntity,
+    tlas_builder::RtxInstanceMask,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
@@ -438,9 +442,22 @@ fn load_gltf_texture(
 
 fn extract_gltfs(
     mut commands: Commands,
-    meshes: Extract<Query<(&GltfModelHandle, &Transform, &GlobalTransform)>>,
+    meshes: Extract<
+        Query<(
+            &GltfModelHandle,
+            &Transform,
+            &GlobalTransform,
+            Option<&InheritedVisibility>,
+        )>,
+    >,
 ) {
-    for (mesh, t, gt) in meshes.iter() {
-        commands.spawn((ExtractedEntity, mesh.clone(), t.clone(), gt.clone()));
+    for (mesh, t, gt, visibility) in meshes.iter() {
+        commands.spawn((
+            ExtractedEntity,
+            mesh.clone(),
+            t.clone(),
+            gt.clone(),
+            RtxInstanceMask::from_visibility(visibility),
+        ));
     }
 }

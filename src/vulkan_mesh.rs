@@ -1,4 +1,5 @@
 use bevy::{
+    camera::visibility::InheritedVisibility,
     prelude::*,
     render::{RenderApp, mesh::Indices},
 };
@@ -7,6 +8,7 @@ use crate::{
     blas::{BLAS, BlasBuildInput, GeometryDescr, Vertex, build_blas_batch},
     extract::Extract,
     ray_render_plugin::ExtractedEntity,
+    tlas_builder::RtxInstanceMask,
     render_buffer::BufferProvider,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
@@ -139,16 +141,18 @@ fn extract_meshes(
             &MeshMaterial3d<StandardMaterial>,
             &Transform,
             &GlobalTransform,
+            Option<&InheritedVisibility>,
         )>,
     >,
 ) {
-    for (mesh, mat, t, gt) in meshes.iter() {
+    for (mesh, mat, t, gt, visibility) in meshes.iter() {
         commands.spawn((
             ExtractedEntity,
             mesh.clone(),
             mat.clone(),
             t.clone(),
             gt.clone(),
+            RtxInstanceMask::from_visibility(visibility),
         ));
     }
 }

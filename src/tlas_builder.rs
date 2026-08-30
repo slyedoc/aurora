@@ -9,7 +9,9 @@ use crate::{
     vk_utils,
 };
 use ash::vk;
-use bevy::{asset::UntypedAssetId, prelude::*, render::RenderApp};
+use bevy::{
+    asset::UntypedAssetId, camera::visibility::InheritedVisibility, prelude::*, render::RenderApp,
+};
 
 use crate::{
     blas::AccelerationStructure,
@@ -19,6 +21,26 @@ use crate::{
     vulkan_asset::VulkanAssets,
 };
 
+/// The 8-bit instance mask a ray's cull mask is tested against. Hidden entities keep their slot
+/// in the TLAS -- same instance list, same topology -- but no ray can hit them.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtxInstanceMask(pub u8);
+
+impl RtxInstanceMask {
+    pub const VISIBLE: Self = Self(0xFF);
+    pub const HIDDEN: Self = Self(0x00);
+
+    /// Extracts from `InheritedVisibility` (what UI and hierarchy hiding drive); entities without
+    /// the component are treated as visible.
+    pub fn from_visibility(visibility: Option<&InheritedVisibility>) -> Self {
+        if visibility.is_none_or(|v| v.get()) {
+            Self::VISIBLE
+        } else {
+            Self::HIDDEN
+        }
+    }
+}
+
 #[derive(Default, Resource)]
 pub struct TLAS {
     pub acceleration_structure: AccelerationStructure,
@@ -26,68 +48,97 @@ pub struct TLAS {
     pub scratch_buffer: Buffer<u8>,
     pub mesh_to_hit_offset: HashMap<UntypedAssetId, u32>,
     pub material_buffer: Buffer<RTXMaterial>,
+    /// CPU mirror of what the GPU buffers hold (or will hold once `pending` is recorded). A
+    /// frame whose gather matches it skips the upload and the build entirely.
+    instances: Vec<vk::AccelerationStructureInstanceKHR>,
+    materials: Vec<RTXMaterial>,
+    /// `instances`/`materials` changed since the last recorded build.
+    pending: bool,
+    /// Size the current `acceleration_structure.handle` was created with (0 = none).
+    handle_size: u64,
+    scratch_alignment: u64,
+}
+
+fn instance_bytes(instances: &[vk::AccelerationStructureInstanceKHR]) -> &[u8] {
+    // repr(C), 64 bytes, no padding: 12 floats + two packed u32 + a u64 union.
+    unsafe {
+        std::slice::from_raw_parts(
+            instances.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(instances),
+        )
+    }
 }
 
 impl TLAS {
-    pub fn update(
+    /// Hands the frame's gathered instances to the TLAS. Only a change against the previous
+    /// gather marks a build pending; a static scene costs nothing past the comparison.
+    pub fn set_instances(
         &mut self,
-        render_device: &RenderDevice,
-        instances: &[(vk::AccelerationStructureInstanceKHR, Vec<RTXMaterial>)],
+        instances: Vec<vk::AccelerationStructureInstanceKHR>,
+        materials: Vec<RTXMaterial>,
     ) {
-        if instances.is_empty() {
+        let unchanged = instance_bytes(&instances) == instance_bytes(&self.instances)
+            && bytemuck::cast_slice::<_, u8>(&materials)
+                == bytemuck::cast_slice::<_, u8>(&self.materials);
+        if unchanged {
             return;
         }
+        self.instances = instances;
+        self.materials = materials;
+        self.pending = true;
+    }
 
-        let materials = instances
-            .iter()
-            .map(|(_, m)| m.iter().cloned())
-            .flatten()
-            .collect::<Vec<_>>();
-        // recreate the index buffer and material if the number of instances changed
-        if instances.len() != self.instance_buffer.nr_elements as usize {
+    /// Records the pending build into the frame's command buffer, followed by the barrier that
+    /// makes it visible to the trace. Must be called after the in-flight fence wait: with one
+    /// frame in flight the previous trace is done, so the single TLAS and its host-visible
+    /// instance/material buffers are rewritten in place.
+    pub fn record_build(&mut self, render_device: &RenderDevice, cmd_buffer: vk::CommandBuffer) {
+        if !self.pending || self.instances.is_empty() {
+            return;
+        }
+        self.pending = false;
+
+        if self.scratch_alignment == 0 {
+            self.scratch_alignment = vk_utils::get_acceleration_structure_properties(render_device)
+                .min_acceleration_structure_scratch_offset_alignment
+                as u64;
+        }
+
+        if self.instances.len() != self.instance_buffer.nr_elements as usize {
             log::debug!(
-                "Reallocting instance buffer from {} to {} elements",
+                "Reallocating instance buffer from {} to {} elements",
                 self.instance_buffer.nr_elements,
-                instances.len()
+                self.instances.len()
             );
             render_device
                 .destroyer
                 .destroy_buffer(self.instance_buffer.handle);
             self.instance_buffer = render_device
                 .create_host_buffer::<vk::AccelerationStructureInstanceKHR>(
-                    instances.len() as u64,
+                    self.instances.len() as u64,
                     vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 );
         }
-
-        if materials.len() != self.material_buffer.nr_elements as usize {
+        if self.materials.len() != self.material_buffer.nr_elements as usize {
             log::debug!(
-                "Reallocting material buffer from {} to {} elements",
-                self.instance_buffer.nr_elements,
-                instances.len()
+                "Reallocating material buffer from {} to {} elements",
+                self.material_buffer.nr_elements,
+                self.materials.len()
             );
-
             render_device
                 .destroyer
                 .destroy_buffer(self.material_buffer.handle);
             self.material_buffer = render_device.create_host_buffer::<RTXMaterial>(
-                materials.len() as u64,
+                self.materials.len() as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
         }
-
-        // update the instance buffer
-        {
-            let instances = instances.iter().map(|(i, _)| *i).collect::<Vec<_>>();
-            let mut ptr = render_device.map_buffer(&mut self.instance_buffer);
-            ptr.copy_from_slice(&instances);
-        }
-
-        // update the material buffer
-        {
-            let mut ptr = render_device.map_buffer(&mut self.material_buffer);
-            ptr.copy_from_slice(&materials);
-        }
+        render_device
+            .map_buffer(&mut self.instance_buffer)
+            .copy_from_slice(&self.instances);
+        render_device
+            .map_buffer(&mut self.material_buffer)
+            .copy_from_slice(&self.materials);
 
         let geometry = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)
@@ -99,27 +150,29 @@ impl TLAS {
                         device_address: self.instance_buffer.address,
                     }),
             });
-
-        let build_geometry = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-            .geometries(std::slice::from_ref(&geometry));
-
-        let primitive_count = instances.len() as u32;
+        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+        let primitive_count = self.instances.len() as u32;
         let mut build_size = vk::AccelerationStructureBuildSizesInfoKHR::default();
         unsafe {
             render_device
                 .ext_acc_struct
                 .get_acceleration_structure_build_sizes(
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                    &build_geometry,
+                    &vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                        .flags(flags)
+                        .geometries(std::slice::from_ref(&geometry)),
                     std::slice::from_ref(&primitive_count),
                     &mut build_size,
                 )
         };
 
-        // only recreate the buffer for the acceleration_structure if the size increased
-        if build_size.acceleration_structure_size > self.acceleration_structure.buffer.nr_elements {
+        // The structure and its handle persist; both are only recreated when the scene outgrows
+        // them (a handle created with a larger size stays valid for smaller builds).
+        if build_size.acceleration_structure_size > self.handle_size {
+            render_device
+                .destroyer
+                .destroy_acceleration_structure(self.acceleration_structure.handle);
             render_device
                 .destroyer
                 .destroy_buffer(self.acceleration_structure.buffer.handle);
@@ -127,29 +180,29 @@ impl TLAS {
                 build_size.acceleration_structure_size,
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
             );
+            self.acceleration_structure.handle = unsafe {
+                render_device.ext_acc_struct.create_acceleration_structure(
+                    &vk::AccelerationStructureCreateInfoKHR::default()
+                        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                        .size(build_size.acceleration_structure_size)
+                        .buffer(self.acceleration_structure.buffer.handle),
+                    None,
+                )
+            }
+            .unwrap();
+            self.handle_size = build_size.acceleration_structure_size;
+            self.acceleration_structure.address = unsafe {
+                render_device
+                    .ext_acc_struct
+                    .get_acceleration_structure_device_address(
+                        &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                            .acceleration_structure(self.acceleration_structure.handle),
+                    )
+            };
         }
 
-        render_device
-            .destroyer
-            .destroy_acceleration_structure(self.acceleration_structure.handle);
-        self.acceleration_structure.handle = unsafe {
-            render_device.ext_acc_struct.create_acceleration_structure(
-                &vk::AccelerationStructureCreateInfoKHR::default()
-                    .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                    .size(build_size.acceleration_structure_size)
-                    .buffer(self.acceleration_structure.buffer.handle),
-                None,
-            )
-        }
-        .unwrap();
-
-        let as_properties = vk_utils::get_acceleration_structure_properties(&render_device);
-        let scratch_alignment =
-            as_properties.min_acceleration_structure_scratch_offset_alignment as u64;
-        let scratch_size = vk_utils::aligned_size(build_size.build_scratch_size, scratch_alignment);
-
-        // only recreate the scratch buffer if the size changed
-        if scratch_size != self.scratch_buffer.nr_elements {
+        let scratch_size = build_size.build_scratch_size + self.scratch_alignment;
+        if scratch_size > self.scratch_buffer.nr_elements {
             render_device
                 .destroyer
                 .destroy_buffer(self.scratch_buffer.handle);
@@ -157,54 +210,45 @@ impl TLAS {
                 .create_device_buffer(scratch_size, vk::BufferUsageFlags::STORAGE_BUFFER);
         }
 
-        let scratch_buffer_aligned_address =
-            vk_utils::aligned_size(self.scratch_buffer.address, scratch_alignment);
-
-        assert_eq!(
-            self.acceleration_structure.buffer.address
-                % as_properties.min_acceleration_structure_scratch_offset_alignment as u64,
-            0,
-            "Acceleration structure scratch buffer address is not aligned"
-        );
-
         let build_geometry = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .flags(flags)
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .dst_acceleration_structure(self.acceleration_structure.handle)
             .geometries(std::slice::from_ref(&geometry))
             .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch_buffer_aligned_address,
+                device_address: vk_utils::aligned_size(
+                    self.scratch_buffer.address,
+                    self.scratch_alignment,
+                ),
             });
-
         let build_range = vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .primitive_count(primitive_count)
-            .primitive_offset(0)
-            .first_vertex(0)
-            .transform_offset(0);
-
+            .primitive_count(primitive_count);
         let build_range_infos = std::slice::from_ref(&build_range);
-        render_device.run_transfer_commands(&|command_buffer| unsafe {
+
+        unsafe {
             render_device
                 .ext_acc_struct
                 .cmd_build_acceleration_structures(
-                    command_buffer,
+                    cmd_buffer,
                     std::slice::from_ref(&build_geometry),
                     std::slice::from_ref(&build_range_infos),
                 );
-        });
-
-        self.acceleration_structure.address = unsafe {
-            render_device
-                .ext_acc_struct
-                .get_acceleration_structure_device_address(
-                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                        .acceleration_structure(self.acceleration_structure.handle),
-                )
-        };
+            let barrier = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+                .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
+                .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR);
+            render_device.ext_sync2.cmd_pipeline_barrier2(
+                cmd_buffer,
+                &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
+            );
+        }
     }
 }
 
+/// Gathers this frame's instances on the CPU and hands them to the TLAS, which builds only when
+/// they differ from the previous frame (see `TLAS::record_build`).
 pub fn update_tlas(
     render_device: Res<RenderDevice>,
     mut tlas: ResMut<TLAS>,
@@ -218,6 +262,7 @@ pub fn update_tlas(
     sphere_blas: Res<SphereBLAS>,
     spheres: Query<(Entity, &crate::sphere::Sphere)>,
     transforms: Query<&GlobalTransform>,
+    masks: Query<&RtxInstanceMask>,
 ) {
     tlas.mesh_to_hit_offset.clear();
     // Reserve the first offset for the sphere hit group
@@ -309,9 +354,10 @@ pub fn update_tlas(
                 ],
             };
 
+            let mask = masks.get(*e).copied().unwrap_or(RtxInstanceMask::VISIBLE).0;
             let instance = vk::AccelerationStructureInstanceKHR {
                 transform,
-                instance_custom_index_and_mask: vk::Packed24_8::new(material_offset, 0xFF),
+                instance_custom_index_and_mask: vk::Packed24_8::new(material_offset, mask),
                 instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                     *hit_offset,
                     0b1,
@@ -340,11 +386,8 @@ pub fn update_tlas(
         })
         .collect();
 
-    if instances.is_empty() {
-        return;
-    }
-
-    tlas.update(&render_device, &instances);
+    let (instances, materials): (Vec<_>, Vec<_>) = instances.into_iter().unzip();
+    tlas.set_instances(instances, materials.into_iter().flatten().collect());
 }
 
 fn cleanup_tlas(world: &mut World) {

@@ -452,7 +452,7 @@ fn render_frame(
     textures: Res<VulkanAssets<bevy::prelude::Image>>,
     postprocess_filters: Res<VulkanAssets<PostProcessFilter>>,
     bluenoise_buffer: Res<BlueNoiseBuffer>,
-    tlas: Res<TLAS>,
+    mut tlas: ResMut<TLAS>,
     sbt: Res<SBT>,
     camera: Query<(&Projection, &GlobalTransform), With<Camera>>,
     mut tick: Local<u32>,
@@ -568,6 +568,10 @@ fn render_frame(
         frame
             .render_frame_buffers
             .prepare(&render_device, &swapchain, cmd_buffer);
+
+        // The in-flight fence was waited in aquire_next_image, so the previous trace is done and
+        // the single TLAS can be rebuilt in place, inside this frame's command buffer.
+        tlas.record_build(&render_device, cmd_buffer);
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
