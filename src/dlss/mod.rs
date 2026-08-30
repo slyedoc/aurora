@@ -35,11 +35,13 @@ pub use stub::DlssRenderer;
 /// never change it, and it must parse as a real UUID.
 pub const AURORA_PROJECT_ID: &str = "a17b0d3e-5c42-4f9a-9d31-6b0e2f8c74d5";
 
-/// DLSS Ray Reconstruction mode. Every non-`Off` mode is an NGX `PerfQuality` value: the
-/// render resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution.
-/// `Dlaa` is 1:1 (denoise + AA, no upscale).
-#[derive(Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[reflect(Default, Clone, PartialEq)]
+/// DLSS Ray Reconstruction mode -- a component on the `Camera3d` entity, so the world
+/// inspector edits it like anything else. Every non-`Off` mode is an NGX `PerfQuality` value:
+/// the render resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution.
+/// `Dlaa` is 1:1 (denoise + AA, no upscale). A camera spawned without one gets
+/// `$AURORA_DLSS` (or `Off`); D cycles it.
+#[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
     #[default]
     Off,
@@ -88,6 +90,14 @@ impl AuroraDlss {
             Self::Performance => 0,
             Self::UltraPerformance => 3,
         })
+    }
+
+    /// `$AURORA_DLSS` (`dlaa|quality|balanced|performance|ultra-performance`), else `Off`.
+    pub fn from_env() -> Self {
+        std::env::var("AURORA_DLSS")
+            .ok()
+            .and_then(|s| Self::parse(&s))
+            .unwrap_or_default()
     }
 
     pub fn next(self) -> Self {
@@ -158,6 +168,46 @@ pub(crate) fn suggested_jitter(frame: u32, render_width: u32, output_width: u32)
 #[derive(Resource, Default)]
 pub struct DlssState {
     pub renderer: Option<DlssRenderer>,
+    /// Set by [`DlssReset`]; the next evaluate drops its history.
+    pub reset_requested: bool,
+}
+
+/// Drop Ray Reconstruction's temporal history on the next frame: trigger it on the camera
+/// entity after a cut (teleport, scene switch), when reprojection has nothing valid to reuse.
+///
+/// ```ignore
+/// commands.trigger(DlssReset { entity: camera });
+/// ```
+#[derive(EntityEvent, Clone, Copy, Debug)]
+pub struct DlssReset {
+    pub entity: Entity,
+}
+
+fn request_reset(_reset: On<DlssReset>, mut state: ResMut<DlssState>) {
+    state.reset_requested = true;
+}
+
+/// Every 3D camera carries a mode (so it is always there to inspect and to cycle).
+fn default_mode(
+    mut commands: Commands,
+    cameras: Query<Entity, (With<Camera3d>, Without<AuroraDlss>)>,
+) {
+    for camera in &cameras {
+        commands.entity(camera).insert(AuroraDlss::from_env());
+    }
+}
+
+/// D cycles the DLSS mode on every 3D camera.
+fn cycle_mode(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyD) {
+        for mut mode in &mut cameras {
+            *mode = mode.next();
+            log::info!("dlss: {}", *mode);
+        }
+    }
 }
 
 #[cfg(dlss_ngx)]
@@ -284,7 +334,12 @@ impl Plugin for DlssPlugin {
             let rd = app.world().resource::<RenderDevice>();
             DlssRenderer::new(rd)
         };
-        app.insert_resource(DlssState { renderer });
+        app.insert_resource(DlssState {
+            renderer,
+            reset_requested: false,
+        });
+        app.add_observer(request_reset);
+        app.add_systems(Update, (default_mode, cycle_mode));
         app.add_systems(TeardownSchedule, teardown.before(on_shutdown));
     }
 }

@@ -25,7 +25,7 @@ use bevy::{
     ui::Display,
 };
 
-use crate::{ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
+use crate::{dlss::AuroraDlss, ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
 
 /// Renderer tunables edited from the dev panel; the frame reads them directly.
 #[derive(Resource, Reflect, Clone, Debug)]
@@ -43,6 +43,8 @@ pub struct DevUIState {
     pub fog_scatter: f32,
     #[reflect(@0.0..=1.0_f32)]
     pub sky_brightness: f32,
+    /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
+    pub dlss: AuroraDlss,
 }
 
 impl Default for DevUIState {
@@ -50,10 +52,11 @@ impl Default for DevUIState {
         Self {
             gamma: 2.4,
             exposure: 1.0,
-            aperture: 0.008,
+            aperture: 0.0,
             foginess: 0.001,
             fog_scatter: 0.9,
             sky_brightness: 1.0,
+            dlss: AuroraDlss::from_env(),
         }
     }
 }
@@ -95,8 +98,33 @@ impl Plugin for DevUIPlugin {
         app.register_type::<DevUIState>();
         app.init_resource::<DevUIState>();
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(Update, (toggle_panel, update_stats));
+        app.add_systems(Update, (toggle_panel, update_stats, sync_dlss_mode));
     }
+}
+
+/// Keeps the panel's `dlss` field and the camera's [`AuroraDlss`] component equal: whichever
+/// side moved last (the panel, or D cycling the component) wins.
+fn sync_dlss_mode(
+    mut state: ResMut<DevUIState>,
+    mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,
+    mut agreed: Local<Option<AuroraDlss>>,
+) {
+    let last = agreed.unwrap_or(state.dlss);
+    if state.dlss != last {
+        for mut mode in &mut cameras {
+            if *mode != state.dlss {
+                *mode = state.dlss;
+            }
+        }
+        *agreed = Some(state.dlss);
+        return;
+    }
+    if let Some(mode) = cameras.iter().find(|m| **m != last) {
+        state.dlss = *mode;
+        *agreed = Some(*mode);
+        return;
+    }
+    *agreed = Some(last);
 }
 
 fn spawn_panel(world: &mut World) {

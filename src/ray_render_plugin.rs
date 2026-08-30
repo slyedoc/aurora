@@ -30,8 +30,6 @@ pub struct RenderConfig {
     pub sky_color: Vec4,
     pub accumulate: bool,
     pub pull_focus: Option<(u32, u32)>,
-    /// DLSS Ray Reconstruction mode (`Off` traces at output resolution, no denoise).
-    pub dlss: crate::dlss::AuroraDlss,
 }
 
 impl Default for RenderConfig {
@@ -43,12 +41,6 @@ impl Default for RenderConfig {
             sky_color: Vec4::splat(1.0),
             accumulate: Default::default(),
             pull_focus: Default::default(),
-            // `AURORA_DLSS=dlaa|quality|balanced|performance|ultra-performance` picks the
-            // start-up mode; D cycles it at runtime.
-            dlss: std::env::var("AURORA_DLSS")
-                .ok()
-                .and_then(|s| crate::dlss::AuroraDlss::parse(&s))
-                .unwrap_or_default(),
         }
     }
 }
@@ -75,7 +67,9 @@ pub struct UniformData {
     prev_view_proj: [f32; 16],
     jitter: [f32; 2],
     dlss: u32,
-    pad0: u32,
+    /// Free-running frame counter: the RNG seed while DLSS is on, so every frame's noise is
+    /// new for the temporal denoiser (`tick` resets to 0 whenever accumulation is off).
+    frame: u32,
 }
 
 #[repr(C)]
@@ -86,11 +80,6 @@ pub struct FocusData {
 fn handle_input(keyboard: Res<ButtonInput<KeyCode>>, mut render_config: ResMut<RenderConfig>) {
     if keyboard.just_pressed(KeyCode::Space) {
         render_config.accumulate = !render_config.accumulate;
-    }
-    // D cycles the DLSS mode.
-    if keyboard.just_pressed(KeyCode::KeyD) {
-        render_config.dlss = render_config.dlss.next();
-        log::info!("dlss: {}", render_config.dlss);
     }
 }
 
@@ -315,8 +304,16 @@ fn render_frame(
         Res<crate::compute::ComputeModules>,
         Res<SBT>,
     ),
-    camera: Query<(&Projection, &GlobalTransform), With<Camera3d>>,
+    camera: Query<
+        (
+            &Projection,
+            &GlobalTransform,
+            Option<&crate::dlss::AuroraDlss>,
+        ),
+        With<Camera3d>,
+    >,
     mut tick: Local<u32>,
+    mut frame_counter: Local<u32>,
     dlss_stuff: (
         ResMut<crate::dlss::DlssState>,
         Local<Option<Mat4>>,
@@ -336,6 +333,7 @@ fn render_frame(
     if !render_config.accumulate {
         *tick = 0;
     }
+    *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
     let inverse_view = camera.1.to_matrix();
     let projection_matrix = match camera.0 {
@@ -356,11 +354,13 @@ fn render_frame(
     // DLSS: settle the trace resolution and jitter before recording (feature creation, when
     // the mode or window changed, submits and waits on its own).
     let output_extent = swapchain.swapchain_extent;
+    let dlss_mode = camera.2.copied().unwrap_or_default();
     let plan = dlss
         .renderer
         .as_mut()
-        .and_then(|r| r.prepare(&render_device, output_extent, render_config.dlss));
-    let dlss_reset = plan.is_some() && !*dlss_was_active;
+        .and_then(|r| r.prepare(&render_device, output_extent, dlss_mode));
+    let reset_requested = std::mem::take(&mut dlss.reset_requested);
+    let dlss_reset = plan.is_some() && (!*dlss_was_active || reset_requested);
     *dlss_was_active = plan.is_some();
     let trace_extent = plan.map_or(output_extent, |p| p.render);
     // Set once the evaluate has been recorded this frame: only then does the blit read the
@@ -433,7 +433,7 @@ fn render_frame(
             prev_view_proj: last_view_proj.to_cols_array(),
             jitter: plan.map_or([0.0; 2], |p| p.jitter),
             dlss: (plan.is_some() && rtx_ready) as u32,
-            pad0: 0,
+            frame: *frame_counter,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);

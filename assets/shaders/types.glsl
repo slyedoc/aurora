@@ -49,7 +49,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   mat4 prev_view_proj;
   vec2 jitter;
   uint dlss;
-  uint pad0;
+  // Free-running frame counter (RNG seed under DLSS; `tick` is 0 unless accumulating).
+  uint frame;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are

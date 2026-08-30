@@ -84,7 +84,8 @@ vec2 TwoBnoiseSamples(const uint byteIndex) {
 
 // Assumed to be called once per sample
 vec2 bnoiseBest(const uint sampleIdx) {
-  const uint textureIdx = pc.uniforms.tick * SAMPLES + sampleIdx;
+  // 64 bluenoise slices; the seed advances every frame under DLSS (and per accumulation tick).
+  const uint textureIdx = ((pc.uniforms.dlss != 0 ? pc.uniforms.frame : pc.uniforms.tick) * SAMPLES + sampleIdx) % 64;
   if (textureIdx >= 64) { return vec2(randf(), randf()); }
   const uint x = gl_LaunchIDEXT.x % 128;
   const uint y = gl_LaunchIDEXT.y % 128;
@@ -93,7 +94,9 @@ vec2 bnoiseBest(const uint sampleIdx) {
 }
 
 void main() {
-  initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.tick);
+  // Under DLSS every frame needs fresh noise for the temporal denoiser; `tick` is the
+  // accumulation counter and sits at 0 while accumulation is off.
+  initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.dlss != 0 ? pc.uniforms.frame : pc.uniforms.tick);
 
   const ivec2 px = ivec2(gl_LaunchIDEXT.xy);
   const bool dlss = pc.uniforms.dlss != 0;
@@ -171,7 +174,9 @@ void main() {
             const vec4 view_pos = pc.uniforms.view * vec4(hit_pos, 1.0);
             const float linear_depth = max(-view_pos.z, 1.0e-4);
             const vec3 albedo = clamp(payload.color.rgb, vec3(0.0), vec3(1.0));
-            imageStore(guide_normal_roughness, px, vec4(world_normal, clamp(g_roughness, 0.0, 1.0)));
+            // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
+            const float linear_roughness = clamp(g_roughness * g_roughness, 0.0, 1.0);
+            imageStore(guide_normal_roughness, px, vec4(world_normal, linear_roughness));
             imageStore(guide_diffuse, px, vec4(albedo * (1.0 - g_metallic), 1.0));
             imageStore(guide_specular, px, vec4(mix(vec3(0.04), albedo, g_metallic), 1.0));
             imageStore(guide_depth, px, vec4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0));
