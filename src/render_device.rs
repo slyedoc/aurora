@@ -298,39 +298,62 @@ impl RenderDevice {
     /// asset worker records concurrently with the render thread), and the queue only for the
     /// submit itself -- never across the fence wait, which would stall frame submission behind
     /// every asset upload.
+    /// Record `f` into a one-off command buffer, submit it, and wait for it. The queue is
+    /// locked only around the submit; the record and the fence wait run unlocked, so workers
+    /// (asset uploads, BLAS builds) overlap freely.
     pub fn run_transfer_commands(&self, f: impl FnOnce(vk::CommandBuffer)) {
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe { self.device.create_fence(&fence_info, None) }.unwrap();
-
-        let cmd_buffer = {
-            let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
-            let alloc_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(*transfer_command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let cmd_buffer =
-                unsafe { self.device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            unsafe { self.device.begin_command_buffer(cmd_buffer, &begin_info) }.unwrap();
-
-            f(cmd_buffer);
-
-            unsafe { self.device.end_command_buffer(cmd_buffer) }.unwrap();
-            cmd_buffer
-        };
-
-        let submit_info =
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
+        let (cmd_buffer, fence) = self.record_transfer(f);
         {
             let queue = self.queue.lock().unwrap();
-            unsafe {
-                self.device
-                    .queue_submit(*queue, std::slice::from_ref(&submit_info), fence)
-                    .unwrap();
-            }
+            self.submit_transfer(*queue, cmd_buffer, fence);
         }
+        self.finish_transfer(cmd_buffer, fence);
+    }
 
+    /// [`run_transfer_commands`](Self::run_transfer_commands) with the queue lock held for the
+    /// whole record / submit / wait. For callers whose `f` drives a library that uses the
+    /// device queue on its own -- NGX feature creation and release submit and wait internally,
+    /// outside our mutex -- so no worker thread can touch the queue meanwhile. Two threads on
+    /// one `VkQueue` is a data race on an externally synchronized object (seen as the GPU
+    /// dropping off the bus when a texture upload landed during a DLSS rebuild).
+    pub fn run_transfer_commands_exclusive(&self, f: impl FnOnce(vk::CommandBuffer)) {
+        let queue = self.queue.lock().unwrap();
+        let (cmd_buffer, fence) = self.record_transfer(f);
+        self.submit_transfer(*queue, cmd_buffer, fence);
+        self.finish_transfer(cmd_buffer, fence);
+    }
+
+    fn record_transfer(&self, f: impl FnOnce(vk::CommandBuffer)) -> (vk::CommandBuffer, vk::Fence) {
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe { self.device.create_fence(&fence_info, None) }.unwrap();
+        let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(*transfer_command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_buffer = unsafe { self.device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(cmd_buffer, &begin_info) }.unwrap();
+
+        f(cmd_buffer);
+
+        unsafe { self.device.end_command_buffer(cmd_buffer) }.unwrap();
+        (cmd_buffer, fence)
+    }
+
+    /// Caller holds the queue lock.
+    fn submit_transfer(&self, queue: vk::Queue, cmd_buffer: vk::CommandBuffer, fence: vk::Fence) {
+        let submit_info =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
+        unsafe {
+            self.device
+                .queue_submit(queue, std::slice::from_ref(&submit_info), fence)
+                .unwrap();
+        }
+    }
+
+    fn finish_transfer(&self, cmd_buffer: vk::CommandBuffer, fence: vk::Fence) {
         unsafe {
             self.device
                 .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)

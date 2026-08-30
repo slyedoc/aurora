@@ -325,7 +325,8 @@ impl DlssRenderer {
             enable_output_subrects: false,
         };
         let mut handle: Result<*mut NgxHandle, String> = Err("not created".into());
-        rd.run_transfer_commands(|cb| {
+        // Exclusive: NGX submits and waits on the queue internally during creation.
+        rd.run_transfer_commands_exclusive(|cb| {
             handle =
                 unsafe { ngx::create_dlssd_feature(rd.device.handle(), cb, self.params, &create) };
         });
@@ -388,8 +389,13 @@ impl DlssRenderer {
             "dlss: releasing the {} feature (draining the device)",
             view.mode
         );
-        Self::wait_idle(rd);
-        unsafe { NVSDK_NGX_VULKAN_ReleaseFeature(view.handle) };
+        {
+            // Queue lock held across the release too: NGX may use the queue while tearing the
+            // feature down, and a worker upload must not race it.
+            let _queue = rd.queue.lock().unwrap();
+            let _ = unsafe { rd.device.device_wait_idle() };
+            unsafe { NVSDK_NGX_VULKAN_ReleaseFeature(view.handle) };
+        }
         log::info!("dlss: feature released");
         for image in view
             .guides()
