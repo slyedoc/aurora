@@ -13,7 +13,8 @@ impl PluginGroup for RayDefaultPlugins {
             //.add(bevy::app::TypeRegistrationPlugin)
             .add(bevy::diagnostic::FrameCountPlugin)
             .add(bevy::time::TimePlugin)
-            .add(bevy::transform::TransformPlugin)
+            // Root sync only: the hierarchy is propagated on the GPU (see transform.rs).
+            .add(crate::transform::TransformPlugin::default())
             //            .add(bevy::hierarchy::HierarchyPlugin)
             .add(bevy::diagnostic::DiagnosticsPlugin)
             .add(bevy::input::InputPlugin)

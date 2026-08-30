@@ -14,8 +14,9 @@
 //! (`tlas_builder.rs`) copies them straight into the instance buffer. Static scenes cost
 //! nothing past the (empty) delta check. Kernels: `assets/shaders/transform.slang`.
 //!
-//! Bevy's own CPU propagation still runs for whatever reads `GlobalTransform` on the CPU
-//! (cameras, gameplay); the render side never reads it for instances.
+//! The CPU does not propagate the hierarchy at all by default (`transform.rs`): roots get
+//! `GlobalTransform = Transform` for cameras and gameplay, and the render side reads only the
+//! GPU table for instances.
 
 use std::mem::offset_of;
 
