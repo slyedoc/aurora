@@ -6,8 +6,8 @@
 // average (weighted by sample counts), clears the accumulators, and evicts entries that
 // have not been touched for a while.
 
-// Must match SharcEntry in types.glsl. 48 bytes. Resolved values are f32 bit patterns in
-// uints (no 16-bit-float SPIR-V capability needed).
+// Must match SharcEntry in types.glsl. 32 bytes; resolved values are packed f16 pairs
+// (shaderFloat16 is enabled at device creation).
 struct SharcEntry {
     uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
     uint frame;    // Last frame the entry was deposited into or queried.
@@ -15,12 +15,8 @@ struct SharcEntry {
     uint acc_g;
     uint acc_b;
     uint acc_n;    // Samples accumulated this frame.
-    uint res_r;    // Resolved radiance (f32 bits).
-    uint res_g;
-    uint res_b;
-    uint conf;     // Confidence: samples folded in (f32 bits).
-    uint pad0;
-    uint pad1;
+    uint res_rg;   // Resolved radiance, 2xf16 (r, g).
+    uint res_bc;   // Resolved radiance b + confidence (samples folded in), 2xf16.
 };
 
 struct SharcResolveParams {
@@ -53,16 +49,14 @@ void sharc_resolve(uint3 gid: SV_DispatchThreadID) {
         return;
     }
     let fresh = float3(float(e.acc_r), float(e.acc_g), float(e.acc_b)) / float(e.acc_n);
-    let old = float3(asfloat(e.res_r), asfloat(e.res_g), asfloat(e.res_b));
-    let conf = asfloat(e.conf);
+    let old = float3(f16tof32(e.res_rg & 0xFFFF), f16tof32(e.res_rg >> 16), f16tof32(e.res_bc & 0xFFFF));
+    let conf = f16tof32(e.res_bc >> 16);
     // Count-weighted blend, floored so the cache keeps tracking lighting changes.
     let conf_new = min(conf + float(e.acc_n), 1024.0);
     let w = max(float(e.acc_n) / conf_new, 0.05);
     let resolved = lerp(old, fresh, conf <= 0.0 ? 1.0 : w);
-    p.entries[i].res_r = asuint(resolved.x);
-    p.entries[i].res_g = asuint(resolved.y);
-    p.entries[i].res_b = asuint(resolved.z);
-    p.entries[i].conf = asuint(conf_new);
+    p.entries[i].res_rg = f32tof16(resolved.x) | (f32tof16(resolved.y) << 16);
+    p.entries[i].res_bc = f32tof16(resolved.z) | (f32tof16(conf_new) << 16);
     p.entries[i].acc_r = 0;
     p.entries[i].acc_g = 0;
     p.entries[i].acc_b = 0;

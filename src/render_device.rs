@@ -598,8 +598,16 @@ unsafe fn create_logical_device(
         let mut features_scalar_block =
             vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
 
+        // 16-bit arithmetic in shaders: Slang's f16tof32 / f32tof16 lower through 16-bit
+        // integer ops (SPIR-V Int16, core shaderInt16 below), and half math proper declares
+        // Float16. Both are supported on every RTX-class device.
+        let mut features_float16 =
+            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+
         // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`.
-        let core_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .shader_int64(true)
+            .shader_int16(true);
 
         let device_info = vk::DeviceCreateInfo::default()
             .enabled_features(&core_features)
@@ -612,7 +620,8 @@ unsafe fn create_logical_device(
             .push_next(&mut features_indexing)
             .push_next(&mut features_acceleration_structure)
             .push_next(&mut features_raytracing_pipeline)
-            .push_next(&mut features_scalar_block);
+            .push_next(&mut features_scalar_block)
+            .push_next(&mut features_float16);
 
         let device = instance
             .create_device(physical_device, &device_info, None)

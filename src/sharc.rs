@@ -25,7 +25,7 @@ use crate::{
 /// Must match SHARC_ENTRIES in raygen.rgen.
 const SHARC_ENTRIES: u32 = 1 << 20;
 /// Must match SharcEntry in types.glsl / sharc.slang.
-const ENTRY_BYTES: u64 = 48;
+const ENTRY_BYTES: u64 = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

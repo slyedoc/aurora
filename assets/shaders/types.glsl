@@ -140,8 +140,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Sl
   uint data[];
 };
 
-// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 48 bytes; resolved
-// values are f32 bit patterns in uints.
+// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 32 bytes; resolved
+// values are packed f16 pairs.
 struct SharcEntry {
   uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
   uint frame;    // Last frame the entry was deposited into or queried.
@@ -149,12 +149,8 @@ struct SharcEntry {
   uint acc_g;
   uint acc_b;
   uint acc_n;    // Samples accumulated this frame.
-  uint res_r;    // Resolved radiance (f32 bits).
-  uint res_g;
-  uint res_b;
-  uint conf;     // Confidence: samples folded in (f32 bits).
-  uint pad0;
-  uint pad1;
+  uint res_rg;   // Resolved radiance, 2xf16 (r, g).
+  uint res_bc;   // Resolved radiance b + confidence (samples folded in), 2xf16.
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) buffer SharcData {

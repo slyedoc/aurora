@@ -170,10 +170,10 @@ uint sharcSlot(const vec3 pos, const vec3 n, const vec3 cam) {
 
 // The resolved radiance, if the entry has folded in enough samples to be trusted.
 bool sharcQuery(const uint slot, out vec3 radiance) {
-  radiance = vec3(uintBitsToFloat(pc.sharc.data[slot].res_r),
-                  uintBitsToFloat(pc.sharc.data[slot].res_g),
-                  uintBitsToFloat(pc.sharc.data[slot].res_b));
-  return uintBitsToFloat(pc.sharc.data[slot].conf) >= 8.0;
+  const vec2 rg = unpackHalf2x16(pc.sharc.data[slot].res_rg);
+  const vec2 bc = unpackHalf2x16(pc.sharc.data[slot].res_bc);
+  radiance = vec3(rg, bc.x);
+  return bc.y >= 8.0;
 }
 
 // One path sample of the voxel's outgoing radiance (nits, fixed point at 1 nit).
