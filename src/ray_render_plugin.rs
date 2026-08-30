@@ -484,9 +484,9 @@ fn render_frame(
             sun_cos_radius: procedural.sun_cos_radius(),
             sun_direction: procedural.sun_direction().to_array(),
             sun_radiance: Vec3::splat(procedural.sun_radiance).to_array(),
-            sky_zenith: procedural.zenith.to_array(),
-            sky_horizon: procedural.horizon.to_array(),
-            sky_ground: procedural.ground.to_array(),
+            sky_zenith: procedural.zenith_radiance().to_array(),
+            sky_horizon: procedural.horizon_radiance().to_array(),
+            sky_ground: procedural.ground_radiance().to_array(),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);

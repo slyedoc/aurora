@@ -37,7 +37,7 @@ impl Sky {
         match self {
             Sky::Color { radiance } => luma(*radiance),
             Sky::Hdr { scale, .. } => *scale,
-            Sky::Procedural => luma(procedural.zenith),
+            Sky::Procedural => luma(procedural.zenith_radiance()),
         }
     }
 }
@@ -59,9 +59,18 @@ pub struct ProceduralSky {
     /// smaller disc needs a brighter one for the same light on the ground.
     #[reflect(@0.0..=1.0e8_f32)]
     pub sun_radiance: f32,
-    pub zenith: Vec3,
-    pub horizon: Vec3,
-    pub ground: Vec3,
+    /// Sky colour straight up (chromaticity) and its radiance (nits).
+    pub zenith: Color,
+    #[reflect(@0.0..=30000.0_f32)]
+    pub zenith_nits: f32,
+    /// Sky colour at the horizon and its radiance (nits).
+    pub horizon: Color,
+    #[reflect(@0.0..=30000.0_f32)]
+    pub horizon_nits: f32,
+    /// Below the horizon and its radiance (nits).
+    pub ground: Color,
+    #[reflect(@0.0..=30000.0_f32)]
+    pub ground_nits: f32,
 }
 
 impl Default for ProceduralSky {
@@ -71,9 +80,12 @@ impl Default for ProceduralSky {
             sun_azimuth: 150.0,
             sun_angular_radius: 2.0,
             sun_radiance: 3.0e7,
-            zenith: Vec3::new(0.45, 0.62, 1.0) * 8000.0,
-            horizon: Vec3::new(0.80, 0.86, 0.95) * 9000.0,
-            ground: Vec3::new(0.30, 0.28, 0.25) * 2500.0,
+            zenith: Color::linear_rgb(0.45, 0.62, 1.0),
+            zenith_nits: 8000.0,
+            horizon: Color::linear_rgb(0.80, 0.86, 0.95),
+            horizon_nits: 9000.0,
+            ground: Color::linear_rgb(0.30, 0.28, 0.25),
+            ground_nits: 2500.0,
         }
     }
 }
@@ -91,6 +103,22 @@ impl ProceduralSky {
     pub fn sun_cos_radius(&self) -> f32 {
         self.sun_angular_radius.to_radians().cos()
     }
+
+    /// Linear radiance (nits) of the zenith / horizon / ground.
+    pub fn zenith_radiance(&self) -> Vec3 {
+        radiance(self.zenith, self.zenith_nits)
+    }
+    pub fn horizon_radiance(&self) -> Vec3 {
+        radiance(self.horizon, self.horizon_nits)
+    }
+    pub fn ground_radiance(&self) -> Vec3 {
+        radiance(self.ground, self.ground_nits)
+    }
+}
+
+/// A colour (any space) times a radiance, as linear RGB nits.
+fn radiance(color: Color, nits: f32) -> Vec3 {
+    color.to_linear().to_vec3() * nits
 }
 
 pub fn luma(c: Vec3) -> f32 {
