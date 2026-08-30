@@ -315,7 +315,18 @@ fn extract_mesh_data(
                 .pbr_metallic_roughness()
                 .metallic_factor(),
             refract_index: primitive.material().ior().unwrap_or(1.0),
-            __padding: [0; 12],
+            // KHR_materials_volume attenuation, when the glTF carries it; clear otherwise.
+            absorption: primitive
+                .material()
+                .volume()
+                .map(|v| {
+                    let c = v.attenuation_color();
+                    crate::blas::absorption_from_attenuation(
+                        bevy::color::LinearRgba::new(c[0], c[1], c[2], 1.0),
+                        v.attenuation_distance(),
+                    )
+                })
+                .unwrap_or([0.0; 3]),
         };
 
         let reader = primitive.reader(|buffer| Some(&gltf.buffers[buffer.index()]));

@@ -66,7 +66,7 @@ aurora_cluster_mesh = { path = "crates/aurora_cluster_mesh" }
 bytemuck = { version = "1.14.3", features = ["derive"] }
 crossbeam = "0.8.4"
 glam = { version = "0.33.0" }
-gltf = { version = "1.4.1", features = ["KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
+gltf = { version = "1.4.1", features = ["KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume", "KHR_materials_emissive_strength", "KHR_texture_transform"] }
 gpu-allocator = "0.28.0"
 #gpu-allocator = { git = "https://github.com/Traverse-Research/gpu-allocator.git", branch = "main" }
 half = "2.4.1"

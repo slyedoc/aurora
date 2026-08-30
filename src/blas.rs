@@ -77,7 +77,19 @@ pub struct RTXMaterial {
     pub roughness_factor: f32,
     pub metallic_factor: f32,
     pub refract_index: f32,
-    pub __padding: [u8; 12],
+    /// Beer-Lambert absorption per unit distance travelled inside the surface (linear RGB).
+    pub absorption: [f32; 3],
+}
+
+/// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:
+/// light travelling `attenuation_distance` through the medium is tinted to `attenuation_color`.
+/// An infinite (default) distance means a clear medium.
+pub fn absorption_from_attenuation(color: bevy::color::LinearRgba, distance: f32) -> [f32; 3] {
+    if !distance.is_finite() || distance <= 0.0 {
+        return [0.0; 3];
+    }
+    let k = |c: f32| -(c.clamp(1e-4, 1.0)).ln() / distance;
+    [k(color.red), k(color.green), k(color.blue)]
 }
 
 impl RTXMaterial {
@@ -100,7 +112,10 @@ impl RTXMaterial {
             roughness_factor: material.perceptual_roughness,
             metallic_factor: material.metallic,
             refract_index: material.ior,
-            __padding: [0; 12],
+            absorption: absorption_from_attenuation(
+                material.attenuation_color.to_linear(),
+                material.attenuation_distance,
+            ),
         }
     }
 }
@@ -119,7 +134,7 @@ impl Default for RTXMaterial {
             roughness_factor: 1.0,
             metallic_factor: 0.0,
             refract_index: 1.0,
-            __padding: [0; 12],
+            absorption: [0.0; 3],
         }
     }
 }
