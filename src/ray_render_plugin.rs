@@ -78,6 +78,8 @@ pub struct UniformData {
     /// pair while Ray Reconstruction runs).
     samples: u32,
     max_bounces: u32,
+    /// Post-process vignette strength (0 = off).
+    vignette: f32,
 }
 
 #[repr(C)]
@@ -213,9 +215,11 @@ fn update_render_window(
         }
     }
 
+    // Physical pixels: the swapchain is recreated whenever this changes (Wayland never
+    // reports OUT_OF_DATE; the compositor would silently scale a stale-size image).
     commands.insert_resource(RenderWindow {
-        width: window.resolution.width().max(1.0) as u32,
-        height: window.resolution.height().max(1.0) as u32,
+        width: window.resolution.physical_width().max(1),
+        height: window.resolution.physical_height().max(1),
     });
 }
 
@@ -460,6 +464,7 @@ fn render_frame(
                 dev_ui_state.max_bounces
             }
             .max(1),
+            vignette: dev_ui_state.vignette,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);

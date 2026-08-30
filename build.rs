@@ -8,6 +8,39 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{sdk}/lib");
     }
     dlss();
+    aftermath();
+}
+
+/// Nsight Aftermath: link the SDK's shared lib when the `dev` feature is on AND the lib
+/// exists -- `cfg(aftermath_gfsdk)` gates the real FFI in `src/aftermath.rs`, so a machine
+/// without the SDK compiles the no-op stubs instead of failing at link. The `-l`/`-L` ride
+/// the rlib to downstream binaries; the rpath link-arg does not propagate, so binaries in
+/// other workspaces carry their own (aurora_files' bsn / bevy_city build.rs).
+fn aftermath() {
+    println!("cargo:rerun-if-env-changed=AFTERMATH_SDK");
+    println!("cargo::rustc-check-cfg=cfg(aftermath_gfsdk)");
+    if std::env::var_os("CARGO_FEATURE_DEV").is_none() {
+        return;
+    }
+    let sdk = std::env::var("AFTERMATH_SDK").unwrap_or_else(|_| {
+        format!(
+            "{}/nvidia/aftermath",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let lib = std::path::Path::new(&sdk).join("lib/x64");
+    if !lib.join("libGFSDK_Aftermath_Lib.x64.so").exists() {
+        println!(
+            "cargo:warning=dev feature on but {}/libGFSDK_Aftermath_Lib.x64.so not found -- \
+             GPU crash dumps compile out (set AFTERMATH_SDK)",
+            lib.display(),
+        );
+        return;
+    }
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=dylib=GFSDK_Aftermath_Lib.x64");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    println!("cargo:rustc-cfg=aftermath_gfsdk");
 }
 
 // DLSS (NGX) link wiring, additive and guarded: `DLSS_SDK` must name a tree holding

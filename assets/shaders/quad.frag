@@ -25,22 +25,16 @@ vec3 tonemapFilmic(const vec3 color) {
 	return (x * (6.2 * x + 0.5)) / (x * (6.2 * x + 1.7) + 0.06);
 }
 
-vec3 applyVignette(vec3 color) {
-    // Find the distance from the center of the screen
-    vec2 uv = in_UV - 0.5;
-    float dist = length(uv);
-
-    // Parameters for controlling the vignette strength and smoothness
-    float vignetteStrength = 0.35; // How much the vignette darkens (0.0 to 1.0)
-    float vignetteRadius = 0.75;   // The radius from the center where the vignette starts
-
-    // Calculate vignette factor based on the distance and radius
-    float vignette = smoothstep(vignetteRadius, vignetteRadius - vignetteStrength, dist);
-
-    // Apply the vignette effect by darkening the color at the corners
-    return mix(color, color * vignette, vignetteStrength);
+// Aspect-corrected: 0 at the centre, 1 at the corners, so it is the same shape at any
+// window size; `strength` (0 = off) is how dark the corners get.
+vec3 applyVignette(vec3 color, float strength) {
+    if (strength <= 0.0) { return color; }
+    vec2 size = vec2(textureSize(test, 0));
+    vec2 half_extent = vec2(size.x / size.y, 1.0) * 0.5;
+    float dist = length((in_UV - 0.5) * vec2(size.x / size.y, 1.0)) / length(half_extent);
+    float falloff = smoothstep(1.0, 0.45, dist);
+    return mix(color, color * falloff, strength);
 }
-
 
 void main() {
   vec4 accBuffer = texture(test, in_UV);
@@ -52,7 +46,7 @@ void main() {
   color *= dlss ? 1.0 : uniforms.exposure;
   color = acesFilm(color);
   color = pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0/uniforms.gamma));
-  color = applyVignette(color);
+  color = applyVignette(color, uniforms.vignette);
 
   out_Color = vec4(color, 1.0);
 }

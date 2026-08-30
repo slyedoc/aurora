@@ -16,6 +16,9 @@ pub struct Swapchain {
     pub swapchain_images: Vec<vk::Image>,
     pub swapchain_image_views: Vec<vk::ImageView>,
     pub swapchain_extent: vk::Extent2D,
+    /// The window size the current swapchain was built for; a different `RenderWindow`
+    /// triggers a rebuild in `aquire_next_image`.
+    requested: (u32, u32),
     pub current_image_idx: u32,
     pub image_available_semaphore: vk::Semaphore,
     /// One per swapchain image, indexed by the acquired image: a present's wait on it is not
@@ -75,6 +78,7 @@ impl Swapchain {
                 swapchain_images: Vec::new(),
                 swapchain_image_views: Vec::new(),
                 swapchain_extent: vk::Extent2D::default(),
+                requested: (0, 0),
                 image_available_semaphore,
                 render_finished_semaphores: Vec::new(),
                 current_image_idx: 0,
@@ -144,6 +148,7 @@ impl Swapchain {
             };
 
             self.swapchain_extent = surface_resolution;
+            self.requested = (window.width, window.height);
 
             let pre_transform = if surface_caps
                 .supported_transforms
@@ -251,7 +256,9 @@ impl Swapchain {
         window: &RenderWindow,
     ) -> (vk::Image, vk::ImageView) {
         unsafe {
-            if self.swapchain == vk::SwapchainKHR::null() {
+            if self.swapchain == vk::SwapchainKHR::null()
+                || self.requested != (window.width, window.height)
+            {
                 self.on_resize(window);
                 self.resized = true;
             }
@@ -267,7 +274,11 @@ impl Swapchain {
                     true,
                     std::u64::MAX,
                 )
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    // Device loss surfaces here first: let the driver finish its crash dump.
+                    crate::aftermath::note_device_lost(e);
+                    panic!("frame fence wait failed: {e:?}");
+                });
             self.device
                 .reset_fences(std::slice::from_ref(
                     &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
@@ -317,7 +328,10 @@ impl Swapchain {
                     std::slice::from_ref(&submit_info),
                     self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
                 )
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("frame submit failed: {e:?}");
+                });
 
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(std::slice::from_ref(
@@ -339,7 +353,10 @@ impl Swapchain {
                     self.on_resize(window);
                     self.resized = true;
                 }
-                Err(e) => panic!("Failed to present swapchain image: {:?}", e),
+                Err(e) => {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("Failed to present swapchain image: {:?}", e)
+                }
                 Ok(false) => {
                     self.resized = false;
                 }

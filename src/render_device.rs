@@ -132,6 +132,8 @@ impl Clone for RenderDevice {
 
 impl RenderDevice {
     pub unsafe fn from_display(display_handle: &DisplayHandle) -> Self {
+        // Before the loader is touched: Aftermath registers ahead of instance/device creation.
+        crate::aftermath::enable();
         unsafe {
             let entry = ash::Entry::linked();
             let instance = create_instance(display_handle, &entry);
@@ -332,7 +334,10 @@ impl RenderDevice {
         unsafe {
             self.device
                 .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("transfer fence wait failed: {e:?}");
+                });
             let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
             self.device
                 .free_command_buffers(*transfer_command_pool, std::slice::from_ref(&cmd_buffer));

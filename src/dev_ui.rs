@@ -63,6 +63,9 @@ pub struct DevUIState {
     /// path is all the denoiser needs.
     #[reflect(@1.0..=64.0_f32)]
     pub dlss_max_bounces: u32,
+    /// Post-process vignette strength (0 = off); aspect-corrected, darkens towards the corners.
+    #[reflect(@0.0..=1.0_f32)]
+    pub vignette: f32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -81,6 +84,7 @@ impl Default for DevUIState {
             max_bounces: 64,
             dlss_samples: 1,
             dlss_max_bounces: 8,
+            vignette: 0.0,
             dlss: AuroraDlss::from_env(),
         }
     }

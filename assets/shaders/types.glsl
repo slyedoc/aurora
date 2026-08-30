@@ -56,6 +56,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   // Paths per pixel this frame and their maximum length.
   uint samples;
   uint max_bounces;
+  // Post-process vignette strength (0 = off).
+  float vignette;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
