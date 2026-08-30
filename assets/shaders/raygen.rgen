@@ -301,11 +301,12 @@ void main() {
         if (NoL > 0.0 && dot(l, surface_normal) > 0.0) {
           const vec3 f = evalDisneyBRDF(-direction, world_normal, l, disney_mat);
           if (any(greaterThan(f, vec3(0.0)))) {
-            // Shadow ray: any hit terminates without running a closest-hit shader, so the
-            // payload's t only becomes 0 when the miss shader ran.
+            // Shadow ray: any accepted hit terminates without running a closest-hit
+            // shader, so the payload's t only becomes 0 when the miss shader ran. Not
+            // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
-                        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                         0xFF, 0, 0, 0, origin, tmin, l, tmax, 0);
             if (payload.t == 0.0) {
               const float solid_angle = 2.0 * PI * (1.0 - pc.uniforms.sun_cos_radius);

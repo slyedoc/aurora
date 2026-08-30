@@ -75,6 +75,8 @@ pub struct RTXMaterial {
     pub refract_index: f32,
     /// Beer-Lambert absorption per unit distance travelled inside the surface (linear RGB).
     pub absorption: [f32; 3],
+    /// Alpha-mask cutout threshold; 0 = opaque (the any-hit shader never tests it).
+    pub alpha_cutoff: f32,
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:
@@ -105,6 +107,7 @@ impl Default for RTXMaterial {
             metallic_factor: 0.0,
             refract_index: 1.0,
             absorption: [0.0; 3],
+            alpha_cutoff: 0.0,
         }
     }
 }
@@ -411,8 +414,9 @@ fn geometry_infos(
         .geometries
         .iter()
         .map(|_| {
+            // Not OPAQUE: any-hit runs for alpha-masked materials. Instances whose
+            // materials are all opaque set VK_GEOMETRY_INSTANCE_FORCE_OPAQUE instead.
             vk::AccelerationStructureGeometryKHR::default()
-                .flags(vk::GeometryFlagsKHR::OPAQUE)
                 .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
                 .geometry(vk::AccelerationStructureGeometryDataKHR {
                     triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()

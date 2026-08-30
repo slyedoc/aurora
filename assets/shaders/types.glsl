@@ -108,6 +108,8 @@ struct Material {
   float refract_index;
   // Beer-Lambert absorption per unit distance inside the surface (linear RGB).
   vec3 absorption;
+  // Alpha-mask cutout threshold (0 = opaque, no any-hit test).
+  float alpha_cutoff;
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialData {

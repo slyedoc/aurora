@@ -45,7 +45,7 @@ impl AssetLoader for ShaderLoader {
 
     fn extensions(&self) -> &[&str] {
         &[
-            "vert", "frag", "comp", "rgen", "rint", "rchit", "rmiss", "slang",
+            "vert", "frag", "comp", "rgen", "rint", "rchit", "rahit", "rmiss", "slang",
         ]
     }
 
@@ -95,6 +95,7 @@ impl AssetLoader for ShaderLoader {
                 "rgen" => shaderc::ShaderKind::RayGeneration,
                 "rint" => shaderc::ShaderKind::Intersection,
                 "rchit" => shaderc::ShaderKind::ClosestHit,
+                "rahit" => shaderc::ShaderKind::AnyHit,
                 "rmiss" => shaderc::ShaderKind::Miss,
                 _ => panic!("Unsupported shader extension: {}", ext),
             };

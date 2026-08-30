@@ -20,6 +20,7 @@ impl Plugin for DevShaderPlugin {
             raygen_shader: asset_server.load(aurora_asset("shaders/raygen.rgen")),
             miss_shader: asset_server.load(aurora_asset("shaders/miss.rmiss")),
             hit_shader: asset_server.load(aurora_asset("shaders/closest_hit.rchit")),
+            any_hit_shader: asset_server.load(aurora_asset("shaders/any_hit.rahit")),
             sphere_intersection_shader: asset_server
                 .load(aurora_asset("shaders/sphere_intersection.rint")),
             sphere_hit_shader: asset_server.load(aurora_asset("shaders/sphere_hit.rchit")),

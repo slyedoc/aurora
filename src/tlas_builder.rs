@@ -40,6 +40,9 @@ use crate::{
 
 /// `VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR`.
 const INSTANCE_FLAGS: u32 = 0b1;
+/// `VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR`: set when every material of the instance is
+/// opaque, so the alpha-mask any-hit shader only runs where a cutout can happen.
+const INSTANCE_FORCE_OPAQUE: u32 = 0b100;
 
 /// The static half of an instance slot (must match instances.slang). 32 bytes.
 #[repr(C)]
@@ -778,11 +781,17 @@ pub fn prepare_instances(
             (None, None) => vec![RTXMaterial::default()],
         };
         let custom_index = tlas.materials.set(slot, &material_slice);
+        let flags = INSTANCE_FLAGS
+            | if material_slice.iter().all(|m| m.alpha_cutoff <= 0.0) {
+                INSTANCE_FORCE_OPAQUE
+            } else {
+                0
+            };
 
         let record = InstanceRecord {
             slot,
             custom_and_mask: (custom_index & 0x00FF_FFFF) | ((source.mask as u32) << 24),
-            sbt_and_flags: (hit_offset & 0x00FF_FFFF) | (INSTANCE_FLAGS << 24),
+            sbt_and_flags: (hit_offset & 0x00FF_FFFF) | (flags << 24),
             node: source.node,
             blas,
             pad: 0,

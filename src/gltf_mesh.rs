@@ -323,6 +323,13 @@ fn extract_mesh_data(
                     )
                 })
                 .unwrap_or([0.0; 3]),
+            alpha_cutoff: match primitive.material().alpha_mode() {
+                gltf::material::AlphaMode::Opaque => 0.0,
+                gltf::material::AlphaMode::Mask => {
+                    primitive.material().alpha_cutoff().unwrap_or(0.5).max(1.0 / 255.0)
+                }
+                gltf::material::AlphaMode::Blend => 0.5,
+            },
         };
 
         let reader = primitive.reader(|buffer| Some(&gltf.buffers[buffer.index()]));

@@ -144,6 +144,13 @@ impl RTXMaterial {
                 material.attenuation_color.to_linear(),
                 material.attenuation_distance,
             ),
+            alpha_cutoff: match material.alpha_mode {
+                AlphaMode::Opaque => 0.0,
+                AlphaMode::Mask(cutoff) => cutoff.max(1.0 / 255.0),
+                // Blend traces as a 0.5 cutout for shadow rays; the raygen's stochastic
+                // alpha still handles the camera-visible transparency.
+                AlphaMode::Blend => 0.5,
+            },
         }
     }
 }

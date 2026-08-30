@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+
+// Alpha-mask cutout for non-opaque instances (material.alpha_cutoff > 0): a candidate hit
+// whose base-colour alpha is under the cutoff is ignored, so shadow rays pass through
+// foliage cards instead of treating them as solid quads. Instances whose materials are all
+// opaque carry VK_GEOMETRY_INSTANCE_FORCE_OPAQUE and never run this shader; primary rays
+// trace with gl_RayFlagsOpaqueEXT and keep the stochastic-alpha handling in the raygen.
+
+#include "types.glsl"
+
+layout(set=1, binding=200) uniform sampler2D textures[];
+
+layout(shaderRecordEXT, scalar) buffer ShaderRecord
+{
+  VertexData vertexData;
+  TriangleData triangleData;
+  IndexData  indexData;
+  GeometryData geometries;
+  GeometryData triangles;
+};
+
+layout(push_constant, std430) uniform Registers {
+  PushConstants pc;
+};
+
+hitAttributeEXT vec2 attribs;
+
+void main() {
+  const Material material = pc.materials.materials[gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT];
+  // Opaque geometry inside a mixed (non-force-opaque) instance: accept immediately.
+  if (material.alpha_cutoff <= 0.0) { return; }
+  const vec3 baryCoords = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+  const Triangle tri = triangleData.data[triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID];
+  const vec2 uv = mat3x2(
+      unpackUv(tri.uvs[0]),
+      unpackUv(tri.uvs[1]),
+      unpackUv(tri.uvs[2])
+  ) * baryCoords;
+  const float alpha = material.base_color_factor.a * texture(textures[material.base_color_texture], uv).a;
+  if (alpha < material.alpha_cutoff) { ignoreIntersectionEXT; }
+}

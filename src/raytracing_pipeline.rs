@@ -27,6 +27,8 @@ pub struct RaytracingPipeline {
     #[dependency]
     pub hit_shader: Handle<Shader>,
     #[dependency]
+    pub any_hit_shader: Handle<Shader>,
+    #[dependency]
     pub sphere_intersection_shader: Handle<Shader>,
     #[dependency]
     pub sphere_hit_shader: Handle<Shader>,
@@ -59,7 +61,7 @@ pub struct RaytracingPushConstants {
 }
 
 impl VulkanAsset for RaytracingPipeline {
-    type ExtractedAsset = (Shader, Shader, Shader, Shader, Shader);
+    type ExtractedAsset = (Shader, Shader, Shader, Shader, Shader, Shader);
     type ExtractParam = SRes<Assets<crate::shader::Shader>>;
     type PreparedAsset = CompiledRaytracingPipeline;
 
@@ -84,6 +86,11 @@ impl VulkanAsset for RaytracingPipeline {
             return None;
         };
 
+        let Some(any_hit_shader) = shaders.get(&self.any_hit_shader) else {
+            log::warn!("Any-hit shader not ready yet");
+            return None;
+        };
+
         let Some(sphere_intersection_shader) = shaders.get(&self.sphere_intersection_shader) else {
             log::warn!("Sphere intersection shader not ready yet");
             return None;
@@ -98,6 +105,7 @@ impl VulkanAsset for RaytracingPipeline {
             raygen_shader.clone(),
             miss_shader.clone(),
             hit_shader.clone(),
+            any_hit_shader.clone(),
             sphere_intersection_shader.clone(),
             sphere_hit_shader.clone(),
         ))
@@ -108,8 +116,14 @@ impl VulkanAsset for RaytracingPipeline {
         render_device: &crate::render_device::RenderDevice,
     ) -> Self::PreparedAsset {
         let start = Instant::now();
-        let (raygen_shader, miss_shader, hit_shader, sphere_intersection_shader, sphere_hit_shader) =
-            asset;
+        let (
+            raygen_shader,
+            miss_shader,
+            hit_shader,
+            any_hit_shader,
+            sphere_intersection_shader,
+            sphere_hit_shader,
+        ) = asset;
 
         // 0: accumulation target; 1..=7: the DLSS guide images (normal+roughness, diffuse,
         // specular, depth, specular hit distance, motion, colour) -- partially bound, only
@@ -212,6 +226,10 @@ impl VulkanAsset for RaytracingPipeline {
                 &sphere_hit_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::CLOSEST_HIT_KHR,
             ),
+            render_device.load_shader(
+                &any_hit_shader.spirv.unwrap(),
+                vk::ShaderStageFlags::ANY_HIT_KHR,
+            ),
         ];
 
         let shader_group = [
@@ -229,12 +247,12 @@ impl VulkanAsset for RaytracingPipeline {
                 .closest_hit_shader(vk::SHADER_UNUSED_KHR)
                 .any_hit_shader(vk::SHADER_UNUSED_KHR)
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
-            // Triangle hit shader
+            // Triangle hit shader (any-hit does the alpha-mask cutout)
             vk::RayTracingShaderGroupCreateInfoKHR::default()
                 .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
                 .general_shader(vk::SHADER_UNUSED_KHR)
                 .closest_hit_shader(2)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(5)
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
             // Sphere shader
             vk::RayTracingShaderGroupCreateInfoKHR::default()
@@ -344,6 +362,7 @@ fn propagate_modified(
                     if filter.raygen_shader.id() == *id
                         || filter.miss_shader.id() == *id
                         || filter.hit_shader.id() == *id
+                        || filter.any_hit_shader.id() == *id
                         || filter.sphere_intersection_shader.id() == *id
                         || filter.sphere_hit_shader.id() == *id
                     {
