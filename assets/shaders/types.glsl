@@ -130,6 +130,10 @@ struct HitPayload {
   vec3 absorption;
   // Where this hit point was last frame (object motion for DLSS motion vectors).
   vec3 prev_world_pos;
+  // Raygen -> miss: 1 when a miss may return the procedural sun disc (camera rays and
+  // pure-specular paths); 0 after a BRDF-sampled bounce, where the sun is gathered by
+  // next-event estimation instead.
+  uint want_sun;
 };
 
 struct PushConstants {

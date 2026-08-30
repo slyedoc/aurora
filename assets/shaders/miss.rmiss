@@ -26,8 +26,10 @@ vec3 hdr_sky(const vec3 d) {
 }
 
 // Analytic clear sky: zenith / horizon gradient above, horizon / ground below, a soft sun
-// disc with a small aureole. All inputs in nits.
-vec3 procedural_sky(const vec3 d) {
+// disc with a small aureole. All inputs in nits. The disc itself is only added when the
+// path may see it directly (`want_sun`); other paths gather the sun by next-event
+// estimation in the raygen.
+vec3 procedural_sky(const vec3 d, const bool want_sun) {
   const float up = d.y;
   vec3 col;
   if (up >= 0.0) {
@@ -40,7 +42,7 @@ vec3 procedural_sky(const vec3 d) {
   // Disc: full inside the radius, fading over the outer fifth of it.
   const float disc = smoothstep(cos_r - (1.0 - cos_r) * 0.2, cos_r, c);
   const float aureole = pow(max(c, 0.0), 48.0) * 0.35;
-  col += pc.uniforms.sun_radiance * disc * step(0.0, up);
+  if (want_sun) { col += pc.uniforms.sun_radiance * disc * step(0.0, up); }
   col += pc.uniforms.sky_horizon * aureole;
   return col;
 }
@@ -51,7 +53,7 @@ void main() {
   vec3 sky;
   switch (pc.uniforms.sky_mode) {
     case 1u: sky = hdr_sky(d); break;
-    case 2u: sky = procedural_sky(d); break;
+    case 2u: sky = procedural_sky(d, payload.want_sun != 0u); break;
     default: sky = pc.uniforms.skycolor.rgb; break;
   }
   payload.emission = sky * pc.uniforms.sky_brightness;

@@ -8,10 +8,9 @@
 //!   gradient, ground, and a soft sun disc. The default: nothing to load.
 //!
 //! [`DevUIState::sky_brightness`](crate::dev_ui::DevUIState) multiplies whichever is active.
-//! Without next-event estimation a small, physically bright sun is only ever found by chance
-//! (and its indirect contribution is then firefly-clamped), so the procedural sun defaults
-//! to a wide, moderate disc that still reads as a sun and lights the scene; a true 0.27° sun
-//! is a job for NEE.
+//! The procedural sun is gathered by next-event estimation in the raygen (one shadow ray per
+//! surface hit towards the disc), so it can be small and physically bright: the defaults
+//! give ~115 klux of direct sunlight against a ~25 klux sky, i.e. real shadows.
 
 use bevy::prelude::*;
 
@@ -53,11 +52,12 @@ pub struct ProceduralSky {
     /// Sun heading, degrees clockwise from -Z.
     #[reflect(@0.0..=360.0_f32)]
     pub sun_azimuth: f32,
-    /// Angular radius of the disc. The real sun is 0.27°; wide and soft converges without NEE.
+    /// Angular radius of the disc (the real sun is 0.27°); softer shadows as it grows.
     #[reflect(@0.25..=20.0_f32)]
     pub sun_angular_radius: f32,
-    /// Radiance of the disc (nits).
-    #[reflect(@0.0..=2.0e6_f32)]
+    /// Radiance of the disc (nits). Irradiance = radiance × the disc's solid angle, so a
+    /// smaller disc needs a brighter one for the same light on the ground.
+    #[reflect(@0.0..=1.0e8_f32)]
     pub sun_radiance: f32,
     pub zenith: Vec3,
     pub horizon: Vec3,
@@ -67,10 +67,10 @@ pub struct ProceduralSky {
 impl Default for ProceduralSky {
     fn default() -> Self {
         Self {
-            sun_elevation: 40.0,
+            sun_elevation: 35.0,
             sun_azimuth: 150.0,
-            sun_angular_radius: 6.0,
-            sun_radiance: 1.2e5,
+            sun_angular_radius: 2.0,
+            sun_radiance: 3.0e7,
             zenith: Vec3::new(0.45, 0.62, 1.0) * 8000.0,
             horizon: Vec3::new(0.80, 0.86, 0.95) * 9000.0,
             ground: Vec3::new(0.30, 0.28, 0.25) * 2500.0,

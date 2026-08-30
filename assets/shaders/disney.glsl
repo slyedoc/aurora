@@ -231,10 +231,33 @@ vec4 sampleDisneyBRDF(const vec4 noise, const vec3 v, const vec3 n, const Disney
 }
 
 
+// The BRDF that sampleDisneyBRDF implicitly integrates, evaluated for a given light direction
+// (no cosine): Disney diffuse scaled by (1 - F) and (1 - metallic), plus the GGX specular lobe.
+// Next-event estimation (the sun) uses this so its estimate matches BRDF sampling.
+vec3 evalDisneyBRDF(const vec3 v, const vec3 n, const vec3 l, const DisneyMaterial mat) {
+    const float NoL = dot(n, l);
+    const float NoV = dot(n, v);
+    if (NoL <= 0.0 || NoV <= 0.0) { return vec3(0.0); }
+    const vec3 h = normalize(l + v);
+    const float NoH = min(dot(n, h), 0.99);
+    const float LoH = dot(l, h);
+    const float roughness = pow(mat.roughness, 2.);
+    const vec3 f0 = mix(vec3(0.04), mat.albedo, mat.metallic);
+    const vec3 F = F_Schlick(f0, dot(v, h));
+    const vec3 diff = evalDisneyDiffuse(mat, NoL, NoV, LoH, roughness) * (1. - F) * (1. - mat.metallic);
+    const vec3 spec = evalDisneySpecular(mat, F, NoH, NoV, NoL);
+    return diff + spec;
+}
 
-
-
-
+// Uniform direction inside the cone of half-angle acos(cos_r) around `dir`; pdf = 1 / solid angle.
+vec3 sampleCone(const vec3 dir, const float cos_r, const float r1, const float r2) {
+    const float cos_t = 1.0 - r1 * (1.0 - cos_r);
+    const float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+    const float phi = 2.0 * PI * r2;
+    vec3 t, b;
+    basis(dir, t, b);
+    return normalize(t * (sin_t * cos(phi)) + b * (sin_t * sin(phi)) + dir * cos_t);
+}
 
 #endif // H_DISNEY
 
