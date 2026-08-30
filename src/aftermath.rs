@@ -96,7 +96,11 @@ mod imp {
         let dir = dump_dir();
         let _ = fs::create_dir_all(&dir); // lazily, at the first dump
         let path = dir.join(name);
-        match fs::write(&path, bytes) {
+        // fsync: the box usually gets hard-reset within seconds of a GPU loss, and a dump
+        // sitting in the page cache is lost with it (seen: 1400 bytes written, 0 on disk).
+        let written = fs::File::create(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, bytes).and_then(|_| f.sync_all()));
+        match written {
             Ok(()) => Some(path),
             Err(e) => {
                 // eprintln, not log: this runs on a driver thread mid-crash.

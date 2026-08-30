@@ -10,8 +10,9 @@ edition = "2024"
 
 [features]
 default = []
-# Developer diagnostics: Nsight Aftermath GPU crash dumps (src/aftermath.rs), linked from
-# `$AFTERMATH_SDK` (default `~/nvidia/aftermath`) when that lib exists at build time.
+# Developer diagnostics: Vulkan validation + synchronization validation in every build, and
+# Nsight Aftermath GPU crash dumps (src/aftermath.rs), linked from `$AFTERMATH_SDK` (default
+# `~/nvidia/aftermath`) when that lib exists at build time.
 dev = []
 
 # Enable a small amount of optimization in debug mode

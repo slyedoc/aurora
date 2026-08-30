@@ -381,10 +381,15 @@ unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) ->
         let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
         let mut layer_names: Vec<&CStr> = Vec::new();
 
-        #[cfg(debug_assertions)]
-        layer_names.push(CStr::from_bytes_with_nul_unchecked(
-            b"VK_LAYER_KHRONOS_validation\0",
-        ));
+        // Validation: on in debug builds and whenever the `dev` feature is on (which also
+        // turns on synchronization validation -- the hazard checker for buffer / image access
+        // races between submissions).
+        let validate = cfg!(debug_assertions) || cfg!(feature = "dev");
+        if validate {
+            layer_names.push(CStr::from_bytes_with_nul_unchecked(
+                b"VK_LAYER_KHRONOS_validation\0",
+            ));
+        }
 
         println!("Validation layers:");
         for layer_name in layer_names.iter() {
@@ -422,10 +427,21 @@ unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) ->
             .engine_version(0)
             .api_version(vk::make_api_version(0, 1, 3, 0));
 
-        let instance_info = vk::InstanceCreateInfo::default()
+        let sync_validation = cfg!(feature = "dev");
+        if sync_validation {
+            instance_extensions.push(ash::ext::validation_features::NAME.as_ptr());
+        }
+        let enabled = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+        let mut validation_features =
+            vk::ValidationFeaturesEXT::default().enabled_validation_features(&enabled);
+
+        let mut instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_layer_names(&layers_names_raw)
             .enabled_extension_names(&instance_extensions);
+        if sync_validation {
+            instance_info = instance_info.push_next(&mut validation_features);
+        }
 
         entry.create_instance(&instance_info, None).unwrap()
     }
