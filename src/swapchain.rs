@@ -162,10 +162,17 @@ impl Swapchain {
                 )
                 .unwrap();
 
+            // `AURORA_PRESENT_MODE` = mailbox (default) | fifo | immediate; FIFO is always
+            // available and is the fallback.
+            let wanted = match std::env::var("AURORA_PRESENT_MODE").as_deref() {
+                Ok("fifo") => vk::PresentModeKHR::FIFO,
+                Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+                _ => vk::PresentModeKHR::MAILBOX,
+            };
             let present_mode = present_modes
                 .iter()
                 .cloned()
-                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+                .find(|&mode| mode == wanted)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
 
             log::info!("Present mode: {:?}", present_mode);
