@@ -264,9 +264,14 @@ impl DlssRenderer {
         })
     }
 
+    /// Drains the whole device under the queue lock. NGX's feature lifecycle wants
+    /// `vkDeviceWaitIdle` (not just our queue idle: the feature may own work on queues we
+    /// never see) before `ReleaseFeature` and before `CreateFeature1`, which records GPU
+    /// work and reconfigures the feature's allocations. Running either alongside an in-flight
+    /// trace is a hard GPU hang -- Xid 79, the card falls off the bus.
     fn wait_idle(rd: &RenderDevice) {
-        let queue = rd.queue.lock().unwrap();
-        let _ = unsafe { rd.device.queue_wait_idle(*queue) };
+        let _queue = rd.queue.lock().unwrap();
+        let _ = unsafe { rd.device.device_wait_idle() };
     }
 
     fn rebuild(
@@ -277,7 +282,21 @@ impl DlssRenderer {
         output: vk::Extent2D,
         quality: i32,
     ) -> Option<()> {
+        // DRAIN FIRST, ALWAYS -- including the very first creation, where `release_view` has
+        // nothing to release. `prepare` runs before the frame's fence wait, so on a runtime
+        // mode switch or a resize the previous frame (a full trace + TLAS build) is still
+        // executing when NGX would otherwise record and submit its feature creation alongside
+        // it. This only moves on a mode change or a resize, so the cost is nil.
+        log::info!(
+            "dlss: rebuild -> {mode} {}x{} -> {}x{}: draining the device",
+            render.width,
+            render.height,
+            output.width,
+            output.height
+        );
+        Self::wait_idle(rd);
         self.release_view(rd);
+        log::info!("dlss: rebuild: creating images + feature");
         let one = vk::Extent2D {
             width: 1,
             height: 1,
@@ -365,8 +384,13 @@ impl DlssRenderer {
         let Some(view) = self.view.take() else {
             return;
         };
+        log::info!(
+            "dlss: releasing the {} feature (draining the device)",
+            view.mode
+        );
         Self::wait_idle(rd);
         unsafe { NVSDK_NGX_VULKAN_ReleaseFeature(view.handle) };
+        log::info!("dlss: feature released");
         for image in view
             .guides()
             .into_iter()

@@ -86,6 +86,11 @@ impl Swapchain {
     }
 
     pub unsafe fn on_resize(&mut self, window: &RenderWindow) {
+        log::info!(
+            "swapchain: recreating for {}x{} (draining the queue first)",
+            window.width,
+            window.height
+        );
         unsafe {
             {
                 let queue = self.device.queue.lock().unwrap();
@@ -222,8 +227,8 @@ impl Swapchain {
                 })
                 .collect();
 
-            log::debug!(
-                "Swapchain created: {}x{} {:?}",
+            log::info!(
+                "swapchain: created {}x{} {:?}",
                 surface_resolution.width,
                 surface_resolution.height,
                 surface_format.format
