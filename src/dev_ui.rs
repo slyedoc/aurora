@@ -25,7 +25,10 @@ use bevy::{
     ui::Display,
 };
 
-use crate::{dlss::AuroraDlss, ray_render_plugin::RenderConfig, ui_render::UiRenderPlugin};
+use crate::{
+    dlss::AuroraDlss, ray_render_plugin::RenderConfig, sky::ProceduralSky,
+    ui_render::UiRenderPlugin,
+};
 
 /// Renderer tunables edited from the dev panel; the frame reads them directly.
 #[derive(Resource, Reflect, Clone, Debug)]
@@ -101,6 +104,10 @@ struct DevUIStats;
 /// The node the resource inspector is built under.
 #[derive(Component, Default, Clone)]
 struct DevUIInspectorHost;
+
+/// The node the [`ProceduralSky`] inspector is built under.
+#[derive(Component, Default, Clone)]
+struct DevUISkyHost;
 
 pub struct DevUIPlugin;
 
@@ -181,6 +188,14 @@ fn spawn_panel(world: &mut World) {
                     }
                     DevUIInspectorHost
                 ),
+                caption("sky (procedural)"),
+                (
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        align_self: AlignSelf::Stretch,
+                    }
+                    DevUISkyHost
+                ),
             ]
         })
         .expect("dev panel spawns")
@@ -193,6 +208,12 @@ fn spawn_panel(world: &mut World) {
         .find(|_| true)
         .unwrap_or(panel);
     build_resource_inspector(world, TypeId::of::<DevUIState>(), host);
+    let sky_host = world
+        .query_filtered::<Entity, With<DevUISkyHost>>()
+        .iter(world)
+        .find(|_| true)
+        .unwrap_or(panel);
+    build_resource_inspector(world, TypeId::of::<ProceduralSky>(), sky_host);
 }
 
 fn toggle_panel(

@@ -9,6 +9,7 @@ use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
 
+use crate::sky::{ProceduralSky, Sky};
 use crate::{
     bluenoise_plugin::BlueNoiseBuffer,
     post_process_filter::PostProcessFilter,
@@ -26,8 +27,6 @@ use crate::{
 pub struct RenderConfig {
     pub rtx_pipeline: Handle<RaytracingPipeline>,
     pub postprocess_pipeline: Handle<PostProcessFilter>,
-    pub skydome: Option<Handle<bevy::prelude::Image>>,
-    pub sky_color: Vec4,
     pub accumulate: bool,
     pub pull_focus: Option<(u32, u32)>,
 }
@@ -37,8 +36,6 @@ impl Default for RenderConfig {
         Self {
             rtx_pipeline: Default::default(),
             postprocess_pipeline: Default::default(),
-            skydome: Default::default(),
-            sky_color: Vec4::splat(1.0),
             // `AURORA_ACCUMULATE=1` starts with accumulation on (Space toggles it) -- a
             // converged reference for headless comparisons.
             accumulate: std::env::var_os("AURORA_ACCUMULATE").is_some(),
@@ -80,6 +77,14 @@ pub struct UniformData {
     max_bounces: u32,
     /// Post-process vignette strength (0 = off).
     vignette: f32,
+    /// Sky source: 0 flat colour, 1 equirect HDR (`sky_color` = scale), 2 procedural.
+    sky_mode: u32,
+    sun_cos_radius: f32,
+    sun_direction: [f32; 3],
+    sun_radiance: [f32; 3],
+    sky_zenith: [f32; 3],
+    sky_horizon: [f32; 3],
+    sky_ground: [f32; 3],
 }
 
 #[repr(C)]
@@ -140,6 +145,7 @@ impl Plugin for RayRenderPlugin {
             )
                 .chain(),
         );
+        app.add_plugins(crate::sky::SkyPlugin);
         app.add_systems(Update, (handle_input, set_focus_pulling));
         app.add_systems(
             Last,
@@ -303,6 +309,8 @@ fn render_frame(
     dev_ui_stuff: (
         Option<Res<crate::dev_ui::DevUIState>>,
         crate::ui_render::UiDrawParams,
+        Res<Sky>,
+        Res<ProceduralSky>,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -338,7 +346,7 @@ fn render_frame(
     let (mut transforms, modules, sbt) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
-    let (dev_ui_state, mut ui) = dev_ui_stuff;
+    let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
 
     *tick += 1;
@@ -422,7 +430,11 @@ fn render_frame(
     {
         let dlss_on = plan.is_some() && rtx_ready;
         let data = UniformData {
-            sky_color: render_config.sky_color,
+            sky_color: match &*sky {
+                Sky::Color { radiance } => radiance.extend(0.0),
+                Sky::Hdr { scale, .. } => Vec4::splat(*scale),
+                Sky::Procedural => Vec4::ONE,
+            },
             inverse_view,
             inverse_projection,
             tick: *tick,
@@ -448,8 +460,7 @@ fn render_frame(
             dlss: dlss_on as u32,
             frame: *frame_counter,
             radiance_clamp: {
-                let sky = render_config.sky_color * dev_ui_state.sky_brightness;
-                let sky_luma = 0.2126 * sky.x + 0.7152 * sky.y + 0.0722 * sky.z;
+                let sky_luma = sky.reference_luminance(&procedural) * dev_ui_state.sky_brightness;
                 dev_ui_state.firefly_clamp * sky_luma.max(1e-3)
             },
             samples: if dlss_on {
@@ -465,6 +476,17 @@ fn render_frame(
             }
             .max(1),
             vignette: dev_ui_state.vignette,
+            sky_mode: match &*sky {
+                Sky::Color { .. } => 0,
+                Sky::Hdr { .. } => 1,
+                Sky::Procedural => 2,
+            },
+            sun_cos_radius: procedural.sun_cos_radius(),
+            sun_direction: procedural.sun_direction().to_array(),
+            sun_radiance: Vec3::splat(procedural.sun_radiance).to_array(),
+            sky_zenith: procedural.zenith.to_array(),
+            sky_horizon: procedural.horizon.to_array(),
+            sky_ground: procedural.ground.to_array(),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
@@ -597,11 +619,13 @@ fn render_frame(
                     material_buffer: tlas.material_address(),
                     bluenoise_buffer2: bluenoise_buffer.0.address,
                     focus_buffer: frame.focus_data.address,
-                    sky_texture: match &render_config.skydome {
-                        None => WHITE_TEXTURE_IDX,
-                        Some(skydome) => textures.get(skydome).map_or(WHITE_TEXTURE_IDX, |t| {
-                            render_device.register_bindless_texture(&t)
-                        }),
+                    sky_texture: match &*sky {
+                        Sky::Hdr { image, .. } => {
+                            textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
+                                render_device.register_bindless_texture(&t)
+                            })
+                        }
+                        _ => WHITE_TEXTURE_IDX,
                     },
                     padding: [0; 1],
                     prev_instances: tlas.prev_instances_address(),

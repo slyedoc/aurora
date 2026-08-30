@@ -58,6 +58,14 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint max_bounces;
   // Post-process vignette strength (0 = off).
   float vignette;
+  // Sky source: 0 flat colour (skycolor), 1 equirect HDR (skycolor = scale), 2 procedural.
+  uint sky_mode;
+  float sun_cos_radius;
+  vec3 sun_direction;
+  vec3 sun_radiance;
+  vec3 sky_zenith;
+  vec3 sky_horizon;
+  vec3 sky_ground;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are

@@ -22,6 +22,7 @@ pub mod render_env;
 pub mod render_texture;
 pub mod sbt;
 pub mod shader;
+pub mod sky;
 pub mod sphere;
 pub mod swapchain;
 pub mod tlas_builder;

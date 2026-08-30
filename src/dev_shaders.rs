@@ -28,7 +28,6 @@ impl Plugin for DevShaderPlugin {
         let render_config = RenderConfig {
             rtx_pipeline: asset_server.add(rtx_pipeline),
             postprocess_pipeline: asset_server.add(filter),
-            skydome: Some(asset_server.load(aurora_asset("textures/sky.hdr"))),
             ..default()
         };
 
