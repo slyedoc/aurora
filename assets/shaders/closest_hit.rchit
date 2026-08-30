@@ -113,6 +113,8 @@ void main() {
   const vec3 world_normal = normalize(mat3(gl_ObjectToWorldEXT) * TBN * texture_normal);
 
   payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);
+  payload.slot = gl_InstanceID;
+  payload.prim_tri = triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID;
   {
     // Object-space hit point through last frame's instance transform.
     const vec4 p = vec4(gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT, 1.0);

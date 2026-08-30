@@ -66,6 +66,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   vec3 sky_zenith;
   vec3 sky_horizon;
   vec3 sky_ground;
+  // Entries in the emissive-triangle light table (0 = no light NEE / MIS).
+  uint light_entries;
 };
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
@@ -92,6 +94,47 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer In
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer GeometryData {
   uint index_offsets[];
+};
+
+// ---- Emissive-triangle light table (src/lights.rs, lights.slang) --------------------------
+
+// One emissive instance: its BLAS streams, its TLAS slot (world transform), and the range
+// of entries its triangles occupy in the global table. 64 bytes.
+struct LightInstance {
+  VertexData vertices;
+  IndexData indices;
+  GeometryData geom_to_index;
+  GeometryData geom_to_triangle;
+  uint geom_count;
+  uint slot;
+  uint entry_base;
+  uint tri_count;
+  vec3 emission;
+  float pad;
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightCdf {
+  float data[];
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightInstances {
+  LightInstance data[];
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer SlotToLight {
+  uint data[];
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightsHeader {
+  uint entry_count;
+  uint linst_count;
+  // Written by the light_scan kernel; 0 = table not ready, sampling is skipped.
+  float total_power;
+  uint slot_map_count;
+  LightCdf cdf;
+  LightInstances linsts;
+  SlotToLight slot_to_linst;
+  uvec2 pad2;
 };
 
 struct Material {
@@ -136,6 +179,10 @@ struct HitPayload {
   // pure-specular paths); 0 after a BRDF-sampled bounce, where the sun is gathered by
   // next-event estimation instead.
   uint want_sun;
+  // Hit identity for the light-table MIS lookup: TLAS slot (gl_InstanceID; ~0 for
+  // spheres) and the global triangle index within the BLAS.
+  uint slot;
+  uint prim_tri;
 };
 
 struct PushConstants {
@@ -146,6 +193,10 @@ struct PushConstants {
   uint skydome;
   uint pad0;
   PrevInstances prev_instances;
+  // Emissive-triangle light table (valid whenever uniforms.light_entries > 0).
+  LightsHeader lights;
+  // This frame's instance rows (same layout as prev_instances), for light transforms.
+  PrevInstances cur_instances;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

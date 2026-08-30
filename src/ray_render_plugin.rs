@@ -85,6 +85,8 @@ pub struct UniformData {
     sky_zenith: [f32; 3],
     sky_horizon: [f32; 3],
     sky_ground: [f32; 3],
+    /// Entries in the emissive-triangle light table (0 = no light NEE / MIS).
+    light_entries: u32,
 }
 
 #[repr(C)]
@@ -323,6 +325,7 @@ fn render_frame(
         ResMut<crate::gpu_transform::GpuTransforms>,
         Res<crate::compute::ComputeModules>,
         Res<SBT>,
+        ResMut<crate::lights::LightManager>,
     ),
     camera: Query<
         (
@@ -343,7 +346,7 @@ fn render_frame(
     let Some(mut swapchain) = swapchain else {
         return;
     };
-    let (mut transforms, modules, sbt) = gpu;
+    let (mut transforms, modules, sbt, mut lights) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
     let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
@@ -487,6 +490,11 @@ fn render_frame(
             sky_zenith: procedural.zenith_radiance().to_array(),
             sky_horizon: procedural.horizon_radiance().to_array(),
             sky_ground: procedural.ground_radiance().to_array(),
+            light_entries: if dev_ui_state.light_nee {
+                lights.active_entries
+            } else {
+                0
+            },
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
@@ -528,6 +536,9 @@ fn render_frame(
             &transforms,
             world_changed,
         );
+        // The light table's weight/CDF kernels, whenever the light set changed (they read
+        // the instance rows the gather above wrote).
+        lights.record(&render_device, cmd_buffer, &modules, &tlas);
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
@@ -629,6 +640,8 @@ fn render_frame(
                     },
                     padding: [0; 1],
                     prev_instances: tlas.prev_instances_address(),
+                    lights: lights.header_address(),
+                    instances: tlas.instances_address(),
                 };
 
                 render_device.cmd_push_constants(

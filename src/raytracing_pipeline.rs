@@ -58,6 +58,10 @@ pub struct RaytracingPushConstants {
     pub padding: [u32; 1],
     /// Last frame's instance transforms (`tlas_builder`), for motion vectors.
     pub prev_instances: u64,
+    /// The emissive-triangle light table header (`lights`; 0 until built).
+    pub lights: u64,
+    /// This frame's instance rows, for light-sample transforms.
+    pub instances: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {

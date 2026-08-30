@@ -69,6 +69,9 @@ pub struct DevUIState {
     /// Post-process vignette strength (0 = off); aspect-corrected, darkens towards the corners.
     #[reflect(@0.0..=1.0_f32)]
     pub vignette: f32,
+    /// Next-event estimation for emissive triangles (off = BRDF sampling only, the
+    /// reference estimator).
+    pub light_nee: bool,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
 }
@@ -88,6 +91,7 @@ impl Default for DevUIState {
             dlss_samples: 1,
             dlss_max_bounces: 8,
             vignette: 0.0,
+            light_nee: true,
             dlss: AuroraDlss::from_env(),
         }
     }

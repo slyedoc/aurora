@@ -323,6 +323,12 @@ impl TLAS {
         self.prev_instances_buf.address
     }
 
+    /// Device address of this frame's instance array (the TLAS build input; the light
+    /// kernels and the raygen's light sampling read world transforms from its rows).
+    pub fn instances_address(&self) -> u64 {
+        self.instances_buf.address
+    }
+
     /// Number of SBT hit-group records the instances may reference.
     pub fn hit_offset_count(&self) -> u32 {
         self.next_hit_offset

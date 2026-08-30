@@ -93,6 +93,39 @@ vec2 bnoiseBest(const uint sampleIdx) {
   return TwoBnoiseSamples(byteIndex);
 }
 
+// The world-space corners of triangle `tri` of light instance `li`, through the live
+// TLAS instance row (3x4 row-major, as in prev_instances).
+void lightTriangleWorld(LightInstance li, const uint tri, out vec3 w0, out vec3 w1, out vec3 w2) {
+  uint g = 0u;
+  for (uint k = 1u; k < li.geom_count; k++) {
+    if (li.geom_to_triangle.index_offsets[k] <= tri) { g = k; } else { break; }
+  }
+  const uint idx = li.geom_to_index.index_offsets[g] + (tri - li.geom_to_triangle.index_offsets[g]) * 3u;
+  const vec3 p0 = li.vertices.data[li.indices.data[idx + 0u]].position;
+  const vec3 p1 = li.vertices.data[li.indices.data[idx + 1u]].position;
+  const vec3 p2 = li.vertices.data[li.indices.data[idx + 2u]].position;
+  const uint base = li.slot * 4u;
+  const vec4 r0 = pc.cur_instances.data[base + 0u];
+  const vec4 r1 = pc.cur_instances.data[base + 1u];
+  const vec4 r2 = pc.cur_instances.data[base + 2u];
+  w0 = vec3(dot(r0, vec4(p0, 1.0)), dot(r1, vec4(p0, 1.0)), dot(r2, vec4(p0, 1.0)));
+  w1 = vec3(dot(r0, vec4(p1, 1.0)), dot(r1, vec4(p1, 1.0)), dot(r2, vec4(p1, 1.0)));
+  w2 = vec3(dot(r0, vec4(p2, 1.0)), dot(r1, vec4(p2, 1.0)), dot(r2, vec4(p2, 1.0)));
+}
+
+// Solid-angle pdf of the light table picking direction onto triangle `tri` of `li` at
+// distance `t` along `dir` (for MIS against BRDF sampling). 0 when degenerate.
+float lightTrianglePdf(LightInstance li, const uint tri, const float p_pick, const float t, const vec3 dir) {
+  vec3 w0, w1, w2;
+  lightTriangleWorld(li, tri, w0, w1, w2);
+  const vec3 lng = cross(w1 - w0, w2 - w0);
+  const float area2 = length(lng);
+  if (area2 <= 0.0) { return 0.0; }
+  const float cos_l = abs(dot(lng / area2, dir));
+  if (cos_l <= 1.0e-4) { return 0.0; }
+  return p_pick * t * t / (cos_l * 0.5 * area2);
+}
+
 void main() {
   // Under DLSS every frame needs fresh noise for the temporal denoiser; `tick` is the
   // accumulation counter and sits at 0 while accumulation is off.
@@ -155,6 +188,9 @@ void main() {
     // The camera ray and pure-specular continuations may see the sun disc directly; after a
     // BRDF-sampled bounce the sun comes from next-event estimation only.
     bool want_sun = true;
+    // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
+    // camera ray and delta continuations): the MIS partner of light-table sampling.
+    float prev_pdf = 0.0;
 
     for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
       payload.want_sun = want_sun ? 1u : 0u;
@@ -215,12 +251,34 @@ void main() {
         origin = origin + direction * fogDistance;
         mask *= calcFogTransmittance(fogDistance);
         direction = sampleFogScatterDirection(direction);
+        prev_pdf = 0.0;
         continue;
       }
 
       // hit an emitter
       if (payload.emission != vec3(0.0) || payload.t == 0.0) {
         vec3 contribution = mask * payload.emission;
+        // MIS: a BRDF-sampled ray landing on a table light shares credit with the
+        // next-event estimate taken at the previous vertex (prev_pdf 0 = camera ray or
+        // delta continuation, which take the emission at full weight).
+        if (payload.t != 0.0 && prev_pdf > 0.0 && pc.uniforms.light_entries > 0u
+            && payload.slot < pc.lights.slot_map_count && pc.lights.total_power > 0.0) {
+          const uint linst_idx = pc.lights.slot_to_linst.data[payload.slot];
+          if (linst_idx != 0xFFFFFFFFu) {
+            LightInstance li = pc.lights.linsts.data[linst_idx];
+            if (payload.prim_tri < li.tri_count) {
+              const uint e = li.entry_base + payload.prim_tri;
+              const float p_pick = (pc.lights.cdf.data[e] - (e > 0u ? pc.lights.cdf.data[e - 1u] : 0.0))
+                                   / pc.lights.total_power;
+              if (p_pick > 0.0) {
+                const float pdf_light = lightTrianglePdf(li, payload.prim_tri, p_pick, payload.t, direction);
+                if (pdf_light > 0.0) {
+                  contribution *= prev_pdf / (prev_pdf + pdf_light);
+                }
+              }
+            }
+          }
+        }
         // Firefly suppression: an indirect path that reaches an emitter far brighter than the
         // sky would take hundreds of frames to average out; clamp its luminance instead.
         if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
@@ -273,6 +331,7 @@ void main() {
         if (inside) {
           mask *= exp(-payload.t * payload.absorption);
         }
+        prev_pdf = 0.0;
         continue;
       }
 
@@ -290,6 +349,63 @@ void main() {
       const DisneyMaterial disney_mat = DisneyMaterial(
         payload.color.rgb, metallic, roughness
       );
+
+      // Next-event estimation for emissive triangles: one triangle from the power CDF,
+      // one shadow ray, weighted against BRDF sampling (MIS balance heuristic). Positions
+      // and areas are read live, so the estimate stays unbiased even with stale weights.
+      if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
+        const float total = pc.lights.total_power;
+        const uint n = pc.lights.entry_count;
+        const float x = randf() * total;
+        uint lo = 0u, hi = n - 1u;
+        while (lo < hi) {
+          const uint mid = (lo + hi) / 2u;
+          if (pc.lights.cdf.data[mid] < x) { lo = mid + 1u; } else { hi = mid; }
+        }
+        const uint e = lo;
+        const float p_pick = (pc.lights.cdf.data[e] - (e > 0u ? pc.lights.cdf.data[e - 1u] : 0.0)) / total;
+        if (p_pick > 0.0) {
+          // The light instance owning the entry: greatest entry_base <= e.
+          uint llo = 0u, lhi = pc.lights.linst_count - 1u;
+          while (llo < lhi) {
+            const uint mid = (llo + lhi + 1u) / 2u;
+            if (pc.lights.linsts.data[mid].entry_base <= e) { llo = mid; } else { lhi = mid - 1u; }
+          }
+          LightInstance li = pc.lights.linsts.data[llo];
+          vec3 lw0, lw1, lw2;
+          lightTriangleWorld(li, e - li.entry_base, lw0, lw1, lw2);
+          const float su = sqrt(randf());
+          const float sv = randf();
+          const vec3 point = lw0 * (1.0 - su) + lw1 * (su * (1.0 - sv)) + lw2 * (su * sv);
+          const vec3 to_light = point - origin;
+          const float dist = length(to_light);
+          const vec3 lng = cross(lw1 - lw0, lw2 - lw0);
+          const float area2 = length(lng);
+          if (dist > 1.0e-4 && area2 > 0.0) {
+            const vec3 l = to_light / dist;
+            const float cos_l = abs(dot(lng / area2, l));
+            const float NoL = dot(world_normal, l);
+            if (cos_l > 1.0e-4 && NoL > 0.0 && dot(l, surface_normal) > 0.0) {
+              const vec3 f = evalDisneyBRDF(-direction, world_normal, l, disney_mat);
+              if (any(greaterThan(f, vec3(0.0)))) {
+                const float pdf_light = p_pick * dist * dist / (cos_l * 0.5 * area2);
+                const float w = pdf_light / (pdf_light + pdfDisneyBRDF(-direction, world_normal, l, disney_mat));
+                payload.t = -1.0;
+                traceRayEXT(topLevelAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                            0xFF, 0, 0, 0, origin, tmin, l, dist - 2.0 * tmin, 0);
+                if (payload.t == 0.0) {
+                  vec3 contribution = mask * f * NoL * li.emission * (w / pdf_light);
+                  if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
+                    contribution *= min(1.0, pc.uniforms.radiance_clamp / max(luma(contribution), 1.0e-6));
+                  }
+                  acc += contribution;
+                }
+              }
+            }
+          }
+        }
+      }
 
       // Next-event estimation for the procedural sun: one shadow ray towards a uniformly
       // sampled point on the disc. Direct sunlight is the dominant, low-variance term, so it
@@ -341,6 +457,8 @@ void main() {
 
       const vec4 brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
       want_sun = false;
+      // brdf.a is the lobe-weighted solid-angle pdf; ~0 marks a pure specular (delta) bounce.
+      prev_pdf = brdf.a > 0.0001 ? brdf.a : 0.0;
 
       // Prevent going into the surface (leaks light through walls)
       if (dot(direction, surface_normal) < 0) { break; }

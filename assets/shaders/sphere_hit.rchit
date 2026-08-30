@@ -39,6 +39,8 @@ void main() {
 
   payload.refract_index = material.refract_index;
   payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);
+  payload.slot = 0xFFFFFFFFu;
+  payload.prim_tri = 0u;
   payload.prev_world_pos = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
   hitPayloadSetTransmission(payload, transmission);
   hitPayloadSetRoughness(payload, roughness);

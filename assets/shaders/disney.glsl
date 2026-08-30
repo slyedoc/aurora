@@ -249,6 +249,25 @@ vec3 evalDisneyBRDF(const vec3 v, const vec3 n, const vec3 l, const DisneyMateri
     return diff + spec;
 }
 
+// The solid-angle pdf sampleDisneyBRDF draws directions from (lobe-weighted cosine +
+// GGX VNDF), for MIS against light sampling.
+float pdfDisneyBRDF(const vec3 v, const vec3 n, const vec3 l, const DisneyMaterial mat) {
+    const float NoL = dot(n, l);
+    const float NoV = dot(n, v);
+    if (NoL <= 0.0 || NoV <= 0.0) { return 0.0; }
+    const vec3 h = normalize(l + v);
+    const float NoH = min(dot(n, h), 0.99);
+    const float roughness = pow(mat.roughness, 2.);
+    const vec3 f0 = mix(vec3(0.04), mat.albedo, mat.metallic);
+    const vec3 F = F_Schlick(f0, dot(v, h));
+    float diffW = 1. - mat.metallic;
+    float specW = luma(F);
+    const float invW = 1. / (diffW + specW);
+    diffW *= invW;
+    specW *= invW;
+    return diffW * (NoL / PI) + specW * GGXVNDFPdf(NoH, NoV, roughness);
+}
+
 // Uniform direction inside the cone of half-angle acos(cos_r) around `dir`; pdf = 1 / solid angle.
 vec3 sampleCone(const vec3 dir, const float cos_r, const float r1, const float r2) {
     const float cos_t = 1.0 - r1 * (1.0 - cos_r);

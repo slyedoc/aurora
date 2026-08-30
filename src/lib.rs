@@ -11,6 +11,7 @@ pub mod dev_ui;
 pub mod dlss;
 pub mod gltf_mesh;
 pub mod gpu_transform;
+pub mod lights;
 pub mod material;
 pub mod post_process_filter;
 pub mod ray_default_plugins;
