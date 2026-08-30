@@ -162,12 +162,15 @@ impl Swapchain {
                 )
                 .unwrap();
 
-            // `AURORA_PRESENT_MODE` = mailbox (default) | fifo | immediate; FIFO is always
-            // available and is the fallback.
+            // `AURORA_PRESENT_MODE` = fifo (default) | mailbox | immediate. FIFO is the default
+            // because MAILBOX on the NVIDIA Wayland WSI (610.43.02, COSMIC) takes the GPU off
+            // the bus (Xid 79, reboot) the moment the compositor resizes the window while the
+            // renderer is at full load -- four times on 2026-08-30, none with FIFO. Use
+            // mailbox / immediate for uncapped fps measurements only, and don't resize.
             let wanted = match std::env::var("AURORA_PRESENT_MODE").as_deref() {
-                Ok("fifo") => vk::PresentModeKHR::FIFO,
+                Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
                 Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
-                _ => vk::PresentModeKHR::MAILBOX,
+                _ => vk::PresentModeKHR::FIFO,
             };
             let present_mode = present_modes
                 .iter()
