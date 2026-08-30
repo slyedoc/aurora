@@ -4,6 +4,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
@@ -23,7 +24,7 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
     mut render_config: ResMut<RenderConfig>,
 ) {
     //render_config.skydome = None;
@@ -39,7 +40,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(0.0, 1.5, -0.3)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.0, 0.0),
             emissive: LinearRgba::new(10.0, 7.0, 5.0, 1.0),
             ..default()
@@ -49,7 +50,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(2.0, 1.5, -0.3)),
         Mesh3d(meshes.add(Cuboid::new(0.8, 0.3, 2.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 1.0, 1.0),
             perceptual_roughness: 0.0,
             ior: 1.08,
@@ -61,7 +62,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(0.0, 6.1, 5.5)).with_scale(Vec3::splat(2.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 1.0, 1.0),
             perceptual_roughness: 0.0,
             ior: 1.22,

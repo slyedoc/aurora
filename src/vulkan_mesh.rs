@@ -132,7 +132,5 @@ impl Plugin for VulkanMeshPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<Mesh>();
         app.init_vulkan_asset::<Mesh>();
-        app.init_asset::<StandardMaterial>();
-        app.init_vulkan_asset::<StandardMaterial>();
     }
 }

@@ -5,6 +5,7 @@ use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
@@ -25,7 +26,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     mut windows: Query<&mut Window>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_config: ResMut<RenderConfig>,
 ) {
@@ -50,7 +51,7 @@ fn setup(
     // plane
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(100.0, 100.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.1, 0.2, 0.1),
             perceptual_roughness: 1.0,
             ..default()
@@ -60,7 +61,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(0.0, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.8, 0.8),
             ..default()
         })),
@@ -69,7 +70,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(3.8, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 1.0, 1.0),
             perceptual_roughness: 0.00,
             ior: 1.05,
@@ -81,7 +82,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(-3.8, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.2, 0.2),
             perceptual_roughness: 0.001,
             metallic: 0.5,
@@ -107,7 +108,7 @@ fn setup(
             }
 
             let choose_mat: f32 = rng.r#gen();
-            let mut material = StandardMaterial::default();
+            let mut material = AuroraMaterial::default();
 
             if choose_mat < 0.7 {
                 // lambertian
@@ -132,7 +133,7 @@ fn setup(
                 Transform::from_translation(Vec3::new(xf, scale / 2.0, yf))
                     .with_scale(Vec3::splat(scale))
                     .with_rotation(Quat::from_rotation_y(rng.r#gen::<f32>() * 2.0 * PI)),
-                MeshMaterial3d(materials.add(material)),
+                AuroraMaterial3d(materials.add(material)),
             ));
 
             let choose_shape: f32 = rng.r#gen();

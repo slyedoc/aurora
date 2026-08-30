@@ -8,6 +8,7 @@ use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
@@ -30,7 +31,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     mut windows: Query<&mut Window>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut render_config: ResMut<RenderConfig>,
 ) {
@@ -48,7 +49,7 @@ fn setup(
 
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(40.0, 40.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.3, 0.3, 0.3),
             perceptual_roughness: 1.0,
             ..default()
@@ -58,7 +59,7 @@ fn setup(
     // Always visible reference.
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.2, 0.4, 0.9),
             ..default()
         })),
@@ -70,7 +71,7 @@ fn setup(
         .spawn((
             Blinker,
             Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-            MeshMaterial3d(materials.add(StandardMaterial {
+            AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: Color::srgb(0.9, 0.8, 0.2),
                 ..default()
             })),
@@ -78,7 +79,7 @@ fn setup(
         ))
         .with_child((
             Mesh3d(meshes.add(Cuboid::new(0.5, 0.5, 0.5))),
-            MeshMaterial3d(materials.add(StandardMaterial {
+            AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: Color::srgb(0.2, 0.9, 0.4),
                 ..default()
             })),
@@ -88,7 +89,7 @@ fn setup(
         Blinker,
         Sphere,
         Visibility::default(),
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.1, 0.1),
             emissive: LinearRgba::new(4.0, 0.5, 0.5, 1.0),
             ..default()

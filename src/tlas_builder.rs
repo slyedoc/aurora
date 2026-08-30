@@ -29,6 +29,7 @@ use crate::{
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
     gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::{GpuNode, GpuTransforms, ensure_staging, upload_slice},
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -137,7 +138,7 @@ enum Geometry {
 #[derive(Clone, Debug, PartialEq)]
 struct InstanceSource {
     geometry: Geometry,
-    material: Option<AssetId<StandardMaterial>>,
+    material: Option<AssetId<AuroraMaterial>>,
     node: u32,
     mask: u8,
 }
@@ -601,7 +602,7 @@ type ChangedInstances = Or<(
     Changed<GpuNode>,
     Changed<Mesh3d>,
     Changed<GltfModelHandle>,
-    Changed<MeshMaterial3d<StandardMaterial>>,
+    Changed<AuroraMaterial3d>,
     Changed<InheritedVisibility>,
 )>;
 
@@ -616,7 +617,7 @@ fn extract_instances(
             Option<&Mesh3d>,
             Option<&GltfModelHandle>,
             Has<Sphere>,
-            Option<&MeshMaterial3d<StandardMaterial>>,
+            Option<&AuroraMaterial3d>,
             Option<&InheritedVisibility>,
         ),
         ChangedInstances,
@@ -640,7 +641,7 @@ fn extract_instances(
             instance.0,
             Some(InstanceSource {
                 geometry,
-                material: material.map(|m| m.id()),
+                material: material.map(|m| m.0.id()),
                 node: node.0,
                 mask: if visibility.is_none_or(|v| v.get()) {
                     0xFF
@@ -659,7 +660,7 @@ pub fn prepare_instances(
     mut tlas: ResMut<TLAS>,
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
-    materials: Res<VulkanAssets<StandardMaterial>>,
+    materials: Res<VulkanAssets<AuroraMaterial>>,
     textures: Res<VulkanAssets<Image>>,
     sphere_blas: Res<SphereBLAS>,
 ) {
@@ -785,7 +786,7 @@ impl Plugin for TLASBuilderPlugin {
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<Mesh>)
                     .after(poll_for_asset::<GltfModel>)
-                    .after(poll_for_asset::<StandardMaterial>)
+                    .after(poll_for_asset::<AuroraMaterial>)
                     .after(poll_for_asset::<Image>),
             ),
         );

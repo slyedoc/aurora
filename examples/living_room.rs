@@ -4,6 +4,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
@@ -22,7 +23,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
     mut render_config: ResMut<RenderConfig>,
 ) {
     //render_config.skydome = None;
@@ -44,7 +45,7 @@ fn setup(
     commands.spawn((
         Transform::from_translation(Vec3::new(0.0, 1.5, 0.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.0, 0.0),
             emissive: LinearRgba::new(10.0, 7.0, 5.0, 1.0),
             ..default()

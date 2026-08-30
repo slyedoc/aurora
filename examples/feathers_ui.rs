@@ -17,6 +17,7 @@ use bevy_aurora::{
     debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
+    material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     ray_render_plugin::RenderConfig,
     sphere::Sphere,
@@ -47,7 +48,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     mut windows: Query<&mut Window>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
     mut render_config: ResMut<RenderConfig>,
 ) {
     let mut window = windows.single_mut().unwrap();
@@ -76,7 +77,7 @@ fn setup(
         commands.spawn((
             Transform::from_xyz(i as f32 * 2.5 - 2.5, 1.0, 0.0),
             Sphere,
-            MeshMaterial3d(materials.add(StandardMaterial {
+            AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: color,
                 perceptual_roughness: 0.3,
                 ..default()
@@ -88,7 +89,7 @@ fn setup(
     commands.spawn((
         Transform::from_xyz(0.0, 6.0, -2.0).with_scale(Vec3::splat(2.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::WHITE,
             emissive: LinearRgba::new(10.0, 9.0, 8.0, 1.0),
             ..default()

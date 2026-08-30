@@ -2,7 +2,6 @@ use ash::vk;
 use bevy::{
     asset::Asset,
     math::{Vec2, Vec3},
-    pbr::StandardMaterial,
     reflect::TypePath,
 };
 use bytemuck::{Pod, Zeroable};
@@ -15,7 +14,6 @@ use crate::{
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
     render_texture::RenderTexture,
     vk_utils,
-    vulkan_asset::VulkanAsset,
 };
 
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
@@ -90,33 +88,7 @@ pub fn absorption_from_attenuation(color: bevy::color::LinearRgba, distance: f32
     [k(color.red), k(color.green), k(color.blue)]
 }
 
-impl RTXMaterial {
-    pub fn from_bevy_standard_material(material: &StandardMaterial) -> Self {
-        RTXMaterial {
-            base_color_factor: {
-                let c = material.base_color.to_srgba();
-                [c.red, c.green, c.blue, c.alpha]
-            },
-            base_emissive_factor: {
-                let c = material.emissive;
-                [c.red, c.green, c.blue, c.alpha]
-            },
-            base_color_texture: WHITE_TEXTURE_IDX,
-            base_emissive_texture: WHITE_TEXTURE_IDX,
-            normal_texture: DEFAULT_NORMAL_TEXTURE_IDX,
-            specular_transmission_texture: WHITE_TEXTURE_IDX,
-            metallic_roughness_texture: WHITE_TEXTURE_IDX,
-            specular_transmission_factor: material.specular_transmission,
-            roughness_factor: material.perceptual_roughness,
-            metallic_factor: material.metallic,
-            refract_index: material.ior,
-            absorption: absorption_from_attenuation(
-                material.attenuation_color.to_linear(),
-                material.attenuation_distance,
-            ),
-        }
-    }
-}
+impl RTXMaterial {}
 
 impl Default for RTXMaterial {
     fn default() -> Self {
@@ -135,94 +107,6 @@ impl Default for RTXMaterial {
             absorption: [0.0; 3],
         }
     }
-}
-
-/// An extracted `StandardMaterial`: the shader-side record plus the images its texture slots come
-/// from. The slots are resolved to bindless indices at TLAS update time, once the images have
-/// uploaded — so textures apply whenever they finish loading, without re-extracting the material.
-#[derive(Clone, Default)]
-pub struct StandardRtxMaterial {
-    pub material: RTXMaterial,
-    pub base_color_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
-    pub emissive_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
-    pub metallic_roughness_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
-    pub normal_map_texture: Option<bevy::asset::AssetId<bevy::image::Image>>,
-}
-
-impl StandardRtxMaterial {
-    /// The record with every texture slot filled from `textures` (or its fallback).
-    pub fn resolve(
-        &self,
-        render_device: &RenderDevice,
-        textures: &crate::vulkan_asset::VulkanAssets<bevy::image::Image>,
-    ) -> RTXMaterial {
-        self.resolve_checked(render_device, textures).0
-    }
-
-    /// Like [`resolve`](Self::resolve), plus whether every referenced texture was found (a
-    /// `false` means a fallback stands in and the record is worth resolving again later).
-    pub fn resolve_checked(
-        &self,
-        render_device: &RenderDevice,
-        textures: &crate::vulkan_asset::VulkanAssets<bevy::image::Image>,
-    ) -> (RTXMaterial, bool) {
-        let mut complete = true;
-        let mut slot = |id: Option<bevy::asset::AssetId<bevy::image::Image>>, fallback: u32| {
-            let Some(id) = id else { return fallback };
-            match textures.get_by_id(id) {
-                Some(texture) => render_device.register_bindless_texture(texture),
-                None => {
-                    complete = false;
-                    fallback
-                }
-            }
-        };
-        let material = RTXMaterial {
-            base_color_texture: slot(self.base_color_texture, WHITE_TEXTURE_IDX),
-            base_emissive_texture: slot(self.emissive_texture, WHITE_TEXTURE_IDX),
-            metallic_roughness_texture: slot(self.metallic_roughness_texture, WHITE_TEXTURE_IDX),
-            normal_texture: slot(self.normal_map_texture, DEFAULT_NORMAL_TEXTURE_IDX),
-            ..self.material
-        };
-        (material, complete)
-    }
-}
-
-impl VulkanAsset for StandardMaterial {
-    type ExtractedAsset = StandardRtxMaterial;
-    type ExtractParam = ();
-    type PreparedAsset = StandardRtxMaterial;
-
-    fn extract_asset(
-        &self,
-        _param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
-    ) -> Option<Self::ExtractedAsset> {
-        Some(StandardRtxMaterial {
-            material: RTXMaterial::from_bevy_standard_material(self),
-            base_color_texture: self
-                .base_color_texture
-                .as_ref()
-                .map(bevy::asset::Handle::id),
-            emissive_texture: self.emissive_texture.as_ref().map(bevy::asset::Handle::id),
-            metallic_roughness_texture: self
-                .metallic_roughness_texture
-                .as_ref()
-                .map(bevy::asset::Handle::id),
-            normal_map_texture: self
-                .normal_map_texture
-                .as_ref()
-                .map(bevy::asset::Handle::id),
-        })
-    }
-
-    fn prepare_asset(
-        asset: Self::ExtractedAsset,
-        _render_device: &RenderDevice,
-    ) -> Self::PreparedAsset {
-        asset
-    }
-
-    fn destroy_asset(_render_device: &RenderDevice, _prepared_asset: &Self::PreparedAsset) {}
 }
 
 pub struct BLAS {

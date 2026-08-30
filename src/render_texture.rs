@@ -50,7 +50,7 @@ impl VulkanAsset for bevy::prelude::Image {
         if matches!(bytes_per_pixel, Some(4) | Some(16)) {
             return Some(self.clone());
         }
-        match self.convert(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb) {
+        match self.convert(wgpu_types::TextureFormat::Rgba8UnormSrgb) {
             Some(converted) => Some(converted),
             None => {
                 log::warn!(
