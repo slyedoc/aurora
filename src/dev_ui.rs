@@ -216,17 +216,10 @@ fn update_stats(
     mut stats: Query<&mut Text, With<DevUIStats>>,
     mut fps_avg: Local<f32>,
     mut ticks: Local<u32>,
-    mut since_log: Local<f32>,
 ) {
     let dt = time.delta_secs();
     if dt > 0.0 {
         *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
-    }
-    // Also to the log every 5 s, so headless / scripted runs get the number without the panel.
-    *since_log += dt;
-    if *since_log >= 5.0 {
-        *since_log = 0.0;
-        log::info!("fps: {:.1}", *fps_avg);
     }
     // Mirrors the frame's accumulation counter: counts while accumulating, else 0.
     *ticks = if render_config.accumulate {
