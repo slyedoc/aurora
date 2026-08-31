@@ -67,6 +67,9 @@ pub struct RaytracingPushConstants {
     pub reservoirs_cur: u64,
     /// Radiance-cache entries (`sharc`; 0 until first enabled).
     pub sharc: u64,
+    /// Auto-exposure: per-pixel luminance out, smoothed exposure in (`auto_exposure`).
+    pub lum_buffer: u64,
+    pub auto_exposure: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {
@@ -134,9 +137,8 @@ impl VulkanAsset for RaytracingPipeline {
             sphere_hit_shader,
         ) = asset;
 
-        // 0: accumulation target; 1..=7: the DLSS guide images (normal+roughness, diffuse,
-        // specular, depth, specular hit distance, motion, colour) -- partially bound, only
-        // written when DLSS is on; 100: the TLAS.
+        // 0..=6: the DLSS guide images (normal+roughness, diffuse, specular, depth,
+        // specular hit distance, motion, colour); 100: the TLAS.
         let storage = |binding: u32| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
@@ -152,30 +154,15 @@ impl VulkanAsset for RaytracingPipeline {
             storage(4),
             storage(5),
             storage(6),
-            storage(7),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(100)
                 .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
         ];
-        let binding_flags = [
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-            vk::DescriptorBindingFlags::empty(),
-        ];
-        let mut flags_info =
-            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
 
-        let descriptor_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&bindings)
-            .push_next(&mut flags_info);
+        let descriptor_set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
         let descriptor_set_layout = unsafe {
             render_device

@@ -8,16 +8,15 @@
 #include "common.glsl"
 #include "disney.glsl"
 
-layout(set=0, binding=0, rgba32f) uniform restrict image2D render_target;
-// DLSS Ray Reconstruction guides, render resolution, written for the primary hit of sample 0
-// when uniforms.dlss != 0 (partially bound otherwise).
-layout(set=0, binding=1, rgba16f) uniform restrict writeonly image2D guide_normal_roughness;
-layout(set=0, binding=2, rgba8)   uniform restrict writeonly image2D guide_diffuse;
-layout(set=0, binding=3, rgba8)   uniform restrict writeonly image2D guide_specular;
-layout(set=0, binding=4, r32f)    uniform restrict writeonly image2D guide_depth;
-layout(set=0, binding=5, r32f)    uniform restrict writeonly image2D guide_spec_hit;
-layout(set=0, binding=6, rg16f)   uniform restrict writeonly image2D guide_motion;
-layout(set=0, binding=7, rgba16f) uniform restrict writeonly image2D dlss_color;
+// DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
+// primary hit of sample 0.
+layout(set=0, binding=0, rgba16f) uniform restrict writeonly image2D guide_normal_roughness;
+layout(set=0, binding=1, rgba8)   uniform restrict writeonly image2D guide_diffuse;
+layout(set=0, binding=2, rgba8)   uniform restrict writeonly image2D guide_specular;
+layout(set=0, binding=3, r32f)    uniform restrict writeonly image2D guide_depth;
+layout(set=0, binding=4, r32f)    uniform restrict writeonly image2D guide_spec_hit;
+layout(set=0, binding=5, rg16f)   uniform restrict writeonly image2D guide_motion;
+layout(set=0, binding=6, rgba16f) uniform restrict writeonly image2D dlss_color;
 layout(set=0, binding=100)        uniform accelerationStructureEXT topLevelAS;
 layout(set=1, binding=200)        uniform sampler2D textures[];
 
@@ -84,8 +83,8 @@ vec2 TwoBnoiseSamples(const uint byteIndex) {
 
 // Assumed to be called once per sample
 vec2 bnoiseBest(const uint sampleIdx) {
-  // 64 bluenoise slices; the seed advances every frame under DLSS (and per accumulation tick).
-  const uint textureIdx = ((pc.uniforms.dlss != 0 ? pc.uniforms.frame : pc.uniforms.tick) * pc.uniforms.samples + sampleIdx) % 64;
+  // 64 bluenoise slices; the seed advances every frame.
+  const uint textureIdx = (pc.uniforms.frame * pc.uniforms.samples + sampleIdx) % 64;
   if (textureIdx >= 64) { return vec2(randf(), randf()); }
   const uint x = gl_LaunchIDEXT.x % 128;
   const uint y = gl_LaunchIDEXT.y % 128;
@@ -264,35 +263,17 @@ vec3 envBRDFApprox2(vec3 f0, float alpha, float NoV) {
 }
 
 void main() {
-  // Under DLSS every frame needs fresh noise for the temporal denoiser; `tick` is the
-  // accumulation counter and sits at 0 while accumulation is off.
-  initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.dlss != 0 ? pc.uniforms.frame : pc.uniforms.tick);
+  // Fresh noise every frame for the temporal denoiser.
+  initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.frame);
 
   const ivec2 px = ivec2(gl_LaunchIDEXT.xy);
-  const bool dlss = pc.uniforms.dlss != 0;
-
-  // wide screen
-  if (float(gl_LaunchIDEXT.y) < gl_LaunchSizeEXT.y * 0.1 || float(gl_LaunchIDEXT.y) > gl_LaunchSizeEXT.y * 0.9) {
-    if (dlss) {
-      imageStore(dlss_color, px, vec4(0.0, 0.0, 0.0, 1.0));
-      imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
-      imageStore(guide_diffuse, px, vec4(0.0));
-      imageStore(guide_specular, px, vec4(0.5, 0.5, 0.5, 1.0)); // sky: RR guide 3.4.2
-      imageStore(guide_depth, px, vec4(0.0));
-      imageStore(guide_spec_hit, px, vec4(0.0));
-      imageStore(guide_motion, px, vec4(0.0));
-    } else {
-      imageStore(render_target, px, vec4(0.0));
-    }
-    return;
-  }
 
   const float tmin = 0.0001;
   const float tmax = 1000.0;
 
-  // DLSS: a known sub-pixel jitter (told to NGX) instead of the random one; the launch
-  // y is flipped into the NDC-up space here, so the image-space offset is +jitter.
-  const vec2 subpixel = dlss ? vec2(0.5 + pc.uniforms.jitter.x, 0.5 - pc.uniforms.jitter.y) : vec2(randf(), randf());
+  // A known sub-pixel jitter (told to NGX); the launch y is flipped into the NDC-up space
+  // here, so the image-space offset is +jitter.
+  const vec2 subpixel = vec2(0.5 + pc.uniforms.jitter.x, 0.5 - pc.uniforms.jitter.y);
   const vec2 pixel_center = vec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - gl_LaunchIDEXT.y) + subpixel;
   const vec2 inUV = pixel_center / vec2(gl_LaunchSizeEXT.xy);
   const vec2 d = inUV * 2.0 - 1.0;
@@ -344,7 +325,7 @@ void main() {
       const vec3 world_normal = oct_to_float32x3(payload.surface_and_world_normal.zw);
 
       // DLSS guides from sample 0's primary hit; the specular hit distance from its next hit.
-      if (dlss && sample_idx == 0) {
+      if (sample_idx == 0) {
         if (bounce_idx == 0) {
           if (payload.t == 0.0) {
             imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
@@ -730,16 +711,13 @@ void main() {
   }
 
 
-  if (dlss) {
-    // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
-    // own -- RR guide 3.7), so the camera exposure is applied here and the blit skips it for
-    // this path. Finite and inside f16 range.
-    const vec3 radiance = clamp(acc / SAMPLES * pc.uniforms.exposure, vec3(0.0), vec3(65504.0));
-    imageStore(dlss_color, px, vec4(radiance, 1.0));
-    return;
-  }
-  vec4 prev = imageLoad(render_target, px);
-  if (pc.uniforms.accumulate == 0) { prev = vec4(0); }
-  imageStore(render_target, px, vec4(acc / SAMPLES, 1) + prev);
+  const vec3 mean = acc / SAMPLES;
+  // Raw-radiance luminance for next frame's auto-exposure metering (auto_exposure.slang).
+  pc.lum.data[px.y * gl_LaunchSizeEXT.x + px.x] = dot(vec3(0.2125, 0.7154, 0.0721), mean);
+  // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
+  // own -- RR guide 3.7), so the metered (or manual) exposure is applied here and the blit
+  // skips it. Finite and inside f16 range.
+  const vec3 radiance = clamp(mean * pc.ae.exposure, vec3(0.0), vec3(65504.0));
+  imageStore(dlss_color, px, vec4(radiance, 1.0));
 }
 

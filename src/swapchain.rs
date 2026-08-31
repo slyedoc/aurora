@@ -16,6 +16,7 @@ pub struct Swapchain {
     pub swapchain_images: Vec<vk::Image>,
     pub swapchain_image_views: Vec<vk::ImageView>,
     pub swapchain_extent: vk::Extent2D,
+    pub swapchain_format: vk::Format,
     /// The window size the current swapchain was built for; a different `RenderWindow`
     /// triggers a rebuild in `aquire_next_image`.
     requested: (u32, u32),
@@ -78,6 +79,7 @@ impl Swapchain {
                 swapchain_images: Vec::new(),
                 swapchain_image_views: Vec::new(),
                 swapchain_extent: vk::Extent2D::default(),
+                swapchain_format: vk::Format::UNDEFINED,
                 requested: (0, 0),
                 image_available_semaphore,
                 render_finished_semaphores: Vec::new(),
@@ -148,6 +150,7 @@ impl Swapchain {
             };
 
             self.swapchain_extent = surface_resolution;
+            self.swapchain_format = surface_format.format;
             self.requested = (window.width, window.height);
 
             let pre_transform = if surface_caps
@@ -192,7 +195,10 @@ impl Swapchain {
                 .image_color_space(surface_format.color_space)
                 .image_format(surface_format.format)
                 .image_extent(surface_resolution)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                // TRANSFER_SRC so a screenshot request can copy the presented frame out.
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(pre_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)

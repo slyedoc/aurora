@@ -18,30 +18,17 @@ use crate::{
     render_device::RenderDevice,
     render_env::WHITE_TEXTURE_IDX,
     sbt::SBT,
+    util::screenshot::ScreenshotRequests,
     tlas_builder::TLAS,
-    vk_init, vk_utils,
+    vk_utils,
     vulkan_asset::VulkanAssets,
 };
 
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Default)]
 pub struct RenderConfig {
     pub rtx_pipeline: Handle<RaytracingPipeline>,
     pub postprocess_pipeline: Handle<PostProcessFilter>,
-    pub accumulate: bool,
     pub pull_focus: Option<(u32, u32)>,
-}
-
-impl Default for RenderConfig {
-    fn default() -> Self {
-        Self {
-            rtx_pipeline: Default::default(),
-            postprocess_pipeline: Default::default(),
-            // `AURORA_ACCUMULATE=1` starts with accumulation on (Space toggles it) -- a
-            // converged reference for headless comparisons.
-            accumulate: std::env::var_os("AURORA_ACCUMULATE").is_some(),
-            pull_focus: Default::default(),
-        }
-    }
 }
 
 #[repr(C)]
@@ -49,12 +36,9 @@ pub struct UniformData {
     sky_color: Vec4,
     inverse_view: Mat4,
     inverse_projection: Mat4,
-    tick: u32,
-    accumulate: u32,
     pull_focus_x: u32,
     pull_focus_y: u32,
     gamma: f32,
-    exposure: f32,
     aperture: f32,
     foginess: f32,
     fog_scatter: f32,
@@ -65,14 +49,12 @@ pub struct UniformData {
     view_proj: [f32; 16],
     prev_view_proj: [f32; 16],
     jitter: [f32; 2],
-    dlss: u32,
-    /// Free-running frame counter: the RNG seed while DLSS is on, so every frame's noise is
-    /// new for the temporal denoiser (`tick` resets to 0 whenever accumulation is off).
+    /// Free-running frame counter: the RNG seed, so every frame's noise is new for the
+    /// temporal denoiser.
     frame: u32,
     /// Indirect path contributions are clamped to this luminance (0 = off).
     radiance_clamp: f32,
-    /// Paths per pixel this frame and their maximum length (from [`DevUIState`], the DLSS
-    /// pair while Ray Reconstruction runs).
+    /// Paths per pixel this frame and their maximum length (from [`DevUIState`]).
     samples: u32,
     max_bounces: u32,
     /// Post-process vignette strength (0 = off).
@@ -104,11 +86,6 @@ pub struct FocusData {
     focal_distance: f32,
 }
 
-fn handle_input(keyboard: Res<ButtonInput<KeyCode>>, mut render_config: ResMut<RenderConfig>) {
-    if keyboard.just_pressed(KeyCode::Space) {
-        render_config.accumulate = !render_config.accumulate;
-    }
-}
 
 /// The renderer's teardown: every plugin that owns Vulkan objects destroys them here, and
 /// [`on_shutdown`] (ordered last) drops the device. Run once by [`shutdown`].
@@ -142,6 +119,7 @@ impl Plugin for RayRenderPlugin {
         app.insert_resource(sphere_blas);
         app.init_resource::<Frame>();
         app.init_resource::<RenderConfig>();
+        app.init_resource::<ScreenshotRequests>();
 
         let mut teardown = Schedule::new(TeardownSchedule);
         teardown.add_systems(on_shutdown);
@@ -158,7 +136,7 @@ impl Plugin for RayRenderPlugin {
                 .chain(),
         );
         app.add_plugins(crate::sky::SkyPlugin);
-        app.add_systems(Update, (handle_input, set_focus_pulling));
+        app.add_systems(Update, set_focus_pulling);
         app.add_systems(
             Last,
             (
@@ -262,56 +240,8 @@ fn set_focus_pulling(
 pub struct Frame {
     pub swapchain_image: vk::Image,
     pub swapchain_view: vk::ImageView,
-    pub render_frame_buffers: RenderFrameBuffers,
     pub uniform_buffer: Buffer<UniformData>,
     pub focus_data: Buffer<FocusData>,
-}
-
-#[derive(Default)]
-pub struct RenderFrameBuffers {
-    pub main: (vk::Image, vk::ImageView),
-}
-
-impl RenderFrameBuffers {
-    pub unsafe fn prepare(
-        &mut self,
-        render_device: &RenderDevice,
-        swapchain: &crate::swapchain::Swapchain,
-        cmd_buffer: vk::CommandBuffer,
-    ) {
-        unsafe {
-            // (Re)create the render target if needed
-            if self.main.0 == vk::Image::null() || swapchain.resized {
-                log::trace!("(Re)creating render target");
-                render_device.destroyer.destroy_image_view(self.main.1);
-                render_device.destroyer.destroy_image(self.main.0);
-                let image_info = vk_init::image_info(
-                    swapchain.swapchain_extent.width,
-                    swapchain.swapchain_extent.height,
-                    vk::Format::R32G32B32A32_SFLOAT,
-                    vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-                );
-                self.main.0 = render_device.create_render_target(&image_info);
-
-                let view_info = vk_init::image_view_info(self.main.0, image_info.format);
-                self.main.1 = render_device.create_image_view(&view_info, None).unwrap();
-
-                // Transition to render target to general
-                vk_utils::transition_image_layout(
-                    &render_device,
-                    cmd_buffer,
-                    self.main.0,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                );
-            }
-        }
-    }
-
-    pub fn destroy(&mut self, render_device: &RenderDevice) {
-        render_device.destroyer.destroy_image_view(self.main.1);
-        render_device.destroyer.destroy_image(self.main.0);
-    }
 }
 
 fn render_frame(
@@ -338,16 +268,19 @@ fn render_frame(
         ResMut<crate::lights::LightManager>,
         ResMut<crate::restir::RestirState>,
         ResMut<crate::sharc::SharcState>,
+        ResMut<ScreenshotRequests>,
+        ResMut<crate::auto_exposure::AutoExposureState>,
+        Res<Time>,
     ),
     camera: Query<
         (
             &Projection,
             &GlobalTransform,
             Option<&crate::dlss::AuroraDlss>,
+            Option<&crate::auto_exposure::AuroraAutoExposure>,
         ),
         With<Camera3d>,
     >,
-    mut tick: Local<u32>,
     mut frame_counter: Local<u32>,
     dlss_stuff: (
         ResMut<crate::dlss::DlssState>,
@@ -358,16 +291,12 @@ fn render_frame(
     let Some(mut swapchain) = swapchain else {
         return;
     };
-    let (mut transforms, modules, sbt, mut lights, mut restir, mut sharc) = gpu;
+    let (mut transforms, modules, sbt, mut lights, mut restir, mut sharc, mut screenshots, mut ae, time) =
+        gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
     let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
-
-    *tick += 1;
-    if !render_config.accumulate {
-        *tick = 0;
-    }
     *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
     let inverse_view = camera.1.to_matrix();
@@ -401,9 +330,6 @@ fn render_frame(
     // Set once the evaluate has been recorded this frame: only then does the blit read the
     // DLSS output (before the RT pipeline is compiled nothing has written it).
     let mut dlss_ran = false;
-    let rtx_ready = rtx_pipelines.get(&render_config.rtx_pipeline).is_some()
-        && sbt.data.address != 0
-        && tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null();
 
     // Ensure the uniform_buffer exists
     if frame.uniform_buffer.handle == vk::Buffer::null() {
@@ -443,7 +369,6 @@ fn render_frame(
 
     // Update the uniform buffer
     {
-        let dlss_on = plan.is_some() && rtx_ready;
         let data = UniformData {
             sky_color: match &*sky {
                 Sky::Color { radiance } => radiance.extend(0.0),
@@ -452,8 +377,6 @@ fn render_frame(
             },
             inverse_view,
             inverse_projection,
-            tick: *tick,
-            accumulate: if render_config.accumulate { 1 } else { 0 },
             pull_focus_x: render_config
                 .pull_focus
                 .map(|(x, _)| x)
@@ -463,7 +386,6 @@ fn render_frame(
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
             gamma: dev_ui_state.gamma,
-            exposure: dev_ui_state.exposure_ev.exp2(),
             aperture: dev_ui_state.aperture,
             foginess: dev_ui_state.foginess,
             fog_scatter: dev_ui_state.fog_scatter,
@@ -472,24 +394,13 @@ fn render_frame(
             view_proj: view_proj.to_cols_array(),
             prev_view_proj: last_view_proj.to_cols_array(),
             jitter: plan.map_or([0.0; 2], |p| p.jitter),
-            dlss: dlss_on as u32,
             frame: *frame_counter,
             radiance_clamp: {
                 let sky_luma = sky.reference_luminance(&procedural) * dev_ui_state.sky_brightness;
                 dev_ui_state.firefly_clamp * sky_luma.max(1e-3)
             },
-            samples: if dlss_on {
-                dev_ui_state.dlss_samples
-            } else {
-                dev_ui_state.samples
-            }
-            .max(1),
-            max_bounces: if dlss_on {
-                dev_ui_state.dlss_max_bounces
-            } else {
-                dev_ui_state.max_bounces
-            }
-            .max(1),
+            samples: dev_ui_state.samples.max(1),
+            max_bounces: dev_ui_state.max_bounces.max(1),
             vignette: dev_ui_state.vignette,
             sky_mode: match &*sky {
                 Sky::Color { .. } => 0,
@@ -507,8 +418,7 @@ fn render_frame(
             } else {
                 0
             },
-            // Accumulation stays the uncorrelated reference estimator.
-            restir_candidates: if dev_ui_state.restir && !render_config.accumulate {
+            restir_candidates: if dev_ui_state.restir {
                 dev_ui_state.restir_candidates.clamp(1, 32)
             } else {
                 0
@@ -516,12 +426,21 @@ fn render_frame(
             light_epoch: lights.epoch,
             restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
                 .max(1.0),
-            sharc: (dev_ui_state.sharc && !render_config.accumulate) as u32,
+            sharc: dev_ui_state.sharc as u32,
             sharc_voxel: dev_ui_state.sharc_voxel.max(0.01),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffer);
         mapped.copy_from_slice(&[data]);
+    }
+
+    // A dev-snippet debug hotkey is (or is about to be) reallocating NGX-internal
+    // visualisation resources inside evaluate: run these frames fully serialized so the
+    // realloc never overlaps in-flight work (Xid 79 on this hardware otherwise).
+    let dev_drain = dlss.dev_drain > 0;
+    if dev_drain {
+        dlss.dev_drain -= 1;
+        let _ = unsafe { render_device.device.device_wait_idle() };
     }
 
     unsafe {
@@ -544,10 +463,6 @@ fn render_frame(
             )
             .unwrap();
 
-        frame
-            .render_frame_buffers
-            .prepare(&render_device, &swapchain, cmd_buffer);
-
         // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place -- all inside this command buffer.
@@ -568,7 +483,19 @@ fn render_frame(
             cmd_buffer,
             &modules,
             *frame_counter,
-            dev_ui_state.sharc && !render_config.accumulate,
+            dev_ui_state.sharc,
+        );
+        // Auto-exposure: meter last frame's luminance into this frame's exposure (the
+        // raygen reads it; manual `exposure_ev` when the camera has it disabled).
+        let ae_settings = camera.3.cloned().unwrap_or_default();
+        ae.record(
+            &render_device,
+            cmd_buffer,
+            &modules,
+            trace_extent,
+            &ae_settings,
+            dev_ui_state.exposure_ev,
+            time.delta_secs(),
         );
 
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
@@ -576,10 +503,6 @@ fn render_frame(
                 && sbt.data.address != 0
             {
                 // Ensure the descriptor set is up to date
-                let render_target_main_binding = vk::DescriptorImageInfo::default()
-                    .image_layout(vk::ImageLayout::GENERAL)
-                    .image_view(frame.render_frame_buffers.main.1);
-
                 let mut ac_binding = vk::WriteDescriptorSetAccelerationStructureKHR::default()
                     .acceleration_structures(std::slice::from_ref(
                         &tlas.acceleration_structure.handle,
@@ -589,18 +512,12 @@ fn render_frame(
                 let mut writes = vec![
                     vk::WriteDescriptorSet::default()
                         .dst_set(set)
-                        .dst_binding(0)
-                        .descriptor_count(1)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(std::slice::from_ref(&render_target_main_binding)),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
                         .dst_binding(100)
                         .descriptor_count(1)
                         .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                         .push_next(&mut ac_binding),
                 ];
-                // DLSS guide images (partially bound: only written while DLSS is on).
+                // DLSS guide images + noisy colour.
                 let guide_infos: Vec<vk::DescriptorImageInfo> = dlss
                     .renderer
                     .as_ref()
@@ -629,7 +546,7 @@ fn render_frame(
                     writes.push(
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
-                            .dst_binding(1 + i as u32)
+                            .dst_binding(i as u32)
                             .descriptor_count(1)
                             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                             .image_info(std::slice::from_ref(info)),
@@ -678,6 +595,8 @@ fn render_frame(
                     reservoirs_prev,
                     reservoirs_cur,
                     sharc: sharc.address(),
+                    lum_buffer: ae.addresses().0,
+                    auto_exposure: ae.addresses().1,
                 };
 
                 render_device.cmd_push_constants(
@@ -709,17 +628,8 @@ fn render_frame(
                         dlss_reset,
                     );
                     dlss_ran = true;
-                } else {
-                    render_device.ext_rtx_pipeline.cmd_trace_rays(
-                        cmd_buffer,
-                        &sbt.raygen_region,
-                        &sbt.miss_region,
-                        &sbt.hit_region,
-                        &vk::StridedDeviceAddressRegionKHR::default(),
-                        trace_extent.width,
-                        trace_extent.height,
-                        1,
-                    );
+                    // The raygen just filled the luminance buffer at this size.
+                    ae.primed = true;
                 }
             }
         }
@@ -761,7 +671,17 @@ fn render_frame(
             ),
         );
 
-        if let Some(pipeline) = postprocess_filters.get(&render_config.postprocess_pipeline) {
+        // Until the RT pipeline compiles and the first evaluate lands there is nothing to
+        // sample -- leave the clear (the UI still draws).
+        let source_view = dlss
+            .renderer
+            .as_ref()
+            .filter(|_| dlss_ran)
+            .and_then(|r| r.output_view());
+        if let (Some(pipeline), Some(source_view)) = (
+            postprocess_filters.get(&render_config.postprocess_pipeline),
+            source_view,
+        ) {
             render_device.cmd_bind_pipeline(
                 cmd_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -777,14 +697,6 @@ fn render_frame(
                 bytemuck::cast_slice(&[push_constants]),
             );
 
-            // Ensure the descriptor set is up to date: the DLSS output when it ran this
-            // frame, else the accumulation target.
-            let source_view = dlss
-                .renderer
-                .as_ref()
-                .filter(|_| dlss_ran)
-                .and_then(|r| r.output_view())
-                .unwrap_or(frame.render_frame_buffers.main.1);
             let render_target_main_binding = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::GENERAL)
                 .image_view(source_view)
@@ -821,17 +733,72 @@ fn render_frame(
 
         render_device.cmd_end_rendering(cmd_buffer);
 
+        // A pending screenshot copies the finished frame (UI included) out through a host
+        // buffer on its way to present.
+        let capture = screenshots.take_next().map(|path| {
+            let size = output_extent.width as u64 * output_extent.height as u64 * 4;
+            let buffer: Buffer<u8> =
+                render_device.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST);
+            vk_utils::transition_image_layout(
+                &render_device,
+                cmd_buffer,
+                frame.swapchain_image,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: output_extent.width,
+                    height: output_extent.height,
+                    depth: 1,
+                });
+            render_device.cmd_copy_image_to_buffer(
+                cmd_buffer,
+                frame.swapchain_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.handle,
+                std::slice::from_ref(&region),
+            );
+            (path, buffer)
+        });
+
         // Make swapchain available for present
         vk_utils::transition_image_layout(
             &render_device,
             cmd_buffer,
             frame.swapchain_image,
-            vk::ImageLayout::ATTACHMENT_OPTIMAL,
+            if capture.is_some() {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            } else {
+                vk::ImageLayout::ATTACHMENT_OPTIMAL
+            },
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
 
         render_device.end_command_buffer(cmd_buffer).unwrap();
         swapchain.submit_presentation(&window, cmd_buffer);
+        if dev_drain {
+            let _ = render_device.device.device_wait_idle();
+        }
+
+        if let Some((path, mut buffer)) = capture {
+            // Debug tool: one hitch per capture beats plumbing a fence through the frame.
+            let _ = render_device.device.device_wait_idle();
+            let mut view = render_device.map_buffer(&mut buffer);
+            crate::util::screenshot::save_png(
+                view.as_slice_mut(),
+                swapchain.swapchain_format,
+                output_extent,
+                &path,
+            );
+            render_device.destroyer.destroy_buffer(buffer.handle);
+        }
     }
 }
 
@@ -840,8 +807,7 @@ pub(crate) fn on_shutdown(world: &mut World) {
         .remove_resource::<crate::render_device::RenderDevice>()
         .unwrap();
 
-    let mut frame = world.remove_resource::<Frame>().unwrap();
-    frame.render_frame_buffers.destroy(&render_device);
+    let frame = world.remove_resource::<Frame>().unwrap();
 
     render_device
         .destroyer

@@ -93,6 +93,15 @@ pub const P_DLSS_FEATURE_CREATE_FLAGS: &CStr = c"DLSS.Feature.Create.Flags";
 pub const P_DLSS_ENABLE_OUTPUT_SUBRECTS: &CStr = c"DLSS.Enable.Output.Subrects";
 pub const P_DLSS_DENOISE_MODE: &CStr = c"DLSS.Denoise.Mode";
 pub const P_DLSS_ROUGHNESS_MODE: &CStr = c"DLSS.Roughness.Mode";
+// RR render-preset hints, one per PerfQuality mode (nvsdk_ngx_defs_dlssd.h). 0 = Default
+// (currently resolves to D), 4 = D (transformer), 5 = E (latest transformer).
+pub const P_RR_PRESET_DLAA: &CStr = c"RayReconstruction.Hint.Render.Preset.DLAA";
+pub const P_RR_PRESET_QUALITY: &CStr = c"RayReconstruction.Hint.Render.Preset.Quality";
+pub const P_RR_PRESET_BALANCED: &CStr = c"RayReconstruction.Hint.Render.Preset.Balanced";
+pub const P_RR_PRESET_PERFORMANCE: &CStr = c"RayReconstruction.Hint.Render.Preset.Performance";
+pub const P_RR_PRESET_ULTRA_PERFORMANCE: &CStr =
+    c"RayReconstruction.Hint.Render.Preset.UltraPerformance";
+pub const P_RR_PRESET_ULTRA_QUALITY: &CStr = c"RayReconstruction.Hint.Render.Preset.UltraQuality";
 pub const P_DLSS_USE_HW_DEPTH: &CStr = c"DLSS.Use.HW.Depth";
 pub const P_DLSS_GET_DYNAMIC_MAX_RENDER_WIDTH: &CStr = c"DLSS.Get.Dynamic.Max.Render.Width";
 pub const P_DLSS_GET_DYNAMIC_MAX_RENDER_HEIGHT: &CStr = c"DLSS.Get.Dynamic.Max.Render.Height";
@@ -295,6 +304,8 @@ pub struct NgxDlssdCreateParams {
     pub perf_quality_value: i32,
     pub feature_create_flags: i32,
     pub enable_output_subrects: bool,
+    /// `NVSDK_NGX_RayReconstruction_Hint_Render_Preset`, applied to every mode.
+    pub render_preset: u32,
 }
 
 /// `NVSDK_NGX_Feature_Create_Params` + `NVSDK_NGX_DLSS_Create_Params`.
@@ -697,6 +708,16 @@ pub unsafe fn create_dlssd_feature(
             create.roughness_mode,
         );
         NVSDK_NGX_Parameter_SetUI(params, P_DLSS_USE_HW_DEPTH.as_ptr(), create.use_hw_depth);
+        for name in [
+            P_RR_PRESET_DLAA,
+            P_RR_PRESET_QUALITY,
+            P_RR_PRESET_BALANCED,
+            P_RR_PRESET_PERFORMANCE,
+            P_RR_PRESET_ULTRA_PERFORMANCE,
+            P_RR_PRESET_ULTRA_QUALITY,
+        ] {
+            NVSDK_NGX_Parameter_SetUI(params, name.as_ptr(), create.render_preset);
+        }
 
         let mut handle: *mut NgxHandle = std::ptr::null_mut();
         check(

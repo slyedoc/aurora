@@ -32,24 +32,19 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   vec4 skycolor;
   mat4 inverse_view;
   mat4 inverse_projection;
-  uint tick;
-  uint accumulate;
   uint pull_focus_x;
   uint pull_focus_y;
   float gamma;
-  float exposure;
   float aperture;
   float foginess;
   float fog_scatter;
   float sky_brightness;
-  // DLSS: camera matrices for depth / motion vectors, the sub-pixel jitter (pixels), and
-  // whether the guide images are bound this frame.
+  // DLSS: camera matrices for depth / motion vectors, and the sub-pixel jitter (pixels).
   mat4 view;
   mat4 view_proj;
   mat4 prev_view_proj;
   vec2 jitter;
-  uint dlss;
-  // Free-running frame counter (RNG seed under DLSS; `tick` is 0 unless accumulating).
+  // Free-running frame counter (the RNG seed -- fresh noise every frame for the denoiser).
   uint frame;
   // Firefly suppression: indirect path contributions are clamped to this luminance (0 = off).
   float radiance_clamp;
@@ -74,7 +69,7 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint light_epoch;
   // Cap on temporal history, in candidate-samples.
   float restir_m_clamp;
-  // Radiance cache: 0 = off (also while accumulating); else paths may terminate into it.
+  // Radiance cache: 0 = off; else paths may terminate into it.
   uint sharc;
   // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
   float sharc_voxel;
@@ -237,6 +232,19 @@ struct HitPayload {
   uint prim_tri;
 };
 
+// Per-pixel raw-radiance luminance, render resolution: the raygen writes it, the
+// auto-exposure metering (auto_exposure.slang) histograms it next frame.
+layout (buffer_reference, scalar, buffer_reference_align = 4) buffer LumData {
+  float data[];
+};
+
+// Smoothed exposure from the metering (or the manual value): `exposure` = exp2(ev) is the
+// linear multiplier the raygen applies to radiance before Ray Reconstruction.
+layout (buffer_reference, scalar, buffer_reference_align = 4) readonly restrict buffer AeData {
+  float ev;
+  float exposure;
+};
+
 struct PushConstants {
   UniformData uniforms;
   MaterialData materials;
@@ -254,6 +262,9 @@ struct PushConstants {
   ReservoirData reservoirs_cur;
   // Radiance-cache entries (valid whenever uniforms.sharc != 0).
   SharcData sharc;
+  // Auto-exposure: per-pixel luminance out, smoothed exposure in (auto_exposure.slang).
+  LumData lum;
+  AeData ae;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

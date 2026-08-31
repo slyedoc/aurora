@@ -2,15 +2,14 @@
 //!
 //! The path tracer writes, at render resolution, the guides DLSS-RR consumes (noisy HDR
 //! colour, linear depth, motion vectors, diffuse/specular albedo, normal + roughness,
-//! specular hit distance); NGX denoises and upscales them into an output-resolution image
-//! that the post-process blit reads instead of the accumulation target. Mode lives in
-//! [`RenderConfig::dlss`](crate::ray_render_plugin::RenderConfig): `Off` traces at output
-//! resolution exactly as before.
+//! specular hit distance); NGX denoises and upscales them into the output-resolution image
+//! the post-process blit reads. Ray Reconstruction is the renderer's ONLY resolve -- there
+//! is no unfiltered fallback path, so the engine requires a working NGX (the SDK at build
+//! time via `$DLSS_SDK` -> `cfg(dlss_ngx)` from `build.rs`, and an RR-capable GPU/driver at
+//! run time; [`DlssPlugin`] panics otherwise). The camera's [`AuroraDlss`] picks the mode.
 //!
 //! The NGX FFI ([`ngx`]) and the call sequence are the ones proved in the old engine
-//! (`bevy_aurora_old/docs/dlss_notes.md`). Everything is gated on `cfg(dlss_ngx)`, set by
-//! `build.rs` when `$DLSS_SDK` holds the SDK; without it [`DlssRenderer`] is a stub and every
-//! mode renders as `Off`.
+//! (`bevy_aurora_old/docs/dlss_notes.md`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,16 +40,59 @@ pub const AURORA_PROJECT_ID: &str = "a17b0d3e-5c42-4f9a-9d31-6b0e2f8c74d5";
 /// search path at the SDK's `dev` libraries instead of `rel`.
 static DEV_SNIPPET: AtomicBool = AtomicBool::new(false);
 
+/// `NVSDK_NGX_RayReconstruction_Hint_Render_Preset` value; set by [`DlssPlugin`], read at
+/// feature creation. Same pattern as [`DEV_SNIPPET`].
+static RR_PRESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Which Ray Reconstruction model the feature is created with (RR guide 3.13). Changing it
+/// at runtime (the dev panel has a row for it) rebuilds the feature.
+#[derive(Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[reflect(Default, Clone, PartialEq)]
+pub enum RrPreset {
+    /// NVIDIA's pick, may move with OTA updates (currently resolves to D).
+    #[default]
+    Default,
+    /// The default transformer model (`diamond_wallaby`).
+    D,
+    /// The latest transformer model (`truthful_shrimp`); required for the DoF guide.
+    E,
+}
+
+impl RrPreset {
+    fn to_ngx(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::D => 4,
+            Self::E => 5,
+        }
+    }
+
+    /// The active preset ([`DlssPlugin::preset`], or a later runtime change).
+    pub fn current() -> Self {
+        match RR_PRESET.load(Ordering::Relaxed) {
+            4 => Self::D,
+            5 => Self::E,
+            _ => Self::Default,
+        }
+    }
+
+    /// Make `self` the active preset; the renderer rebuilds the feature when it differs
+    /// from the one the current view was created with.
+    pub fn make_current(self) {
+        RR_PRESET.store(self.to_ngx(), Ordering::Relaxed);
+    }
+}
+
 /// DLSS Ray Reconstruction mode -- a component on the `Camera3d` entity, so the world
-/// inspector edits it like anything else. Every non-`Off` mode is an NGX `PerfQuality` value:
-/// the render resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution.
-/// `Dlaa` is 1:1 (denoise + AA, no upscale). A camera spawned without one gets
-/// `$AURORA_DLSS` (or `Off`); F3 cycles it.
+/// inspector edits it like anything else. Ray Reconstruction is the renderer's only resolve
+/// (there is no unfiltered path), so every mode is an NGX `PerfQuality` value: the render
+/// resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution. `Dlaa`
+/// is 1:1 (denoise + AA, no upscale). A camera spawned without one gets `$AURORA_DLSS`
+/// (or `Dlaa`); F3 cycles it.
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
     #[default]
-    Off,
     Dlaa,
     Quality,
     Balanced,
@@ -60,7 +102,6 @@ pub enum AuroraDlss {
 
 impl AuroraDlss {
     pub const ALL: &'static [AuroraDlss] = &[
-        Self::Off,
         Self::Dlaa,
         Self::Quality,
         Self::Balanced,
@@ -70,7 +111,6 @@ impl AuroraDlss {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "off",
             Self::Dlaa => "dlaa",
             Self::Quality => "quality",
             Self::Balanced => "balanced",
@@ -86,19 +126,18 @@ impl AuroraDlss {
             .find(|m| m.label() == s || (s == "ultra" && *m == Self::UltraPerformance))
     }
 
-    /// `NVSDK_NGX_PerfQuality_Value` (`None` when off).
-    pub fn perf_quality(self) -> Option<i32> {
-        Some(match self {
-            Self::Off => return None,
+    /// `NVSDK_NGX_PerfQuality_Value`.
+    pub fn perf_quality(self) -> i32 {
+        match self {
             Self::Dlaa => 5,
             Self::Quality => 2,
             Self::Balanced => 1,
             Self::Performance => 0,
             Self::UltraPerformance => 3,
-        })
+        }
     }
 
-    /// `$AURORA_DLSS` (`dlaa|quality|balanced|performance|ultra-performance`), else `Off`.
+    /// `$AURORA_DLSS` (`dlaa|quality|balanced|performance|ultra-performance`), else `Dlaa`.
     pub fn from_env() -> Self {
         std::env::var("AURORA_DLSS")
             .ok()
@@ -109,11 +148,6 @@ impl AuroraDlss {
     pub fn next(self) -> Self {
         let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
         Self::ALL[(i + 1) % Self::ALL.len()]
-    }
-
-    #[inline]
-    pub fn is_on(self) -> bool {
-        self != Self::Off
     }
 }
 
@@ -176,6 +210,11 @@ pub struct DlssState {
     pub renderer: Option<DlssRenderer>,
     /// Set by [`DlssReset`]; the next evaluate drops its history.
     pub reset_requested: bool,
+    /// Dev snippet only: frames left to serialize with `vkDeviceWaitIdle` around a debug
+    /// hotkey. The snippet reallocates its visualisation resources inside evaluate when a
+    /// hotkey lands; overlapped with in-flight work that realloc has taken this 5090 off
+    /// the bus (Xid 79), same as the un-drained NGX create/release used to.
+    pub dev_drain: u32,
 }
 
 /// Drop Ray Reconstruction's temporal history on the next frame: trigger it on the camera
@@ -200,6 +239,33 @@ fn default_mode(
 ) {
     for camera in &cameras {
         commands.entity(camera).insert(AuroraDlss::from_env());
+    }
+}
+
+/// How many frames a dev-snippet hotkey serializes. The snippet polls evdev itself, so it
+/// can act a frame or two after winit reports the press; drain a small window around it.
+const DEV_DRAIN_FRAMES: u32 = 4;
+
+/// Dev snippet only: the snippet's debug hotkeys (shift/ctrl+alt + F-keys) make it rebuild
+/// visualisation resources inside the next evaluate. Spot the same combos here and have the
+/// render system drain around them -- a few hitched frames instead of Xid 79.
+fn dev_snippet_hotkeys(keyboard: Res<ButtonInput<KeyCode>>, mut state: ResMut<DlssState>) {
+    use KeyCode::*;
+    let shift = keyboard.pressed(ShiftLeft) || keyboard.pressed(ShiftRight);
+    let ctrl_alt = (keyboard.pressed(ControlLeft) || keyboard.pressed(ControlRight))
+        && (keyboard.pressed(AltLeft) || keyboard.pressed(AltRight));
+    if (shift || ctrl_alt)
+        && [F4, F5, F6, F8, F9, F11, F12]
+            .iter()
+            .any(|k| keyboard.just_pressed(*k))
+    {
+        state.dev_drain = DEV_DRAIN_FRAMES;
+    }
+    // Diagnostic: hold F10 to serialize every frame. If a dev-overlay artifact (flicker,
+    // tearing) stops while held, it's an ordering race in our frame; if it persists under
+    // full serialization, it's snippet-internal.
+    if keyboard.pressed(F10) {
+        state.dev_drain = state.dev_drain.max(2);
     }
 }
 
@@ -349,14 +415,22 @@ fn teardown(world: &mut World) {
 /// - `shift+f11`/`shift+f12` responsivity scale, `alt+shift+f11/f12` bias
 /// - `shift+f4` bias-current mask, `shift+f5` specular-motion mode,
 ///   `shift+f6` flip depth-inverted, `shift+f8` accumulation mode
+///
+/// The snippet acts on these inside evaluate, rebuilding its visualisation resources
+/// there; [`dev_snippet_hotkeys`] mirrors the combos and drains the device around them
+/// (a short hitch) so that rebuild never overlaps in-flight work.
 #[derive(Default)]
 pub struct DlssPlugin {
     pub dev_snippet: bool,
+    /// Which RR model to create the feature with; `Default` unless experimenting.
+    pub preset: RrPreset,
 }
 
 impl Plugin for DlssPlugin {
     fn build(&self, app: &mut App) {
         DEV_SNIPPET.store(self.dev_snippet, Ordering::Relaxed);
+        self.preset.make_current();
+        app.register_type::<RrPreset>();
         if self.dev_snippet {
             // The dev snippet gates its status HUD on this (SR guide 8.2); set before
             // NGX loads it in `DlssRenderer::new` below.
@@ -368,12 +442,23 @@ impl Plugin for DlssPlugin {
             let rd = app.world().resource::<RenderDevice>();
             DlssRenderer::new(rd)
         };
+        // RR is the renderer's only resolve; without it every frame would present raw
+        // 1-2 spp noise, so fail loudly here instead.
+        assert!(
+            renderer.is_some(),
+            "DLSS Ray Reconstruction is required: build with $DLSS_SDK set and run on an \
+             RR-capable NVIDIA GPU/driver"
+        );
         app.insert_resource(DlssState {
             renderer,
             reset_requested: false,
+            dev_drain: 0,
         });
         app.add_observer(request_reset);
         app.add_systems(Update, (default_mode, cycle_mode));
+        if self.dev_snippet {
+            app.add_systems(Update, dev_snippet_hotkeys);
+        }
         app.add_systems(TeardownSchedule, teardown.before(on_shutdown));
     }
 }

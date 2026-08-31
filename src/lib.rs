@@ -1,5 +1,6 @@
 pub mod aftermath;
 pub mod assets;
+pub mod auto_exposure;
 pub mod blas;
 pub mod bsn;
 pub mod compute;
@@ -31,6 +32,7 @@ pub mod swapchain;
 pub mod tlas_builder;
 pub mod transform;
 pub mod ui_render;
+pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;

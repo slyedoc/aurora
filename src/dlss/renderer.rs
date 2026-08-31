@@ -1,6 +1,8 @@
 //! The NGX session and one view's Ray Reconstruction feature: its guide images (written by
 //! the raygen through storage-image bindings), the evaluate, and the output image.
 
+use std::sync::atomic::Ordering;
+
 use ash::vk;
 use bevy::math::Mat4;
 
@@ -69,6 +71,8 @@ impl DlssImage {
 struct DlssView {
     handle: *mut NgxHandle,
     mode: AuroraDlss,
+    /// NGX preset value the feature was created with (rebuild when it changes).
+    preset: u32,
     render: vk::Extent2D,
     output: vk::Extent2D,
     color: DlssImage,
@@ -217,20 +221,18 @@ impl DlssRenderer {
         output: vk::Extent2D,
         mode: AuroraDlss,
     ) -> Option<DlssPlan> {
-        if !self.rr_available || !mode.is_on() || output.width == 0 || output.height == 0 {
-            if mode.is_on() && self.view.is_some() {
-                self.release_view(rd);
-            }
-            if !mode.is_on() && self.view.is_some() {
+        if !self.rr_available || output.width == 0 || output.height == 0 {
+            if self.view.is_some() {
                 self.release_view(rd);
             }
             return None;
         }
-        let quality = mode.perf_quality()?;
+        let quality = mode.perf_quality();
+        let preset = super::RR_PRESET.load(Ordering::Relaxed);
         let fresh = self
             .view
             .as_ref()
-            .is_none_or(|v| v.mode != mode || v.output != output);
+            .is_none_or(|v| v.mode != mode || v.output != output || v.preset != preset);
         if fresh {
             let render = if mode == AuroraDlss::Dlaa {
                 output
@@ -323,6 +325,7 @@ impl DlssRenderer {
             perf_quality_value: quality,
             feature_create_flags,
             enable_output_subrects: false,
+            render_preset: super::RR_PRESET.load(Ordering::Relaxed),
         };
         let mut handle: Result<*mut NgxHandle, String> = Err("not created".into());
         // Exclusive: NGX submits and waits on the queue internally during creation.
@@ -364,6 +367,7 @@ impl DlssRenderer {
         self.view = Some(DlssView {
             handle,
             mode,
+            preset: super::RR_PRESET.load(Ordering::Relaxed),
             render,
             output,
             color,

@@ -18,15 +18,16 @@ use bevy::{
         tokens,
     },
     feathers_inspector::{
-        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, WorldInspectorPlugin,
-        build_resource_inspector,
+        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, InspectorCollapsed,
+        InspectorRoot, WorldInspectorPlugin, build_resource_inspector,
     },
     prelude::*,
     ui::Display,
 };
 
 use crate::{
-    dlss::AuroraDlss, ray_render_plugin::RenderConfig, sky::ProceduralSky,
+    dlss::{AuroraDlss, RrPreset},
+    sky::ProceduralSky,
     ui_render::UiRenderPlugin,
 };
 
@@ -36,7 +37,9 @@ use crate::{
 pub struct DevUIState {
     #[reflect(@1.5..=3.0_f32)]
     pub gamma: f32,
-    /// Exposure in stops: the frame is multiplied by `2^exposure_ev` before tonemapping.
+    /// MANUAL exposure in stops, used only while the camera's
+    /// [`AuroraAutoExposure`](crate::auto_exposure::AuroraAutoExposure) is disabled;
+    /// metering owns the exposure otherwise (its `compensation` is the artist offset).
     #[reflect(@-20.0..=20.0_f32)]
     pub exposure_ev: f32,
     #[reflect(@0.0..=0.02_f32)]
@@ -48,24 +51,17 @@ pub struct DevUIState {
     #[reflect(@0.0..=1.0_f32)]
     pub sky_brightness: f32,
     /// Firefly suppression: indirect contributions are clamped to this many times the sky's
-    /// luminance (0 = off). Biases bright indirect paths down; kills speckle for accumulation
-    /// and Ray Reconstruction alike.
+    /// luminance (0 = off). Biases bright indirect paths down; kills the speckle Ray
+    /// Reconstruction would otherwise smear.
     #[reflect(@0.0..=64.0_f32)]
     pub firefly_clamp: f32,
-    /// Paths per pixel per frame for the plain / accumulating path.
-    #[reflect(@1.0..=8.0_f32)]
+    /// Paths per pixel per frame; RR is trained for 1 spp, so extra samples mostly buy
+    /// trace time.
+    #[reflect(@1.0..=4.0_f32)]
     pub samples: u32,
-    /// Maximum path length for the plain / accumulating path.
+    /// Maximum path length. With the firefly clamp a short path is all the denoiser needs.
     #[reflect(@1.0..=64.0_f32)]
     pub max_bounces: u32,
-    /// Paths per pixel while Ray Reconstruction is on; RR is trained for 1 spp, so extra
-    /// samples mostly buy trace time.
-    #[reflect(@1.0..=4.0_f32)]
-    pub dlss_samples: u32,
-    /// Maximum path length while Ray Reconstruction is on. With the firefly clamp a short
-    /// path is all the denoiser needs.
-    #[reflect(@1.0..=64.0_f32)]
-    pub dlss_max_bounces: u32,
     /// Post-process vignette strength (0 = off); aspect-corrected, darkens towards the corners.
     #[reflect(@0.0..=1.0_f32)]
     pub vignette: f32,
@@ -89,6 +85,8 @@ pub struct DevUIState {
     pub sharc_voxel: f32,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
+    /// Ray Reconstruction model preset; changing it rebuilds the feature.
+    pub rr_preset: RrPreset,
 }
 
 impl Default for DevUIState {
@@ -101,10 +99,8 @@ impl Default for DevUIState {
             fog_scatter: 0.9,
             sky_brightness: 1.0,
             firefly_clamp: 8.0,
-            samples: 2,
-            max_bounces: 64,
-            dlss_samples: 1,
-            dlss_max_bounces: 8,
+            samples: 1,
+            max_bounces: 8,
             vignette: 0.0,
             light_nee: true,
             restir: true,
@@ -113,6 +109,7 @@ impl Default for DevUIState {
             sharc: true,
             sharc_voxel: 0.25,
             dlss: AuroraDlss::from_env(),
+            rr_preset: RrPreset::current(),
         }
     }
 }
@@ -121,7 +118,7 @@ impl Default for DevUIState {
 #[derive(Component, Default, Clone)]
 struct DevUIPanel;
 
-/// The live stats line (fps, accumulation ticks).
+/// The live stats line (fps).
 #[derive(Component, Default, Clone)]
 struct DevUIStats;
 
@@ -158,7 +155,10 @@ impl Plugin for DevUIPlugin {
         app.register_type::<DevUIState>();
         app.init_resource::<DevUIState>();
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(Update, (toggle_panel, update_stats, sync_dlss_mode));
+        app.add_systems(
+            Update,
+            (toggle_panel, update_stats, sync_dlss_mode, sync_rr_preset),
+        );
     }
 }
 
@@ -185,6 +185,13 @@ fn sync_dlss_mode(
         return;
     }
     *agreed = Some(last);
+}
+
+/// Applies the panel's preset row; the renderer rebuilds the feature on the next frame.
+fn sync_rr_preset(state: Res<DevUIState>) {
+    if state.rr_preset != RrPreset::current() {
+        state.rr_preset.make_current();
+    }
 }
 
 fn spawn_panel(world: &mut World) {
@@ -226,6 +233,14 @@ fn spawn_panel(world: &mut World) {
         .id();
     world.flush();
 
+    // Both cards start collapsed (expanding is one click; the panel stays compact).
+    {
+        let mut collapsed = world.resource_mut::<InspectorCollapsed>();
+        for type_id in [TypeId::of::<DevUIState>(), TypeId::of::<ProceduralSky>()] {
+            collapsed.set(&InspectorRoot::Resource { type_id }, "", true);
+        }
+    }
+
     let host = world
         .query_filtered::<Entity, With<DevUIInspectorHost>>()
         .iter(world)
@@ -257,22 +272,14 @@ fn toggle_panel(
 
 fn update_stats(
     time: Res<Time>,
-    render_config: Res<RenderConfig>,
     mut stats: Query<&mut Text, With<DevUIStats>>,
     mut fps_avg: Local<f32>,
-    mut ticks: Local<u32>,
 ) {
     let dt = time.delta_secs();
     if dt > 0.0 {
         *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
     }
-    // Mirrors the frame's accumulation counter: counts while accumulating, else 0.
-    *ticks = if render_config.accumulate {
-        *ticks + 1
-    } else {
-        0
-    };
     for mut text in &mut stats {
-        text.0 = format!("fps: {:.1}    ticks: {}", *fps_avg, *ticks);
+        text.0 = format!("fps: {:.1}", *fps_avg);
     }
 }
