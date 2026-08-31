@@ -3,6 +3,18 @@ use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
+/// Must match `Registers` in quad.frag.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PostProcessPushConstants {
+    pub uniforms: u64,
+    pub auto_exposure: u64,
+    /// 0 = follow the metering; else a fixed linear exposure re-applied over it.
+    pub display_exposure: f32,
+    /// [`AuroraDebugView`](crate::debug_view::AuroraDebugView) as its shader index.
+    pub debug_view: u32,
+}
+
 #[derive(Asset, TypePath, Debug, Clone)]
 pub struct PostProcessFilter {
     #[dependency]
@@ -46,10 +58,12 @@ impl VulkanAsset for PostProcessFilter {
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
 
+        // 8 sampled images: the DLSS output plus the guide buffers for the debug views
+        // (quad.frag's `test[8]`).
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .binding(0)
-            .descriptor_count(1)
+            .descriptor_count(8)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
 
         let descriptor_layout_info =
@@ -64,7 +78,7 @@ impl VulkanAsset for PostProcessFilter {
         let push_constant_info = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::ALL)
             .offset(0)
-            .size(std::mem::size_of::<u64>() as u32);
+            .size(std::mem::size_of::<PostProcessPushConstants>() as u32);
 
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))

@@ -14,6 +14,10 @@ default = []
 # Nsight Aftermath GPU crash dumps (src/aftermath.rs), linked from `$AFTERMATH_SDK` (default
 # `~/nvidia/aftermath`) when that lib exists at build time.
 dev = []
+# The NGX development snippet: DLSS-RR status HUD + input visualiser (see `DlssPlugin`).
+# Opt in from any binary: `--features bevy_aurora/dlss-dev`. Separate from `dev`, which
+# bsn/bevy_city keep always-on for the crash dumps.
+dlss-dev = []
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]

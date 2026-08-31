@@ -238,11 +238,15 @@ layout (buffer_reference, scalar, buffer_reference_align = 4) buffer LumData {
   float data[];
 };
 
-// Smoothed exposure from the metering (or the manual value): `exposure` = exp2(ev) is the
-// linear multiplier the raygen applies to radiance before Ray Reconstruction.
+// Exposure state from the metering (auto_exposure.slang). The raygen applies
+// `input_exposure` (quantised, held constant between rare whole-EV steps -- Ray
+// Reconstruction's history needs a still input exposure); the blit maps it onto the smooth
+// `exposure` (Auto look) or a fixed one.
 layout (buffer_reference, scalar, buffer_reference_align = 4) readonly restrict buffer AeData {
   float ev;
   float exposure;
+  float input_ev;
+  float input_exposure;
 };
 
 struct PushConstants {

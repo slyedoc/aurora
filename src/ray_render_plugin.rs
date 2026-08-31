@@ -277,7 +277,8 @@ fn render_frame(
             &Projection,
             &GlobalTransform,
             Option<&crate::dlss::AuroraDlss>,
-            Option<&crate::auto_exposure::AuroraAutoExposure>,
+            Option<&crate::auto_exposure::AuroraExposure>,
+            Option<&crate::debug_view::AuroraDebugView>,
         ),
         With<Camera3d>,
     >,
@@ -485,16 +486,15 @@ fn render_frame(
             *frame_counter,
             dev_ui_state.sharc,
         );
-        // Auto-exposure: meter last frame's luminance into this frame's exposure (the
-        // raygen reads it; manual `exposure_ev` when the camera has it disabled).
-        let ae_settings = camera.3.cloned().unwrap_or_default();
+        // Exposure: meter last frame's luminance into this frame's exposure (the raygen
+        // reads it), or write the camera's fixed EV.
+        let exposure = camera.3.cloned().unwrap_or_default();
         ae.record(
             &render_device,
             cmd_buffer,
             &modules,
             trace_extent,
-            &ae_settings,
-            dev_ui_state.exposure_ev,
+            &exposure,
             time.delta_secs(),
         );
 
@@ -688,25 +688,50 @@ fn render_frame(
                 pipeline.pipeline,
             );
 
-            let push_constants = frame.uniform_buffer.address;
+            let push_constants = crate::post_process_filter::PostProcessPushConstants {
+                uniforms: frame.uniform_buffer.address,
+                auto_exposure: ae.addresses().1,
+                display_exposure: exposure.display_exposure(),
+                debug_view: camera.4.copied().unwrap_or_default().shader_index(),
+            };
             render_device.cmd_push_constants(
                 cmd_buffer,
                 pipeline.pipeline_layout,
                 vk::ShaderStageFlags::ALL,
                 0,
-                bytemuck::cast_slice(&[push_constants]),
+                bytemuck::bytes_of(&push_constants),
             );
 
-            let render_target_main_binding = vk::DescriptorImageInfo::default()
+            // Slot 0: the output; 1..=7 the guides for the debug views (aliasing the
+            // output until the renderer has them). Guides sit in SHADER_READ_ONLY after
+            // the evaluate; the output stays GENERAL.
+            let output_info = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::GENERAL)
                 .image_view(source_view)
                 .sampler(render_device.linear_sampler);
+            let mut image_infos = [output_info; 8];
+            if let Some(g) = dlss.renderer.as_ref().and_then(|r| r.guide_views()) {
+                for (slot, view) in [
+                    (1, g.color),
+                    (2, g.normal_roughness),
+                    (3, g.diffuse),
+                    (4, g.specular),
+                    (5, g.depth),
+                    (6, g.spec_hit),
+                    (7, g.motion),
+                ] {
+                    image_infos[slot] = vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image_view(view)
+                        .sampler(render_device.linear_sampler);
+                }
+            }
 
             let writes = [vk::WriteDescriptorSet::default()
                 .dst_set(pipeline.descriptor_sets[swapchain.frame_count % 2])
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&render_target_main_binding))];
+                .image_info(&image_infos)];
 
             render_device.update_descriptor_sets(&writes, &[]);
 

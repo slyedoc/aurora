@@ -403,15 +403,17 @@ fn teardown(world: &mut World) {
     });
 }
 
-/// Adds DLSS Ray Reconstruction. `dev_snippet` swaps the NGX feature libraries for the
-/// SDK's development builds (`$DLSS_SDK/lib/Linux_x86_64/dev`) and turns their status
-/// HUD on -- integration debugging only, never in anything shipped.
+/// Adds DLSS Ray Reconstruction. The `dlss-dev` cargo feature (`--features bevy_aurora/dlss-dev`)
+/// swaps the NGX feature libraries for the SDK's development builds
+/// (`$DLSS_SDK/lib/Linux_x86_64/dev`) and turns their status HUD on -- integration
+/// debugging only, never in anything shipped.
 ///
 /// The dev snippet's debug controls are its OWN keyboard poller, with the app window
-/// focused (the NGX parameter-block overlay names exist but are inert in 310.7):
-/// - `ctl+alt+shift+f12` cycle the input visualisation (`ctl+alt+f12` is documented
-///   too, but Linux VT-switches on it)
-/// - `ctl+alt+f11` visualisation size (window / fullscreen)
+/// focused (the NGX parameter-block overlay names exist but are inert in 310.7; the
+/// combos below are the `~/ngx/settings.ngxconfig` remaps where Linux VT-switching eats
+/// the defaults):
+/// - `ctl+shift+f12` cycle the input visualisation, `ctl+shift+f11` its size
+/// - `ctl+shift+f5` force/auto debug-display exposure, `ctl+shift+f8`/`f9` step it
 /// - `shift+f11`/`shift+f12` responsivity scale, `alt+shift+f11/f12` bias
 /// - `shift+f4` bias-current mask, `shift+f5` specular-motion mode,
 ///   `shift+f6` flip depth-inverted, `shift+f8` accumulation mode
@@ -421,17 +423,16 @@ fn teardown(world: &mut World) {
 /// (a short hitch) so that rebuild never overlaps in-flight work.
 #[derive(Default)]
 pub struct DlssPlugin {
-    pub dev_snippet: bool,
     /// Which RR model to create the feature with; `Default` unless experimenting.
     pub preset: RrPreset,
 }
 
 impl Plugin for DlssPlugin {
     fn build(&self, app: &mut App) {
-        DEV_SNIPPET.store(self.dev_snippet, Ordering::Relaxed);
+        DEV_SNIPPET.store(cfg!(feature = "dlss-dev"), Ordering::Relaxed);
         self.preset.make_current();
         app.register_type::<RrPreset>();
-        if self.dev_snippet {
+        if cfg!(feature = "dlss-dev") {
             // The dev snippet gates its status HUD on this (SR guide 8.2); set before
             // NGX loads it in `DlssRenderer::new` below.
             // SAFETY: main thread, before the renderer/task pools spawn readers.
@@ -456,7 +457,7 @@ impl Plugin for DlssPlugin {
         });
         app.add_observer(request_reset);
         app.add_systems(Update, (default_mode, cycle_mode));
-        if self.dev_snippet {
+        if cfg!(feature = "dlss-dev") {
             app.add_systems(Update, dev_snippet_hotkeys);
         }
         app.add_systems(TeardownSchedule, teardown.before(on_shutdown));

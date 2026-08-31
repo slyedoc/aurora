@@ -37,11 +37,6 @@ use crate::{
 pub struct DevUIState {
     #[reflect(@1.5..=3.0_f32)]
     pub gamma: f32,
-    /// MANUAL exposure in stops, used only while the camera's
-    /// [`AuroraAutoExposure`](crate::auto_exposure::AuroraAutoExposure) is disabled;
-    /// metering owns the exposure otherwise (its `compensation` is the artist offset).
-    #[reflect(@-20.0..=20.0_f32)]
-    pub exposure_ev: f32,
     #[reflect(@0.0..=0.02_f32)]
     pub aperture: f32,
     #[reflect(@0.0..=0.2_f32)]
@@ -93,7 +88,6 @@ impl Default for DevUIState {
     fn default() -> Self {
         Self {
             gamma: 2.4,
-            exposure_ev: 0.0,
             aperture: 0.0,
             foginess: 0.001,
             fog_scatter: 0.9,

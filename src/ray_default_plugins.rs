@@ -45,6 +45,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::restir::RestirPlugin);
         group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
+        group = group.add(crate::debug_view::DebugViewPlugin);
         group = group.add(crate::sbt::SBTPlugin);
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);

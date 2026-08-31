@@ -86,7 +86,10 @@ void main() {
 #endif
 
 
-  const bool inside = dot(object_normal, gl_ObjectRayDirectionEXT) > 0.0f;
+  // Which side of the triangle was hit: the hardware's geometric answer, stable under
+  // camera motion. A smooth-normal dot test here flips front-face grazing hits, which made
+  // foliage normals (and the medium side for glass) swim with the camera.
+  const bool inside = gl_HitKindEXT == gl_HitKindBackFacingTriangleEXT;
   if (inside) { object_normal = -object_normal; }
 
   const vec3 surface_normal = normalize((gl_ObjectToWorldEXT * vec4(object_normal, 0.0)).xyz);

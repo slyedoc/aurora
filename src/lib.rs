@@ -7,6 +7,7 @@ pub mod compute;
 pub use aurora_cluster_mesh as cluster_mesh;
 pub mod bluenoise_plugin;
 pub mod debug_camera;
+pub mod debug_view;
 pub mod dev_shaders;
 pub mod dev_ui;
 pub mod dlss;

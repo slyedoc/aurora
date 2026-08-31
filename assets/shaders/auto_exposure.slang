@@ -10,8 +10,13 @@ static const uint AE_HISTOGRAM_THREADS = 16384;
 
 // Must match AeGpu in src/auto_exposure.rs (and AeData in types.glsl).
 struct AeState {
-    float ev;        // Smoothed log2 exposure.
-    float exposure;  // exp2(ev): the linear multiplier the raygen applies.
+    float ev;              // Smoothed log2 exposure (the Auto look).
+    float exposure;        // exp2(ev).
+    // What the raygen actually applies: `ev` quantised to whole EV steps with hysteresis.
+    // Ray Reconstruction's temporal history cannot be told about per-frame exposure
+    // changes, so its input exposure must sit still; the blit maps input -> look.
+    float input_ev;
+    float input_exposure;  // exp2(input_ev)
 };
 
 // One block for both kernels (the compute layout is push constants only).
@@ -99,5 +104,13 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
                          p.min_ev, p.max_ev);
     }
     state.exposure = exp2(state.ev);
+    // The raygen's exposure is FROZEN: any change to RR's input exposure rings through its
+    // temporal history as a full-screen transient (measured 16% frame RMSE while tracking,
+    // 0.7% frozen). Re-snap only when metering says the operating point is hopelessly off
+    // (one honest pop instead of a wrong range).
+    if (abs(state.ev - state.input_ev) > 4.0) {
+        state.input_ev = state.ev;
+    }
+    state.input_exposure = exp2(state.input_ev);
     p.state[0] = state;
 }

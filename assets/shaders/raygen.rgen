@@ -720,9 +720,11 @@ void main() {
   // Raw-radiance luminance for next frame's auto-exposure metering (auto_exposure.slang).
   pc.lum.data[px.y * gl_LaunchSizeEXT.x + px.x] = dot(vec3(0.2125, 0.7154, 0.0721), mean);
   // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
-  // own -- RR guide 3.7), so the metered (or manual) exposure is applied here and the blit
-  // skips it. Finite and inside f16 range.
-  const vec3 radiance = clamp(mean * pc.ae.exposure, vec3(0.0), vec3(65504.0));
+  // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
+  // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the
+  // input exposure showed up as full-screen flicker) and the blit re-exposes to the look.
+  // Finite and inside f16 range.
+  const vec3 radiance = clamp(mean * pc.ae.input_exposure, vec3(0.0), vec3(65504.0));
   imageStore(dlss_color, px, vec4(radiance, 1.0));
 }
 
