@@ -549,8 +549,13 @@ void main() {
           const vec4 prev_clip = pc.uniforms.prev_view_proj * vec4(payload.prev_world_pos, 1.0);
           if (prev_clip.w > 1.0e-4) {
             const vec2 uv01 = (prev_clip.xy / prev_clip.w) * 0.5 + 0.5;
+            // Inverse of the forward mapping (pixel_center = (x, H - y) + subpixel): the
+            // flipped y needs +1 so truncation lands in (y, y+1) like x's (x, x+1) --
+            // without it every fetch reads the row above and the reservoir pattern
+            // scrolls down the screen one row per frame.
             const ivec2 ppx = ivec2(uv01.x * float(gl_LaunchSizeEXT.x),
-                                    float(gl_LaunchSizeEXT.y) - uv01.y * float(gl_LaunchSizeEXT.y));
+                                    float(gl_LaunchSizeEXT.y) + 1.0
+                                        - uv01.y * float(gl_LaunchSizeEXT.y));
             if (ppx.x >= 0 && ppx.y >= 0
                 && ppx.x < int(gl_LaunchSizeEXT.x) && ppx.y < int(gl_LaunchSizeEXT.y)) {
               const Reservoir prev = pc.reservoirs_prev.data[ppx.y * int(gl_LaunchSizeEXT.x) + ppx.x];
