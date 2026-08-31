@@ -245,6 +245,24 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   return f * NoL * emission * (cos_l / (dist * dist));
 }
 
+// DLSS-RR specular albedo: pre-integrated environment BRDF (split-sum scale/bias
+// fit, Ray Tracing Gems ch. 32) -- the RR Integration Guide's EnvBRDFApprox2. RR
+// demodulates specular with this, NOT raw F0. `alpha` is GGX alpha (perceptual
+// roughness squared). HLSL mul(M, v) with row-major literals becomes v * M here.
+vec3 envBRDFApprox2(vec3 f0, float alpha, float NoV) {
+  NoV = abs(NoV);
+  const vec4 X = vec4(1.0, NoV, NoV * NoV, NoV * NoV * NoV);
+  const vec4 Y = vec4(1.0, alpha, alpha * alpha, alpha * alpha * alpha);
+  const mat2 M1 = mat2(0.99044, -1.28514, 1.29678, -0.755907);
+  const mat3 M2 = mat3(1.0, 2.92338, 59.4188, 20.3225, -27.0302, 222.592, 121.563, 626.13, 316.627);
+  const mat2 M3 = mat2(0.0365463, 3.32707, 9.0632, -9.04756);
+  const mat3 M4 = mat3(1.0, 3.59685, -1.36772, 9.04401, -16.3174, 9.22949, 5.56589, 19.7886, -20.2123);
+  const float bias = dot(X.xy * M1, Y.xy) / dot(X.xyw * M2, Y.xyw)
+                   * clamp(f0.g * 50.0, 0.0, 1.0); // the guide's zero-reflectance hack
+  const float scale = dot(X.xy * M3, Y.xy) / dot(X.xzw * M4, Y.xyw);
+  return f0 * max(0.0, scale) + max(0.0, bias);
+}
+
 void main() {
   // Under DLSS every frame needs fresh noise for the temporal denoiser; `tick` is the
   // accumulation counter and sits at 0 while accumulation is off.
@@ -259,7 +277,7 @@ void main() {
       imageStore(dlss_color, px, vec4(0.0, 0.0, 0.0, 1.0));
       imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
       imageStore(guide_diffuse, px, vec4(0.0));
-      imageStore(guide_specular, px, vec4(0.0));
+      imageStore(guide_specular, px, vec4(0.5, 0.5, 0.5, 1.0)); // sky: RR guide 3.4.2
       imageStore(guide_depth, px, vec4(0.0));
       imageStore(guide_spec_hit, px, vec4(0.0));
       imageStore(guide_motion, px, vec4(0.0));
@@ -331,7 +349,7 @@ void main() {
           if (payload.t == 0.0) {
             imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
             imageStore(guide_diffuse, px, vec4(0.0));
-            imageStore(guide_specular, px, vec4(0.0));
+            imageStore(guide_specular, px, vec4(0.5, 0.5, 0.5, 1.0)); // sky: RR guide 3.4.2
             imageStore(guide_depth, px, vec4(0.0));
             imageStore(guide_motion, px, vec4(0.0));
             imageStore(guide_spec_hit, px, vec4(0.0));
@@ -346,7 +364,9 @@ void main() {
             const float linear_roughness = clamp(g_roughness * g_roughness, 0.0, 1.0);
             imageStore(guide_normal_roughness, px, vec4(world_normal, linear_roughness));
             imageStore(guide_diffuse, px, vec4(albedo * (1.0 - g_metallic), 1.0));
-            imageStore(guide_specular, px, vec4(mix(vec3(0.04), albedo, g_metallic), 1.0));
+            const vec3 g_f0 = mix(vec3(0.04), albedo, g_metallic);
+            const float g_NoV = dot(world_normal, -direction);
+            imageStore(guide_specular, px, vec4(envBRDFApprox2(g_f0, linear_roughness, g_NoV), 1.0));
             imageStore(guide_depth, px, vec4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0));
             // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
             const vec4 cur_clip = pc.uniforms.view_proj * vec4(hit_pos, 1.0);

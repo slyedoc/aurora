@@ -30,7 +30,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(bevy::audio::AudioPlugin::default());
 
         group = group.add(crate::ray_render_plugin::RayRenderPlugin);
-        group = group.add(crate::dlss::DlssPlugin);
+        group = group.add(crate::dlss::DlssPlugin::default());
         group = group.add(crate::render_env::RenderEnvPlugin);
         group = group.add(crate::post_process_filter::PostProcessFilterPlugin);
         group = group.add(crate::raytracing_pipeline::RaytracingPipelinePlugin);

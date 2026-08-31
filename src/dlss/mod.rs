@@ -12,6 +12,8 @@
 //! `build.rs` when `$DLSS_SDK` holds the SDK; without it [`DlssRenderer`] is a stub and every
 //! mode renders as `Off`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ash::vk;
 use bevy::prelude::*;
 
@@ -34,6 +36,10 @@ pub use stub::DlssRenderer;
 /// Fixed UUID identifying aurora to NGX (OTA snippet updates and per-app tuning key off it):
 /// never change it, and it must parse as a real UUID.
 pub const AURORA_PROJECT_ID: &str = "a17b0d3e-5c42-4f9a-9d31-6b0e2f8c74d5";
+
+/// Set by [`DlssPlugin`] before NGX initialises; [`feature_info`] then points the snippet
+/// search path at the SDK's `dev` libraries instead of `rel`.
+static DEV_SNIPPET: AtomicBool = AtomicBool::new(false);
 
 /// DLSS Ray Reconstruction mode -- a component on the `Camera3d` entity, so the world
 /// inspector edits it like anything else. Every non-`Off` mode is an NGX `PerfQuality` value:
@@ -213,6 +219,7 @@ fn cycle_mode(
 #[cfg(dlss_ngx)]
 mod ext {
     use std::ffi::{CStr, CString, c_char};
+    use std::sync::atomic::Ordering;
 
     use ash::vk;
 
@@ -234,7 +241,12 @@ mod ext {
         // falls back to the driver-installed copies.
         let mut search = Vec::new();
         if let Ok(sdk) = std::env::var("DLSS_SDK") {
-            search.push(format!("{sdk}/lib/Linux_x86_64/rel"));
+            let dir = if super::DEV_SNIPPET.load(Ordering::Relaxed) {
+                "dev"
+            } else {
+                "rel"
+            };
+            search.push(format!("{sdk}/lib/Linux_x86_64/{dir}"));
         }
         let verbose = std::env::var_os("AURORA_NGX_LOG").is_some();
         FeatureInfo::new(
@@ -325,10 +337,32 @@ fn teardown(world: &mut World) {
     });
 }
 
-pub struct DlssPlugin;
+/// Adds DLSS Ray Reconstruction. `dev_snippet` swaps the NGX feature libraries for the
+/// SDK's development builds (`$DLSS_SDK/lib/Linux_x86_64/dev`) and turns their status
+/// HUD on -- integration debugging only, never in anything shipped.
+///
+/// The dev snippet's debug controls are its OWN keyboard poller, with the app window
+/// focused (the NGX parameter-block overlay names exist but are inert in 310.7):
+/// - `ctl+alt+shift+f12` cycle the input visualisation (`ctl+alt+f12` is documented
+///   too, but Linux VT-switches on it)
+/// - `ctl+alt+f11` visualisation size (window / fullscreen)
+/// - `shift+f11`/`shift+f12` responsivity scale, `alt+shift+f11/f12` bias
+/// - `shift+f4` bias-current mask, `shift+f5` specular-motion mode,
+///   `shift+f6` flip depth-inverted, `shift+f8` accumulation mode
+#[derive(Default)]
+pub struct DlssPlugin {
+    pub dev_snippet: bool,
+}
 
 impl Plugin for DlssPlugin {
     fn build(&self, app: &mut App) {
+        DEV_SNIPPET.store(self.dev_snippet, Ordering::Relaxed);
+        if self.dev_snippet {
+            // The dev snippet gates its status HUD on this (SR guide 8.2); set before
+            // NGX loads it in `DlssRenderer::new` below.
+            // SAFETY: main thread, before the renderer/task pools spawn readers.
+            unsafe { std::env::set_var("__NGX_SHOW_INDICATOR", "1") };
+        }
         app.register_type::<AuroraDlss>();
         let renderer = {
             let rd = app.world().resource::<RenderDevice>();
