@@ -58,6 +58,10 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "bevy_mesh",
     "bevy_mikktspace",
     "bevy_camera",
+    # Light COMPONENTS only (render-free): extracted into the NEE light table.
+    "bevy_light",
+    # Fly camera for examples (bevy_camera_controller).
+    "free_camera",
     # ui stack, render-free
     "bevy_text",
     "default_font",

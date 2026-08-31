@@ -1,11 +1,13 @@
-//! Emissive-triangle lights: the sampling table for next-event estimation.
+//! The light table for next-event estimation: emissive triangles + analytic lights.
 //!
-//! Every instance whose [`AuroraMaterial`] has a non-zero emissive colour contributes all of
-//! its BLAS triangles as one contiguous range of entries in a global light table. The CPU only
-//! tracks *which* instances are emissive and uploads the per-instance records; geometry and
-//! world transforms stay on the GPU, so the per-entry sampling weights (world area x emitted
-//! luminance) and their CDF are computed by `lights.slang` inside the frame command buffer,
-//! reading the live TLAS instance rows.
+//! Entries `[0, analytic_count)` are analytic lights extracted from bevy's `PointLight` /
+//! `SpotLight` / `RectLight` components (sampled NEE-only -- they have no geometry, so BRDF
+//! rays never find them). The rest: every instance whose [`AuroraMaterial`] has a non-zero
+//! emissive colour contributes all of its BLAS triangles as one contiguous range. The CPU
+//! only tracks *which* instances are emissive and uploads the per-instance records;
+//! geometry and world transforms stay on the GPU, so the per-entry sampling weights (world
+//! area x emitted luminance) and their CDF are computed by `lights.slang` inside the frame
+//! command buffer, reading the live TLAS instance rows.
 //!
 //! The raygen samples a triangle by binary-searching the CDF and converts to a solid-angle
 //! pdf with the *live* triangle area, so the estimator stays unbiased even when the CDF's
@@ -24,6 +26,8 @@ use std::collections::HashMap;
 use ash::vk;
 use bevy::ecs::lifecycle::Remove;
 use bevy::ecs::observer::On;
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::light::{PointLight, RectLight, SpotLight};
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
 
@@ -58,7 +62,7 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in types.glsl / lights.slang. 48 bytes.
+/// Must match `LightsHeader` in types.glsl / lights.slang. 56 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -67,10 +71,35 @@ struct LightsHeaderGpu {
     /// Written by the `light_scan` kernel; 0 until then gates the raygen off the table.
     total_power: f32,
     slot_map_count: u32,
+    /// Entries `[0, analytic_count)` are analytic lights; the rest triangles.
+    analytic_count: u32,
+    pad1: u32,
     cdf: u64,
     linsts: u64,
     slot_to_linst: u64,
-    pad: u64,
+    analytics: u64,
+}
+
+/// One analytic light (point / spot / rect). Must match `AnalyticLight` in types.glsl /
+/// lights.slang. 80 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct AnalyticLightGpu {
+    position: [f32; 3],
+    /// 0 point, 1 spot, 2 rect.
+    kind: u32,
+    direction: [f32; 3],
+    radius: f32,
+    tangent: [f32; 3],
+    cos_inner: f32,
+    /// Point/spot: luminous intensity I (nit*m^2); rect: emitted radiance L (nits).
+    emission: [f32; 3],
+    cos_outer: f32,
+    half_extents: [f32; 2],
+    /// CDF weight, same units as the triangle entries (flux / pi).
+    power: f32,
+    /// Bit 0: two-sided (rect).
+    flags: u32,
 }
 
 #[repr(C)]
@@ -79,10 +108,11 @@ struct LightPowerParams {
     linsts: u64,
     instances: u64,
     powers: u64,
+    analytics: u64,
     linst_count: u32,
     entry_count: u32,
+    analytic_count: u32,
     base: u32,
-    pad: u32,
 }
 
 #[repr(C)]
@@ -117,6 +147,11 @@ pub struct LightManager {
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
     emissions: Buffer<f32>,
+    analytics: Buffer<AnalyticLightGpu>,
+    /// The analytic lights as last extracted (entry order); re-uploaded when they move.
+    analytic_cache: Vec<AnalyticLightGpu>,
+    /// The cache changed in-place (same set): re-upload in `record` without a rebuild.
+    analytic_upload: bool,
     entry_count: u32,
     linst_count: u32,
     needs_power_pass: bool,
@@ -140,6 +175,9 @@ impl LightManager {
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
             emissions: Buffer::default(),
+            analytics: Buffer::default(),
+            analytic_cache: Vec::new(),
+            analytic_upload: false,
             entry_count: 0,
             linst_count: 0,
             needs_power_pass: false,
@@ -162,6 +200,7 @@ impl LightManager {
             self.slot_map.handle,
             self.cdf.handle,
             self.emissions.handle,
+            self.analytics.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
         }
@@ -170,6 +209,7 @@ impl LightManager {
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
         self.emissions = Buffer::default();
+        self.analytics = Buffer::default();
     }
 
     /// Records the weight + CDF kernels into the frame command buffer. Call after
@@ -184,7 +224,8 @@ impl LightManager {
         if !self.needs_power_pass || self.entry_count == 0 {
             return;
         }
-        if tlas.instances_address() == 0 {
+        // Triangle entries read live TLAS rows; analytic-only tables have none to read.
+        if self.linst_count > 0 && tlas.instances_address() == 0 {
             return;
         }
         let Some(module) = modules.get(&self.module) else {
@@ -194,14 +235,37 @@ impl LightManager {
             }
             return;
         };
+        // Moved / re-tuned analytic lights: refresh in place (no rebuild, no epoch bump --
+        // reservoirs re-evaluate against the live data like they do for moved triangles).
+        if self.analytic_upload && self.analytics.handle != vk::Buffer::null() {
+            self.analytic_upload = false;
+            unsafe {
+                rd.device.cmd_update_buffer(
+                    cmd,
+                    self.analytics.handle,
+                    0,
+                    bytemuck::cast_slice(&self.analytic_cache),
+                );
+            }
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::SHADER_READ,
+            );
+        }
         let params = LightPowerParams {
             linsts: self.linsts.address,
             instances: tlas.instances_address(),
             powers: self.cdf.address,
+            analytics: self.analytics.address,
             linst_count: self.linst_count,
             entry_count: self.entry_count,
+            analytic_count: self.analytic_cache.len() as u32,
             base: 0,
-            pad: 0,
         };
         record_dispatch(
             rd,
@@ -233,9 +297,10 @@ impl LightManager {
         if self.logged != (self.linst_count, self.entry_count) {
             self.logged = (self.linst_count, self.entry_count);
             log::info!(
-                "light table: {} instances, {} triangle entries",
+                "light table: {} instances, {} entries ({} analytic)",
                 self.linst_count,
-                self.entry_count
+                self.entry_count,
+                self.analytic_cache.len()
             );
         }
     }
@@ -396,7 +461,9 @@ fn prepare_lights(
     // Per-geometry emissions, concatenated; each linst's geom_emission starts as a float
     // offset into this and is rebased once the device buffer exists.
     let mut emissions: Vec<f32> = Vec::new();
-    let mut entry_base = 0u32;
+    // Entries [0, analytic_count) are the analytic lights; triangles follow.
+    let analytic_count = lights.analytic_cache.len() as u32;
+    let mut entry_base = analytic_count;
     let mut max_slot = 0u32;
     let mut waiting = false;
     let mut slots: Vec<u32> = lights.sources.keys().copied().collect();
@@ -487,11 +554,14 @@ fn prepare_lights(
     }
 
     let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-    lights.linsts = render_device.create_device_buffer(linsts.len() as u64, storage);
+    lights.linsts = render_device.create_device_buffer(linsts.len().max(1) as u64, storage);
     lights.slot_map = render_device.create_device_buffer(slot_map.len() as u64, storage);
     lights.cdf = render_device.create_device_buffer(entry_base as u64, storage);
     lights.header = render_device.create_device_buffer(1, storage);
-    lights.emissions = render_device.create_device_buffer(emissions.len() as u64, storage);
+    lights.emissions = render_device.create_device_buffer(emissions.len().max(1) as u64, storage);
+    lights.analytics =
+        render_device.create_device_buffer(lights.analytic_cache.len().max(1) as u64, storage);
+    lights.analytic_upload = false;
     let mut linsts = linsts;
     for li in &mut linsts {
         li.geom_emission = lights.emissions.address + li.geom_emission * 4;
@@ -501,17 +571,157 @@ fn prepare_lights(
         linst_count: lights.linst_count,
         total_power: 0.0,
         slot_map_count: slot_map.len() as u32,
+        analytic_count,
+        pad1: 0,
         cdf: lights.cdf.address,
         linsts: lights.linsts.address,
         slot_to_linst: lights.slot_map.address,
-        pad: 0,
+        analytics: lights.analytics.address,
     };
     render_device.run_transfer_commands(|cmd| {
-        upload_slice(&render_device, cmd, &linsts, &lights.linsts);
+        if !linsts.is_empty() {
+            upload_slice(&render_device, cmd, &linsts, &lights.linsts);
+        }
         upload_slice(&render_device, cmd, &slot_map, &lights.slot_map);
         upload_slice(&render_device, cmd, &[header], &lights.header);
-        upload_slice(&render_device, cmd, &emissions, &lights.emissions);
+        if !emissions.is_empty() {
+            upload_slice(&render_device, cmd, &emissions, &lights.emissions);
+        }
+        if !lights.analytic_cache.is_empty() {
+            upload_slice(&render_device, cmd, &lights.analytic_cache, &lights.analytics);
+        }
     });
+}
+
+fn luma(rgb: [f32; 3]) -> f32 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+/// Extracts bevy's analytic lights (`PointLight` / `SpotLight` / `RectLight`) into the
+/// table. A changed set rebuilds the table (new epoch); mere movement / re-tuning
+/// re-uploads in place so ReSTIR history survives. Entry order is by entity id, stable
+/// across frames.
+///
+/// Units: bevy `intensity` is luminous power in lumens; the tracer works in nits.
+/// Point/spot store luminous intensity `I = lm / 4pi` (contribution `I / d^2`), rects the
+/// emitted radiance `L = lm / (pi * area)`. CDF weights are flux / pi, matching the
+/// triangle entries' `area * L`.
+fn track_analytic_lights(
+    mut lights: ResMut<LightManager>,
+    points: Query<(Entity, &PointLight)>,
+    spots: Query<(Entity, &SpotLight)>,
+    rects: Query<(Entity, &RectLight)>,
+    nodes: Query<(&Transform, Option<&ChildOf>)>,
+) {
+    use std::f32::consts::PI;
+    // CPU hierarchy propagation is off (mesh transforms propagate on the GPU), so a child
+    // light's GlobalTransform never updates: walk the parent chain here instead. Lights
+    // are few and hierarchies shallow.
+    let world_of = |entity: Entity| -> Mat4 {
+        let mut m = Mat4::IDENTITY;
+        let mut cur = Some(entity);
+        while let Some(e) = cur {
+            let Ok((t, child_of)) = nodes.get(e) else {
+                break;
+            };
+            m = t.to_matrix() * m;
+            cur = child_of.map(|c| c.parent());
+        }
+        m
+    };
+    let mut found: Vec<(Entity, AnalyticLightGpu)> = Vec::new();
+    for (entity, light) in &points {
+        let c = light.color.to_linear();
+        let i = light.intensity / (4.0 * PI);
+        let emission = [c.red * i, c.green * i, c.blue * i];
+        found.push((
+            entity,
+            AnalyticLightGpu {
+                position: world_of(entity).w_axis.truncate().to_array(),
+                kind: 0,
+                direction: [0.0, -1.0, 0.0],
+                radius: light.radius,
+                tangent: [1.0, 0.0, 0.0],
+                cos_inner: 1.0,
+                emission,
+                cos_outer: -1.0,
+                half_extents: [0.0; 2],
+                power: 4.0 * luma(emission),
+                flags: 0,
+            },
+        ));
+    }
+    for (entity, light) in &spots {
+        let c = light.color.to_linear();
+        let i = light.intensity / (4.0 * PI);
+        let emission = [c.red * i, c.green * i, c.blue * i];
+        let cos_outer = light.outer_angle.cos();
+        let solid_angle = 2.0 * PI * (1.0 - cos_outer);
+        let m = world_of(entity);
+        found.push((
+            entity,
+            AnalyticLightGpu {
+                position: m.w_axis.truncate().to_array(),
+                kind: 1,
+                direction: m
+                    .transform_vector3(Vec3::NEG_Z)
+                    .normalize_or(Vec3::NEG_Z)
+                    .to_array(),
+                radius: light.radius,
+                tangent: [1.0, 0.0, 0.0],
+                cos_inner: light.inner_angle.cos(),
+                emission,
+                cos_outer,
+                half_extents: [0.0; 2],
+                power: luma(emission) * solid_angle / PI,
+                flags: 0,
+            },
+        ));
+    }
+    for (entity, light) in &rects {
+        let c = light.color.to_linear();
+        let m = world_of(entity);
+        // The rect spans local XY, faces local -Z; world scale stretches it.
+        let half_x = m.transform_vector3(Vec3::X * (light.width * 0.5));
+        let half_y = m.transform_vector3(Vec3::Y * (light.height * 0.5));
+        let area = (4.0 * half_x.length() * half_y.length()).max(1.0e-6);
+        let l = light.intensity / (PI * area);
+        let emission = [c.red * l, c.green * l, c.blue * l];
+        found.push((
+            entity,
+            AnalyticLightGpu {
+                position: m.w_axis.truncate().to_array(),
+                kind: 2,
+                direction: m
+                    .transform_vector3(Vec3::NEG_Z)
+                    .normalize_or(Vec3::NEG_Z)
+                    .to_array(),
+                radius: 0.0,
+                tangent: half_x.normalize_or(Vec3::X).to_array(),
+                cos_inner: 1.0,
+                emission,
+                cos_outer: -1.0,
+                half_extents: [half_x.length(), half_y.length()],
+                power: luma(emission) * area,
+                flags: 0,
+            },
+        ));
+    }
+    found.sort_by_key(|(entity, _)| *entity);
+    let found: Vec<AnalyticLightGpu> = found.into_iter().map(|(_, l)| l).collect();
+    if found != lights.analytic_cache {
+        for l in &found {
+            log::debug!("analytic light: {l:?}");
+        }
+        if found.len() != lights.analytic_cache.len() {
+            // The entry layout shifts: full rebuild, reservoirs dropped via the epoch.
+            lights.dirty = true;
+        } else {
+            lights.analytic_upload = true;
+            lights.needs_power_pass = true;
+        }
+        lights.analytic_cache = found;
+    }
 }
 
 fn cleanup_lights(mut lights: ResMut<LightManager>, render_device: Res<RenderDevice>) {
@@ -533,7 +743,7 @@ impl Plugin for LightsPlugin {
         app.add_systems(
             Last,
             (
-                track_lights.in_set(RenderSet::Extract),
+                (track_lights, track_analytic_lights).in_set(RenderSet::Extract),
                 prepare_lights
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<Mesh>)

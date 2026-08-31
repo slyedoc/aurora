@@ -196,14 +196,69 @@ uint lightsPickEntry(const float x, out float p_pick) {
   return lo;
 }
 
-// The light instance owning entry e (greatest entry_base <= e).
+// The light instance owning entry e (greatest entry_base <= e); 0 for analytic entries
+// (which have no instance -- lightSampleEval never reads it for them).
 uint lightsFindInstance(const uint e) {
+  if (e < pc.lights.analytic_count || pc.lights.linst_count == 0u) { return 0u; }
   uint lo = 0u, hi = pc.lights.linst_count - 1u;
   while (lo < hi) {
     const uint mid = (lo + hi + 1u) / 2u;
     if (pc.lights.linsts.data[mid].entry_base <= e) { lo = mid; } else { hi = mid - 1u; }
   }
   return lo;
+}
+
+// Unshadowed contribution of analytic light `e` (same contract as lightSampleEval below).
+// Point and spot are sampled as deltas: `p_area` is just the pick probability and
+// `pdf_solid` is a huge sentinel so the MIS weight against BRDF sampling goes to 1 (a BRDF
+// ray can never hit them -- they have no geometry; same for rects, which are one-entry
+// area lights sampled uniformly).
+vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const float sv,
+                        const vec3 sp, const vec3 n, const vec3 ns, const vec3 v,
+                        const DisneyMaterial mat,
+                        out float p_area, out float pdf_solid, out vec3 dir, out float dist) {
+  p_area = 0.0;
+  pdf_solid = 0.0;
+  dir = vec3(0.0);
+  dist = 0.0;
+  AnalyticLight al = pc.lights.analytics.data[e];
+  if (al.kind == 2u) {
+    // Rect: uniform point on the rectangle, evaluated exactly like a triangle entry.
+    const vec3 bitangent = cross(al.direction, al.tangent);
+    const vec3 point = al.position
+        + al.tangent * ((su * 2.0 - 1.0) * al.half_extents.x)
+        + bitangent * ((sv * 2.0 - 1.0) * al.half_extents.y);
+    const vec3 to_light = point - sp;
+    dist = length(to_light);
+    if (dist <= 1.0e-4) { return vec3(0.0); }
+    dir = to_light / dist;
+    float cos_l = dot(al.direction, -dir);
+    if ((al.flags & 1u) != 0u) { cos_l = abs(cos_l); }
+    const float NoL = dot(n, dir);
+    if (cos_l <= 1.0e-4 || NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+    const float area = 4.0 * al.half_extents.x * al.half_extents.y;
+    if (area <= 0.0) { return vec3(0.0); }
+    p_area = p_pick / area;
+    pdf_solid = p_area * dist * dist / cos_l;
+    return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (cos_l / (dist * dist));
+  }
+  // Point / spot: a delta at the position (al.radius reserved for soft sampling later).
+  const vec3 to_light = al.position - sp;
+  dist = length(to_light);
+  if (dist <= 1.0e-4) { return vec3(0.0); }
+  dir = to_light / dist;
+  const float NoL = dot(n, dir);
+  if (NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+  float atten = 1.0;
+  if (al.kind == 1u) {
+    // Bevy's spot falloff: smooth between the inner and outer cone.
+    const float cos_a = dot(al.direction, -dir);
+    if (cos_a <= al.cos_outer) { return vec3(0.0); }
+    atten = smoothstep(al.cos_outer, max(al.cos_inner, al.cos_outer + 1.0e-4), cos_a);
+  }
+  p_area = p_pick;
+  pdf_solid = 1.0e16;
+  return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (atten / (dist * dist));
 }
 
 // Unshadowed contribution of the point (su, sv) on light-table entry `e`, in AREA measure:
@@ -215,6 +270,10 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
                      const vec3 sp, const vec3 n, const vec3 ns, const vec3 v,
                      const DisneyMaterial mat,
                      out float p_area, out float pdf_solid, out vec3 dir, out float dist) {
+  if (e < pc.lights.analytic_count) {
+    return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat,
+                              p_area, pdf_solid, dir, dist);
+  }
   p_area = 0.0;
   pdf_solid = 0.0;
   dir = vec3(0.0);

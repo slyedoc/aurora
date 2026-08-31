@@ -172,16 +172,41 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) buffer ReservoirDa
   Reservoir data[];
 };
 
+// One analytic light (point / spot / rect): table entries [0, analytic_count). Positions
+// and orientations are world-space, refreshed from the CPU every frame they change.
+// 80 bytes; must match AnalyticLightGpu in lights.rs and AnalyticLight in lights.slang.
+struct AnalyticLight {
+  vec3 position;
+  uint kind;          // 0 point, 1 spot, 2 rect
+  vec3 direction;     // spot axis / rect normal
+  float radius;       // point/spot emitter radius (reserved; sampled as a delta for now)
+  vec3 tangent;       // rect: +X edge direction
+  float cos_inner;    // spot: full-intensity cone
+  // point/spot: luminous intensity I (nit*m^2); rect: emitted radiance L (nits).
+  vec3 emission;
+  float cos_outer;    // spot: falloff limit
+  vec2 half_extents;  // rect half sizes along tangent / bitangent
+  float power;        // CPU-computed CDF weight (same units as tri entries: flux / pi)
+  uint flags;         // bit 0: two-sided (rect)
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer AnalyticLights {
+  AnalyticLight data[];
+};
+
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LightsHeader {
   uint entry_count;
   uint linst_count;
   // Written by the light_scan kernel; 0 = table not ready, sampling is skipped.
   float total_power;
   uint slot_map_count;
+  // Entries [0, analytic_count) are analytic lights; the rest are emissive triangles.
+  uint analytic_count;
+  uint pad1;
   LightCdf cdf;
   LightInstances linsts;
   SlotToLight slot_to_linst;
-  uvec2 pad2;
+  AnalyticLights analytics;
 };
 
 struct Material {

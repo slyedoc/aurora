@@ -36,10 +36,28 @@ struct LightsHeader {
     uint linst_count;
     float total_power;
     uint slot_map_count;
+    uint analytic_count;
+    uint pad1;
     uint64_t cdf;
     uint64_t linsts;
     uint64_t slot_to_linst;
-    uint64_t pad;
+    uint64_t analytics;
+};
+
+// Must match AnalyticLight in types.glsl / AnalyticLightGpu in lights.rs. 80 bytes; the
+// power kernel only reads the CPU-computed `power`.
+struct AnalyticLight {
+    float3 position;
+    uint kind;
+    float3 direction;
+    float radius;
+    float3 tangent;
+    float cos_inner;
+    float3 emission;
+    float cos_outer;
+    float2 half_extents;
+    float power;
+    uint flags;
 };
 
 float3 vertex_position(float* verts, uint i) {
@@ -51,8 +69,10 @@ struct LightPowerParams {
     LightInst* linsts;
     Instance* instances;
     float* powers;
+    AnalyticLight* analytics;
     uint linst_count;
     uint entry_count;
+    uint analytic_count;
     uint base;
 };
 [[vk::push_constant]] LightPowerParams power_params;
@@ -63,6 +83,11 @@ void light_powers(uint3 gid: SV_DispatchThreadID) {
     let p = power_params;
     let e = p.base + gid.x;
     if (e >= p.entry_count) {
+        return;
+    }
+    // Analytic entries carry their weight from the CPU.
+    if (e < p.analytic_count) {
+        p.powers[e] = p.analytics[e].power;
         return;
     }
     // The light instance owning this entry: greatest entry_base <= e.
