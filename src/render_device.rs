@@ -7,7 +7,7 @@ use std::{
 
 use ash::vk;
 use ash::{
-    ext::descriptor_indexing,
+    ext::{descriptor_indexing, opacity_micromap},
     khr::{
         acceleration_structure, deferred_host_operations, maintenance4, ray_tracing_pipeline,
         spirv_1_4, surface, swapchain, synchronization2,
@@ -92,6 +92,8 @@ pub struct RenderDeviceData {
     pub ext_sync2: synchronization2::Device,
     pub ext_rtx_pipeline: ray_tracing_pipeline::Device,
     pub ext_acc_struct: acceleration_structure::Device,
+    /// `VK_EXT_opacity_micromap`, when the device has it (omm.rs); `None` otherwise.
+    pub ext_micromap: Option<opacity_micromap::Device>,
     pub command_pool: vk::CommandPool,
     pub bindless_descriptor_set: vk::DescriptorSet,
     pub bindless_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -140,12 +142,13 @@ impl RenderDevice {
             let instance = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::new(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
-            let (device, queue) =
+            let (device, queue, micromaps) =
                 create_logical_device(&entry, &instance, physical_device, queue_family_idx, xr);
             let ext_swapchain = swapchain::Device::new(&instance, &device);
             let ext_sync2 = synchronization2::Device::new(&instance, &device);
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
             let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
+            let ext_micromap = micromaps.then(|| opacity_micromap::Device::new(&instance, &device));
             let command_pool = create_command_pool(&device, queue_family_idx);
             let transfer_command_pool = Mutex::new(create_command_pool(&device, queue_family_idx));
             let command_buffers = create_command_buffers(&device, command_pool);
@@ -185,6 +188,7 @@ impl RenderDevice {
                 ext_sync2,
                 ext_rtx_pipeline,
                 ext_acc_struct,
+                ext_micromap,
                 command_pool,
                 bindless_descriptor_set,
                 bindless_descriptor_set_layout,
@@ -553,7 +557,7 @@ unsafe fn create_logical_device(
     physical_device: vk::PhysicalDevice,
     queue_family_idx: u32,
     xr: Option<&XrContext>,
-) -> (ash::Device, Mutex<vk::Queue>) {
+) -> (ash::Device, Mutex<vk::Queue>, bool) {
     unsafe {
         let mut device_extensions = vec![
             swapchain::NAME.as_ptr(),
@@ -588,6 +592,18 @@ unsafe fn create_logical_device(
             } else if !listed {
                 device_extensions.push(ext.as_ptr());
             }
+        }
+
+        // Opacity micromaps (omm.rs): optional, so a device without them still comes up.
+        let micromaps = supported
+            .iter()
+            .any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == opacity_micromap::NAME);
+        if micromaps {
+            device_extensions.push(opacity_micromap::NAME.as_ptr());
+        } else {
+            println!(
+                "device lacks VK_EXT_opacity_micromap -- alpha cutouts stay on the any-hit path"
+            );
         }
 
         println!("Device extensions:");
@@ -635,6 +651,9 @@ unsafe fn create_logical_device(
         let mut features_float16 =
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
 
+        let mut features_micromap =
+            vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true);
+
         // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`.
         let core_features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
@@ -653,6 +672,11 @@ unsafe fn create_logical_device(
             .push_next(&mut features_raytracing_pipeline)
             .push_next(&mut features_scalar_block)
             .push_next(&mut features_float16);
+        let device_info = if micromaps {
+            device_info.push_next(&mut features_micromap)
+        } else {
+            device_info
+        };
 
         // XR: created through the runtime (xrCreateVulkanDeviceKHR) so it can inject its
         // interop device extensions; identical device otherwise.
@@ -664,7 +688,7 @@ unsafe fn create_logical_device(
         };
         let queue = device.get_device_queue(queue_family_idx, 0);
 
-        (device, Mutex::new(queue))
+        (device, Mutex::new(queue), micromaps)
     }
 }
 
@@ -795,6 +819,7 @@ pub enum VkDestroyCmd {
     PipelineLayout(vk::PipelineLayout),
     DescriptorSetLayout(vk::DescriptorSetLayout),
     AccelerationStructure(vk::AccelerationStructureKHR),
+    Micromap(vk::MicromapEXT),
     Tick,
 }
 
@@ -871,6 +896,14 @@ impl VkDestroyer {
             .unwrap();
     }
 
+    pub fn destroy_micromap(&self, micromap: vk::MicromapEXT) {
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(VkDestroyCmd::Micromap(micromap))
+            .unwrap();
+    }
+
     pub fn tick(&self) {
         self.sender
             .as_ref()
@@ -896,6 +929,8 @@ fn spawn_destroy_thread(
 ) -> ManuallyDrop<VkDestroyer> {
     let ext_swapchain = swapchain::Device::new(&instance, &device);
     let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
+    // Only ever called for micromaps created through the extension (present in that case).
+    let ext_micromap = opacity_micromap::Device::new(&instance, &device);
     let (sender, receiver) = crossbeam::channel::unbounded();
     let thread = std::thread::spawn(move || {
         // Assuming 3 frames in flight
@@ -936,6 +971,13 @@ fn spawn_destroy_thread(
                             VkDestroyCmd::AccelerationStructure(acceleration_structure) => unsafe {
                                 ext_acc_struct
                                     .destroy_acceleration_structure(acceleration_structure, None);
+                            },
+                            VkDestroyCmd::Micromap(micromap) => unsafe {
+                                (ext_micromap.fp().destroy_micromap_ext)(
+                                    ext_micromap.device(),
+                                    micromap,
+                                    std::ptr::null(),
+                                );
                             },
                             VkDestroyCmd::Tick => panic!("Tick event in death list"),
                         }

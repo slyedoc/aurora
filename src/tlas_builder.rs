@@ -43,6 +43,8 @@ const INSTANCE_FLAGS: u32 = 0b1;
 /// `VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR`: set when every material of the instance is
 /// opaque, so the alpha-mask any-hit shader only runs where a cutout can happen.
 const INSTANCE_FORCE_OPAQUE: u32 = 0b100;
+/// `VK_GEOMETRY_INSTANCE_DISABLE_OPACITY_MICROMAPS_BIT_EXT`: the dev panel's `omm` toggle off.
+const INSTANCE_DISABLE_OMM: u32 = 0b1_0000;
 
 /// The static half of an instance slot (must match instances.slang). 32 bytes.
 #[repr(C)]
@@ -256,6 +258,22 @@ impl MaterialArena {
     }
 }
 
+/// Who an SBT hit-group record belongs to: a mesh asset (its BLAS streams), or one TLAS slot
+/// whose streams are its own (a skinned instance, skinning.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HitKey {
+    Asset(UntypedAssetId),
+    Slot(u32),
+}
+
+/// A slot's static half redirected away from its mesh asset: another BLAS over the same
+/// geometry (an opacity-micromap variant, omm.rs) and/or its own hit record (skinning.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstanceOverride {
+    pub blas: u64,
+    pub hit_offset: Option<u32>,
+}
+
 #[derive(Resource)]
 pub struct TLAS {
     module: Handle<ComputeModule>,
@@ -263,9 +281,10 @@ pub struct TLAS {
     scratch_buffer: Buffer<u8>,
     handle_size: u64,
     scratch_alignment: u64,
-    /// SBT hit-group record per mesh asset, stable for the asset's lifetime (0 = spheres).
-    pub mesh_to_hit_offset: HashMap<UntypedAssetId, u32>,
+    /// SBT hit-group record per mesh asset / owning slot, stable for its lifetime (0 = spheres).
+    pub hit_offsets: HashMap<HitKey, u32>,
     next_hit_offset: u32,
+    overrides: HashMap<u32, InstanceOverride>,
     // Slot state.
     sources: Vec<Option<InstanceSource>>,
     mirror: Vec<InstanceRecord>,
@@ -294,8 +313,9 @@ impl TLAS {
             scratch_buffer: Buffer::default(),
             handle_size: 0,
             scratch_alignment: 0,
-            mesh_to_hit_offset: HashMap::new(),
+            hit_offsets: HashMap::new(),
             next_hit_offset: 1,
+            overrides: HashMap::new(),
             sources: Vec::new(),
             mirror: Vec::new(),
             count: 0,
@@ -334,12 +354,33 @@ impl TLAS {
         self.next_hit_offset
     }
 
-    fn hit_offset(&mut self, id: UntypedAssetId) -> u32 {
-        *self.mesh_to_hit_offset.entry(id).or_insert_with(|| {
+    fn hit_offset(&mut self, key: HitKey) -> u32 {
+        *self.hit_offsets.entry(key).or_insert_with(|| {
             let o = self.next_hit_offset;
             self.next_hit_offset += 1;
             o
         })
+    }
+
+    /// The SBT hit record owned by `slot` itself (allocated on first use).
+    pub fn slot_hit_offset(&mut self, slot: u32) -> u32 {
+        self.hit_offset(HitKey::Slot(slot))
+    }
+
+    pub fn release_slot_hit_offset(&mut self, slot: u32) {
+        self.hit_offsets.remove(&HitKey::Slot(slot));
+    }
+
+    /// Redirects (or restores) a slot's BLAS / hit record; the slot is re-resolved by
+    /// `prepare_instances`.
+    pub fn set_override(&mut self, slot: u32, value: Option<InstanceOverride>) {
+        let changed = match value {
+            Some(v) => self.overrides.insert(slot, v) != Some(v),
+            None => self.overrides.remove(&slot).is_some(),
+        };
+        if changed && (slot as usize) < self.sources.len() {
+            self.dirty.push(slot);
+        }
     }
 
     fn set_source(&mut self, slot: u32, source: Option<InstanceSource>) {
@@ -395,7 +436,8 @@ impl TLAS {
     }
 
     /// Records this frame's instance updates and, when anything changed, the TLAS build. Call
-    /// after the transform table's `record` (and the in-flight fence wait).
+    /// after the transform table's `record` (and the in-flight fence wait). `world_changed`
+    /// also covers BLASes rebuilt in place this frame (skinning), which move the TLAS bounds.
     pub fn record(
         &mut self,
         rd: &RenderDevice,
@@ -717,8 +759,20 @@ pub fn prepare_instances(
     materials: Res<VulkanAssets<AuroraMaterial>>,
     textures: Res<VulkanAssets<Image>>,
     sphere_blas: Res<SphereBLAS>,
+    dev_ui: Option<Res<crate::dev_ui::DevUIState>>,
+    mut omm_enabled: Local<Option<bool>>,
 ) {
     let tlas = &mut *tlas;
+    // The micromap toggle lives in the instance flags: flipping it re-resolves every slot.
+    let omm = dev_ui.as_ref().is_none_or(|d| d.omm);
+    if *omm_enabled != Some(omm) {
+        if omm_enabled.is_some() {
+            tlas.dirty.extend(
+                (0..tlas.sources.len() as u32).filter(|&s| tlas.sources[s as usize].is_some()),
+            );
+        }
+        *omm_enabled = Some(omm);
+    }
     if tlas.dirty.is_empty() && tlas.pending.is_empty() {
         return;
     }
@@ -743,9 +797,9 @@ pub fn prepare_instances(
         };
 
         let mut complete = true;
-        let (blas, hit_offset, gltf_materials) = match source.geometry {
+        let (mut blas, mut hit_offset, gltf_materials) = match source.geometry {
             Geometry::Mesh(id) => {
-                let offset = tlas.hit_offset(id.untyped());
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
                 match meshes.get_by_id(id) {
                     Some(b) => (b.acceleration_structure.address, offset, None),
                     None => {
@@ -755,7 +809,7 @@ pub fn prepare_instances(
                 }
             }
             Geometry::Gltf(id) => {
-                let offset = tlas.hit_offset(id.untyped());
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
                 match gltf_meshes.get_by_id(id) {
                     Some(b) => (
                         b.acceleration_structure.address,
@@ -770,6 +824,14 @@ pub fn prepare_instances(
             }
             Geometry::Sphere => (sphere_blas.acceleration_structure.address, 0, None),
         };
+        if blas != 0
+            && let Some(over) = tlas.overrides.get(&slot)
+        {
+            blas = over.blas;
+            if let Some(offset) = over.hit_offset {
+                hit_offset = offset;
+            }
+        }
 
         let material_slice: Vec<RTXMaterial> = match (source.material, gltf_materials) {
             (Some(id), _) => match materials.get_by_id(id) {
@@ -792,7 +854,8 @@ pub fn prepare_instances(
                 INSTANCE_FORCE_OPAQUE
             } else {
                 0
-            };
+            }
+            | if omm { 0 } else { INSTANCE_DISABLE_OMM };
 
         let record = InstanceRecord {
             slot,

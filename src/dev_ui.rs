@@ -78,6 +78,9 @@ pub struct DevUIState {
     /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
     #[reflect(@0.05..=2.0_f32)]
     pub sharc_voxel: f32,
+    /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = every instance
+    /// traces through the any-hit alpha test, for A/B).
+    pub omm: bool,
     /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
     pub dlss: AuroraDlss,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
@@ -102,6 +105,7 @@ impl Default for DevUIState {
             restir_history: 20.0,
             sharc: true,
             sharc_voxel: 0.25,
+            omm: true,
             dlss: AuroraDlss::from_env(),
             rr_preset: RrPreset::current(),
         }

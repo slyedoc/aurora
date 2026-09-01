@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ash::vk;
 use bevy::{
     asset::Asset,
@@ -9,6 +11,8 @@ use half::f16;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
+    cluster_mesh::OmmSlices,
+    omm::{Micromap, MicromapBuild},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
@@ -22,6 +26,31 @@ pub struct Vertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub uv: Vec2,
+}
+
+/// Per-vertex skinning influences (skinning.slang `SkinVertex`): four u16 joint indices packed
+/// low-first into two words, and their weights. Present only on meshes that carry
+/// `Mesh::ATTRIBUTE_JOINT_INDEX` / `ATTRIBUTE_JOINT_WEIGHT`. 32 bytes: the weights sit at a
+/// 16-byte offset so the scalar and the vector-aligned layouts agree.
+#[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct SkinVertex {
+    pub joints: [u32; 2],
+    pub pad: [u32; 2],
+    pub weights: [f32; 4],
+}
+
+impl SkinVertex {
+    pub fn new(joints: [u16; 4], weights: [f32; 4]) -> Self {
+        Self {
+            joints: [
+                joints[0] as u32 | ((joints[1] as u32) << 16),
+                joints[2] as u32 | ((joints[3] as u32) << 16),
+            ],
+            pad: [0; 2],
+            weights,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
@@ -119,12 +148,22 @@ pub struct BLAS {
     pub index_buffer: Buffer<u32>,
     pub geometry_to_index: Buffer<u32>,
     pub geometry_to_triangle: Buffer<u32>,
+    /// Skinning influences, parallel to `vertex_buffer` (skinned meshes only).
+    pub skin_buffer: Option<Buffer<SkinVertex>>,
+    /// The opacity micromap the structure references (alpha-cutout meshes with a bake).
+    pub micromap: Option<Micromap>,
     pub gltf_materials: Option<Vec<RTXMaterial>>,
     pub gltf_textures: Option<Vec<RenderTexture>>,
 }
 
 impl BLAS {
     pub fn destroy(&self, render_device: &RenderDevice) {
+        if let Some(skin) = &self.skin_buffer {
+            render_device.destroyer.destroy_buffer(skin.handle);
+        }
+        if let Some(micromap) = &self.micromap {
+            micromap.destroy(render_device);
+        }
         render_device
             .destroyer
             .destroy_acceleration_structure(self.acceleration_structure.handle);
@@ -179,6 +218,10 @@ pub struct BlasBuildInput {
     pub vertex_buffer_host: Buffer<Vertex>,
     pub index_buffer_host: Buffer<u32>,
     pub geometries: Vec<GeometryDescr>,
+    /// Skinning influences, one per vertex, for meshes that carry joint attributes.
+    pub skin_host: Option<Buffer<SkinVertex>>,
+    /// A baked opacity micromap to attach (single-geometry meshes; omm.rs).
+    pub omm: Option<Arc<OmmSlices>>,
 }
 
 /// Scratch memory a single build submission may hold at once. Cluster meshes need a few KB
@@ -201,6 +244,8 @@ pub fn build_blas_from_buffers(
             vertex_buffer_host,
             index_buffer_host,
             geometries: geometries.to_vec(),
+            skin_host: None,
+            omm: None,
         }],
     )
     .pop()
@@ -214,6 +259,9 @@ struct BlasStaging {
     triangle_buffer: Buffer<Triangle>,
     geom_to_index: Buffer<u32>,
     geom_to_triangle: Buffer<u32>,
+    skin: Option<Buffer<SkinVertex>>,
+    /// Boxed and never moved: the geometry's `pNext` points into it.
+    omm: Option<Box<MicromapBuild>>,
     geometries: Vec<GeometryDescr>,
     vertex_count: usize,
 }
@@ -274,6 +322,8 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             vertex_buffer_host,
             index_buffer_host,
             geometries,
+            skin_host,
+            omm,
         } = input;
         let mut triangle_host: Buffer<Triangle> = render_device.create_host_buffer(
             triangles.len() as u64,
@@ -311,6 +361,17 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             render_device.create_device_buffer(geom_to_index.len() as u64, storage);
         let geom_to_triangle_dev: Buffer<u32> =
             render_device.create_device_buffer(geom_to_triangle.len() as u64, storage);
+        let skin = skin_host.map(|host| {
+            let dev: Buffer<SkinVertex> =
+                render_device.create_device_buffer(host.nr_elements, storage);
+            uploads.push((
+                host.handle,
+                dev.handle,
+                host.nr_elements * std::mem::size_of::<SkinVertex>() as u64,
+            ));
+            host_buffers.push(host.handle);
+            dev
+        });
 
         uploads.push((
             vertex_buffer_host.handle,
@@ -344,17 +405,36 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             geom_to_index_host.handle,
             geom_to_triangle_host.handle,
         ]);
+        // A micromap needs the per-triangle index to line up with one geometry's triangles.
+        let omm = omm
+            .filter(|slices| {
+                let ok = geometries.len() == 1 && slices.index.len() * 3 == index_count;
+                if !ok {
+                    log::warn!(
+                        "omm: {} index entries for {} triangles in {} geometries; skipping",
+                        slices.index.len(),
+                        index_count / 3,
+                        geometries.len()
+                    );
+                }
+                ok
+            })
+            .and_then(|slices| MicromapBuild::prepare(render_device, &slices));
         staging.push(BlasStaging {
             vertex_buffer,
             index_buffer,
             triangle_buffer,
             geom_to_index: geom_to_index_dev,
             geom_to_triangle: geom_to_triangle_dev,
+            skin,
+            omm,
             geometries,
             vertex_count,
         });
     }
 
+    let micromap_builds: Vec<&MicromapBuild> =
+        staging.iter().filter_map(|s| s.omm.as_deref()).collect();
     render_device.run_transfer_commands(|cmd_buffer| {
         for (src, dst, size) in &uploads {
             if *size == 0 {
@@ -370,7 +450,12 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
                 )
             };
         }
+        // Micromaps build here too (host-visible inputs), ahead of the BLAS builds.
+        MicromapBuild::record(render_device, cmd_buffer, &micromap_builds);
     });
+    if !micromap_builds.is_empty() {
+        log::info!("Built {} opacity micromaps", micromap_builds.len());
+    }
     for handle in host_buffers {
         render_device.destroyer.destroy_buffer(handle);
     }
@@ -416,22 +501,26 @@ fn geometry_infos(
         .map(|_| {
             // Not OPAQUE: any-hit runs for alpha-masked materials. Instances whose
             // materials are all opaque set VK_GEOMETRY_INSTANCE_FORCE_OPAQUE instead.
+            let mut triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: staging.vertex_buffer.address,
+                })
+                .vertex_stride(std::mem::size_of::<Vertex>() as u64)
+                .max_vertex(staging.vertex_count as u32)
+                .index_type(vk::IndexType::UINT32)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: staging.index_buffer.address,
+                })
+                .transform_data(vk::DeviceOrHostAddressConstKHR { device_address: 0 });
+            // The opacity micromap rides on the triangles' pNext (the build lives in a box
+            // that outlives every use of this geometry).
+            if let Some(omm) = &staging.omm {
+                triangles.p_next = omm.geometry_ext_ptr();
+            }
             vk::AccelerationStructureGeometryKHR::default()
                 .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                .geometry(vk::AccelerationStructureGeometryDataKHR {
-                    triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                        .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                        .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: staging.vertex_buffer.address,
-                        })
-                        .vertex_stride(std::mem::size_of::<Vertex>() as u64)
-                        .max_vertex(staging.vertex_count as u32)
-                        .index_type(vk::IndexType::UINT32)
-                        .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: staging.index_buffer.address,
-                        })
-                        .transform_data(vk::DeviceOrHostAddressConstKHR { device_address: 0 }),
-                })
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
         })
         .collect();
     let counts = staging
@@ -678,6 +767,8 @@ fn build_chunk(
             index_buffer: s.index_buffer,
             geometry_to_index: s.geom_to_index,
             geometry_to_triangle: s.geom_to_triangle,
+            skin_buffer: s.skin,
+            micromap: s.omm.map(|build| build.finish(render_device)),
             gltf_materials: None,
             gltf_textures: None,
         })

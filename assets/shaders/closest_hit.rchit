@@ -15,6 +15,9 @@ layout(shaderRecordEXT, scalar) buffer ShaderRecord
   IndexData  indexData;
   GeometryData geometries;
   GeometryData triangles;
+  // Skinned instances (sbt.rs): last frame's deformed stream, flagged in recordFlags.x.
+  VertexData prevVertexData;
+  uvec2 recordFlags;
 };
 
 layout(push_constant, std430) uniform Registers {
@@ -119,8 +122,17 @@ void main() {
   payload.slot = gl_InstanceID;
   payload.prim_tri = triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID;
   {
-    // Object-space hit point through last frame's instance transform.
-    const vec4 p = vec4(gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT, 1.0);
+    // Object-space hit point through last frame's instance transform. A skinned instance
+    // takes the point from last frame's deformed vertices instead (object motion).
+    vec3 object_p = gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT;
+    if ((recordFlags.x & 1u) != 0u) {
+      const uint index_offset = geometries.index_offsets[gl_GeometryIndexEXT];
+      const vec3 q0 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 0]].position;
+      const vec3 q1 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 1]].position;
+      const vec3 q2 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 2]].position;
+      object_p = q0 * baryCoords.x + q1 * baryCoords.y + q2 * baryCoords.z;
+    }
+    const vec4 p = vec4(object_p, 1.0);
     const uint base = gl_InstanceID * 4;
     const vec4 r0 = pc.prev_instances.data[base + 0];
     const vec4 r1 = pc.prev_instances.data[base + 1];

@@ -60,6 +60,10 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "png",
     "bevy_mesh",
     "bevy_mikktspace",
+    # Skeletal animation (skinning.rs drives the joints' world transforms into the tracer).
+    "bevy_animation",
+    "bevy_gltf",
+    "gltf_animation",
     "bevy_camera",
     # Light COMPONENTS only (render-free): extracted into the NEE light table.
     "bevy_light",

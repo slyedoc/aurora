@@ -262,7 +262,14 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(3),
         ];
 
+        // Pipelines that trace structures referencing opacity micromaps must say so.
+        let flags = if render_device.ext_micromap.is_some() {
+            vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT
+        } else {
+            vk::PipelineCreateFlags::empty()
+        };
         let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
+            .flags(flags)
             .stages(&shader_stages)
             .groups(&shader_group)
             .max_pipeline_ray_recursion_depth(1)

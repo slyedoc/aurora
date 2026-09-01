@@ -26,6 +26,12 @@ impl PluginGroup for RayDefaultPlugins {
 
         group = group.add(bevy::asset::AssetPlugin::default());
         group = group.add(bevy::scene::ScenePlugin);
+        // Skeletal animation drives joint `Transform`s; the tracer skins on the GPU
+        // (skinning.rs). bevy's glTF loader yields skinned meshes + clips (render-free in the
+        // fork); aurora's own `GltfModel` loader keeps the `.glb` extension for typed loads.
+        group = group.add(bevy::animation::AnimationPlugin);
+        group = group.add(bevy::world_serialization::WorldSerializationPlugin);
+        group = group.add(bevy::gltf::GltfPlugin::default());
         group = group.add(bevy::winit::WinitPlugin::default());
         group = group.add(bevy::audio::AudioPlugin::default());
 
@@ -44,6 +50,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::gltf_mesh::GltfPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
+        group = group.add(crate::skinning::SkinningPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
         group = group.add(crate::sharc::SharcPlugin);

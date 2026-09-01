@@ -4,7 +4,8 @@ use crate::{
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    tlas_builder::{TLAS, prepare_instances},
+    skinning::{Skins, prepare_skins},
+    tlas_builder::{HitKey, TLAS, prepare_instances},
     vk_utils,
     vulkan_asset::{VulkanAssetLoadingState, VulkanAssets, poll_for_asset},
 };
@@ -32,6 +33,10 @@ pub struct SBTRegionHitTriangle {
     pub index_buffer: vk::DeviceAddress,
     pub geometry_to_index: vk::DeviceAddress,
     pub geometry_to_triangle: vk::DeviceAddress,
+    /// Last frame's vertex stream (skinned instances; 0 otherwise) for motion vectors.
+    pub prev_vertex_buffer: vk::DeviceAddress,
+    /// Bit 0: `prev_vertex_buffer` is valid.
+    pub flags: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +67,7 @@ fn update_sbt(
     rtx_pipelines: Res<VulkanAssets<RaytracingPipeline>>,
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    skins: Res<Skins>,
     render_config: Res<RenderConfig>,
     mut aligments: Local<SBTAligments>,
 ) {
@@ -136,7 +142,7 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
 
-                if let Some(offset) = tlas.mesh_to_hit_offset.get(&mesh_id.untyped()) {
+                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
                         .write(SBTRegionHitTriangle {
@@ -146,8 +152,26 @@ fn update_sbt(
                             index_buffer: mesh.index_buffer.address,
                             geometry_to_index: mesh.geometry_to_index.address,
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
+                            prev_vertex_buffer: 0,
+                            flags: 0,
                         });
                 }
+            }
+
+            // Skinned instances: their own deformed streams, plus last frame's positions.
+            for record in skins.hit_records() {
+                (dst.add(record.hit_offset as usize * sbt.hit_region.stride as usize)
+                    as *mut SBTRegionHitTriangle)
+                    .write(SBTRegionHitTriangle {
+                        handle: rtx_pipeline.hit_handle,
+                        vertex_buffer: record.vertex_buffer,
+                        triangle_buffer: record.triangle_buffer,
+                        index_buffer: record.index_buffer,
+                        geometry_to_index: record.geometry_to_index,
+                        geometry_to_triangle: record.geometry_to_triangle,
+                        prev_vertex_buffer: record.prev_vertex_buffer,
+                        flags: 1,
+                    });
             }
 
             for (mesh_id, mesh) in gltf_meshes.iter() {
@@ -156,7 +180,7 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
 
-                if let Some(offset) = tlas.mesh_to_hit_offset.get(&mesh_id.untyped()) {
+                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
                         .write(SBTRegionHitTriangle {
@@ -166,6 +190,8 @@ fn update_sbt(
                             index_buffer: mesh.index_buffer.address,
                             geometry_to_index: mesh.geometry_to_index.address,
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
+                            prev_vertex_buffer: 0,
+                            flags: 0,
                         });
                 }
             }
@@ -192,7 +218,8 @@ impl Plugin for SBTPlugin {
             update_sbt
                 .in_set(RenderSet::Prepare)
                 .after(poll_for_asset::<RaytracingPipeline>)
-                .after(prepare_instances),
+                .after(prepare_instances)
+                .after(prepare_skins),
         );
         app.add_systems(TeardownSchedule, cleanup_sbt.before(on_shutdown));
     }

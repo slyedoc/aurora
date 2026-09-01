@@ -298,6 +298,7 @@ fn render_frame(
         ResMut<ScreenshotRequests>,
         ResMut<crate::auto_exposure::AutoExposureState>,
         Res<Time>,
+        ResMut<crate::skinning::Skins>,
     ),
     camera: Query<
         (
@@ -335,6 +336,7 @@ fn render_frame(
         mut screenshots,
         mut ae,
         time,
+        mut skins,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
@@ -551,12 +553,13 @@ fn render_frame(
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place -- all inside this command buffer.
         let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
+        let skinned = skins.record(&render_device, cmd_buffer, &modules, &transforms);
         tlas.record(
             &render_device,
             cmd_buffer,
             &modules,
             &transforms,
-            world_changed,
+            world_changed || skinned,
         );
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).

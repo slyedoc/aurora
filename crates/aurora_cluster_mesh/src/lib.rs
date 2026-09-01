@@ -14,13 +14,14 @@
 //! [`ClusterMeshData::from_mesh_flat`] writes a single-LOD cluster set so the importers can keep
 //! emitting the same format without aurora's DAG bake (and such files still load in aurora).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bevy::{
-    asset::{AssetLoader, LoadContext, RenderAssetUsages, io::Reader},
+    asset::{AssetLoader, AssetPath, LoadContext, RenderAssetUsages, io::Reader},
     math::{Vec2, Vec3, Vec4},
-    mesh::{Indices, Mesh, PrimitiveTopology},
+    mesh::{Indices, Mesh, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
 };
 use bytemuck::{Pod, Zeroable};
@@ -347,27 +348,105 @@ pub fn unpack_normal(p: u32) -> Vec3 {
 // Mesh conversion
 // ---------------------------------------------------------------------------------------------
 
+/// A mesh's baked opacity micromap, in the triangle order [`ClusterMeshData::to_mesh`] emits:
+/// the `VkMicromapEXT` build inputs (`array_data`, `descs` = `VkMicromapTriangleEXT`s, `usage`)
+/// plus the per-triangle index the BLAS geometry references it through (negative = the
+/// `VK_OPACITY_MICROMAP_SPECIAL_INDEX_*` uniform states) and that index's usage histogram.
+#[derive(Clone, Debug)]
+pub struct OmmSlices {
+    pub array_data: Arc<[u8]>,
+    pub descs: Arc<[OmmDesc]>,
+    pub usage: Arc<[OmmUsage]>,
+    pub index: Vec<i32>,
+    pub index_usage: Vec<OmmUsage>,
+}
+
+/// Where the loader parks each loaded file's [`OmmSlices`], keyed by asset path: the loader
+/// produces a plain [`Mesh`], which has nowhere to carry them, and the renderer picks them up
+/// when it builds the mesh's BLAS.
+pub type OmmRegistry = Arc<Mutex<HashMap<AssetPath<'static>, Arc<OmmSlices>>>>;
+
 impl ClusterMeshData {
+    /// The clusters [`Self::to_mesh`] emits, in emission order: the `lod_level == 0` clusters,
+    /// or every cluster if the file carries no LOD levels.
+    fn finest_clusters(&self) -> Vec<&Cluster> {
+        let lod0: Vec<&Cluster> = self.clusters.iter().filter(|c| c.lod_level == 0).collect();
+        if lod0.is_empty() {
+            self.clusters.iter().collect()
+        } else {
+            lod0
+        }
+    }
+
+    pub fn has_omm(&self) -> bool {
+        !self.omm_array_data.is_empty() && !self.omm_descs.is_empty()
+    }
+
+    /// The baked opacity micromap re-indexed to [`Self::to_mesh`]'s triangle order (the file's
+    /// index is per cluster triangle, in cluster order). `None` when the file has no OMM or no
+    /// emitted triangle references one.
+    pub fn omm_slices(&self) -> Option<OmmSlices> {
+        if !self.has_omm() {
+            return None;
+        }
+        let mut index = Vec::new();
+        for cluster in self.finest_clusters() {
+            let t0 = cluster.index_offset as usize / 3;
+            let t1 = t0 + cluster.triangle_count as usize;
+            if t1 > self.omm_index.len() {
+                return None;
+            }
+            index.extend_from_slice(&self.omm_index[t0..t1]);
+        }
+        let mut histogram: HashMap<(u16, u16), u32> = HashMap::new();
+        for &i in &index {
+            if i >= 0 {
+                let desc = self.omm_descs.get(i as usize)?;
+                *histogram
+                    .entry((desc.subdivision_level, desc.format))
+                    .or_default() += 1;
+            }
+        }
+        if histogram.is_empty() {
+            return None;
+        }
+        let mut index_usage: Vec<OmmUsage> = histogram
+            .into_iter()
+            .map(|((subdivision_level, format), count)| OmmUsage {
+                count,
+                subdivision_level,
+                format,
+            })
+            .collect();
+        index_usage.sort_by_key(|u| (u.subdivision_level, u.format));
+        Some(OmmSlices {
+            array_data: Arc::clone(&self.omm_array_data),
+            descs: Arc::clone(&self.omm_descs),
+            usage: Arc::clone(&self.omm_usage),
+            index,
+            index_usage,
+        })
+    }
+
     /// Rebuilds an indexed triangle mesh from the finest LOD (the `lod_level == 0` clusters, or
     /// every cluster if the file carries no LOD levels).
     pub fn to_mesh(&self) -> Mesh {
-        let finest: Vec<&Cluster> = {
-            let lod0: Vec<&Cluster> = self.clusters.iter().filter(|c| c.lod_level == 0).collect();
-            if lod0.is_empty() {
-                self.clusters.iter().collect()
-            } else {
-                lod0
-            }
-        };
+        let finest = self.finest_clusters();
 
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
         let mut tangents = Vec::new();
+        let mut joints = Vec::new();
+        let mut weights = Vec::new();
         let mut indices = Vec::new();
         let has_normals = self.vertex_normals.len() == self.vertex_positions.len();
         let has_uvs = self.vertex_uvs.len() == self.vertex_positions.len();
         let has_tangents = self.vertex_tangents.len() == self.vertex_positions.len();
+        // v4 skin slices: the renderer skins the mesh on the GPU when the entity carries a
+        // `SkinnedMesh` (see src/skinning.rs).
+        let has_skin = self.vertex_joint_indices.len() == self.vertex_positions.len()
+            && self.vertex_joint_weights.len() == self.vertex_positions.len();
 
         for cluster in finest {
             let base = positions.len() as u32;
@@ -387,6 +466,14 @@ impl ClusterMeshData {
             if has_tangents {
                 tangents.extend(self.vertex_tangents[v0..v1].iter().map(|t| t.to_array()));
             }
+            if has_skin {
+                joints.extend_from_slice(&self.vertex_joint_indices[v0..v1]);
+                weights.extend(
+                    self.vertex_joint_weights[v0..v1]
+                        .iter()
+                        .map(|w| w.to_array()),
+                );
+            }
             let i0 = cluster.index_offset as usize;
             let i1 = i0 + 3 * cluster.triangle_count as usize;
             indices.extend(self.indices[i0..i1].iter().map(|&i| base + i));
@@ -405,6 +492,13 @@ impl ClusterMeshData {
         }
         if has_tangents {
             mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
+        }
+        if has_skin {
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_JOINT_INDEX,
+                VertexAttributeValues::Uint16x4(joints),
+            );
+            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, weights);
         }
         mesh.insert_indices(Indices::U32(indices));
         if !has_normals {
@@ -574,9 +668,12 @@ fn bounding_sphere(points: &[Vec3]) -> [f32; 4] {
 // ---------------------------------------------------------------------------------------------
 
 /// Loads `.cluster_mesh` files as [`Mesh`] assets, so `Mesh3d("x.cluster_mesh")` in a `.bsn`
-/// resolves straight into the BLAS path.
+/// resolves straight into the BLAS path. With an [`OmmRegistry`] attached, each file's baked
+/// opacity micromap is parked there under the file's asset path.
 #[derive(TypePath, Default)]
-pub struct ClusterMeshLoader;
+pub struct ClusterMeshLoader {
+    pub omm: Option<OmmRegistry>,
+}
 
 impl AssetLoader for ClusterMeshLoader {
     type Asset = Mesh;
@@ -587,11 +684,19 @@ impl AssetLoader for ClusterMeshLoader {
         &self,
         reader: &mut dyn Reader,
         _settings: &(),
-        _load_context: &mut LoadContext<'_>,
+        load_context: &mut LoadContext<'_>,
     ) -> Result<Mesh, ClusterMeshError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         let data = read_cluster_mesh_sync(bytes.as_slice())?;
+        if let Some(registry) = &self.omm
+            && let Some(slices) = data.omm_slices()
+        {
+            registry
+                .lock()
+                .unwrap()
+                .insert(load_context.path().clone(), Arc::new(slices));
+        }
         Ok(data.to_mesh())
     }
 

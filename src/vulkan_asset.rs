@@ -29,6 +29,16 @@ pub trait VulkanAsset: Asset + Clone + Send + Sync + 'static {
         param: &mut SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset>;
 
+    /// [`extract_asset`](Self::extract_asset) for assets whose extraction needs to know which
+    /// asset it is (a side table keyed by asset path, say).
+    fn extract_asset_with_id(
+        &self,
+        _id: AssetId<Self>,
+        param: &mut SystemParamItem<Self::ExtractParam>,
+    ) -> Option<Self::ExtractedAsset> {
+        self.extract_asset(param)
+    }
+
     fn prepare_asset(
         asset: Self::ExtractedAsset,
         render_device: &RenderDevice,
@@ -139,7 +149,7 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     id
                 );
                 if let Some(asset) = assets.get(*id) {
-                    if let Some(extracted) = asset.extract_asset(&mut param) {
+                    if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
                         if render_assets
                             .insert(*id, VulkanAssetLoadingState::Loading)
                             .is_none()
@@ -157,7 +167,7 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     id
                 );
                 if let Some(asset) = assets.get(*id) {
-                    if let Some(extracted) = asset.extract_asset(&mut param) {
+                    if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
                         comms.send_work.send((*id, extracted)).unwrap();
                     }
                 } else {
@@ -176,7 +186,7 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     id
                 );
                 if let Some(asset) = assets.get(*id) {
-                    if let Some(extracted) = asset.extract_asset(&mut param) {
+                    if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
                         if render_assets
                             .insert(*id, VulkanAssetLoadingState::Loading)
                             .is_none()
