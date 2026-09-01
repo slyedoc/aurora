@@ -49,9 +49,16 @@ impl ScreenshotExt for App {
                 // Bare keypress only: modifier combos on the same key belong to others
                 // (the NGX dev overlay drives its debug layers with ctl/shift+F-keys).
                 use KeyCode::*;
-                let modified = [ControlLeft, ControlRight, ShiftLeft, ShiftRight, AltLeft, AltRight]
-                    .iter()
-                    .any(|m| input.pressed(*m));
+                let modified = [
+                    ControlLeft,
+                    ControlRight,
+                    ShiftLeft,
+                    ShiftRight,
+                    AltLeft,
+                    AltRight,
+                ]
+                .iter()
+                .any(|m| input.pressed(*m));
                 if input.just_pressed(trigger) && !modified {
                     take_screenshot(&mut requests);
                 }
@@ -112,8 +119,7 @@ pub(crate) fn save_png(
             return;
         }
     };
-    let mut encoder =
-        png::Encoder::new(std::io::BufWriter::new(file), extent.width, extent.height);
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), extent.width, extent.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     match encoder

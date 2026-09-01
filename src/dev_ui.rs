@@ -18,8 +18,8 @@ use bevy::{
         tokens,
     },
     feathers_inspector::{
-        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, InspectorCollapsed,
-        InspectorRoot, WorldInspectorPlugin, build_resource_inspector,
+        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, InspectorCollapsed, InspectorRoot,
+        WorldInspectorPlugin, build_resource_inspector,
     },
     prelude::*,
     ui::Display,

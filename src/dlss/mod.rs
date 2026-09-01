@@ -92,11 +92,11 @@ impl RrPreset {
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
-    #[default]
     Dlaa,
     Quality,
     Balanced,
     Performance,
+    #[default]
     UltraPerformance,
 }
 

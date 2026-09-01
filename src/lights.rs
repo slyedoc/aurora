@@ -24,16 +24,18 @@
 use std::collections::HashMap;
 
 use ash::vk;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::Remove;
 use bevy::ecs::observer::On;
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::light::{PointLight, RectLight, SpotLight};
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
     assets::aurora_asset,
-    compute::{ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch},
+    compute::{
+        ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
+    },
     gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::upload_slice,
     material::{AuroraMaterial, AuroraMaterial3d},
@@ -407,8 +409,7 @@ fn track_lights(
 
     // Mesh materials that had not loaded yet: retry until they have.
     if !lights.pending.is_empty() {
-        let retry: Vec<(u32, LightSource)> =
-            lights.pending.iter().map(|(s, v)| (*s, *v)).collect();
+        let retry: Vec<(u32, LightSource)> = lights.pending.iter().map(|(s, v)| (*s, *v)).collect();
         for (slot, source) in retry {
             let LightSource::Mesh(_, material) = source else {
                 continue;
@@ -588,7 +589,12 @@ fn prepare_lights(
             upload_slice(&render_device, cmd, &emissions, &lights.emissions);
         }
         if !lights.analytic_cache.is_empty() {
-            upload_slice(&render_device, cmd, &lights.analytic_cache, &lights.analytics);
+            upload_slice(
+                &render_device,
+                cmd,
+                &lights.analytic_cache,
+                &lights.analytics,
+            );
         }
     });
 }
@@ -734,10 +740,7 @@ impl Plugin for LightsPlugin {
     fn build(&self, app: &mut App) {
         let asset_server = app.world().resource::<AssetServer>();
         let shader = asset_server.load(aurora_asset("shaders/lights.slang"));
-        let module = asset_server.add(ComputeModule::new(
-            shader,
-            &["light_powers", "light_scan"],
-        ));
+        let module = asset_server.add(ComputeModule::new(shader, &["light_powers", "light_scan"]));
         app.insert_resource(LightManager::new(module));
         app.add_observer(on_light_instance_removed);
         app.add_systems(

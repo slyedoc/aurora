@@ -22,37 +22,46 @@ use crate::{
 /// Must match `Reservoir` in types.glsl.
 const RESERVOIR_BYTES: u64 = 32;
 
-#[derive(Resource, Default)]
-pub struct RestirState {
+/// One view's ping-pong reservoir pair. Temporal reuse reprojects against that view's own
+/// history, so each rendered view (each eye in XR) owns a separate pair.
+#[derive(Default)]
+struct ReservoirView {
     buffers: [Buffer<u8>; 2],
     bytes: u64,
 }
 
+#[derive(Resource, Default)]
+pub struct RestirState {
+    views: [ReservoirView; 2],
+}
+
 impl RestirState {
-    /// Ensures both reservoir buffers cover `extent` (zero-filling on (re)creation inside
-    /// `cmd`) and returns this frame's (previous, current) buffer addresses.
+    /// Ensures the view's reservoir buffers cover `extent` (zero-filling on (re)creation
+    /// inside `cmd`) and returns this frame's (previous, current) buffer addresses.
     pub fn ensure(
         &mut self,
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
         extent: vk::Extent2D,
         frame: u32,
+        view: usize,
     ) -> (u64, u64) {
+        let view = &mut self.views[view];
         let bytes = extent.width as u64 * extent.height as u64 * RESERVOIR_BYTES;
-        if bytes != self.bytes {
-            for b in &self.buffers {
+        if bytes != view.bytes {
+            for b in &view.buffers {
                 rd.destroyer.destroy_buffer(b.handle);
             }
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-            self.buffers = [
+            view.buffers = [
                 rd.create_device_buffer(bytes, usage),
                 rd.create_device_buffer(bytes, usage),
             ];
             unsafe {
                 rd.device
-                    .cmd_fill_buffer(cmd, self.buffers[0].handle, 0, vk::WHOLE_SIZE, 0);
+                    .cmd_fill_buffer(cmd, view.buffers[0].handle, 0, vk::WHOLE_SIZE, 0);
                 rd.device
-                    .cmd_fill_buffer(cmd, self.buffers[1].handle, 0, vk::WHOLE_SIZE, 0);
+                    .cmd_fill_buffer(cmd, view.buffers[1].handle, 0, vk::WHOLE_SIZE, 0);
             }
             memory_barrier(
                 rd,
@@ -62,19 +71,20 @@ impl RestirState {
                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                 vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
             );
-            self.bytes = bytes;
+            view.bytes = bytes;
         }
         let cur = (frame & 1) as usize;
-        (self.buffers[cur ^ 1].address, self.buffers[cur].address)
+        (view.buffers[cur ^ 1].address, view.buffers[cur].address)
     }
 }
 
 fn cleanup_restir(mut state: ResMut<RestirState>, render_device: Res<RenderDevice>) {
-    for b in &state.buffers {
-        render_device.destroyer.destroy_buffer(b.handle);
+    for view in &mut state.views {
+        for b in &view.buffers {
+            render_device.destroyer.destroy_buffer(b.handle);
+        }
+        *view = ReservoirView::default();
     }
-    state.buffers = [Buffer::default(), Buffer::default()];
-    state.bytes = 0;
 }
 
 pub struct RestirPlugin;

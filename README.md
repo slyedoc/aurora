@@ -19,6 +19,11 @@ Besides the rust toolchain, you will need to:
 
 1. Follow the Bevy [installation guide](https://bevyengine.org/learn/quick-start/getting-started/setup/#installing-os-dependencies)
 2. Install the [vulkan-sdk](https://www.lunarg.com/vulkan-sdk/)
+3. An NVIDIA RTX GPU with a recent driver — DLSS Ray Reconstruction is the renderer's only
+   denoiser, so it is required, not optional.
+4. The DLSS SDK: clone [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) and export `DLSS_SDK`
+   pointing at it (e.g. `export DLSS_SDK=$HOME/DLSS`) before building. Without it DLSS
+   compiles out and every example refuses to start.
 
 ## Screenshots
 
@@ -51,6 +56,60 @@ Besides the rust toolchain, you will need to:
   </tbody>
 </table>
 
+
+## VR — a Quest over WiVRn
+
+Any aurora app renders into a headset when built with the `xr` feature (per-eye stereo,
+head-tracked; the window becomes a spectator view). The baked scenes live in
+[aurora_files](https://github.com/slyedoc/aurora_files), whose `bsn` viewer forwards the
+feature — `cargo run --release -p bsn --features xr -- bistro/bistro.bsn` walks the
+path-traced bistro in a Quest 2/3, streamed from the PC over Wi-Fi with
+[WiVRn](https://github.com/WiVRn/WiVRn) (OpenXR, no SteamVR involved). One-time setup:
+
+1. **PC — install the WiVRn server** (Flathub; the client and server must be the same WiVRn
+   version, and the flatpak tracks the store client's releases):
+
+   ```sh
+   flatpak install flathub io.github.wivrn.wivrn
+   ```
+
+2. **PC — firewall**, if one is on: WiVRn streams on 9757 (TCP+UDP) and discovers over
+   mDNS (5353/UDP):
+
+   ```sh
+   sudo ufw allow 9757 && sudo ufw allow 5353/udp
+   ```
+
+3. **Headset — install the WiVRn client**: search "WiVRn" in the Meta Horizon Store (free,
+   official). Sideloading an APK is not needed.
+
+4. **Pair**: launch "WiVRn server" on the PC (it has a first-run wizard), open WiVRn in the
+   headset — the PC appears in its list via auto-discovery (same network; headset on 5 GHz
+   Wi-Fi, PC ideally wired) — hit Connect and enter the PIN the dashboard shows.
+
+5. **Run it** — with the headset showing "Connection ready", from the `aurora_files` repo:
+
+   ```sh
+   cargo run --release -p bsn --features xr -- bistro/bistro.bsn
+   ```
+
+   Fly with WASD, and your head does the rest. Any example in this repo works the same way
+   with `cargo run --release --features xr --example <name>`.
+
+Troubleshooting:
+
+- *Headset says connection refused*: the server app isn't running on the PC.
+- *The app starts flat / can't find OpenXR*: WiVRn registers itself as the active
+  OpenXR runtime when the headset connects; connect first. If it still isn't found, point
+  the loader at the flatpak's manifest explicitly:
+
+  ```sh
+  export XR_RUNTIME_JSON=~/.local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json
+  # system-wide flatpak installs: same path under /var/lib/flatpak/app/...
+  ```
+
+- *Double vision / eye strain*: the frame rate is below the headset's refresh rate. Use
+  `--release`, and cycle the DLSS mode towards Performance with `F3`.
 
 ## Examples
 

@@ -107,10 +107,15 @@ impl DlssView {
     }
 }
 
+/// View slots: 0 = the flat window (or left eye in XR), 1 = the right eye. Each slot is a
+/// full RR feature with its own guides, output and temporal history; the NGX session is
+/// shared.
+pub const DLSS_VIEWS: usize = 2;
+
 pub struct DlssRenderer {
     params: *mut NgxParameter,
     rr_available: bool,
-    view: Option<DlssView>,
+    views: [Option<DlssView>; DLSS_VIEWS],
     frame: u32,
 }
 
@@ -208,29 +213,30 @@ impl DlssRenderer {
         Some(Self {
             params,
             rr_available,
-            view: None,
+            views: [None, None],
             frame: 0,
         })
     }
 
-    /// Settles the frame's plan: (re)creates the feature when the mode or output size
-    /// changed. Call before recording -- feature creation submits and waits on its own.
+    /// Settles the frame's plan for one view slot: (re)creates the feature when the mode or
+    /// output size changed. Call before recording -- feature creation submits and waits on
+    /// its own. Slot 0 also advances the jitter frame, so both eyes share one phase.
     pub fn prepare(
         &mut self,
         rd: &RenderDevice,
+        slot: usize,
         output: vk::Extent2D,
         mode: AuroraDlss,
     ) -> Option<DlssPlan> {
         if !self.rr_available || output.width == 0 || output.height == 0 {
-            if self.view.is_some() {
-                self.release_view(rd);
+            if self.views[slot].is_some() {
+                self.release_view(rd, slot);
             }
             return None;
         }
         let quality = mode.perf_quality();
         let preset = super::RR_PRESET.load(Ordering::Relaxed);
-        let fresh = self
-            .view
+        let fresh = self.views[slot]
             .as_ref()
             .is_none_or(|v| v.mode != mode || v.output != output || v.preset != preset);
         if fresh {
@@ -256,10 +262,12 @@ impl DlssRenderer {
                     }
                 }
             };
-            self.rebuild(rd, mode, render, output, quality)?;
+            self.rebuild(rd, slot, mode, render, output, quality)?;
         }
-        let view = self.view.as_ref()?;
-        self.frame = self.frame.wrapping_add(1);
+        let view = self.views[slot].as_ref()?;
+        if slot == 0 {
+            self.frame = self.frame.wrapping_add(1);
+        }
         Some(DlssPlan {
             render: view.render,
             jitter: suggested_jitter(self.frame, view.render.width, view.output.width),
@@ -279,6 +287,7 @@ impl DlssRenderer {
     fn rebuild(
         &mut self,
         rd: &RenderDevice,
+        slot: usize,
         mode: AuroraDlss,
         render: vk::Extent2D,
         output: vk::Extent2D,
@@ -297,8 +306,8 @@ impl DlssRenderer {
             output.height
         );
         Self::wait_idle(rd);
-        self.release_view(rd);
-        log::info!("dlss: rebuild: creating images + feature");
+        self.release_view(rd, slot);
+        log::info!("dlss: rebuild: creating images + feature (view {slot})");
         let one = vk::Extent2D {
             width: 1,
             height: 1,
@@ -364,7 +373,7 @@ impl DlssRenderer {
                 bytes as f64 / (1024.0 * 1024.0),
             );
         }
-        self.view = Some(DlssView {
+        self.views[slot] = Some(DlssView {
             handle,
             mode,
             preset: super::RR_PRESET.load(Ordering::Relaxed),
@@ -385,8 +394,8 @@ impl DlssRenderer {
         Some(())
     }
 
-    fn release_view(&mut self, rd: &RenderDevice) {
-        let Some(view) = self.view.take() else {
+    fn release_view(&mut self, rd: &RenderDevice, slot: usize) {
+        let Some(view) = self.views[slot].take() else {
             return;
         };
         log::info!(
@@ -410,8 +419,8 @@ impl DlssRenderer {
         }
     }
 
-    pub fn guide_views(&self) -> Option<GuideViews> {
-        let v = self.view.as_ref()?;
+    pub fn guide_views(&self, slot: usize) -> Option<GuideViews> {
+        let v = self.views[slot].as_ref()?;
         Some(GuideViews {
             normal_roughness: v.normal_roughness.view,
             diffuse: v.diffuse.view,
@@ -423,13 +432,13 @@ impl DlssRenderer {
         })
     }
 
-    pub fn output_view(&self) -> Option<vk::ImageView> {
-        self.view.as_ref().map(|v| v.output_image.view)
+    pub fn output_view(&self, slot: usize) -> Option<vk::ImageView> {
+        self.views[slot].as_ref().map(|v| v.output_image.view)
     }
 
     /// Before the trace: guides writable (GENERAL); the exposure texel written once.
-    pub fn record_pre_trace(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
-        let Some(view) = self.view.as_mut() else {
+    pub fn record_pre_trace(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, slot: usize) {
+        let Some(view) = self.views[slot].as_mut() else {
             return;
         };
         let old = if view.guides_initialized {
@@ -515,12 +524,13 @@ impl DlssRenderer {
         &mut self,
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
+        slot: usize,
         view_from_world: Mat4,
         clip_from_view: Mat4,
         jitter: [f32; 2],
         reset: bool,
     ) {
-        let Some(view) = self.view.as_mut() else {
+        let Some(view) = self.views[slot].as_mut() else {
             return;
         };
         let barriers: Vec<_> = view
@@ -615,7 +625,9 @@ impl DlssRenderer {
     }
 
     pub fn destroy(&mut self, rd: &RenderDevice) {
-        self.release_view(rd);
+        for slot in 0..DLSS_VIEWS {
+            self.release_view(rd, slot);
+        }
         unsafe {
             NVSDK_NGX_VULKAN_DestroyParameters(self.params);
             NVSDK_NGX_VULKAN_Shutdown1(rd.device.handle());

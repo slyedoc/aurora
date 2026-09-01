@@ -1,6 +1,8 @@
-use bevy::prelude::*;
+use bevy::{
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    prelude::*,
+};
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
@@ -8,21 +10,19 @@ use bevy_aurora::{
 };
 
 fn main() {
-    let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
-    app.add_plugins(DevShaderPlugin);
-    app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
-    app.add_systems(Startup, setup);
-    app.add_systems(FixedUpdate, print_cam_pos);
-    app.run();
+    App::new()
+        .add_plugins((
+            RayDefaultPlugins,
+            DevShaderPlugin,
+            DevUIPlugin,
+            FreeCameraPlugin::default(),
+        ))
+        .add_systems(Startup, setup)
+        .add_systems(FixedUpdate, print_cam_pos)
+        .run();
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut windows: Query<&mut Window>) {
-    let mut window = windows.single_mut().unwrap();
-    window.resolution.set_scale_factor_override(Some(1.0));
-    window.resolution.set(1920.0, 1080.0);
-
     // camera
     commands.spawn((
         Camera3d::default(),
@@ -32,7 +32,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut windows: Qu
         }),
         Transform::from_xyz(4.98, 5.83, 1.3)
             .with_rotation(Quat::from_xyzw(-0.0941, -0.701, -0.094, 0.700).normalize()),
-        DebugCamera::default(),
+        FreeCamera::default(),
     ));
 
     commands.spawn((

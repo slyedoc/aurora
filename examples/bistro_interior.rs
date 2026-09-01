@@ -1,6 +1,6 @@
+use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::prelude::*;
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
@@ -14,7 +14,7 @@ fn main() {
     app.add_plugins(RayDefaultPlugins);
     app.add_plugins(DevShaderPlugin);
     app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
+    app.add_plugins(FreeCameraPlugin::default());
     app.add_systems(Startup, setup);
     app.run();
 }
@@ -36,7 +36,7 @@ fn setup(
             ..default()
         }),
         Transform::from_xyz(4.0, 1.8, 0.0).looking_at(Vec3::new(4.0, 1.8, 0.0), Vec3::Y),
-        DebugCamera::default(),
+        FreeCamera::default(),
     ));
 
     commands.spawn((

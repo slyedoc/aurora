@@ -1,39 +1,38 @@
-use bevy::prelude::*;
+use bevy::{
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    prelude::*,
+};
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
-    ray_render_plugin::RenderConfig,
     sphere::Sphere,
 };
 
 fn main() {
-    let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
-    app.add_plugins(DevShaderPlugin);
-    app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
-    app.add_systems(Startup, setup);
-    app.run();
+    App::new()
+        .add_plugins((
+            RayDefaultPlugins,
+            DevShaderPlugin,
+            DevUIPlugin,
+            FreeCameraPlugin::default(),
+        ))
+        .add_systems(Startup, setup)
+        .run();
 }
 
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut render_config: ResMut<RenderConfig>,
 ) {
-    //render_config.skydome = None;
-    render_config.sky_color = Vec4::splat(1.0);
-
     // camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(4.0, 1.8, 0.0).looking_at(Vec3::new(4.0, 1.8, 0.0), Vec3::Y),
-        DebugCamera::default(),
+        FreeCamera::default(),
     ));
 
     commands.spawn((

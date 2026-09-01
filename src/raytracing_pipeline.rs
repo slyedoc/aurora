@@ -40,7 +40,10 @@ pub struct CompiledRaytracingPipeline {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    pub descriptor_sets: [vk::DescriptorSet; 2],
+    /// One set per frame parity and view: `[frame_parity * 2 + view]` (view 1 = the XR
+    /// right eye). Each trace dispatch in a frame needs its own set — a set already
+    /// recorded into the command buffer must not be rewritten.
+    pub descriptor_sets: [vk::DescriptorSet; 4],
     pub raygen_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
     pub hit_handle: RTGroupHandle,
@@ -191,7 +194,7 @@ impl VulkanAsset for RaytracingPipeline {
 
         let descriptor_sets = {
             let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout, descriptor_set_layout];
+            let layouts = [descriptor_set_layout; 4];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(*descriptor_pool)
                 .set_layouts(&layouts);

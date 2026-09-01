@@ -42,10 +42,37 @@ Feature-gate all of it (`feature = "xr"`) so the desktop path is untouched.
 
 Two eyes at 72–90 Hz with reprojection punishing every dropped frame is a very different perf envelope from a 1440p window. Bistro on the 5090 through WiVRn at a modest per-eye res with RR upscaling is plausibly in reach, but expect to drop to 72 Hz mode and lean on the ReSTIR/SHaRC work. Motion-to-photon also cares about the encode leg — WiVRn supports h264/h265/AV1; the 5090's encoder is not the bottleneck.
 
+## Status (2026-08-31)
+
+Implemented in `src/xr.rs` (+ hooks in `render_device.rs`, `ray_render_plugin.rs`), behind
+the **`xr` cargo feature** (a marker like `dev`; the `openxr` crate is always compiled and
+only dlopens the loader when the feature is on). The `bsn` viewer in aurora_files forwards
+it: `cargo run --release -p bsn --features xr -- bistro/bistro.bsn`.
+
+- WiVRn server built from source at tag v26.6.2 (protocol must match the headset client):
+  `/mnt/code/f/WiVRn-v26.6.2/build-server/server/wivrn-server`, manifest at
+  `build-server/openxr_wivrn-dev.json`. NVENC + VAAPI + x264 encoders on.
+- Headset-free dev loop: `tail -f /dev/null | XRT_COMPOSITOR_NULL=1 monado-service` (the
+  stdin pipe matters — it epolls stdin), then
+  `XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json cargo run --features xr --example bistro_exterior`.
+- Verified against Monado sim HMD: device created through the runtime, session reaches
+  FOCUSED, frames composite, zero validation errors.
+- **Verified on the Quest 2 over WiVRn** (client from the Meta store, paired with
+  `wivrnctl pair`): bistro_exterior streams to the headset. Mirror mode — no head
+  tracking yet, both eyes see the window image.
+- Gotcha found: the runtime submits on the shared VkQueue inside
+  `xrBeginFrame`/`xrEndFrame`/`xrReleaseSwapchainImage` — those calls hold
+  `RenderDevice::queue`'s mutex or they race the asset-worker transfer submits.
+
 ## First slice
 
-1. Install WiVRn server, verify `hello_xr` (or the openxrs vulkan example) runs against the simulated HMD, then against the Quest.
-2. `xr` feature: session + swapchain + frame loop, **mono** — mirror the existing camera to the HMD.
-3. Stereo raygen from `XrView` poses with asymmetric projection.
-4. Per-eye DLSS-RR, perf pass, 72 Hz target.
-5. Controllers/input, comfort options — later.
+1. ~~Install WiVRn server, verify against the simulated HMD~~ **done**, then against the Quest
+   (client v26.6.x from the Meta store or the v26.6.2 release APK; pair via the dashboard or
+   server log PIN).
+2. ~~Session + swapchain + frame loop, **mono** — mirror the window image to the HMD~~ **done**
+   (blit into both eye layers; UNORM format keeps the gamma-encoded bytes as-is).
+3. Head pose from `locate_views` drives the render camera (mono projection first).
+4. Stereo raygen from `XrView` poses with asymmetric projection; render per-eye into the XR
+   swapchain directly (drops the mirror-blit gamma caveat).
+5. Per-eye DLSS-RR, perf pass, 72 Hz target.
+6. Controllers/input, comfort options — later.

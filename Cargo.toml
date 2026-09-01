@@ -18,6 +18,9 @@ dev = []
 # Opt in from any binary: `--features bevy_aurora/dlss-dev`. Separate from `dev`, which
 # bsn/bevy_city keep always-on for the crash dumps.
 dlss-dev = []
+# VR: render into the active OpenXR runtime (src/xr.rs) -- per-eye stereo, head-tracked,
+# the window a spectator view. `--features bevy_aurora/xr`.
+xr = []
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
@@ -84,6 +87,9 @@ gpu-allocator = "0.28.0"
 #gpu-allocator = { git = "https://github.com/Traverse-Research/gpu-allocator.git", branch = "main" }
 half = "2.4.1"
 log = "0.4.20"
+# OpenXR (VR): `loaded` dlopens libopenxr_loader.so.1 only under the `xr` feature (see
+# src/xr.rs), so flat builds pay nothing at runtime.
+openxr = { version = "0.21", features = ["loaded"] }
 png = "0.17.14"
 rand = "0.8.5"
 rand_chacha = "0.3.1"

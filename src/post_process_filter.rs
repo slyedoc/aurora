@@ -27,7 +27,10 @@ pub struct CompiledPostProcessFilter {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    pub descriptor_sets: [vk::DescriptorSet; 2],
+    /// One set per frame parity and target: `[frame_parity * 3 + target]`, targets being
+    /// 0 = flat window / XR left eye, 1 = XR right eye, 2 = the XR spectator window. Every
+    /// draw in a frame needs its own set — a set already recorded must not be rewritten.
+    pub descriptor_sets: [vk::DescriptorSet; 6],
 }
 
 impl VulkanAsset for PostProcessFilter {
@@ -91,7 +94,7 @@ impl VulkanAsset for PostProcessFilter {
 
         let descriptor_sets = {
             let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 2];
+            let layouts = [descriptor_set_layout; 6];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(*descriptor_pool)
                 .set_layouts(&layouts);

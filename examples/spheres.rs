@@ -1,51 +1,45 @@
 use std::f32::consts::PI;
 
-use bevy::prelude::*;
+use bevy::{
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    prelude::*,
+};
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
-    ray_render_plugin::RenderConfig,
     sphere::Sphere,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 fn main() {
-    let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
-    app.add_plugins(DevShaderPlugin);
-    app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
-    app.add_systems(Startup, setup);
-    app.run();
+    App::new()
+        .add_plugins((
+            RayDefaultPlugins,
+            DevShaderPlugin,
+            DevUIPlugin,
+            FreeCameraPlugin,
+        ))
+        .add_systems(Startup, setup)
+        .run();
 }
 
 fn setup(
     mut commands: Commands,
-    mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut render_config: ResMut<RenderConfig>,
 ) {
-    let mut window = windows.single_mut().unwrap();
-    window.resolution.set_scale_factor_override(Some(1.0));
-    window.resolution.set(1920.0, 1080.0);
-
-    //render_config.skydome = None;
-    render_config.sky_color = 0.1 * Vec4::new(0.529, 0.808, 0.922, 0.0);
-
     // camera
     commands.spawn((
         Camera3d::default(),
+        FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 60.0 * 3.1415926 / 180.0,
             ..default()
         }),
         Transform::from_xyz(0.0, 1.0, 7.0).looking_at(Vec3::new(2.0, 1.0, 0.0), Vec3::Y),
-        DebugCamera::default(),
     ));
 
     // plane

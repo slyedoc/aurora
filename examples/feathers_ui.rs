@@ -2,6 +2,7 @@
 //!
 //! The UI stack is `bevy_feathers_core`: bevy lays the nodes out, `ui_render` rasterizes them.
 
+use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::{
     feathers::{
         controls::{FeathersButton, FeathersCheckbox, FeathersSlider, FeathersToggleSwitch},
@@ -14,12 +15,10 @@ use bevy::{
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
-    ray_render_plugin::RenderConfig,
     sphere::Sphere,
 };
 
@@ -35,7 +34,7 @@ fn main() {
     app.add_plugins(DevShaderPlugin);
     // DevUIPlugin brings the UI stack (UiRenderPlugin, FeathersPlugins) and the dark theme.
     app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
+    app.add_plugins(FreeCameraPlugin::default());
     app.init_resource::<Counter>();
     app.add_systems(Startup, (setup, panel.spawn()));
     app.add_systems(
@@ -49,12 +48,10 @@ fn setup(
     mut commands: Commands,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut render_config: ResMut<RenderConfig>,
 ) {
     let mut window = windows.single_mut().unwrap();
     window.resolution.set_scale_factor_override(Some(1.0));
     window.resolution.set(1600.0, 900.0);
-    render_config.sky_color = 0.1 * Vec4::new(0.529, 0.808, 0.922, 0.0);
 
     commands.spawn((
         Camera3d::default(),
@@ -63,7 +60,7 @@ fn setup(
             ..default()
         }),
         Transform::from_xyz(0.0, 1.5, 6.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
-        DebugCamera::default(),
+        FreeCamera::default(),
     ));
 
     for (i, color) in [

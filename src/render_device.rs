@@ -19,6 +19,7 @@ use gpu_allocator::{AllocationError, MemoryLocation, vulkan::*};
 use raw_window_handle::DisplayHandle;
 
 use crate::render_texture::RenderTexture;
+use crate::xr::XrContext;
 
 const MAX_BINDLESS_IMAGES: u32 = 16536;
 
@@ -131,16 +132,16 @@ impl Clone for RenderDevice {
 }
 
 impl RenderDevice {
-    pub unsafe fn from_display(display_handle: &DisplayHandle) -> Self {
+    pub unsafe fn from_display(display_handle: &DisplayHandle, xr: Option<&XrContext>) -> Self {
         // Before the loader is touched: Aftermath registers ahead of instance/device creation.
         crate::aftermath::enable();
         unsafe {
             let entry = ash::Entry::linked();
-            let instance = create_instance(display_handle, &entry);
+            let instance = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::new(&entry, &instance);
-            let (physical_device, queue_family_idx) = pick_physical_device(&instance);
+            let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
             let (device, queue) =
-                create_logical_device(&instance, physical_device, queue_family_idx);
+                create_logical_device(&entry, &instance, physical_device, queue_family_idx, xr);
             let ext_swapchain = swapchain::Device::new(&instance, &device);
             let ext_sync2 = synchronization2::Device::new(&instance, &device);
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
@@ -399,7 +400,11 @@ impl Drop for RenderDeviceData {
     }
 }
 
-unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) -> ash::Instance {
+unsafe fn create_instance(
+    display_handle: &DisplayHandle,
+    entry: &ash::Entry,
+    xr: Option<&XrContext>,
+) -> ash::Instance {
     unsafe {
         let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
         let mut layer_names: Vec<&CStr> = Vec::new();
@@ -466,12 +471,36 @@ unsafe fn create_instance(display_handle: &DisplayHandle, entry: &ash::Entry) ->
             instance_info = instance_info.push_next(&mut validation_features);
         }
 
-        entry.create_instance(&instance_info, None).unwrap()
+        // XR: the runtime performs the create (xrCreateVulkanInstanceKHR), adding whatever
+        // instance extensions its compositor interop needs on top of ours.
+        match xr {
+            Some(xr) => xr.create_vk_instance(entry, &instance_info),
+            None => entry.create_instance(&instance_info, None).unwrap(),
+        }
     }
 }
 
-unsafe fn pick_physical_device(instance: &ash::Instance) -> (vk::PhysicalDevice, u32) {
+unsafe fn pick_physical_device(
+    instance: &ash::Instance,
+    xr: Option<&XrContext>,
+) -> (vk::PhysicalDevice, u32) {
     unsafe {
+        // XR: the device is not ours to choose — take the one driving the HMD.
+        if let Some(xr) = xr {
+            let physical_device = xr.vk_physical_device(instance);
+            let properties = instance.get_physical_device_queue_family_properties(physical_device);
+            let queue_family_idx = properties
+                .iter()
+                .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .expect("XR physical device has no graphics queue")
+                as u32;
+            let info = instance.get_physical_device_properties(physical_device);
+            println!(
+                "Running on device (OpenXR): {}",
+                CStr::from_ptr(info.device_name.as_ptr()).to_str().unwrap()
+            );
+            return (physical_device, queue_family_idx);
+        }
         let all_devices = instance.enumerate_physical_devices().unwrap();
         println!("Available devices:");
         for device in all_devices.iter() {
@@ -519,9 +548,11 @@ unsafe fn pick_physical_device(instance: &ash::Instance) -> (vk::PhysicalDevice,
 }
 
 unsafe fn create_logical_device(
+    entry: &ash::Entry,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_idx: u32,
+    xr: Option<&XrContext>,
 ) -> (ash::Device, Mutex<vk::Queue>) {
     unsafe {
         let mut device_extensions = vec![
@@ -623,9 +654,14 @@ unsafe fn create_logical_device(
             .push_next(&mut features_scalar_block)
             .push_next(&mut features_float16);
 
-        let device = instance
-            .create_device(physical_device, &device_info, None)
-            .unwrap();
+        // XR: created through the runtime (xrCreateVulkanDeviceKHR) so it can inject its
+        // interop device extensions; identical device otherwise.
+        let device = match xr {
+            Some(xr) => xr.create_vk_device(entry, instance, physical_device, &device_info),
+            None => instance
+                .create_device(physical_device, &device_info, None)
+                .unwrap(),
+        };
         let queue = device.get_device_queue(queue_family_idx, 0);
 
         (device, Mutex::new(queue))
