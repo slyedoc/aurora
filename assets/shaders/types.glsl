@@ -28,6 +28,12 @@ vec2 unpackUv(uint packed) {
   return unpackHalf2x16(packed);
 }
 
+// Environment importance-sampling table (src/env_light.rs): cdf[N + 1] then the solid-angle
+// pdf of each texel, N = env_w * env_h.
+layout (buffer_reference, scalar, buffer_reference_align = 4) readonly buffer EnvData {
+  float data[];
+};
+
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict buffer UniformData {
   vec4 skycolor;
   mat4 inverse_view;
@@ -73,7 +79,29 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint sharc;
   // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
   float sharc_voxel;
+  // Environment importance sampling for the HDR sky (env_w = 0: none).
+  EnvData env;
+  uint env_w;
+  uint env_h;
 };
+
+// The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
+// sampler in the raygen. u wraps around +Z through +X, v runs from +Y (0) to -Y (1).
+const float ENV_PI = 3.14159265359;
+
+vec2 env_dir_to_uv(const vec3 d) {
+  const float phi = atan(d.x, d.z);
+  const float u = ((phi > 0.0 ? phi : (phi + 2.0 * ENV_PI)) / (2.0 * ENV_PI) - 0.5);
+  const float v = acos(clamp(d.y, -1.0, 1.0)) / ENV_PI;
+  return vec2(u < 0.0 ? u + 1.0 : u, v);
+}
+
+vec3 env_uv_to_dir(const vec2 uv) {
+  const float phi = (uv.x + 0.5) * 2.0 * ENV_PI;
+  const float theta = uv.y * ENV_PI;
+  const float st = sin(theta);
+  return vec3(st * sin(phi), cos(theta), st * cos(phi));
+}
 
 // Last frame's VkAccelerationStructureInstanceKHR array: 4 vec4 per instance, rows 0..2 are
 // the 3x4 transform (row-major).

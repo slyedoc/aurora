@@ -15,13 +15,13 @@ const float PI = 3.14159265359;
 
 // Equirectangular lookup: texel (linear radiance) times the scale carried in skycolor.
 vec3 hdr_sky(const vec3 d) {
-  float phi = atan(d.x, d.z);
-  float u = ((phi > 0 ? phi : (phi + 2 * PI)) / (2 * PI) - 0.5);
-  float v = acos(clamp(d.y, -1.0, 1.0)) / PI;
-  vec2 uv = vec2(u < 0.0 ? u + 1.0 : u, v);
-  // The image's extreme spots (the sun) are clamped RELATIVE to the sky scale, so a
-  // physically bright sky (thousands of nits) passes through but a 1e5x sun texel does not.
-  const vec3 texel = min(texture(textures[pc.skydome], uv).rgb, vec3(300.0));
+  const vec2 uv = env_dir_to_uv(d);
+  vec3 texel = texture(textures[pc.skydome], uv).rgb;
+  // Without importance sampling a BRDF-sampled ray is the only way to the sun texel, so its
+  // extreme values are clamped RELATIVE to the sky scale (a physically bright sky passes, a
+  // 1e5x sun does not). With the sampler (env_light.rs) the raygen gathers the sun by
+  // next-event estimation and MIS-weights these hits, so the map is used as is.
+  if (pc.uniforms.env_w == 0u) { texel = min(texel, vec3(300.0)); }
   return pc.uniforms.skycolor.rgb * texel;
 }
 

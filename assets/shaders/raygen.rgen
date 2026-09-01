@@ -321,6 +321,35 @@ vec3 envBRDFApprox2(vec3 f0, float alpha, float NoV) {
   return f0 * max(0.0, scale) + max(0.0, bias);
 }
 
+// ---- HDR environment importance sampling (env_light.rs) ------------------------------------
+
+// Solid-angle pdf of the environment sampler picking direction `d`.
+float envPdf(const vec3 d) {
+  const vec2 uv = env_dir_to_uv(d);
+  const uint x = min(uint(uv.x * float(pc.uniforms.env_w)), pc.uniforms.env_w - 1u);
+  const uint y = min(uint(uv.y * float(pc.uniforms.env_h)), pc.uniforms.env_h - 1u);
+  const uint n = pc.uniforms.env_w * pc.uniforms.env_h;
+  return pc.uniforms.env.data[n + 1u + y * pc.uniforms.env_w + x];
+}
+
+// Draws a direction from the environment's luminance CDF (binary search, jittered inside
+// the texel); returns its radiance, with the direction and its solid-angle pdf.
+vec3 envSample(const float u1, const float u2, const float u3, out vec3 dir, out float pdf) {
+  const uint w = pc.uniforms.env_w;
+  const uint n = w * pc.uniforms.env_h;
+  uint lo = 0u;
+  uint hi = n;
+  while (lo + 1u < hi) {
+    const uint mid = (lo + hi) / 2u;
+    if (pc.uniforms.env.data[mid] <= u1) { lo = mid; } else { hi = mid; }
+  }
+  const uint i = min(lo, n - 1u);
+  const vec2 uv = vec2((float(i % w) + u2) / float(w), (float(i / w) + u3) / float(pc.uniforms.env_h));
+  dir = env_uv_to_dir(uv);
+  pdf = pc.uniforms.env.data[n + 1u + i];
+  return pc.uniforms.skycolor.rgb * texture(textures[pc.skydome], uv).rgb * pc.uniforms.sky_brightness;
+}
+
 void main() {
   // Fresh noise every frame for the temporal denoiser.
   initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.frame);
@@ -464,6 +493,11 @@ void main() {
               }
             }
           }
+        }
+        // MIS against the environment sampler: a BRDF-sampled ray that escapes to the HDR
+        // sky shares credit with the previous vertex's environment estimate.
+        if (payload.t == 0.0 && prev_pdf > 0.0 && pc.uniforms.sky_mode == 1u && pc.uniforms.env_w > 0u) {
+          contribution *= prev_pdf / (prev_pdf + envPdf(direction));
         }
         // Firefly suppression: an indirect path that reaches an emitter far brighter than the
         // sky would take hundreds of frames to average out; clamp its luminance instead.
@@ -693,6 +727,29 @@ void main() {
                 contribution *= min(1.0, pc.uniforms.radiance_clamp / max(luma(contribution), 1.0e-6));
               }
               acc += contribution;
+            }
+          }
+        }
+      }
+
+      // Next-event estimation for an HDR environment: one importance-sampled direction
+      // (luminance x sin theta CDF, env_light.rs), MIS-weighted against BRDF sampling; the
+      // BRDF-sampled rays that reach the sky take the complementary weight on miss.
+      if (pc.uniforms.sky_mode == 1u && pc.uniforms.env_w > 0u) {
+        vec3 l;
+        float pdf_env;
+        const vec3 L = envSample(randf(), randf(), randf(), l, pdf_env);
+        const float NoL = dot(world_normal, l);
+        if (pdf_env > 0.0 && NoL > 0.0 && dot(l, surface_normal) > 0.0 && luma(L) > 0.0) {
+          const vec3 f = evalDisneyBRDF(-direction, world_normal, l, disney_mat);
+          if (any(greaterThan(f, vec3(0.0)))) {
+            const float w = pdf_env / (pdf_env + pdfDisneyBRDF(-direction, world_normal, l, disney_mat));
+            payload.t = -1.0;
+            traceRayEXT(topLevelAS,
+                        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                        0xFF, 0, 0, 0, origin, tmin, l, tmax, 0);
+            if (payload.t == 0.0) {
+              acc += mask * f * NoL * L * (w / pdf_env);
             }
           }
         }

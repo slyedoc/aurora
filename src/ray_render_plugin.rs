@@ -79,6 +79,10 @@ pub struct UniformData {
     sharc: u32,
     /// Base cache voxel size (meters) at the camera.
     sharc_voxel: f32,
+    /// Environment importance sampling (env_light.rs): CDF + pdf buffer, 0 = none.
+    env: u64,
+    env_w: u32,
+    env_h: u32,
 }
 
 #[repr(C)]
@@ -280,6 +284,7 @@ fn render_frame(
         crate::ui_render::UiDrawParams,
         Res<Sky>,
         Res<ProceduralSky>,
+        Res<crate::env_light::EnvLight>,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -340,7 +345,7 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
-    let (dev_ui_state, mut ui, sky, procedural) = dev_ui_stuff;
+    let (dev_ui_state, mut ui, sky, procedural, env_light) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
@@ -514,6 +519,17 @@ fn render_frame(
                 .max(1.0),
             sharc: dev_ui_state.sharc as u32,
             sharc_voxel: dev_ui_state.sharc_voxel.max(0.01),
+            env: env_light.address(),
+            env_w: if env_light.address() != 0 {
+                crate::env_light::ENV_W
+            } else {
+                0
+            },
+            env_h: if env_light.address() != 0 {
+                crate::env_light::ENV_H
+            } else {
+                0
+            },
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
