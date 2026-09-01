@@ -19,7 +19,7 @@ use bevy::{
     },
     feathers_inspector::{
         DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, InspectorCollapsed, InspectorRoot,
-        WorldInspectorPlugin, build_resource_inspector,
+        build_resource_inspector,
     },
     prelude::*,
     ui::Display,
@@ -100,10 +100,10 @@ impl Default for DevUIState {
             max_bounces: 8,
             vignette: 0.0,
             light_nee: true,
-            restir: true,
+            restir: false, // TODO
             restir_candidates: 8,
             restir_history: 20.0,
-            sharc: true,
+            sharc: false, // TODO
             sharc_voxel: 0.25,
             omm: true,
             dlss: AuroraDlss::from_env(),
@@ -146,9 +146,9 @@ impl Plugin for DevUIPlugin {
         if !app.is_plugin_added::<DefaultInspectorWidgetsPlugin>() {
             app.add_plugins(FeathersInspectorPlugins);
         }
-        if !app.is_plugin_added::<WorldInspectorPlugin>() {
-            app.add_plugins(WorldInspectorPlugin::new().with_toggle_key(KeyCode::F1));
-        }
+        // if !app.is_plugin_added::<WorldInspectorPlugin>() {
+        //     app.add_plugins(WorldInspectorPlugin::new().with_toggle_key(KeyCode::F1));
+        // }
 
         app.register_type::<DevUIState>();
         app.init_resource::<DevUIState>();
