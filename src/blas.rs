@@ -347,8 +347,11 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             .map_buffer(&mut geom_to_triangle_host)
             .copy_from_slice(&geom_to_triangle);
 
+        // TRANSFER_SRC: a skinned instance seeds its previous-frame stream from the rest
+        // vertices (skinning.rs) with a buffer copy.
         let as_input = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let vertex_buffer: Buffer<Vertex> =
