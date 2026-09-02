@@ -21,8 +21,11 @@ fn main() {
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,
+            // The render-free fill half; the engine's GizmoRenderPlugin draws it.
+            bevy::gizmos::GizmoPlugin,
         ))
         .add_systems(Startup, setup)
+        .add_systems(Update, debug_gizmos)
         .run();
 }
 
@@ -138,4 +141,17 @@ fn setup(
             }
         }
     }
+}
+
+/// Exercises the gizmo overlay: world axes, a spinning cuboid, a sphere shell around the big
+/// sphere.
+fn debug_gizmos(mut gizmos: Gizmos, time: Res<Time>) {
+    gizmos.line(Vec3::ZERO, Vec3::X * 3.0, Color::srgb(1.0, 0.2, 0.2));
+    gizmos.line(Vec3::ZERO, Vec3::Y * 3.0, Color::srgb(0.2, 1.0, 0.2));
+    gizmos.line(Vec3::ZERO, Vec3::Z * 3.0, Color::srgb(0.3, 0.5, 1.0));
+    gizmos.cube(
+        Transform::from_xyz(3.0, 0.5, 2.0).with_rotation(Quat::from_rotation_y(time.elapsed_secs())),
+        Color::srgb(1.0, 1.0, 0.2),
+    );
+    gizmos.sphere(Isometry3d::from_translation(Vec3::new(0.0, 1.5, 0.0)), 1.6, Color::WHITE);
 }

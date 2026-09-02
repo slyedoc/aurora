@@ -285,6 +285,7 @@ fn render_frame(
         Res<Sky>,
         Res<ProceduralSky>,
         Res<crate::env_light::EnvLight>,
+        crate::gizmo_render::GizmoDrawParams,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -345,7 +346,7 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
-    let (dev_ui_state, mut ui, sky, procedural, env_light) = dev_ui_stuff;
+    let (dev_ui_state, mut ui, sky, procedural, env_light, mut gizmos) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
@@ -889,6 +890,18 @@ fn render_frame(
                     .max_depth(1.0),
             ),
         );
+        // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI.
+        // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
+        // full-window projection.
+        if xr_frame.is_none() {
+            crate::gizmo_render::draw_gizmos(
+                &render_device,
+                cmd_buffer,
+                views[0].view_proj,
+                swapchain.frame_count % 2,
+                &mut gizmos,
+            );
+        }
         crate::ui_render::draw_ui(
             &render_device,
             cmd_buffer,

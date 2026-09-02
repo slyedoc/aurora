@@ -11,6 +11,7 @@ pub mod dev_shaders;
 pub mod dev_ui;
 pub mod dlss;
 pub mod env_light;
+pub mod gizmo_render;
 pub mod gltf_mesh;
 pub mod gpu_transform;
 pub mod lights;

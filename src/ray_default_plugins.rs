@@ -60,6 +60,8 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::sbt::SBTPlugin);
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);
+        // Draws bevy_gizmos lines (add `bevy::gizmos::GizmoPlugin` yourself to switch them on).
+        group = group.add(crate::gizmo_render::GizmoRenderPlugin);
         group = group.add(crate::bluenoise_plugin::BlueNoisePlugin);
         group = group.add(crate::bsn::BsnPlugin);
 

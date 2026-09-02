@@ -67,6 +67,9 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "bevy_camera",
     # Light COMPONENTS only (render-free): extracted into the NEE light table.
     "bevy_light",
+    # Debug gizmos, render-free fill half (`Gizmos`, retained `Gizmo`, config groups);
+    # gizmo_render.rs is the draw half.
+    "bevy_gizmos",
     # Fly camera for examples (bevy_camera_controller).
     "free_camera",
     # ui stack, render-free
