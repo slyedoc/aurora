@@ -104,6 +104,7 @@ void main() {
   payload.color *= toLinear(texture(textures[material.base_color_texture], uv));
   payload.emission = material.base_emissive_factor.rgb;
   payload.emission *= toLinear(texture(textures[material.base_emissive_texture], uv)).rgb;
+  payload.emission *= pc.uniforms.emissive_boost;
 
   float transmission = material.specular_transmission_factor;
   transmission *= texture(textures[material.specular_transmission_texture], uv).r;

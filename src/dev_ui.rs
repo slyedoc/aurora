@@ -45,6 +45,11 @@ pub struct DevUIState {
     pub fog_scatter: f32,
     #[reflect(@0.0..=1.0_f32)]
     pub sky_brightness: f32,
+    /// Uniform multiplier on every light's emission -- emissive surfaces and analytic
+    /// lights alike (the sky has `sky_brightness`). Uniform across lights, so NEE stays
+    /// unbiased and the light table's sampling distribution is unchanged.
+    #[reflect(@0.0..=100.0_f32)]
+    pub emissive_boost: f32,
     /// Firefly suppression: indirect contributions are clamped to this many times the sky's
     /// luminance (0 = off). Biases bright indirect paths down; kills the speckle Ray
     /// Reconstruction would otherwise smear.
@@ -95,6 +100,7 @@ impl Default for DevUIState {
             foginess: 0.001,
             fog_scatter: 0.9,
             sky_brightness: 1.0,
+            emissive_boost: 1.0,
             firefly_clamp: 8.0,
             samples: 1,
             max_bounces: 32,
@@ -124,7 +130,9 @@ struct DevUIStats;
 #[derive(Component, Default, Clone)]
 struct DevUIInspectorHost;
 
-/// The node the [`ProceduralSky`] inspector is built under.
+/// The node the [`ProceduralSky`] inspector is built under (parked with the panel's sky
+/// section; see `spawn_panel`).
+#[allow(dead_code)]
 #[derive(Component, Default, Clone)]
 struct DevUISkyHost;
 
@@ -217,14 +225,16 @@ fn spawn_panel(world: &mut World) {
                     }
                     DevUIInspectorHost
                 ),
-                caption("sky (procedural)"),
-                (
-                    Node {
-                        flex_direction: FlexDirection::Column,
-                        align_self: AlignSelf::Stretch,
-                    }
-                    DevUISkyHost
-                ),
+                // The procedural-sky section is parked while the examples run HDR skies;
+                // uncomment (with the inspector block below) to get it back.
+                // caption("sky (procedural)"),
+                // (
+                //     Node {
+                //         flex_direction: FlexDirection::Column,
+                //         align_self: AlignSelf::Stretch,
+                //     }
+                //     DevUISkyHost
+                // ),
             ]
         })
         .expect("dev panel spawns")
@@ -245,12 +255,14 @@ fn spawn_panel(world: &mut World) {
         .find(|_| true)
         .unwrap_or(panel);
     build_resource_inspector(world, TypeId::of::<DevUIState>(), host);
-    let sky_host = world
-        .query_filtered::<Entity, With<DevUISkyHost>>()
-        .iter(world)
-        .find(|_| true)
-        .unwrap_or(panel);
-    build_resource_inspector(world, TypeId::of::<ProceduralSky>(), sky_host);
+    // Parked with the panel section above.
+    // let sky_host = world
+    //     .query_filtered::<Entity, With<DevUISkyHost>>()
+    //     .iter(world)
+    //     .find(|_| true)
+    //     .unwrap_or(panel);
+    // build_resource_inspector(world, TypeId::of::<ProceduralSky>(), sky_host);
+    let _ = TypeId::of::<ProceduralSky>();
 }
 
 fn toggle_panel(

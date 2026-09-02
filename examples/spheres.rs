@@ -5,14 +5,24 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
+    assets::aurora_asset,
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
+    sky::Sky,
     sphere::Sphere,
+    util::{ScreenshotExt, TimeoutAppExt},
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+
+/// HDR sky brightness: texel value x this = nits (a clear sky sits around 2000-8000).
+const SKY_SCALE_NITS: f32 = 8000.0;
+
+/// Light-sphere brightness in nits (cd/m^2) -- physical units; below ~10k nits an emitter
+/// disappears against a daylit sky (see aurora_files/lighting_units.md).
+const EMISSIVE_NITS: f32 = 1_000_000.0;
 
 fn main() {
     App::new()
@@ -26,14 +36,25 @@ fn main() {
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, debug_gizmos)
+        // F12 captures to target/tmp; AUTO_SCREENSHOT_MS + the CLAUDECODE auto-exit make
+        // headless agent runs self-verifying.
+        .add_screenshot(KeyCode::F12)
+        .add_timeout_exit(None, 12.0)
         .run();
 }
 
 fn setup(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    // HDR environment sky (equirectangular), texel x scale = nits.
+    commands.insert_resource(Sky::Hdr {
+        image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
+        scale: SKY_SCALE_NITS,
+    });
+
     // camera
     commands.spawn((
         Camera3d::default(),
@@ -122,8 +143,9 @@ fn setup(
                 material.ior = 1.01 + 0.15 * rng.r#gen::<f32>();
                 material.specular_transmission = 1.0;
             } else {
-                // light source
-                material.emissive = 50.0 * LinearRgba::rgb(rng.r#gen(), rng.r#gen(), rng.r#gen());
+                // light source (physical nits -- see EMISSIVE_NITS)
+                material.emissive =
+                    EMISSIVE_NITS * LinearRgba::rgb(rng.r#gen(), rng.r#gen(), rng.r#gen());
             }
 
             let mut entity_builder = commands.spawn((
@@ -150,8 +172,13 @@ fn debug_gizmos(mut gizmos: Gizmos, time: Res<Time>) {
     gizmos.line(Vec3::ZERO, Vec3::Y * 3.0, Color::srgb(0.2, 1.0, 0.2));
     gizmos.line(Vec3::ZERO, Vec3::Z * 3.0, Color::srgb(0.3, 0.5, 1.0));
     gizmos.cube(
-        Transform::from_xyz(3.0, 0.5, 2.0).with_rotation(Quat::from_rotation_y(time.elapsed_secs())),
+        Transform::from_xyz(3.0, 0.5, 2.0)
+            .with_rotation(Quat::from_rotation_y(time.elapsed_secs())),
         Color::srgb(1.0, 1.0, 0.2),
     );
-    gizmos.sphere(Isometry3d::from_translation(Vec3::new(0.0, 1.5, 0.0)), 1.6, Color::WHITE);
+    gizmos.sphere(
+        Isometry3d::from_translation(Vec3::new(0.0, 1.5, 0.0)),
+        1.6,
+        Color::WHITE,
+    );
 }

@@ -83,6 +83,9 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   EnvData env;
   uint env_w;
   uint env_h;
+  // Uniform multiplier on every light's emission (emissive surfaces + analytic lights).
+  // Uniform across lights, so the light table's relative weights/CDF stay valid.
+  float emissive_boost;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

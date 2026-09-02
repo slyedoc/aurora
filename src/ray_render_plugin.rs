@@ -83,6 +83,8 @@ pub struct UniformData {
     env: u64,
     env_w: u32,
     env_h: u32,
+    /// Uniform multiplier on every light's emission (from [`DevUIState`]).
+    emissive_boost: f32,
 }
 
 #[repr(C)]
@@ -531,6 +533,7 @@ fn render_frame(
             } else {
                 0
             },
+            emissive_boost: dev_ui_state.emissive_boost.max(0.0),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);

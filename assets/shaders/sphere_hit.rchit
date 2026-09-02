@@ -33,6 +33,7 @@ void main() {
 
   payload.color = material.base_color_factor;
   payload.emission = material.base_emissive_factor.rgb;
+  payload.emission *= pc.uniforms.emissive_boost;
   const float roughness = material.roughness_factor;
   const float metallic = material.metallic_factor;
   const float transmission = material.specular_transmission_factor;

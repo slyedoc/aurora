@@ -272,7 +272,8 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
                      out float p_area, out float pdf_solid, out vec3 dir, out float dist) {
   if (e < pc.lights.analytic_count) {
     return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat,
-                              p_area, pdf_solid, dir, dist);
+                              p_area, pdf_solid, dir, dist)
+        * pc.uniforms.emissive_boost;
   }
   p_area = 0.0;
   pdf_solid = 0.0;
@@ -300,7 +301,7 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   const vec3 emission = vec3(li.geom_emission.data[g * 3u + 0u],
                              li.geom_emission.data[g * 3u + 1u],
                              li.geom_emission.data[g * 3u + 2u]);
-  return f * NoL * emission * (cos_l / (dist * dist));
+  return f * NoL * emission * (pc.uniforms.emissive_boost * cos_l / (dist * dist));
 }
 
 // DLSS-RR specular albedo: pre-integrated environment BRDF (split-sum scale/bias
