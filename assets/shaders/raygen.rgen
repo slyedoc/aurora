@@ -408,6 +408,13 @@ void main() {
     // alpha-cutout edges first); the specular hit distance from the vertex after it.
     bool guides_written = false;
     uint primary_bounce = 0u;
+    // Stable guides (RTXPT "stable planes"): the guide chain follows the analytically
+    // DOMINANT Fresnel lobe through glass. When the radiance path rolls the minority lobe
+    // instead, this frame's guide writes are abandoned (the images keep last frame's
+    // dominant-branch values), so the guides never flicker between the reflected and the
+    // refracted world -- per-pixel-random branch choices are exactly what RR cannot
+    // share history across (see PathTracerStablePlanes.hlsli's seam note).
+    bool guide_live = true;
     // PSR-lite: when guides defer through smooth-transmission (glass) vertices, the first
     // non-delta vertex writes them at a VIRTUAL point this far along the camera ray.
     const vec3 guide_cam_origin = origin;
@@ -438,7 +445,7 @@ void main() {
           && hitPayloadGetTransmission(payload) > 0.5
           && hitPayloadGetRoughness(payload) < 0.1;
 
-      if (sample_idx == 0) {
+      if (sample_idx == 0 && guide_live) {
         if (!guides_written && !pass_through && !guide_defer) {
           guides_written = true;
           primary_bounce = bounce_idx;
@@ -587,8 +594,14 @@ void main() {
             pReflect = 0.5f * (spol * spol + ppol * ppol);
         }
 
+        const bool lobe_reflect = randf() <= pReflect;
+        // Minority Fresnel lobe on the guide chain: stop writing guides this frame (see
+        // `guide_live` above). The radiance stays unbiased -- only the guides sit out.
+        if (sample_idx == 0 && !guides_written && lobe_reflect != (pReflect > 0.5)) {
+          guide_live = false;
+        }
         vec3 refract_dir;
-        if (randf() <= pReflect) {
+        if (lobe_reflect) {
             refract_dir = reflect(direction, world_normal);
         } else {
             refract_dir = normalize(eta * direction + world_normal * (eta * costi - sqrt(k)));
