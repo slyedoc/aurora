@@ -570,24 +570,42 @@ void main() {
       origin = origin + direction * payload.t;
       if (pass_through) { continue; }
 
-      // refraction (glass)
+      // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
+      // vector is sampled from the NDF, Fresnel is evaluated about it, and the ray
+      // reflects/refracts THROUGH it, so rough glass scatters around the true refraction
+      // direction. (The old path lerped toward a cosine sample about the OUTWARD normal,
+      // which fogged and bent refraction for any nonzero roughness.)
       if (randf() < transmission) {
         // calculate the eta based on whether we are inside
         const float n1 = inside ? payload.refract_index : 1.0f;
         const float n2 = inside ? 1.0f : payload.refract_index;
         const float eta = n1 / n2;
 
-        const float costi = dot(world_normal, -direction);
-        const float k = 1 - (eta* eta) * (1 - costi * costi);
+        // Half-vector from the GGX NDF: theta_h = atan(alpha * sqrt(u / (1 - u))).
+        // alpha 0 keeps H = N and the block below reduces to the smooth (delta) case.
+        const float t_alpha = roughness * roughness;
+        vec3 H = world_normal;
+        if (t_alpha > 0.0) {
+          const float u1 = randf();
+          const float ct = inversesqrt(1.0 + t_alpha * t_alpha * u1 / max(1.0 - u1, 1.0e-6));
+          const float st = sqrt(max(0.0, 1.0 - ct * ct));
+          const float phi = 2.0 * PI * randf();
+          const mat3 basis = orthonormalBasis(world_normal);
+          H = normalize(basis * vec3(st * cos(phi), st * sin(phi), ct));
+        }
+        const float costi = dot(H, -direction);
+        if (costi <= 0.0) { break; }  // half-vector faces away from the ray: zero weight
 
+        const float k = 1 - (eta * eta) * (1 - costi * costi);
 
         float pReflect;
         if (k < 0) {
             // Total internal reflection
             pReflect = 1;
         } else {
-            // fresnell equation for reflection contribution
-            const float sinti = sqrt(max(0.0f, 1.0f - costi - costi));
+            // Fresnel about H. (sin^2 = 1 - cos^2; the old code had `1 - costi - costi`,
+            // which zeroed the sine for every mid angle and skewed reflectance.)
+            const float sinti = sqrt(max(0.0f, 1.0f - costi * costi));
             const float costt = sqrt(1.0f - eta * eta * sinti * sinti);
             const float spol = (n1 * costi - n2 * costt) / (n1 * costi + n2 * costt);
             const float ppol = (n1 * costt - n2 * costi) / (n1 * costt + n2 * costi);
@@ -600,16 +618,29 @@ void main() {
         if (sample_idx == 0 && !guides_written && lobe_reflect != (pReflect > 0.5)) {
           guide_live = false;
         }
-        vec3 refract_dir;
+        vec3 new_dir;
         if (lobe_reflect) {
-            refract_dir = reflect(direction, world_normal);
+            new_dir = reflect(direction, H);
+            // A microfacet reflection that tunnels below the surface has zero weight.
+            if (dot(new_dir, world_normal) * dot(-direction, world_normal) < 0.0) { break; }
         } else {
-            refract_dir = normalize(eta * direction + world_normal * (eta * costi - sqrt(k)));
+            new_dir = normalize(eta * direction + H * (eta * costi - sqrt(k)));
+            // A refraction that stays on the incoming side likewise.
+            if (dot(new_dir, world_normal) * dot(-direction, world_normal) > 0.0) { break; }
         }
 
-        const mat3 basis = orthonormalBasis(world_normal);
-        const vec3 sample_dir = basis * CosineSampleHemisphere(randf(), randf());
-        direction = mix(refract_dir, sample_dir, roughness);
+        // Single-scatter Smith weight for NDF-sampled H (Walter eq. 41 with the D and pdf
+        // cancelled): G1(i)·G1(o)·|i·h| / (|i·n|·|h·n|), clamped against grazing fireflies.
+        if (t_alpha > 0.0) {
+          const float a2 = t_alpha * t_alpha;
+          const float NoV = abs(dot(world_normal, -direction));
+          const float NoL = abs(dot(world_normal, new_dir));
+          const float NoH = max(abs(dot(world_normal, H)), 1.0e-6);
+          const float g1v = 2.0 * NoV / (NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV));
+          const float g1l = 2.0 * NoL / (NoL + sqrt(a2 + (1.0 - a2) * NoL * NoL));
+          mask *= clamp(g1v * g1l * costi / max(NoV * NoH, 1.0e-6), 0.0, 4.0);
+        }
+        direction = new_dir;
         if (inside) {
           mask *= exp(-payload.t * payload.absorption);
         }
