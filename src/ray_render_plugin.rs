@@ -733,6 +733,7 @@ fn render_frame(
                             view.projection,
                             plan.jitter,
                             dlss_reset,
+                            time.delta_secs() * 1000.0,
                         );
                         dlss_ran = true;
                         // The raygen just filled the luminance buffer at this size.
@@ -914,8 +915,12 @@ fn render_frame(
 
         // A pending screenshot copies the finished frame (UI included) out through a host
         // buffer on its way to present.
+        // The capture reads the WINDOW swapchain (UI included), so it must use the
+        // swapchain extent -- under XR `output_extent` is the eye extent, and sizing the
+        // copy with it reads out of the swapchain image's bounds (F12 crashed XR runs).
+        let capture_extent = swapchain.swapchain_extent;
         let capture = screenshots.take_next().map(|path| {
-            let size = output_extent.width as u64 * output_extent.height as u64 * 4;
+            let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
             let buffer: Buffer<u8> =
                 render_device.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST);
             vk_utils::transition_image_layout(
@@ -933,8 +938,8 @@ fn render_frame(
                         .layer_count(1),
                 )
                 .image_extent(vk::Extent3D {
-                    width: output_extent.width,
-                    height: output_extent.height,
+                    width: capture_extent.width,
+                    height: capture_extent.height,
                     depth: 1,
                 });
             render_device.cmd_copy_image_to_buffer(
@@ -977,7 +982,7 @@ fn render_frame(
             crate::util::screenshot::save_png(
                 view.as_slice_mut(),
                 swapchain.swapchain_format,
-                output_extent,
+                capture_extent,
                 &path,
             );
             render_device.destroyer.destroy_buffer(buffer.handle);

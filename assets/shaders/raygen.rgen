@@ -408,6 +408,11 @@ void main() {
     // alpha-cutout edges first); the specular hit distance from the vertex after it.
     bool guides_written = false;
     uint primary_bounce = 0u;
+    // PSR-lite: when guides defer through smooth-transmission (glass) vertices, the first
+    // non-delta vertex writes them at a VIRTUAL point this far along the camera ray.
+    const vec3 guide_cam_origin = origin;
+    const vec3 guide_cam_dir = direction;
+    float guide_dist = 0.0;
 
     for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
       payload.want_sun = want_sun ? 1u : 0u;
@@ -425,22 +430,48 @@ void main() {
           && (payload.color.rgb == vec3(0.0)
               || (payload.color.a < 1.0 && randf() < 1.0 - payload.color.a));
 
+      // PSR-lite: a smooth transmissive hit (glass) shows the REFRACTED world, and RR has
+      // no refraction guide -- writing the glass surface here pins that content to the
+      // wrong depth/motion and RR blurs it to frost. Defer: the chain's first non-delta
+      // vertex writes the guides instead, at a virtual point along the camera ray.
+      const bool guide_defer = payload.t != 0.0
+          && hitPayloadGetTransmission(payload) > 0.5
+          && hitPayloadGetRoughness(payload) < 0.1;
+
       if (sample_idx == 0) {
-        if (!guides_written && !pass_through) {
+        if (!guides_written && !pass_through && !guide_defer) {
           guides_written = true;
           primary_bounce = bounce_idx;
           if (payload.t == 0.0) {
             imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
             imageStore(guide_diffuse, px, vec4(0.0));
             imageStore(guide_specular, px, vec4(0.5, 0.5, 0.5, 1.0)); // sky: RR guide 3.4.2
-            imageStore(guide_depth, px, vec4(0.0));
-            imageStore(guide_motion, px, vec4(0.0));
+            // Linear view depth (Depth_Type_Linear): 0 is the CAMERA plane, so the sky
+            // must sit at the far clamp -- 0 here reads as a surface on the lens and the
+            // sky/mesh silhouette boils.
+            imageStore(guide_depth, px, vec4(1.0e7, 0.0, 0.0, 0.0));
+            // Sky motion: reproject the ray direction at infinity (w = 0 cancels the
+            // translation -- infinitely far points only parallax under rotation). Zero
+            // here pins the sky to the screen and it smears whenever the camera turns.
+            const vec4 sky_cur = pc.uniforms.view_proj * vec4(direction, 0.0);
+            const vec4 sky_prev = pc.uniforms.prev_view_proj * vec4(direction, 0.0);
+            vec2 sky_motion = vec2(0.0);
+            if (sky_cur.w > 1.0e-4 && sky_prev.w > 1.0e-4) {
+              const vec2 cuv = (sky_cur.xy / sky_cur.w) * vec2(0.5, -0.5);
+              const vec2 puv = (sky_prev.xy / sky_prev.w) * vec2(0.5, -0.5);
+              sky_motion = clamp(cuv - puv, vec2(-2.0), vec2(2.0));
+            }
+            imageStore(guide_motion, px, vec4(sky_motion, 0.0, 0.0));
             imageStore(guide_spec_hit, px, vec4(0.0));
           } else {
             const float g_roughness = hitPayloadGetRoughness(payload);
             const float g_metallic = hitPayloadGetMetallic(payload);
             const vec3 hit_pos = origin + direction * payload.t;
-            const vec4 view_pos = pc.uniforms.view * vec4(hit_pos, 1.0);
+            // The end of the (possibly refracted) chain laid out along the primary ray at
+            // the accumulated distance. No glass in between => exactly hit_pos.
+            const vec3 virtual_pos =
+                guide_cam_origin + guide_cam_dir * (guide_dist + payload.t);
+            const vec4 view_pos = pc.uniforms.view * vec4(virtual_pos, 1.0);
             const float linear_depth = max(-view_pos.z, 1.0e-4);
             const vec3 albedo = clamp(payload.color.rgb, vec3(0.0), vec3(1.0));
             // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
@@ -452,8 +483,11 @@ void main() {
             imageStore(guide_specular, px, vec4(envBRDFApprox2(g_f0, linear_roughness, g_NoV), 1.0));
             imageStore(guide_depth, px, vec4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0));
             // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
-            const vec4 cur_clip = pc.uniforms.view_proj * vec4(hit_pos, 1.0);
-            const vec4 prev_clip = pc.uniforms.prev_view_proj * vec4(payload.prev_world_pos, 1.0);
+            const vec4 cur_clip = pc.uniforms.view_proj * vec4(virtual_pos, 1.0);
+            // The end vertex's own frame-to-frame motion, applied to the virtual point
+            // (identical to prev_world_pos when no glass was traversed).
+            const vec4 prev_clip = pc.uniforms.prev_view_proj
+                * vec4(virtual_pos - (hit_pos - payload.prev_world_pos), 1.0);
             vec2 motion = vec2(0.0);
             if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
               const vec2 cur_uv = (cur_clip.xy / cur_clip.w) * vec2(0.5, -0.5);
@@ -466,6 +500,9 @@ void main() {
         } else if (guides_written && bounce_idx == primary_bounce + 1u) {
           imageStore(guide_spec_hit, px, vec4(min(payload.t, 1.0e7), 0.0, 0.0, 0.0));
         }
+      }
+      if (!guides_written) {
+        guide_dist += payload.t;
       }
       const float roughness = hitPayloadGetRoughness(payload);
       const float metallic = hitPayloadGetMetallic(payload);

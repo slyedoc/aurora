@@ -529,6 +529,7 @@ impl DlssRenderer {
         clip_from_view: Mat4,
         jitter: [f32; 2],
         reset: bool,
+        frame_time_ms: f32,
     ) {
         let Some(view) = self.views[slot].as_mut() else {
             return;
@@ -580,9 +581,14 @@ impl DlssRenderer {
         let mut r_normals = view.normal_roughness.resource();
         let mut r_spec_hit = view.spec_hit.resource();
         let mut r_exposure = view.exposure.resource();
+        // "All matrices are Row Major Order and use left multiplication" (RR guide 3.4.9):
+        // for a glam column-vector matrix M, the row-vector form is M^T, and storing M^T
+        // row-major is byte-identical to M's own column-major storage -- so the bytes go
+        // through UNTRANSPOSED. (A transpose here hands NGX the wrong basis and its
+        // hit-distance -> specular-MV reprojection trails on motion.)
         let mut camera = RrEvalCamera {
-            world_to_view: view_from_world.transpose().to_cols_array(),
-            view_to_clip: clip_from_view.transpose().to_cols_array(),
+            world_to_view: view_from_world.to_cols_array(),
+            view_to_clip: clip_from_view.to_cols_array(),
         };
         let first = std::mem::replace(&mut view.first_evaluate, false);
         let result = unsafe {
@@ -606,6 +612,8 @@ impl DlssRenderer {
                 [-jitter[0], -jitter[1]],
                 reset || first,
                 [-(view.render.width as f32), -(view.render.height as f32)],
+                // A paused/first frame reports 0; hand NGX a sane 60 Hz delta instead.
+                if frame_time_ms > 0.0 { frame_time_ms } else { 16.6 },
             )
         };
         if let Err(e) = result {

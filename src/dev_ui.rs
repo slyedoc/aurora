@@ -97,7 +97,7 @@ impl Default for DevUIState {
             sky_brightness: 1.0,
             firefly_clamp: 8.0,
             samples: 1,
-            max_bounces: 8,
+            max_bounces: 32,
             vignette: 0.0,
             light_nee: true,
             restir: false, // TODO

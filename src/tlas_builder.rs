@@ -850,7 +850,14 @@ pub fn prepare_instances(
         };
         let custom_index = tlas.materials.set(slot, &material_slice);
         let flags = INSTANCE_FLAGS
-            | if material_slice.iter().all(|m| m.alpha_cutoff <= 0.0) {
+            // Opaque-only instances skip the any-hit entirely. Alpha-masked materials need
+            // it for cutouts; transmissive (glass) ones need it so SHADOW rays can pass
+            // through instead of casting pitch-black shadows (primary rays still trace
+            // with gl_RayFlagsOpaqueEXT, so they hit glass regardless).
+            | if material_slice
+                .iter()
+                .all(|m| m.alpha_cutoff <= 0.0 && m.specular_transmission_factor <= 0.0)
+            {
                 INSTANCE_FORCE_OPAQUE
             } else {
                 0

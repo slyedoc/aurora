@@ -30,6 +30,15 @@ hitAttributeEXT vec2 attribs;
 
 void main() {
   const Material material = pc.materials.materials[gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT];
+  // Shadow rays (NEE / ReSTIR: terminate-on-first-hit + skip-closest-hit) pass through
+  // transmissive surfaces -- clear glass barely blocks light, and counting it as a full
+  // occluder painted black shadows under every wine glass. Absorption/Fresnel are ignored
+  // (the standard shadow-ray approximation); primary rays trace with gl_RayFlagsOpaqueEXT
+  // and never run this, so glass still shows up in the image.
+  if ((gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) != 0
+      && material.specular_transmission_factor > 0.5) {
+    ignoreIntersectionEXT;
+  }
   // Opaque geometry inside a mixed (non-force-opaque) instance: accept immediately.
   if (material.alpha_cutoff <= 0.0) { return; }
   const vec3 baryCoords = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);

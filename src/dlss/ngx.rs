@@ -121,6 +121,7 @@ pub const P_OUTPUT: &CStr = c"Output";
 pub const P_DEPTH: &CStr = c"Depth";
 pub const P_MOTION_VECTORS: &CStr = c"MotionVectors";
 pub const P_RESET: &CStr = c"Reset";
+pub const P_FRAME_TIME_DELTA: &CStr = c"FrameTimeDeltaInMsec";
 pub const P_JITTER_OFFSET_X: &CStr = c"Jitter.Offset.X";
 pub const P_JITTER_OFFSET_Y: &CStr = c"Jitter.Offset.Y";
 pub const P_MV_SCALE_X: &CStr = c"MV.Scale.X";
@@ -836,6 +837,9 @@ pub unsafe fn evaluate_dlssd(
     // `MV.Scale.{X,Y}`: maps the motion-vector texels onto PIXELS pointing at
     // the history. 1.0 when they already are.
     mv_scale: [f32; 2],
+    // Wall-clock milliseconds since the previous evaluate: RR scales its temporal
+    // accumulation by it ("helps in determining the amount to denoise").
+    frame_time_ms: f32,
 ) -> Result<(), String> {
     unsafe {
         let set_res = |name: &CStr, res: *mut NgxResourceVk| {
@@ -878,6 +882,7 @@ pub unsafe fn evaluate_dlssd(
         NVSDK_NGX_Parameter_SetF(params, P_JITTER_OFFSET_X.as_ptr(), jitter[0]);
         NVSDK_NGX_Parameter_SetF(params, P_JITTER_OFFSET_Y.as_ptr(), jitter[1]);
         NVSDK_NGX_Parameter_SetI(params, P_RESET.as_ptr(), reset as i32);
+        NVSDK_NGX_Parameter_SetF(params, P_FRAME_TIME_DELTA.as_ptr(), frame_time_ms);
         NVSDK_NGX_Parameter_SetF(params, P_MV_SCALE_X.as_ptr(), mv_scale[0]);
         NVSDK_NGX_Parameter_SetF(params, P_MV_SCALE_Y.as_ptr(), mv_scale[1]);
         NVSDK_NGX_Parameter_SetUI(params, P_TONEMAPPER_TYPE.as_ptr(), 0);
