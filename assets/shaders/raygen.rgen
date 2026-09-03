@@ -567,6 +567,9 @@ void main() {
             // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
             const float linear_roughness = clamp(g_roughness * g_roughness, 0.0, 1.0);
             imageStore(guide_normal_roughness, px, vec4(world_normal, linear_roughness));
+            // NOTE: emissive is deliberately NOT folded into this guide. A render-res albedo
+            // guide carrying emissive-texture text aliases under the DLSS jitter, and RR's
+            // history churns it into mush whenever the camera rests (tried 2026-09-02).
             imageStore(guide_diffuse, px, vec4(albedo * (1.0 - g_metallic), 1.0));
             const vec3 g_f0 = mix(vec3(0.04), albedo, g_metallic);
             const float g_NoV = dot(world_normal, -direction);

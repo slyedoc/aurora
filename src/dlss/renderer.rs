@@ -93,7 +93,7 @@ struct DlssView {
 }
 
 impl DlssView {
-    /// What the raygen writes, binding order 1..=7.
+    /// What the raygen writes (see the set-0 bindings in `raygen.rgen`).
     fn guides(&self) -> [&DlssImage; 7] {
         [
             &self.normal_roughness,

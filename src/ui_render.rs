@@ -18,7 +18,10 @@
 
 use ash::vk;
 use bevy::{
-    asset::AssetId,
+    asset::{AssetId, uuid::Uuid},
+    picking::pointer::{
+        Location, PointerAction, PointerButton, PointerId, PointerInput, PointerLocation,
+    },
     camera::{
         Camera, CameraProjectionPlugin, ClearColor, RenderTarget, RenderTargetInfo,
         visibility::{InheritedVisibility, VisibilityPropagatePlugin},
@@ -34,7 +37,8 @@ use bevy::{
     text::{ComputedTextBlock, PositionedGlyph, TextColor, TextLayoutInfo, TextPlugin},
     ui::{
         BackgroundColor, BackgroundGradient, BorderColor, BorderGradient, CalculatedClip,
-        ColorStop, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo, ConicGradient,
+        ColorStop, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
+        ComputedUiTargetCamera, ConicGradient,
         Display, Gradient, InterpolationColorSpace, LinearGradient, Node, Outline, RadialGradient,
         ResolvedBorderRadius, UiGlobalTransform, UiPlugin, UiSystems, Val, VisualBox,
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
@@ -45,12 +49,16 @@ use bevy::{
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
+use bevy::platform::collections::HashMap;
+
 use crate::{
     assets::aurora_asset,
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
+    render_texture::{RenderTexture, create_blank_texture},
+    vk_utils,
+    vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssetLoadingState, VulkanAssets},
 };
 
 /// Shader flags; must align with `assets/shaders/ui.frag`.
@@ -372,7 +380,20 @@ impl Plugin for UiRenderPlugin {
 
         app.init_resource::<ExtractedUi>();
         app.init_resource::<UiVertexBuffers>();
+        app.init_resource::<UiSurfaces>();
+        app.init_resource::<UiSurfaceTargets>();
+        app.add_systems(
+            PostUpdate,
+            sync_ui_surfaces.before(UiSystems::Prepare),
+        );
+        app.add_systems(
+            PreUpdate,
+            drive_surface_pointers
+                .after(bevy::input::InputSystems)
+                .before(bevy::picking::PickingSystems::ProcessInput),
+        );
         app.add_systems(Last, extract_ui.in_set(RenderSet::Extract));
+        app.add_systems(Last, prepare_ui_surfaces.in_set(RenderSet::Prepare));
         app.add_systems(
             TeardownSchedule,
             cleanup_ui.before(crate::ray_render_plugin::on_shutdown),
@@ -468,6 +489,9 @@ pub struct ExtractedUi {
     pub quads: Vec<UiQuad>,
     /// Physical size of the primary window, the space `bevy_ui` laid the nodes out in.
     pub window_size: Vec2,
+    /// Offscreen surfaces (world panels), one per `RenderTarget::Image` camera. Kept even
+    /// when empty so a despawned panel leaves transparency, not a ghost.
+    pub surfaces: Vec<ExtractedSurface>,
 }
 
 type UiNodeQuery = (
@@ -477,6 +501,7 @@ type UiNodeQuery = (
     &'static UiGlobalTransform,
     &'static InheritedVisibility,
     &'static ComputedUiRenderTargetInfo,
+    Option<&'static ComputedUiTargetCamera>,
     Option<&'static CalculatedClip>,
     Option<&'static BackgroundColor>,
     Option<&'static BorderColor>,
@@ -493,6 +518,7 @@ type UiNodeQuery = (
 
 fn extract_ui(
     mut extracted: ResMut<ExtractedUi>,
+    surfaces_res: Res<UiSurfaces>,
     images: Res<Assets<Image>>,
     texture_atlases: Res<Assets<TextureAtlasLayout>>,
     text_colors: Query<&TextColor>,
@@ -506,8 +532,23 @@ fn extract_ui(
         .next()
         .map(|w| w.physical_size().as_vec2())
         .unwrap_or(Vec2::ONE);
-    let quads = &mut extracted.quads;
-    quads.clear();
+    let ExtractedUi {
+        quads: window_quads,
+        surfaces,
+        ..
+    } = &mut *extracted;
+    window_quads.clear();
+    surfaces.clear();
+    // camera entity -> surface bucket; nodes routed to no known surface land on the window.
+    let mut surface_index: HashMap<Entity, usize> = HashMap::default();
+    for (camera, (asset, size)) in surfaces_res.by_camera.iter() {
+        surface_index.insert(*camera, surfaces.len());
+        surfaces.push(ExtractedSurface {
+            asset: *asset,
+            size: size.as_vec2(),
+            quads: Vec::new(),
+        });
+    }
 
     for (
         node,
@@ -516,6 +557,7 @@ fn extract_ui(
         transform,
         inherited_visibility,
         target,
+        target_camera,
         clip,
         background_color,
         border_color,
@@ -529,6 +571,15 @@ fn extract_ui(
         if !inherited_visibility.get() || node.is_some_and(|node| node.display == Display::None) {
             continue;
         }
+        // Route the node's quads: to its surface when its target camera is an offscreen UI
+        // surface, to the window otherwise.
+        let quads: &mut Vec<UiQuad> = match target_camera
+            .and_then(|c| c.get())
+            .and_then(|camera| surface_index.get(&camera))
+        {
+            Some(&i) => &mut surfaces[i].quads,
+            None => &mut *window_quads,
+        };
         let z = |offset: f32| stack_index.0 as f32 + offset;
         let transform = Affine2::from(*transform);
 
@@ -723,9 +774,10 @@ fn extract_ui(
             .filter(|(_, v)| v.is_some_and(|v| v.get()))
             .count();
         let nonempty = all_nodes.iter().filter(|(n, _)| !n.is_empty()).count();
+        let surface_quads: usize = extracted.surfaces.iter().map(|s| s.quads.len()).sum();
         log::debug!(
-            "ui extract: {total} nodes, {with_vis} with InheritedVisibility, {visible} visible, {nonempty} non-empty -> {} quads",
-            quads.len()
+            "ui extract: {total} nodes, {with_vis} with InheritedVisibility, {visible} visible, {nonempty} non-empty -> {} window quads + {surface_quads} surface quads",
+            extracted.quads.len()
         );
     }
 }
@@ -1270,6 +1322,8 @@ fn edge_clip<T: Copy>(
 #[derive(Resource, Default)]
 pub struct UiVertexBuffers {
     buffers: [Buffer<UiVertex>; 2],
+    /// The offscreen surfaces' vertices (all surfaces share one buffer per slot).
+    surface_buffers: [Buffer<UiVertex>; 2],
 }
 
 /// Everything [`draw_ui`] needs.
@@ -1277,6 +1331,7 @@ pub struct UiVertexBuffers {
 pub struct UiDrawParams<'w, 's> {
     extracted: Res<'w, ExtractedUi>,
     buffers: ResMut<'w, UiVertexBuffers>,
+    targets: Res<'w, UiSurfaceTargets>,
     config: Option<Res<'w, UiRenderConfig>>,
     pipelines: Res<'w, VulkanAssets<UiPipeline>>,
     textures: Res<'w, VulkanAssets<Image>>,
@@ -1310,14 +1365,126 @@ pub unsafe fn draw_ui(
 
     let vertices = &mut *params.vertices;
     vertices.clear();
+    build_vertices(render_device, &params.textures, &params.extracted.quads, vertices);
 
-    let mut quads: Vec<&UiQuad> = params.extracted.quads.iter().collect();
+    if vertices.is_empty() {
+        if diag {
+            log::debug!(
+                "ui draw: {} quads produced no vertices",
+                params.extracted.quads.len()
+            );
+        }
+        return;
+    }
+    if diag {
+        let v = &vertices[0];
+        log::debug!(
+            "ui draw: {} vertices from {} quads, swapchain {}x{}, window {:?}, v0 pos {:?} color {:?} flags {} size {:?} point {:?}",
+            vertices.len(),
+            params.extracted.quads.len(),
+            extent.width,
+            extent.height,
+            params.extracted.window_size,
+            v.position,
+            v.color,
+            v.flags,
+            v.size,
+            v.point
+        );
+    }
+
+    // Upload into this frame's buffer, growing it if needed. The old buffer may still be in
+    // flight, so it goes through the deferred destroyer.
+    let buffer = &mut params.buffers.buffers[frame_slot % 2];
+    if buffer.nr_elements < vertices.len() as u64 {
+        if buffer.handle != vk::Buffer::null() {
+            render_device.destroyer.destroy_buffer(buffer.handle);
+        }
+        let capacity = (vertices.len() * 2).max(4096) as u64;
+        *buffer = render_device
+            .create_host_buffer::<UiVertex>(capacity, vk::BufferUsageFlags::STORAGE_BUFFER);
+    }
+    {
+        let mut mapped = render_device.map_buffer(buffer);
+        mapped.copy_from_slice(vertices);
+    }
+
+    // Map through the window size bevy_ui laid out against, not the swapchain extent: if the
+    // swapchain lags a resize, the UI stretches with the scene instead of drifting off it.
+    let screen = params.extracted.window_size.max(Vec2::ONE);
+    let push_constants = UiPushConstants {
+        vertex_buffer: buffer.address,
+        screen_size: [screen.x, screen.y],
+    };
+
+    unsafe {
+        render_device.cmd_bind_pipeline(
+            cmd_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline,
+        );
+        render_device.cmd_bind_descriptor_sets(
+            cmd_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline_layout,
+            0,
+            std::slice::from_ref(&render_device.bindless_descriptor_set),
+            &[],
+        );
+        render_device.cmd_push_constants(
+            cmd_buffer,
+            pipeline.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytemuck::bytes_of(&push_constants),
+        );
+        render_device.cmd_draw(cmd_buffer, vertices.len() as u32, 1, 0, 0);
+    }
+}
+
+/// Fan-triangulates a convex polygon into `out`.
+fn push_fan<V: Copy>(out: &mut Vec<UiVertex>, polygon: &[V], vertex: impl Fn(V) -> UiVertex) {
+    for i in 1..polygon.len().saturating_sub(1) {
+        out.push(vertex(polygon[0]));
+        out.push(vertex(polygon[i]));
+        out.push(vertex(polygon[i + 1]));
+    }
+}
+
+fn cleanup_ui(world: &mut World) {
+    let Some(mut buffers) = world.remove_resource::<UiVertexBuffers>() else {
+        return;
+    };
+    let render_device = world.resource::<RenderDevice>();
+    for buffer in buffers
+        .buffers
+        .iter_mut()
+        .chain(buffers.surface_buffers.iter_mut())
+    {
+        if buffer.handle != vk::Buffer::null() {
+            render_device.destroyer.destroy_buffer(buffer.handle);
+            *buffer = Buffer::default();
+        }
+    }
+    // The surface target textures themselves live in `VulkanAssets<Image>`, whose shutdown
+    // drain destroys them like any other texture.
+}
+
+/// Sorts `quads_in` by z and fan-triangulates them into `vertices` -- shared by the window
+/// pass ([`draw_ui`]) and the offscreen surface passes ([`draw_ui_surfaces`]).
+fn build_vertices(
+    render_device: &RenderDevice,
+    textures: &VulkanAssets<Image>,
+    quads_in: &[UiQuad],
+    vertices: &mut Vec<UiVertex>,
+) {
+    let mut quads: Vec<&UiQuad> = quads_in.iter().collect();
     quads.sort_by(|a, b| a.z.total_cmp(&b.z));
 
     for quad in quads {
         let tex_index = match quad.image {
             None => 0,
-            Some(id) => match params.textures.get_by_id(id) {
+            Some(id) => match textures.get_by_id(id) {
                 Some(texture) => render_device.register_bindless_texture(texture),
                 // Not uploaded yet (atlas / image still in flight); skip this frame.
                 None => continue,
@@ -1466,100 +1633,432 @@ pub unsafe fn draw_ui(
             }
         }
     }
+}
 
-    if vertices.is_empty() {
-        if diag {
-            log::debug!(
-                "ui draw: {} quads produced no vertices",
-                params.extracted.quads.len()
-            );
+// ---------------------------------------------------------------------------------------------
+// Offscreen UI surfaces (world panels)
+// ---------------------------------------------------------------------------------------------
+//
+// A bare `Camera` whose `RenderTarget` is an image marks an offscreen UI surface — upstream's
+// own render-to-texture idiom. UI roots pointed at it with `UiTargetCamera` lay out at the
+// TEXTURE's resolution (sync_ui_surfaces publishes the size onto `Camera::computed` for
+// taffy), the extractor routes their quads into per-surface buckets, and draw_ui_surfaces
+// rasterizes each bucket into a bindless-registered B8G8R8A8_UNORM texture BEFORE the trace,
+// so the frame's rays sample this frame's UI. A material referencing the image handle (e.g.
+// as its emissive texture) needs no special casing: `prepare_ui_surfaces` parks the target in
+// `VulkanAssets<Image>` under the placeholder's asset id, and material resolution finds it
+// like any uploaded texture. The panel stores sRGB-encoded straight alpha, which the hit
+// shader's `toLinear` decode matches; an emissive panel glows onto the scene.
+
+/// The live offscreen UI surfaces, rebuilt every frame by [`sync_ui_surfaces`]:
+/// camera entity → (target image asset, physical size).
+#[derive(Resource, Default)]
+pub struct UiSurfaces {
+    pub by_camera: HashMap<Entity, (AssetId<Image>, UVec2)>,
+}
+
+/// One surface's extracted quads for the frame.
+pub struct ExtractedSurface {
+    pub asset: AssetId<Image>,
+    /// Physical size of the target, the space the nodes were laid out in.
+    pub size: Vec2,
+    pub quads: Vec<UiQuad>,
+}
+
+/// The surfaces' GPU targets, minted once per image asset and kept for the app's life (the
+/// texture itself is owned by `VulkanAssets<Image>`; this holds the pass bookkeeping).
+#[derive(Resource, Default)]
+pub struct UiSurfaceTargets {
+    map: HashMap<AssetId<Image>, (RenderTexture, vk::Extent2D)>,
+}
+
+/// A size-carrying placeholder [`Image`] for a UI render target: its `data` is `None`, so the
+/// texture upload path skips it and [`prepare_ui_surfaces`] builds the real render target in
+/// its place.
+pub fn ui_target_placeholder(size: UVec2) -> Image {
+    let mut image = Image::new_target_texture(
+        size.x.max(1),
+        size.y.max(1),
+        wgpu_types::TextureFormat::Bgra8Unorm,
+        None,
+    );
+    image.data = None;
+    image
+}
+
+/// `PostUpdate`, before `UiSystems::Prepare`: publish every `RenderTarget::Image` camera's
+/// geometry so `bevy_ui` lays its roots out at the texture's resolution, and record the
+/// camera → asset mapping for the extractor. The camera scan is the ONE marking mechanism —
+/// no aurora-specific component ([`ui_camera_target_system`] leaves image-target cameras
+/// alone; this is its other half).
+pub fn sync_ui_surfaces(
+    mut surfaces: ResMut<UiSurfaces>,
+    mut cameras: Query<(Entity, &mut Camera, &RenderTarget)>,
+    images: Res<Assets<Image>>,
+) {
+    surfaces.by_camera.clear();
+    for (entity, mut camera, render_target) in &mut cameras {
+        let RenderTarget::Image(target) = render_target else {
+            continue;
+        };
+        let asset = target.handle.id();
+        let Some(image) = images.get(asset) else {
+            continue;
+        };
+        let size = UVec2::new(image.width(), image.height());
+        if size.x == 0 || size.y == 0 {
+            continue;
         }
+        let info = RenderTargetInfo {
+            physical_size: size,
+            scale_factor: target.scale_factor,
+        };
+        // Guarded write: a `Camera` flagged changed every frame is a change-detection lie.
+        let stale = camera.computed.target_info.as_ref().is_none_or(|current| {
+            current.physical_size != info.physical_size || current.scale_factor != info.scale_factor
+        });
+        if stale {
+            camera.computed.target_info = Some(info);
+        }
+        surfaces.by_camera.insert(entity, (asset, size));
+    }
+}
+
+/// `RenderSet::Prepare`: create the render-target texture for every new surface and park it
+/// in `VulkanAssets<Image>` under the placeholder's id, where material resolution finds it.
+/// Targets are app-lifetime: a despawned panel's texture stays (and stays registered), so
+/// re-entering a state reuses the same asset id + bindless slot.
+pub fn prepare_ui_surfaces(
+    render_device: Res<RenderDevice>,
+    surfaces: Res<UiSurfaces>,
+    mut targets: ResMut<UiSurfaceTargets>,
+    mut textures: ResMut<VulkanAssets<Image>>,
+) {
+    for (asset, size) in surfaces.by_camera.values() {
+        if targets.map.contains_key(asset) {
+            continue;
+        }
+        // Same format as the UI pipeline's color attachment; stores sRGB-encoded straight
+        // alpha, which the hit shaders' `toLinear` texture decode expects.
+        let texture = create_blank_texture(
+            &render_device,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            size.x,
+            size.y,
+        );
+        render_device.register_bindless_texture(&texture);
+        if let Some(VulkanAssetLoadingState::Loaded(old)) =
+            textures.insert(*asset, VulkanAssetLoadingState::Loaded(texture))
+        {
+            // The asset carried bytes and uploaded before the camera claimed it. Use
+            // `ui_target_placeholder` (data: None) to avoid the wasted upload.
+            log::warn!("ui: {asset:?} became a surface target after uploading as a texture");
+            <Image as VulkanAsset>::destroy_asset(&render_device, &old);
+        }
+        targets.map.insert(
+            *asset,
+            (
+                texture,
+                vk::Extent2D {
+                    width: size.x,
+                    height: size.y,
+                },
+            ),
+        );
+        log::info!("ui: surface target {:?} ({}x{})", asset, size.x, size.y);
+    }
+}
+
+/// Records one offscreen pass per extracted surface into `cmd_buffer`. Call OUTSIDE any
+/// rendering pass, before the trace, so the frame's rays sample this frame's UI. An empty
+/// surface still clears to transparent — a despawned panel goes blank, it doesn't ghost.
+pub unsafe fn draw_ui_surfaces(
+    render_device: &RenderDevice,
+    cmd_buffer: vk::CommandBuffer,
+    frame_slot: usize,
+    params: &mut UiDrawParams,
+) {
+    if params.extracted.surfaces.is_empty() {
         return;
     }
-    if diag {
-        let v = &vertices[0];
-        log::debug!(
-            "ui draw: {} vertices from {} quads, swapchain {}x{}, window {:?}, v0 pos {:?} color {:?} flags {} size {:?} point {:?}",
-            vertices.len(),
-            params.extracted.quads.len(),
-            extent.width,
-            extent.height,
-            params.extracted.window_size,
-            v.position,
-            v.color,
-            v.flags,
-            v.size,
-            v.point
-        );
+    let Some(config) = params.config.as_ref() else {
+        return;
+    };
+    let Some(pipeline) = params.pipelines.get(&config.pipeline) else {
+        return;
+    };
+
+    // All surfaces share one vertex buffer per frame slot; each records its range.
+    let vertices = &mut *params.vertices;
+    vertices.clear();
+    let mut ranges: Vec<(usize, u32, u32)> = Vec::new(); // (surface, first, count)
+    for (i, surface) in params.extracted.surfaces.iter().enumerate() {
+        if !params.targets.map.contains_key(&surface.asset) {
+            continue;
+        }
+        let first = vertices.len() as u32;
+        build_vertices(render_device, &params.textures, &surface.quads, vertices);
+        ranges.push((i, first, vertices.len() as u32 - first));
+    }
+    if ranges.is_empty() {
+        return;
     }
 
-    // Upload into this frame's buffer, growing it if needed. The old buffer may still be in
-    // flight, so it goes through the deferred destroyer.
-    let buffer = &mut params.buffers.buffers[frame_slot % 2];
-    if buffer.nr_elements < vertices.len() as u64 {
-        if buffer.handle != vk::Buffer::null() {
-            render_device.destroyer.destroy_buffer(buffer.handle);
+    if !vertices.is_empty() {
+        let buffer = &mut params.buffers.surface_buffers[frame_slot % 2];
+        if buffer.nr_elements < vertices.len() as u64 {
+            if buffer.handle != vk::Buffer::null() {
+                render_device.destroyer.destroy_buffer(buffer.handle);
+            }
+            let capacity = (vertices.len() * 2).max(4096) as u64;
+            *buffer = render_device
+                .create_host_buffer::<UiVertex>(capacity, vk::BufferUsageFlags::STORAGE_BUFFER);
         }
-        let capacity = (vertices.len() * 2).max(4096) as u64;
-        *buffer = render_device
-            .create_host_buffer::<UiVertex>(capacity, vk::BufferUsageFlags::STORAGE_BUFFER);
-    }
-    {
         let mut mapped = render_device.map_buffer(buffer);
         mapped.copy_from_slice(vertices);
     }
+    let buffer_address = params.buffers.surface_buffers[frame_slot % 2].address;
 
-    // Map through the window size bevy_ui laid out against, not the swapchain extent: if the
-    // swapchain lags a resize, the UI stretches with the scene instead of drifting off it.
-    let screen = params.extracted.window_size.max(Vec2::ONE);
-    let push_constants = UiPushConstants {
-        vertex_buffer: buffer.address,
-        screen_size: [screen.x, screen.y],
-    };
-
-    unsafe {
-        render_device.cmd_bind_pipeline(
-            cmd_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline,
-        );
-        render_device.cmd_bind_descriptor_sets(
-            cmd_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline_layout,
-            0,
-            std::slice::from_ref(&render_device.bindless_descriptor_set),
-            &[],
-        );
-        render_device.cmd_push_constants(
-            cmd_buffer,
-            pipeline.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            0,
-            bytemuck::bytes_of(&push_constants),
-        );
-        render_device.cmd_draw(cmd_buffer, vertices.len() as u32, 1, 0, 0);
+    for (i, first, count) in ranges {
+        let surface = &params.extracted.surfaces[i];
+        let Some((texture, extent)) = params.targets.map.get(&surface.asset) else {
+            continue;
+        };
+        unsafe {
+            vk_utils::transition_image_layout(
+                render_device,
+                cmd_buffer,
+                texture.image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
+            );
+            let render_area = vk::Rect2D::default().extent(*extent);
+            let attachment_info = vk::RenderingAttachmentInfo::default()
+                .image_view(texture.image_view)
+                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0; 4] },
+                });
+            let render_info = vk::RenderingInfo::default()
+                .layer_count(1)
+                .render_area(render_area)
+                .color_attachments(std::slice::from_ref(&attachment_info));
+            render_device.cmd_begin_rendering(cmd_buffer, &render_info);
+            render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
+            render_device.cmd_set_viewport(
+                cmd_buffer,
+                0,
+                std::slice::from_ref(
+                    &vk::Viewport::default()
+                        .width(extent.width as f32)
+                        .height(extent.height as f32)
+                        .max_depth(1.0),
+                ),
+            );
+            if count > 0 {
+                render_device.cmd_bind_pipeline(
+                    cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.pipeline,
+                );
+                render_device.cmd_bind_descriptor_sets(
+                    cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.pipeline_layout,
+                    0,
+                    std::slice::from_ref(&render_device.bindless_descriptor_set),
+                    &[],
+                );
+                let push_constants = UiPushConstants {
+                    vertex_buffer: buffer_address,
+                    screen_size: [surface.size.x.max(1.0), surface.size.y.max(1.0)],
+                };
+                render_device.cmd_push_constants(
+                    cmd_buffer,
+                    pipeline.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&push_constants),
+                );
+                render_device.cmd_draw(cmd_buffer, count, 1, first, 0);
+            }
+            render_device.cmd_end_rendering(cmd_buffer);
+            vk_utils::transition_image_layout(
+                render_device,
+                cmd_buffer,
+                texture.image,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+        }
     }
 }
 
-/// Fan-triangulates a convex polygon into `out`.
-fn push_fan<V: Copy>(out: &mut Vec<UiVertex>, polygon: &[V], vertex: impl Fn(V) -> UiVertex) {
-    for i in 1..polygon.len().saturating_sub(1) {
-        out.push(vertex(polygon[0]));
-        out.push(vertex(polygon[i]));
-        out.push(vertex(polygon[i + 1]));
-    }
+// ---------------------------------------------------------------------------------------------
+// Mouse -> surface pointer bridge
+// ---------------------------------------------------------------------------------------------
+
+/// Declares that this entity displays a UI surface on its local XY plane: the texture spans
+/// `size` meters centered on the origin (+X right, +Y up, plane z = 0, viewed from +Z), with
+/// the image's v = 0 row at the TOP — the same convention as the flipped-V panel quad. With
+/// this component on the panel mesh, [`drive_surface_pointers`] maps the window mouse through
+/// the main camera onto the surface, and the panel's widgets hover/click/drag like window UI.
+#[derive(Component, Clone)]
+pub struct UiSurfacePanel {
+    /// The surface's target image (the same handle the camera renders to and the material
+    /// samples).
+    pub target: Handle<Image>,
+    /// World size of the displayed face in meters.
+    pub size: Vec2,
 }
 
-fn cleanup_ui(world: &mut World) {
-    let Some(mut buffers) = world.remove_resource::<UiVertexBuffers>() else {
-        return;
-    };
-    let render_device = world.resource::<RenderDevice>();
-    for buffer in buffers.buffers.iter_mut() {
-        if buffer.handle != vk::Buffer::null() {
-            render_device.destroyer.destroy_buffer(buffer.handle);
-            *buffer = Buffer::default();
+/// `PreUpdate`, before picking processes input: cast the window cursor through the main
+/// camera, intersect every [`UiSurfacePanel`] plane, and drive a custom picking pointer on
+/// the nearest hit surface (texture-space position, image target). bevy_picking's UI backend
+/// then hit-tests the surface's nodes exactly as it does window nodes — hover, press, drag
+/// all flow. Off-panel the pointer parks outside the surface, ending any hover.
+fn drive_surface_pointers(
+    mut commands: Commands,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+    panels: Query<(&GlobalTransform, &UiSurfacePanel)>,
+    targets: Res<UiSurfaceTargets>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut writer: MessageWriter<PointerInput>,
+    mut state: Local<Option<(PointerId, Option<Location>)>>,
+) {
+    const BUTTONS: [(MouseButton, PointerButton); 3] = [
+        (MouseButton::Left, PointerButton::Primary),
+        (MouseButton::Right, PointerButton::Secondary),
+        (MouseButton::Middle, PointerButton::Middle),
+    ];
+
+    let hit = (|| {
+        let window = windows.iter().next()?;
+        let cursor = window.cursor_position()?;
+        let (cam_tf, projection) = cameras.iter().next()?;
+        let Projection::Perspective(persp) = projection else {
+            return None;
+        };
+        let win = window.size();
+        if win.x <= 0.0 || win.y <= 0.0 {
+            return None;
+        }
+        let ndc = Vec2::new(
+            cursor.x / win.x * 2.0 - 1.0,
+            1.0 - cursor.y / win.y * 2.0,
+        );
+        let tan_half = (persp.fov * 0.5).tan();
+        let aspect = win.x / win.y;
+        let dir_view = Vec3::new(ndc.x * tan_half * aspect, ndc.y * tan_half, -1.0);
+        let origin = cam_tf.translation();
+        let dir = cam_tf.affine().transform_vector3(dir_view).normalize();
+
+        let mut best: Option<(f32, &UiSurfacePanel, Vec2)> = None;
+        for (panel_tf, panel) in &panels {
+            let inv = panel_tf.affine().inverse();
+            let o = inv.transform_point3(origin);
+            let d = inv.transform_vector3(dir);
+            // Front side only: the camera must sit on +Z and the ray must head towards the
+            // plane.
+            if o.z <= 0.0 || d.z >= -1.0e-6 {
+                continue;
+            }
+            let t = -o.z / d.z;
+            let p = o + d * t;
+            if p.x.abs() > panel.size.x * 0.5 || p.y.abs() > panel.size.y * 0.5 {
+                continue;
+            }
+            let dist = (panel_tf.affine().transform_point3(p) - origin).length();
+            if best.as_ref().is_none_or(|(b, _, _)| dist < *b) {
+                // Image convention: v = 0 at the top.
+                let uv = Vec2::new(p.x / panel.size.x + 0.5, 0.5 - p.y / panel.size.y);
+                best = Some((dist, panel, uv));
+            }
+        }
+        best.map(|(_, panel, uv)| (panel, uv))
+    })();
+
+    match hit {
+        Some((panel, uv)) => {
+            let Some((_, extent)) = targets.map.get(&panel.target.id()) else {
+                return;
+            };
+            let position = uv * Vec2::new(extent.width as f32, extent.height as f32);
+            let location = Location {
+                target: bevy::camera::NormalizedRenderTarget::Image(
+                    bevy::camera::ImageRenderTarget {
+                        handle: panel.target.clone(),
+                        scale_factor: 1.0,
+                    },
+                ),
+                position,
+            };
+            let (id, last) = state.get_or_insert_with(|| {
+                let id = PointerId::Custom(Uuid::new_v4());
+                commands.spawn((
+                    Name::new("ui surface pointer"),
+                    id,
+                    PointerLocation::new(location.clone()),
+                ));
+                (id, None)
+            });
+            let delta = match last {
+                Some(prev) if prev.target == location.target => position - prev.position,
+                _ => Vec2::ZERO,
+            };
+            writer.write(PointerInput::new(
+                *id,
+                location.clone(),
+                PointerAction::Move { delta },
+            ));
+            for (button, pointer_button) in BUTTONS {
+                if mouse.just_pressed(button) {
+                    writer.write(PointerInput::new(
+                        *id,
+                        location.clone(),
+                        PointerAction::Press(pointer_button),
+                    ));
+                }
+                if mouse.just_released(button) {
+                    writer.write(PointerInput::new(
+                        *id,
+                        location.clone(),
+                        PointerAction::Release(pointer_button),
+                    ));
+                }
+            }
+            *last = Some(location);
+        }
+        None => {
+            if let Some((id, last)) = state.as_mut()
+                && let Some(prev) = last.take()
+            {
+                // Let go of anything held at the last on-surface position, then park the
+                // pointer far outside the surface so hover ends cleanly.
+                for (button, pointer_button) in BUTTONS {
+                    if mouse.just_released(button) {
+                        writer.write(PointerInput::new(
+                            *id,
+                            prev.clone(),
+                            PointerAction::Release(pointer_button),
+                        ));
+                    }
+                }
+                let parked = Location {
+                    target: prev.target,
+                    position: Vec2::splat(-1.0e5),
+                };
+                writer.write(PointerInput::new(
+                    *id,
+                    parked,
+                    PointerAction::Move { delta: Vec2::ZERO },
+                ));
+            }
         }
     }
 }

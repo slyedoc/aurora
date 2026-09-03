@@ -617,6 +617,15 @@ fn render_frame(
             )
             .unwrap();
 
+        // Offscreen UI surfaces (world panels) render first, so this frame's trace samples
+        // this frame's UI.
+        crate::ui_render::draw_ui_surfaces(
+            &render_device,
+            cmd_buffer,
+            swapchain.frame_count % 2,
+            &mut ui,
+        );
+
         // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place -- all inside this command buffer.

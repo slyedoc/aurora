@@ -39,6 +39,13 @@ impl VulkanAsset for bevy::prelude::Image {
         &self,
         _param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
+        // A data-less image is a render target (a UI surface placeholder -- see
+        // `ui_render::ui_target_placeholder`): its GPU side is created and registered by its
+        // owner, never uploaded from bytes. Skipping here keeps the owner's entry in
+        // `VulkanAssets<Image>` from being clobbered by the asset worker.
+        if self.data.is_none() {
+            return None;
+        }
         // The upload path knows RGBA8 and RGBA32F. Anything else (RGB / grey / 16-bit PNGs,
         // which scene textures frequently are) is converted here, on the main thread's copy.
         let bytes_per_pixel = self.data.as_ref().map(|d| {
@@ -260,4 +267,78 @@ pub fn padd_pixel_bytes_rgba_unorm(
     }
 
     padded_bytes
+}
+
+/// Creates an empty GPU texture (no byte upload) and transitions it to `desired_layout`:
+/// render targets like the UI surface panels, written by the GPU and sampled bindlessly.
+pub fn create_blank_texture(
+    device: &RenderDevice,
+    format: vk::Format,
+    usage_flags: vk::ImageUsageFlags,
+    desired_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+) -> RenderTexture {
+    let image_info = vk_init::image_info(width, height, format, usage_flags);
+    let image_handle = unsafe { device.device.create_image(&image_info, None).unwrap() };
+
+    let requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image_handle);
+    let mut dedicated_requirements_info = vk::MemoryDedicatedRequirements::default();
+    let mut requirements =
+        vk::MemoryRequirements2KHR::default().push_next(&mut dedicated_requirements_info);
+    unsafe {
+        device
+            .device
+            .get_image_memory_requirements2(&requirements_info, &mut requirements)
+    };
+
+    {
+        let mut state = device.allocator_state.lock().unwrap();
+        let allocation = state
+            .allocate(&AllocationCreateDesc {
+                name: "blank_texture",
+                requirements: requirements.memory_requirements,
+                linear: false,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                allocation_scheme: if dedicated_requirements_info.requires_dedicated_allocation == 1
+                    || dedicated_requirements_info.prefers_dedicated_allocation == 1
+                {
+                    AllocationScheme::DedicatedImage(image_handle)
+                } else {
+                    AllocationScheme::GpuAllocatorManaged
+                },
+            })
+            .unwrap();
+        unsafe {
+            device
+                .device
+                .bind_image_memory(image_handle, allocation.memory(), allocation.offset())
+                .unwrap();
+        }
+        state.register_image_allocation(image_handle, allocation);
+    }
+
+    device.run_transfer_commands(|cmd_buffer| unsafe {
+        let to_final = vk_init::layout_transition2(
+            image_handle,
+            vk::ImageLayout::UNDEFINED,
+            desired_layout,
+        )
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::MEMORY_WRITE);
+        device.ext_sync2.cmd_pipeline_barrier2(
+            cmd_buffer,
+            &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_final)),
+        );
+    });
+
+    let view_info = vk_init::image_view_info(image_handle, format);
+    let view = unsafe { device.device.create_image_view(&view_info, None).unwrap() };
+
+    RenderTexture {
+        image: image_handle,
+        image_view: view,
+    }
 }
