@@ -645,9 +645,36 @@ fn build_chunk(
         render_device
             .device
             .cmd_reset_query_pool(cmd_buffer, query_pool, 0, n as u32);
-        render_device
-            .ext_acc_struct
-            .cmd_build_acceleration_structures(cmd_buffer, &build_infos, &build_ranges);
+        // AURORA_SINGLE_AS_BUILDS=1 (device-lost hunt): one vkCmdBuildAccelerationStructures
+        // per BLAS with a full build barrier between, instead of N structures in one call.
+        static SINGLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let single =
+            *SINGLE.get_or_init(|| std::env::var_os("AURORA_SINGLE_AS_BUILDS").is_some());
+        if single {
+            for (info, ranges) in build_infos.iter().zip(&build_ranges) {
+                render_device.ext_acc_struct.cmd_build_acceleration_structures(
+                    cmd_buffer,
+                    std::slice::from_ref(info),
+                    std::slice::from_ref(ranges),
+                );
+                let one = vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+                    .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+                    .dst_access_mask(
+                        vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
+                            | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+                    );
+                render_device.ext_sync2.cmd_pipeline_barrier2(
+                    cmd_buffer,
+                    &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&one)),
+                );
+            }
+        } else {
+            render_device
+                .ext_acc_struct
+                .cmd_build_acceleration_structures(cmd_buffer, &build_infos, &build_ranges);
+        }
         // Builds must land before the compacted-size query reads them.
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
@@ -691,7 +718,13 @@ fn build_chunk(
     // size yields VK_NULL_HANDLE, which then fails AS creation and the compacting copy. Keep the
     // uncompacted structure instead of building on top of a bad query.
     let mut copies: Vec<(usize, AccelerationStructure)> = Vec::new();
+    // AURORA_NO_COMPACT=1 (device-lost hunt): keep the uncompacted structures.
+    static NO_COMPACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_compact = *NO_COMPACT.get_or_init(|| std::env::var_os("AURORA_NO_COMPACT").is_some());
     for (i, &compacted) in compacted_sizes.iter().enumerate() {
+        if no_compact {
+            break;
+        }
         let full = sizes[i].acceleration_structure_size;
         log::debug!(
             "BLAS compaction: {} -> {} ({}%)",
