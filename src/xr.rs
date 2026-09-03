@@ -525,9 +525,11 @@ impl XrState {
         let layer = xr::CompositionLayerProjection::new()
             .space(&self.space)
             .views(&projection_views);
-        self.frame_stream
-            .end(time, self.blend_mode, &[&layer])
-            .unwrap();
+        if let Err(e) = self.frame_stream.end(time, self.blend_mode, &[&layer]) {
+            // The runtime hands back POSE_INVALID while the headset has no tracking yet
+            // (waking from dormancy, session not yet focused): drop the frame, not the game.
+            log::warn!("xr: frame end failed: {e:?} (frame dropped)");
+        }
     }
 }
 
