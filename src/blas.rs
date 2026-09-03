@@ -714,9 +714,7 @@ fn build_chunk(
     // size yields VK_NULL_HANDLE, which then fails AS creation and the compacting copy. Keep the
     // uncompacted structure instead of building on top of a bad query.
     let mut copies: Vec<(usize, AccelerationStructure)> = Vec::new();
-    // TEMP(crash-hunt): compaction disabled for A/B -- the untested suspect in the
-    // AS Build/Refit fault family under heavy streaming.
-    for (i, &compacted) in compacted_sizes.iter().enumerate().take(0) {
+    for (i, &compacted) in compacted_sizes.iter().enumerate() {
         let full = sizes[i].acceleration_structure_size;
         log::debug!(
             "BLAS compaction: {} -> {} ({}%)",
