@@ -84,7 +84,17 @@ pub struct UniformData {
     env_w: u32,
     env_h: u32,
     /// Uniform multiplier on every light's emission (from [`DevUIState`]).
+    /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
+    portals: u64,
+    portal_count: u32,
     emissive_boost: f32,
+    /// The camera's render-layer cull mask (tlas_builder::layers_mask); rays start with
+    /// it and portals swap it to the exit instance's mask.
+    camera_mask: u32,
+    /// Per-layer skies (LayerSkies): mode / bindless texture / colour-or-scale per layer.
+    sky_layer_mode: [u32; 8],
+    sky_layer_tex: [u32; 8],
+    sky_layer_color: [[f32; 4]; 8],
 }
 
 #[repr(C)]
@@ -288,6 +298,7 @@ fn render_frame(
         Res<ProceduralSky>,
         Res<crate::env_light::EnvLight>,
         crate::gizmo_render::GizmoDrawParams,
+        Res<crate::sky::LayerSkies>,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -307,6 +318,7 @@ fn render_frame(
         ResMut<crate::auto_exposure::AutoExposureState>,
         Res<Time>,
         ResMut<crate::skinning::Skins>,
+        Res<crate::portal::PortalTable>,
     ),
     camera: Query<
         (
@@ -315,6 +327,7 @@ fn render_frame(
             Option<&crate::dlss::AuroraDlss>,
             Option<&crate::auto_exposure::AuroraExposure>,
             Option<&crate::debug_view::AuroraDebugView>,
+            Option<&bevy::camera::visibility::RenderLayers>,
         ),
         With<Camera3d>,
     >,
@@ -345,10 +358,12 @@ fn render_frame(
         mut ae,
         time,
         mut skins,
+        portal_table,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
-    let (dev_ui_state, mut ui, sky, procedural, env_light, mut gizmos) = dev_ui_stuff;
+    let (dev_ui_state, mut ui, sky, procedural, env_light, mut gizmos, layer_skies) =
+        dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
@@ -461,6 +476,33 @@ fn render_frame(
             .destroy_buffer(staging_buffer.handle);
     }
 
+    // Per-layer sky table: every layer defaults to the global sky; LayerSkies overrides.
+    let sky_entry = |s: &Sky| -> (u32, u32, Vec4) {
+        match s {
+            Sky::Color { radiance } => (0, WHITE_TEXTURE_IDX, radiance.extend(0.0)),
+            Sky::Hdr { image, scale } => (
+                1,
+                textures
+                    .get(image)
+                    .map_or(WHITE_TEXTURE_IDX, |t| render_device.register_bindless_texture(t)),
+                Vec4::splat(*scale),
+            ),
+            Sky::Procedural => (2, WHITE_TEXTURE_IDX, Vec4::ONE),
+        }
+    };
+    let global_entry = sky_entry(&sky);
+    let mut sky_layer_mode = [global_entry.0; 8];
+    let mut sky_layer_tex = [global_entry.1; 8];
+    let mut sky_layer_color = [global_entry.2.to_array(); 8];
+    for (layer, layer_sky) in &layer_skies.0 {
+        if *layer < 8 {
+            let (mode, tex, color) = sky_entry(layer_sky);
+            sky_layer_mode[*layer] = mode;
+            sky_layer_tex[*layer] = tex;
+            sky_layer_color[*layer] = color.to_array();
+        }
+    }
+
     // Update each view's uniform buffer
     for view in &views {
         let data = UniformData {
@@ -534,6 +576,12 @@ fn render_frame(
                 0
             },
             emissive_boost: dev_ui_state.emissive_boost.max(0.0),
+            portals: portal_table.address(),
+            portal_count: portal_table.count(),
+            camera_mask: crate::tlas_builder::layers_mask(camera.5) as u32,
+            sky_layer_mode,
+            sky_layer_tex,
+            sky_layer_color,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);

@@ -34,6 +34,11 @@ layout (buffer_reference, scalar, buffer_reference_align = 4) readonly buffer En
   float data[];
 };
 
+// Ray-portal pair table (src/portal.rs): x = instance slot, y = target slot, z = valid.
+layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer PortalData {
+  uvec4 pairs[];
+};
+
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict buffer UniformData {
   vec4 skycolor;
   mat4 inverse_view;
@@ -83,9 +88,20 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   EnvData env;
   uint env_w;
   uint env_h;
+  // Ray portals (src/portal.rs): pair table + entry count (0 = none).
+  PortalData portals;
+  uint portal_count;
   // Uniform multiplier on every light's emission (emissive surfaces + analytic lights).
   // Uniform across lights, so the light table's relative weights/CDF stay valid.
   float emissive_boost;
+  // The camera's render-layer cull mask; every ray starts with it (portals swap it).
+  uint camera_mask;
+  // Per-render-layer skies (src/sky.rs LayerSkies): a ray's miss evaluates the sky of
+  // the world its mask says it is in. mode 0 = colour, 1 = HDR (tex, colour = scale),
+  // 2 = procedural (shares the global procedural params).
+  uint sky_layer_mode[8];
+  uint sky_layer_tex[8];
+  vec4 sky_layer_color[8];
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

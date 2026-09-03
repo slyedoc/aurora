@@ -31,6 +31,13 @@ impl Default for Sky {
     }
 }
 
+/// Per-render-layer sky overrides: `(layer, sky)` pairs. A ray evaluates the sky of the
+/// world it is IN (its cull mask, which portals swap), so two portal-linked worlds get
+/// their own skies; layers without an entry fall back to the global [`Sky`]. Procedural
+/// entries share the single global [`ProceduralSky`] parameter set.
+#[derive(Resource, Default, Clone, Debug)]
+pub struct LayerSkies(pub Vec<(usize, Sky)>);
+
 impl Sky {
     /// The luminance the firefly clamp is relative to (the sky's typical radiance, nits).
     pub fn reference_luminance(&self, procedural: &ProceduralSky) -> f32 {
@@ -129,6 +136,7 @@ pub struct SkyPlugin;
 
 impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<LayerSkies>();
         app.register_type::<Sky>()
             .register_type::<ProceduralSky>()
             .init_resource::<Sky>()

@@ -32,6 +32,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(bevy::animation::AnimationPlugin);
         group = group.add(bevy::world_serialization::WorldSerializationPlugin);
         group = group.add(bevy::gltf::GltfPlugin::default());
+        group = group.add(crate::portal::PortalPlugin);
         group = group.add(bevy::winit::WinitPlugin::default());
         group = group.add(bevy::audio::AudioPlugin::default());
 

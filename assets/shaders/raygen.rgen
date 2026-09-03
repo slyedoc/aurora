@@ -351,6 +351,67 @@ vec3 envSample(const float u1, const float u2, const float u3, out vec3 dir, out
   return pc.uniforms.skycolor.rgb * texture(textures[pc.skydome], uv).rgb * pc.uniforms.sky_brightness;
 }
 
+// ---- ray portals (src/portal.rs) -------------------------------------------------------
+// Instance rows are the VkAccelerationStructureInstanceKHR 3x4 transform, row-major:
+// r_k = row k of world_from_local. Inverse via the 3x3 adjugate, -L^-1 t for translation.
+void portalAffineInverse(const vec4 r0, const vec4 r1, const vec4 r2,
+                         out vec4 o0, out vec4 o1, out vec4 o2) {
+  const vec3 c0 = vec3(r0.x, r1.x, r2.x);
+  const vec3 c1 = vec3(r0.y, r1.y, r2.y);
+  const vec3 c2 = vec3(r0.z, r1.z, r2.z);
+  const vec3 t = vec3(r0.w, r1.w, r2.w);
+  const float inv_det = 1.0 / dot(c0, cross(c1, c2));
+  const vec3 i0 = cross(c1, c2) * inv_det;
+  const vec3 i1 = cross(c2, c0) * inv_det;
+  const vec3 i2 = cross(c0, c1) * inv_det;
+  o0 = vec4(i0, -dot(i0, t));
+  o1 = vec4(i1, -dot(i1, t));
+  o2 = vec4(i2, -dot(i2, t));
+}
+
+vec3 portalXformPoint(const vec4 r0, const vec4 r1, const vec4 r2, const vec3 p) {
+  const vec4 h = vec4(p, 1.0);
+  return vec3(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+vec3 portalXformDir(const vec4 r0, const vec4 r1, const vec4 r2, const vec3 v) {
+  return vec3(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
+}
+
+// If `hit_slot` is a portal surface, rewrite the ray to continue from the paired portal
+// (into portal-local, a half-turn about local Y, out through the target's frame) and
+// return true; else leave the ray untouched.
+bool portalRedirect(const uint hit_slot, const vec3 hit_pos,
+                    inout vec3 origin, inout vec3 direction, inout uint ray_mask) {
+  for (uint i = 0u; i < pc.uniforms.portal_count; i++) {
+    const uvec4 pair = pc.uniforms.portals.pairs[i];
+    if (pair.z == 0u || pair.x != hit_slot) { continue; }
+    const uint pb = pair.x * 4u;
+    vec4 i0, i1, i2;
+    portalAffineInverse(
+        pc.cur_instances.data[pb + 0u],
+        pc.cur_instances.data[pb + 1u],
+        pc.cur_instances.data[pb + 2u],
+        i0, i1, i2);
+    vec3 p = portalXformPoint(i0, i1, i2, hit_pos);
+    vec3 d = portalXformDir(i0, i1, i2, direction);
+    p = vec3(-p.x, p.y, -p.z);
+    d = vec3(-d.x, d.y, -d.z);
+    const uint tb = pair.y * 4u;
+    const vec4 t0 = pc.cur_instances.data[tb + 0u];
+    const vec4 t1 = pc.cur_instances.data[tb + 1u];
+    const vec4 t2 = pc.cur_instances.data[tb + 2u];
+    direction = normalize(portalXformDir(t0, t1, t2, d));
+    // Nudge past the exit surface so the continued ray doesn't immediately re-hit it.
+    origin = portalXformPoint(t0, t1, t2, p) + direction * 1.0e-4;
+    // The ray now lives in whatever world the exit does: adopt the exit INSTANCE's
+    // render-layer mask (instance row 3 packs custom_index | mask << 24).
+    ray_mask = (floatBitsToUint(pc.cur_instances.data[tb + 3u].x) >> 24) & 0xFFu;
+    return true;
+  }
+  return false;
+}
+
 void main() {
   // Fresh noise every frame for the temporal denoiser.
   initRandom(gl_LaunchSizeEXT.xy, gl_LaunchIDEXT.xy, pc.uniforms.frame);
@@ -358,7 +419,8 @@ void main() {
   const ivec2 px = ivec2(gl_LaunchIDEXT.xy);
 
   const float tmin = 0.0001;
-  const float tmax = 1000.0;
+  // Far range: the sim-scale sky domes sit kilometers out.
+  const float tmax = 20000.0;
 
   // A known sub-pixel jitter (told to NGX); the launch y is flipped into the NDC-up space
   // here, so the image-space offset is +jitter.
@@ -398,6 +460,8 @@ void main() {
     // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
     // camera ray and delta continuations): the MIS partner of light-table sampling.
     float prev_pdf = 0.0;
+    // The world this ray sees: the camera's layer mask until a portal swaps it.
+    uint ray_mask = pc.uniforms.camera_mask;
     // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
     // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
     // once the path ends.
@@ -423,11 +487,29 @@ void main() {
     float guide_dist = 0.0;
 
     for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
-      payload.want_sun = want_sun ? 1u : 0u;
-      traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, origin, tmin, direction, tmax, 0);
+      // Low bit: may this miss return the sun disc; high bits: the ray's world mask
+      // (the miss picks that layer's sky).
+      payload.want_sun = (want_sun ? 1u : 0u) | (ray_mask << 1);
+      traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, ray_mask, 0, 0, 0, origin, tmin, direction, tmax, 0);
 
       const vec3 surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
       const vec3 world_normal = oct_to_float32x3(payload.surface_and_world_normal.zw);
+
+      // Ray portals: a portal-surface hit continues from the paired portal. A delta
+      // teleport, not a scatter: guides stay deferred (the far side writes them at the
+      // virtual distance, PSR-style) and the next emissive hit is taken at full weight
+      // (NEE cannot sample lights through a portal, so MIS must not discount them).
+      if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
+        vec3 p_origin = origin;
+        vec3 p_dir = direction;
+        if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask)) {
+          if (!guides_written) { guide_dist += payload.t; }
+          origin = p_origin;
+          direction = p_dir;
+          prev_pdf = 0.0;
+          continue;
+        }
+      }
 
       // Alpha-cutout pass-through (stochastic alpha at the edge texels of a masked material,
       // pure-black texels used as masks) is decided BEFORE the DLSS guides: a primary ray that
@@ -782,7 +864,7 @@ void main() {
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                        0xFF, 0, 0, 0, origin, tmin, r_dir, r_dist - 2.0 * tmin, 0);
+                        ray_mask, 0, 0, 0, origin, tmin, r_dir, r_dist - 2.0 * tmin, 0);
             if (payload.t == 0.0) {
               acc += mask * r_val * r_W;
             } else {
@@ -814,7 +896,7 @@ void main() {
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                        0xFF, 0, 0, 0, origin, tmin, ldir, ldist - 2.0 * tmin, 0);
+                        ray_mask, 0, 0, 0, origin, tmin, ldir, ldist - 2.0 * tmin, 0);
             if (payload.t == 0.0) {
               vec3 contribution = mask * val * (w / p_area);
               if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
@@ -841,7 +923,7 @@ void main() {
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                        0xFF, 0, 0, 0, origin, tmin, l, tmax, 0);
+                        ray_mask, 0, 0, 0, origin, tmin, l, tmax, 0);
             if (payload.t == 0.0) {
               acc += mask * f * NoL * L * (w / pdf_env);
             }
@@ -865,7 +947,7 @@ void main() {
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                        0xFF, 0, 0, 0, origin, tmin, l, tmax, 0);
+                        ray_mask, 0, 0, 0, origin, tmin, l, tmax, 0);
             if (payload.t == 0.0) {
               const float solid_angle = 2.0 * PI * (1.0 - pc.uniforms.sun_cos_radius);
               acc += mask * f * NoL * pc.uniforms.sun_radiance * solid_angle;

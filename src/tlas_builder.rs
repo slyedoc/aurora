@@ -700,7 +700,27 @@ type ChangedInstances = Or<(
     Changed<GltfModelHandle>,
     Changed<AuroraMaterial3d>,
     Changed<InheritedVisibility>,
+    Changed<bevy::camera::visibility::RenderLayers>,
 )>;
+
+/// [`RenderLayers`](bevy::camera::visibility::RenderLayers) folded into the 8-bit TLAS
+/// instance mask: layer *i* sets bit *i* (layers past 7 are ignored -- the ray-traced
+/// world has 8 layers). No component = the default layer = `0x01`; rays carry the
+/// camera's mask (portals swap it to the exit's), so a ray only sees its own world.
+pub fn layers_mask(layers: Option<&bevy::camera::visibility::RenderLayers>) -> u8 {
+    match layers {
+        None => 0x01,
+        Some(layers) => {
+            let mut mask = 0u8;
+            for layer in layers.iter() {
+                if layer < 8 {
+                    mask |= 1 << layer;
+                }
+            }
+            mask
+        }
+    }
+}
 
 #[allow(clippy::type_complexity)]
 fn extract_instances(
@@ -715,6 +735,7 @@ fn extract_instances(
             Has<Sphere>,
             Option<&AuroraMaterial3d>,
             Option<&InheritedVisibility>,
+            Option<&bevy::camera::visibility::RenderLayers>,
         ),
         ChangedInstances,
     >,
@@ -723,7 +744,7 @@ fn extract_instances(
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
     }
-    for (instance, node, mesh, gltf, sphere, material, visibility) in changed.iter() {
+    for (instance, node, mesh, gltf, sphere, material, visibility, layers) in changed.iter() {
         let geometry = if let Some(mesh) = mesh {
             Geometry::Mesh(mesh.id())
         } else if let Some(gltf) = gltf {
@@ -740,7 +761,7 @@ fn extract_instances(
                 material: material.map(|m| m.0.id()),
                 node: node.0,
                 mask: if visibility.is_none_or(|v| v.get()) {
-                    0xFF
+                    layers_mask(layers)
                 } else {
                     0x00
                 },
