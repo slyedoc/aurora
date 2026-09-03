@@ -141,6 +141,12 @@ mod imp {
         write_blob(blob, size, name);
     }
 
+    /// Whether the crash-dump callbacks registered successfully: the device-creation
+    /// path only asks for `VK_NV_device_diagnostics_config` when someone is listening.
+    pub fn is_armed() -> bool {
+        ARMED.load(Ordering::Acquire)
+    }
+
     /// Register the crash-dump callbacks with the driver. Idempotent; must run
     /// before instance/device creation (it does -- first line of
     /// `RenderDevice::from_display`). Failure warns and continues: device bring-up
@@ -235,6 +241,10 @@ mod imp {
     pub fn enable() {}
     /// Compiled out — nothing to wait for.
     pub fn wait_for_dump() {}
+    /// Compiled out — never armed.
+    pub fn is_armed() -> bool {
+        false
+    }
 }
 
-pub use imp::{enable, wait_for_dump};
+pub use imp::{enable, is_armed, wait_for_dump};

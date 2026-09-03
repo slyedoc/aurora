@@ -606,6 +606,18 @@ unsafe fn create_logical_device(
             );
         }
 
+        // Nsight Aftermath (aftermath.rs): with the callbacks armed, ask the driver to
+        // track resources, shader debug info, checkpoints, and shader error reporting, so
+        // a crash dump names the faulting buffer / shader source line instead of a bare
+        // VA ("Shader mapping: null"). NV-only extension; skipped when unsupported.
+        let diagnostics = crate::aftermath::is_armed()
+            && supported.iter().any(|p| {
+                CStr::from_ptr(p.extension_name.as_ptr()) == vk::NV_DEVICE_DIAGNOSTICS_CONFIG_NAME
+            });
+        if diagnostics {
+            device_extensions.push(vk::NV_DEVICE_DIAGNOSTICS_CONFIG_NAME.as_ptr());
+        }
+
         println!("Device extensions:");
         for extension_name in device_extensions.iter() {
             println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
@@ -654,6 +666,17 @@ unsafe fn create_logical_device(
         let mut features_micromap =
             vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true);
 
+        // Aftermath diagnostics: the feature bit plus what to track (the full set from
+        // NVIDIA's VkHelloNsightAftermath sample; `dev`-only overhead).
+        let mut features_diagnostics =
+            vk::PhysicalDeviceDiagnosticsConfigFeaturesNV::default().diagnostics_config(true);
+        let mut diagnostics_info = vk::DeviceDiagnosticsConfigCreateInfoNV::default().flags(
+            vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_DEBUG_INFO
+                | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_RESOURCE_TRACKING
+                | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_AUTOMATIC_CHECKPOINTS
+                | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_ERROR_REPORTING,
+        );
+
         // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`.
         let core_features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
@@ -674,6 +697,13 @@ unsafe fn create_logical_device(
             .push_next(&mut features_float16);
         let device_info = if micromaps {
             device_info.push_next(&mut features_micromap)
+        } else {
+            device_info
+        };
+        let device_info = if diagnostics {
+            device_info
+                .push_next(&mut features_diagnostics)
+                .push_next(&mut diagnostics_info)
         } else {
             device_info
         };
