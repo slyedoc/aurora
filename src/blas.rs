@@ -645,11 +645,17 @@ fn build_chunk(
         render_device
             .device
             .cmd_reset_query_pool(cmd_buffer, query_pool, 0, n as u32);
-        // AURORA_SINGLE_AS_BUILDS=1 (device-lost hunt): one vkCmdBuildAccelerationStructures
-        // per BLAS with a full build barrier between, instead of N structures in one call.
+        // One vkCmdBuildAccelerationStructures per BLAS, a full build barrier between.
+        // Batching N structures into one call device-losts on GB202/610.43: the driver's
+        // internal AS-build shader reads a wild/misaligned address at glb hydration bursts
+        // (~1-in-3 runs; one crash fingerprint across flat + XR; inputs audited clean and
+        // every other theory -- portals, asset arrival, submission overlap, compaction --
+        // eliminated by A/B). Split builds: 8/8 clean through the same frames. Costs build
+        // parallelism within a batch, worker-side only. AURORA_MULTI_AS_BUILDS=1 restores
+        // the batched call for A/B against future drivers.
         static SINGLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let single =
-            *SINGLE.get_or_init(|| std::env::var_os("AURORA_SINGLE_AS_BUILDS").is_some());
+            *SINGLE.get_or_init(|| std::env::var_os("AURORA_MULTI_AS_BUILDS").is_none());
         if single {
             for (info, ranges) in build_infos.iter().zip(&build_ranges) {
                 render_device.ext_acc_struct.cmd_build_acceleration_structures(
