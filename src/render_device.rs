@@ -310,19 +310,7 @@ impl RenderDevice {
         let (cmd_buffer, fence) = self.record_transfer(f);
         {
             let queue = self.queue.lock().unwrap();
-            // Diagnostic lever (door-open device-lost hunt): AURORA_SERIAL_SUBMITS=1 keeps
-            // worker submissions from ever executing concurrently with an in-flight frame --
-            // AS builds on overlapping queue submissions are the remaining suspect class.
-            static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let serial =
-                *SERIAL.get_or_init(|| std::env::var_os("AURORA_SERIAL_SUBMITS").is_some());
-            if serial {
-                let _ = unsafe { self.device.queue_wait_idle(*queue) };
-            }
             self.submit_transfer(*queue, cmd_buffer, fence);
-            if serial {
-                let _ = unsafe { self.device.queue_wait_idle(*queue) };
-            }
         }
         self.finish_transfer(cmd_buffer, fence);
     }
