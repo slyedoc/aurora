@@ -34,6 +34,7 @@ pub mod sky;
 pub mod sphere;
 pub mod swapchain;
 pub mod portal;
+pub mod terrain;
 pub mod tlas_builder;
 pub mod transform;
 pub mod ui_render;

@@ -53,6 +53,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
+        group = group.add(crate::terrain::TerrainPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
         group = group.add(crate::sharc::SharcPlugin);

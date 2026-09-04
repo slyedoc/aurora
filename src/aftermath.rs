@@ -29,6 +29,9 @@
 /// compiled out or failed to arm.
 pub fn note_device_lost(err: ash::vk::Result) {
     if err == ash::vk::Result::ERROR_DEVICE_LOST {
+        // The sync-val tail first: it is pure CPU state and survives even when the driver's
+        // dump collection stalls or the dump comes out truncated (bus fall).
+        crate::render_device::dump_validation_tail();
         wait_for_dump();
     }
 }

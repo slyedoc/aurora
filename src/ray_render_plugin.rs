@@ -319,6 +319,7 @@ fn render_frame(
         Res<Time>,
         ResMut<crate::skinning::Skins>,
         Res<crate::portal::PortalTable>,
+        ResMut<crate::terrain::Terrains>,
     ),
     camera: Query<
         (
@@ -359,6 +360,7 @@ fn render_frame(
         time,
         mut skins,
         portal_table,
+        mut terrains,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
@@ -631,12 +633,13 @@ fn render_frame(
         // them, and rebuild the single TLAS in place -- all inside this command buffer.
         let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
         let skinned = skins.record(&render_device, cmd_buffer, &modules, &transforms);
+        let terrain_changed = terrains.record(&render_device, cmd_buffer, &modules, &textures);
         tlas.record(
             &render_device,
             cmd_buffer,
             &modules,
             &transforms,
-            world_changed || skinned,
+            world_changed || skinned || terrain_changed,
         );
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).

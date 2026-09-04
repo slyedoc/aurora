@@ -463,6 +463,11 @@ unsafe fn create_instance(
         if sync_validation {
             instance_extensions.push(ash::ext::validation_features::NAME.as_ptr());
         }
+        if validate {
+            // For the messenger below: without it the layer prints to stdout only, and the
+            // sync-val tail is lost in scrollback exactly when a device loss needs it.
+            instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+        }
         let enabled = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
         let mut validation_features =
             vk::ValidationFeaturesEXT::default().enabled_validation_features(&enabled);
@@ -477,10 +482,99 @@ unsafe fn create_instance(
 
         // XR: the runtime performs the create (xrCreateVulkanInstanceKHR), adding whatever
         // instance extensions its compositor interop needs on top of ours.
-        match xr {
+        let instance = match xr {
             Some(xr) => xr.create_vk_instance(entry, &instance_info),
             None => entry.create_instance(&instance_info, None).unwrap(),
+        };
+
+        // Route validation output through `log` and keep a tail for the crash reporter
+        // (dump_validation_tail). The messenger lives for the process; the layer's
+        // "messenger not destroyed" complaint at teardown lands in our own callback.
+        if validate {
+            let debug_utils = ash::ext::debug_utils::Instance::new(entry, &instance);
+            let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                .message_severity(
+                    vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                )
+                .message_type(
+                    vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                        | vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                )
+                .pfn_user_callback(Some(debug_utils_callback));
+            match debug_utils.create_debug_utils_messenger(&info, None) {
+                Ok(_) => log::info!("validation messenger armed (tail kept for device loss)"),
+                Err(err) => log::warn!("validation messenger failed: {err:?}"),
+            }
         }
+        instance
+    }
+}
+
+// ---- validation message capture --------------------------------------------------------------
+
+/// Recent validation warnings/errors (newest last), kept for [`dump_validation_tail`]:
+/// when the GPU falls off the bus the Aftermath dump is often truncated, and this tail is
+/// the only evidence of a sync hazard building up to it.
+static VALIDATION_TAIL: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const VALIDATION_TAIL_CAP: usize = 200;
+
+unsafe extern "system" fn debug_utils_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _user: *mut std::ffi::c_void,
+) -> vk::Bool32 {
+    use vk::DebugUtilsMessageSeverityFlagsEXT as S;
+    let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) }
+        .to_string_lossy()
+        .into_owned();
+    if severity.contains(S::ERROR) {
+        log::error!("vk: {msg}");
+    } else if severity.contains(S::WARNING) {
+        log::warn!("vk: {msg}");
+    } else {
+        log::debug!("vk: {msg}");
+    }
+    if severity.intersects(S::ERROR | S::WARNING) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut tail = VALIDATION_TAIL.lock().unwrap();
+        if tail.len() >= VALIDATION_TAIL_CAP {
+            tail.pop_front();
+        }
+        tail.push_back(format!("[{ms}] {msg}"));
+    }
+    vk::FALSE
+}
+
+/// Write the validation tail next to the Aftermath dumps (same `AURORA_AFTERMATH_DIR` /
+/// `./crash-dumps` resolution), fsynced — the box often gets hard-reset seconds after a
+/// GPU loss. Called from `aftermath::note_device_lost`; a no-op when the tail is empty.
+pub fn dump_validation_tail() {
+    let tail: Vec<String> = VALIDATION_TAIL.lock().unwrap().iter().cloned().collect();
+    if tail.is_empty() {
+        return;
+    }
+    let dir = std::env::var_os("AURORA_AFTERMATH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("crash-dumps"));
+    let _ = std::fs::create_dir_all(&dir);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("validation-tail-{ms}.log"));
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        use std::io::Write as _;
+        let _ = f.write_all(tail.join("
+").as_bytes());
+        let _ = f.sync_all();
+        log::error!("wrote validation tail ({} messages) -> {}", tail.len(), path.display());
     }
 }
 

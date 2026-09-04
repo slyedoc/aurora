@@ -68,6 +68,7 @@ fn update_sbt(
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
     skins: Res<Skins>,
+    terrains: Res<crate::terrain::Terrains>,
     render_config: Res<RenderConfig>,
     mut aligments: Local<SBTAligments>,
 ) {
@@ -174,6 +175,23 @@ fn update_sbt(
                     });
             }
 
+            // Terrain tiles: their own deformed streams (static addresses; the previous
+            // frame's positions come from the instance transform like any rigid mesh).
+            for record in terrains.hit_records() {
+                (dst.add(record.hit_offset as usize * sbt.hit_region.stride as usize)
+                    as *mut SBTRegionHitTriangle)
+                    .write(SBTRegionHitTriangle {
+                        handle: rtx_pipeline.hit_handle,
+                        vertex_buffer: record.vertex_buffer,
+                        triangle_buffer: record.triangle_buffer,
+                        index_buffer: record.index_buffer,
+                        geometry_to_index: record.geometry_to_index,
+                        geometry_to_triangle: record.geometry_to_triangle,
+                        prev_vertex_buffer: 0,
+                        flags: 0,
+                    });
+            }
+
             for (mesh_id, mesh) in gltf_meshes.iter() {
                 let mesh = match mesh {
                     VulkanAssetLoadingState::Loading => continue,
@@ -219,7 +237,8 @@ impl Plugin for SBTPlugin {
                 .in_set(RenderSet::Prepare)
                 .after(poll_for_asset::<RaytracingPipeline>)
                 .after(prepare_instances)
-                .after(prepare_skins),
+                .after(prepare_skins)
+                .after(crate::terrain::prepare_terrains),
         );
         app.add_systems(TeardownSchedule, cleanup_sbt.before(on_shutdown));
     }
