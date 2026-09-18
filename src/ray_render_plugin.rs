@@ -11,8 +11,8 @@ use ash::vk;
 
 use crate::sky::{ProceduralSky, Sky};
 use crate::{
-    bluenoise_plugin::BlueNoiseBuffer,
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
+    bluenoise_plugin::BlueNoiseBuffer,
     post_process_filter::PostProcessFilter,
     raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants},
     render_buffer::{Buffer, BufferProvider},
@@ -506,9 +506,9 @@ fn render_frame(
             Sky::Color { radiance } => (0, WHITE_TEXTURE_IDX, radiance.extend(0.0)),
             Sky::Hdr { image, scale } => (
                 1,
-                textures
-                    .get(image)
-                    .map_or(WHITE_TEXTURE_IDX, |t| render_device.register_bindless_texture(t)),
+                textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
+                    render_device.register_bindless_texture(t)
+                }),
                 Vec4::splat(*scale),
             ),
             Sky::Procedural => (2, WHITE_TEXTURE_IDX, Vec4::ONE),
@@ -1088,13 +1088,19 @@ fn render_frame(
         if let (Some(xr_state), Some(xr_frame)) = (xr.as_deref_mut(), xr_frame) {
             xr_state.end_frame(&render_device, xr_frame);
         }
+        // Whole-device drains take the queue lock: the asset workers submit their builds
+        // through the same VkQueue, and a drain racing a submit is a threading violation.
         if dev_drain {
+            let _queue = render_device.queue.lock().unwrap();
             let _ = render_device.device.device_wait_idle();
         }
 
         if let Some((path, mut buffer)) = capture {
             // Debug tool: one hitch per capture beats plumbing a fence through the frame.
-            let _ = render_device.device.device_wait_idle();
+            {
+                let _queue = render_device.queue.lock().unwrap();
+                let _ = render_device.device.device_wait_idle();
+            }
             let mut view = render_device.map_buffer(&mut buffer);
             crate::util::screenshot::save_png(
                 view.as_slice_mut(),
@@ -1176,7 +1182,7 @@ unsafe fn record_post_draw(
     }
 }
 
-pub(crate) fn on_shutdown(world: &mut World) {
+pub fn on_shutdown(world: &mut World) {
     // XR session and instance go before the VkDevice they wrap.
     let xr_state = world.remove_resource::<crate::xr::XrState>();
     world.remove_resource::<crate::xr::XrContext>();

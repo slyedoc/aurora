@@ -744,8 +744,11 @@ void main() {
       // to gather much light yet except those directly in view of the camera, but
       // those paths would be terminated there and then anyway because they hit
       // an emitter.
+      // Survival follows the path THROUGHPUT, not the local albedo: a path that has
+      // already lost most of its energy in a valley of 0.4-albedo rock is not worth
+      // another shadow ray, however bright the rock it just hit.
       if (bounce_idx > 1) {
-        const float pRussian = clamp(luma(payload.color.rgb), 0.03, 0.9);
+        const float pRussian = clamp(luma(mask), 0.03, 0.9);
         if (randf() >= pRussian) { break; }
         mask /= pRussian;
       }

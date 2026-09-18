@@ -291,17 +291,23 @@ impl Swapchain {
                 ))
                 .unwrap();
 
-            self.current_image_idx = self
-                .device
-                .ext_swapchain
-                .acquire_next_image(
+            // A swapchain the compositor already invalidated (a fullscreen window settling
+            // in) surfaces here; rebuild it and acquire again.
+            self.current_image_idx = loop {
+                match self.device.ext_swapchain.acquire_next_image(
                     self.swapchain,
                     u64::MAX,
                     self.image_available_semaphore,
                     vk::Fence::null(),
-                )
-                .unwrap()
-                .0;
+                ) {
+                    Ok((index, _)) => break index,
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        log::info!("swapchain: out of date at acquire, recreating");
+                        self.on_resize(window);
+                    }
+                    Err(e) => panic!("acquire_next_image failed: {e:?}"),
+                }
+            };
 
             return (
                 self.swapchain_images[self.current_image_idx as usize],
