@@ -302,7 +302,26 @@ mod ext {
         );
     }
 
+    /// Keeps NGX from launching the driver's `nvidia-ngx-updater` (OTA snippet fetch).
+    /// The snippets come from the SDK search path or the driver, so an OTA copy would only
+    /// make the build non-deterministic, and the updater is a child process whose stderr
+    /// ("NGX Updater reported an error ...") lands untouched in our terminal, once per NGX
+    /// query, whenever NVIDIA's CDN refuses it. `AURORA_NGX_OTA=1` leaves the updater on.
+    fn disable_ota() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            const VAR: &str = "__NGX_DISABLE_UPDATER";
+            if std::env::var_os("AURORA_NGX_OTA").is_some() || std::env::var_os(VAR).is_some() {
+                return;
+            }
+            // Before any NGX call, and before the Vulkan loader or anything else that reads
+            // the environment from another thread exists; bevy's task pools are up but idle.
+            unsafe { std::env::set_var(VAR, "1") };
+        });
+    }
+
     pub(crate) fn feature_info(feature_id: u32) -> FeatureInfo {
+        disable_ota();
         // NGX looks for the per-feature snippets (libnvidia-ngx-dlss*.so) here first, then
         // falls back to the driver-installed copies.
         let mut search = Vec::new();

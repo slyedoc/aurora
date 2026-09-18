@@ -28,6 +28,7 @@ layout(location = 14) flat in uint in_color_space;
 layout(location = 0) out vec4 out_color;
 
 const uint TEXTURED = 1u;
+const uint TEXTURE_SRGB = 2u;
 // must align with `ui_render::shader_flags`
 const uint RADIAL = 16u;
 const uint FILL_START = 32u;
@@ -269,12 +270,15 @@ void main() {
     color = in_color;
   }
 
-  // The swapchain is UNORM, so linear colors from bevy get encoded here.
-  color = vec4(linear_rgb_to_srgb(color.rgb), color.a);
+  // Linear light out: the sRGB attachment encodes on store and blends in linear space.
   if (enabled(in_flags, TEXTURED)) {
-    // Image bytes are already sRGB encoded (loaded as UNORM); glyph atlases are
-    // white alpha masks. Apply them after encoding the tint.
-    color *= texture(textures[nonuniformEXT(in_tex)], in_uv);
+    vec4 texel = texture(textures[nonuniformEXT(in_tex)], in_uv);
+    // Image bytes are sRGB encoded (uploaded as UNORM); alpha-mask glyph atlases are
+    // linear coverage.
+    if (enabled(in_flags, TEXTURE_SRGB)) {
+      texel.rgb = srgb_to_linear_rgb(texel.rgb);
+    }
+    color *= texel;
   }
 
   if (enabled(in_flags, BORDER_ANY)) {

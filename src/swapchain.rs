@@ -8,6 +8,12 @@ use crate::render_device::RenderDevice;
 
 const FRAMES_IN_FLIGHT: usize = 1;
 
+/// The format of everything drawn for a display: the window swapchain, the XR eye targets,
+/// and every graphics pipeline's colour attachment (post-process, UI, gizmos). sRGB, so the
+/// shaders write linear light and the hardware applies the transfer function on store and
+/// blends in linear space -- the same convention as bevy's swapchain view.
+pub const DISPLAY_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
+
 #[derive(Resource)]
 pub struct Swapchain {
     device: RenderDevice,
@@ -108,17 +114,14 @@ impl Swapchain {
                 .get_physical_device_surface_formats(self.device.physical_device, self.surface)
                 .unwrap();
 
-            // Every graphics pipeline in this crate (post-process, egui, bevy_ui) is created
-            // against B8G8R8A8_UNORM, so prefer that; fall back to the RGBA twin.
+            // Every graphics pipeline in this crate is created against DISPLAY_FORMAT, so
+            // the surface has to offer it (every desktop driver does).
             let surface_format = formats
                 .iter()
-                .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
-                .or_else(|| {
-                    formats
-                        .iter()
-                        .find(|f| f.format == vk::Format::R8G8B8A8_UNORM)
-                })
-                .unwrap_or(&formats[0]);
+                .find(|f| f.format == DISPLAY_FORMAT)
+                .unwrap_or_else(|| {
+                    panic!("surface does not offer {DISPLAY_FORMAT:?}; it has {formats:?}")
+                });
 
             log::info!("Surface format: {:?}", surface_format);
 

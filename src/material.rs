@@ -124,7 +124,8 @@ impl RTXMaterial {
     pub fn from_material(material: &AuroraMaterial) -> Self {
         RTXMaterial {
             base_color_factor: {
-                let c = material.base_color.to_srgba();
+                // Linear, like the glTF loader's factors; the hit shaders use it as albedo.
+                let c = material.base_color.to_linear();
                 [c.red, c.green, c.blue, c.alpha]
             },
             base_emissive_factor: {

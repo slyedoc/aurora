@@ -35,8 +35,6 @@ use crate::{
 #[derive(Resource, Reflect, Clone, Debug)]
 #[reflect(Resource, Default)]
 pub struct DevUIState {
-    #[reflect(@1.5..=3.0_f32)]
-    pub gamma: f32,
     #[reflect(@0.0..=0.02_f32)]
     pub aperture: f32,
     #[reflect(@0.0..=0.2_f32)]
@@ -50,9 +48,10 @@ pub struct DevUIState {
     /// unbiased and the light table's sampling distribution is unchanged.
     #[reflect(@0.0..=100.0_f32)]
     pub emissive_boost: f32,
-    /// Firefly suppression: indirect contributions are clamped to this many times the sky's
-    /// luminance (0 = off). Biases bright indirect paths down; kills the speckle Ray
-    /// Reconstruction would otherwise smear.
+    /// Firefly suppression: indirect contributions are clamped to this many times the
+    /// metered mid-gray luminance, i.e. what the exposure shows as 18% gray (0 = off), so it
+    /// follows the scene whether a sky or an emitter lights it. Biases bright indirect paths
+    /// down; kills the speckle Ray Reconstruction would otherwise smear.
     #[reflect(@0.0..=64.0_f32)]
     pub firefly_clamp: f32,
     /// Paths per pixel per frame; RR is trained for 1 spp, so extra samples mostly buy
@@ -95,7 +94,6 @@ pub struct DevUIState {
 impl Default for DevUIState {
     fn default() -> Self {
         Self {
-            gamma: 2.4,
             aperture: 0.0,
             foginess: 0.001,
             fog_scatter: 0.9,

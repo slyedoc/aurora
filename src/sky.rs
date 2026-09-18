@@ -43,19 +43,6 @@ impl Default for Sky {
 #[derive(Resource, Default, Clone, Debug)]
 pub struct LayerSkies(pub Vec<(usize, Sky)>);
 
-impl Sky {
-    /// The luminance the firefly clamp is relative to (the sky's typical radiance, nits).
-    pub fn reference_luminance(&self, procedural: &ProceduralSky) -> f32 {
-        match self {
-            Sky::Color { radiance } => luma(*radiance),
-            Sky::Hdr { scale, .. } => *scale,
-            Sky::Procedural => luma(procedural.zenith_radiance()),
-            // A clear daytime zenith; the LUTs are on the GPU, so this is a nominal value.
-            Sky::Atmosphere => 8000.0,
-        }
-    }
-}
-
 /// Parameters of [`Sky::Procedural`]; radiances in nits, angles in degrees.
 #[derive(Resource, Reflect, Clone, Debug)]
 #[reflect(Resource)]

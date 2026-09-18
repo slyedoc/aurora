@@ -52,6 +52,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::platform::collections::HashMap;
 
 use crate::{
+    swapchain::DISPLAY_FORMAT,
     assets::aurora_asset,
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
@@ -65,6 +66,9 @@ use crate::{
 pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     pub const TEXTURED: u32 = 1;
+    /// The texture holds sRGB-encoded colour (an `ImageNode` image, a colour glyph atlas)
+    /// rather than linear data (an alpha-mask glyph atlas): decode before use.
+    pub const TEXTURE_SRGB: u32 = 2;
     pub const RADIAL: u32 = 16;
     pub const FILL_START: u32 = 32;
     pub const FILL_END: u32 = 64;
@@ -251,7 +255,7 @@ impl VulkanAsset for UiPipeline {
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
         let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&[vk::Format::B8G8R8A8_UNORM]);
+            .color_attachment_formats(&[DISPLAY_FORMAT]);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
@@ -476,6 +480,8 @@ pub enum UiItem {
         translation: Vec2,
         size: Vec2,
         uvs: [Vec2; 4],
+        /// `TEXTURED`, plus `TEXTURE_SRGB` for a colour (emoji) atlas.
+        flags: u32,
     },
     /// A whole gradient; drawn as one segment quad per pair of adjacent stops.
     Gradient {
@@ -756,10 +762,13 @@ fn extract_ui(
                 else {
                     continue;
                 };
-                let glyph_color = if atlas_info.is_alpha_mask {
-                    color
+                let (glyph_color, glyph_flags) = if atlas_info.is_alpha_mask {
+                    (color, shader_flags::TEXTURED)
                 } else {
-                    LinearRgba::WHITE
+                    (
+                        LinearRgba::WHITE,
+                        shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
+                    )
                 };
                 quads.push(UiQuad {
                     z: z(z_offsets::TEXT),
@@ -771,6 +780,7 @@ fn extract_ui(
                         translation: *position,
                         size: atlas_info.rect.size(),
                         uvs: rect_uvs(atlas_info.rect, atlas_size, false, false),
+                        flags: glyph_flags,
                     },
                 });
             }
@@ -1227,7 +1237,7 @@ fn extract_image(
             uvs: rect_uvs(rect, atlas_extent, image.flip_x, image.flip_y),
             border_radius: clamped_radius.into(),
             border: [0.0; 4],
-            flags: shader_flags::TEXTURED,
+            flags: shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
         },
     })
 }
@@ -1553,6 +1563,7 @@ fn build_vertices(
                 translation,
                 size,
                 uvs,
+                flags,
             } => {
                 let positions = QUAD_VERTEX_POSITIONS
                     .map(|p| quad.transform.transform_point2(*translation + p * *size));
@@ -1570,7 +1581,7 @@ fn build_vertices(
                     position: position.into(),
                     uv: uv.into(),
                     color: *color,
-                    flags: shader_flags::TEXTURED,
+                    flags: *flags,
                     tex_index,
                     size: (*size).into(),
                     ..UiVertex::ZERO

@@ -39,7 +39,6 @@ pub struct UniformData {
     inverse_projection: Mat4,
     pull_focus_x: u32,
     pull_focus_y: u32,
-    gamma: f32,
     aperture: f32,
     foginess: f32,
     fog_scatter: f32,
@@ -53,8 +52,9 @@ pub struct UniformData {
     /// Free-running frame counter: the RNG seed, so every frame's noise is new for the
     /// temporal denoiser.
     frame: u32,
-    /// Indirect path contributions are clamped to this luminance (0 = off).
-    radiance_clamp: f32,
+    /// Indirect path contributions are clamped to this multiple of the metered mid-gray
+    /// luminance (0 = off); the raygen turns it into nits from the exposure state.
+    firefly_clamp: f32,
     /// Paths per pixel this frame and their maximum length (from [`DevUIState`]).
     samples: u32,
     max_bounces: u32,
@@ -557,7 +557,6 @@ fn render_frame(
                 .pull_focus
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
-            gamma: dev_ui_state.gamma,
             aperture: dev_ui_state.aperture,
             foginess: dev_ui_state.foginess,
             fog_scatter: dev_ui_state.fog_scatter,
@@ -567,10 +566,7 @@ fn render_frame(
             prev_view_proj: view.last_view_proj.to_cols_array(),
             jitter: view.plan.map_or([0.0; 2], |p| p.jitter),
             frame: *frame_counter,
-            radiance_clamp: {
-                let sky_luma = sky.reference_luminance(&procedural) * dev_ui_state.sky_brightness;
-                dev_ui_state.firefly_clamp * sky_luma.max(1e-3)
-            },
+            firefly_clamp: dev_ui_state.firefly_clamp,
             samples: dev_ui_state.samples.max(1),
             max_bounces: dev_ui_state.max_bounces.max(1),
             vignette: dev_ui_state.vignette,

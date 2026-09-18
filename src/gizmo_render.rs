@@ -31,6 +31,7 @@ use bevy::{
 };
 
 use crate::{
+    swapchain::DISPLAY_FORMAT,
     assets::aurora_asset,
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
@@ -167,7 +168,7 @@ impl VulkanAsset for GizmoPipeline {
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
         let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&[vk::Format::B8G8R8A8_UNORM]);
+            .color_attachment_formats(&[DISPLAY_FORMAT]);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)

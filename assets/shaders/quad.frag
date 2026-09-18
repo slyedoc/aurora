@@ -53,8 +53,8 @@ void main() {
     switch (debug_view) {
       case 2: v = texture(test[2], in_UV).rgb * 0.5 + 0.5; break;             // normals
       case 3: v = vec3(texture(test[2], in_UV).a); break;                     // roughness
-      case 4: v = pow(texture(test[3], in_UV).rgb, vec3(1.0 / 2.2)); break;   // diffuse
-      case 5: v = pow(texture(test[4], in_UV).rgb, vec3(1.0 / 2.2)); break;   // specular
+      case 4: v = texture(test[3], in_UV).rgb; break;                        // diffuse
+      case 5: v = texture(test[4], in_UV).rgb; break;                        // specular
       case 6: v = vec3(exp2(-texture(test[5], in_UV).r / 32.0)); break;       // depth
       case 7: v = vec3(exp2(-texture(test[6], in_UV).r / 32.0)); break;       // spec hit
       default: v = vec3(texture(test[7], in_UV).rg * 0.1 + 0.5, 0.5); break;  // motion
@@ -66,11 +66,11 @@ void main() {
   // The DLSS output (or, view 1, its noisy colour input): resolved linear HDR at the
   // quantised input exposure (the raygen keeps RR's input near mid-gray and STILL).
   // Re-expose to the look here -- the smooth metered value (Auto) or a fixed one -- where
-  // it cannot disturb RR's history. Tonemap, then encode for the display (gamma last).
+  // it cannot disturb RR's history. Tonemap to display-linear; the sRGB attachment applies
+  // the transfer function on store.
   const float look = display_exposure > 0.0 ? display_exposure : ae.exposure;
   vec3 color = texture(test[debug_view], in_UV).rgb * (look / max(ae.input_exposure, 1.0e-12));
-  color = acesFilm(color);
-  color = pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0/uniforms.gamma));
+  color = clamp(acesFilm(color), vec3(0.0), vec3(1.0));
   color = applyVignette(color, uniforms.vignette);
 
   out_Color = vec4(color, 1.0);

@@ -70,9 +70,10 @@ it: `cargo run --release -p bsn --features xr -- bistro/bistro.bsn`.
    (client v26.6.x from the Meta store or the v26.6.2 release APK; pair via the dashboard or
    server log PIN).
 2. ~~Session + swapchain + frame loop, **mono** — mirror the window image to the HMD~~ **done**
-   (blit into both eye layers; UNORM format keeps the gamma-encoded bytes as-is).
+   (blit into both eye layers; the eye targets and the XR swapchain are both sRGB
+   (`swapchain::DISPLAY_FORMAT`), so the blit is a copy).
 3. Head pose from `locate_views` drives the render camera (mono projection first).
 4. Stereo raygen from `XrView` poses with asymmetric projection; render per-eye into the XR
-   swapchain directly (drops the mirror-blit gamma caveat).
+   swapchain directly.
 5. Per-eye DLSS-RR, perf pass, 72 Hz target.
 6. Controllers/input, comfort options — later.

@@ -23,6 +23,7 @@ use bevy::transform::TransformSystems;
 use openxr as xr;
 
 use crate::render_device::RenderDevice;
+use crate::swapchain::DISPLAY_FORMAT;
 use crate::vk_init;
 
 /// Which controller / hand.
@@ -130,9 +131,9 @@ pub struct XrState {
     images: Vec<vk::Image>,
     /// Per-eye pixel size of the XR swapchain (runtime's recommendation).
     pub extent: vk::Extent2D,
-    /// Per-eye render targets: the post-process draws each eye into these (the pipeline's
-    /// B8G8R8A8_UNORM), then [`Self::record_eye_to_layer`] blits into the XR image layer,
-    /// whatever format the runtime picked.
+    /// Per-eye render targets: the post-process draws each eye into these
+    /// ([`DISPLAY_FORMAT`]), then [`Self::record_eye_to_layer`] blits into the XR image
+    /// layer (the same format, so the blit is a copy).
     eye_targets: [EyeTarget; 2],
     blend_mode: xr::EnvironmentBlendMode,
     /// Session is between Begin and End (READY seen, STOPPING not yet).
@@ -610,16 +611,15 @@ impl XrState {
             height: views[0].recommended_image_rect_height,
         };
 
-        // The window path renders gamma-encoded values into a UNORM image; an SRGB XR format
-        // would have the blit re-encode them. Prefer the matching UNORM format and let the
-        // compositor treat it as sRGB bytes (the proper fix lands with the per-eye render
-        // path, which will render straight into this image).
+        // The eye targets are DISPLAY_FORMAT (sRGB); the same format here makes the blit
+        // into the layer a straight copy. An sRGB format of either channel order still
+        // blits exactly; a UNORM fallback would land linear values, so it is last.
         let formats = session.enumerate_swapchain_formats()?;
         let format = [
+            DISPLAY_FORMAT.as_raw() as u32,
+            vk::Format::R8G8B8A8_SRGB.as_raw() as u32,
             vk::Format::B8G8R8A8_UNORM.as_raw() as u32,
             vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
-            vk::Format::B8G8R8A8_SRGB.as_raw() as u32,
-            vk::Format::R8G8B8A8_SRGB.as_raw() as u32,
         ]
         .into_iter()
         .find(|f| formats.contains(f))
@@ -648,19 +648,19 @@ impl XrState {
             xr::ViewConfigurationType::PRIMARY_STEREO,
         )?[0];
 
-        // Matches the post-process pipeline's hard-coded attachment format.
+        // The post-process pipeline's attachment format.
         let eye_targets = [0; 2].map(|_| {
             let info = vk_init::image_info(
                 extent.width,
                 extent.height,
-                vk::Format::B8G8R8A8_UNORM,
+                DISPLAY_FORMAT,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
             );
             let image = device.create_render_target(&info);
             let view = unsafe {
                 device
                     .create_image_view(
-                        &vk_init::image_view_info(image, vk::Format::B8G8R8A8_UNORM),
+                        &vk_init::image_view_info(image, DISPLAY_FORMAT),
                         None,
                     )
                     .unwrap()

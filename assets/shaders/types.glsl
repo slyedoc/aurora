@@ -45,7 +45,6 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   mat4 inverse_projection;
   uint pull_focus_x;
   uint pull_focus_y;
-  float gamma;
   float aperture;
   float foginess;
   float fog_scatter;
@@ -57,8 +56,9 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   vec2 jitter;
   // Free-running frame counter (the RNG seed -- fresh noise every frame for the denoiser).
   uint frame;
-  // Firefly suppression: indirect path contributions are clamped to this luminance (0 = off).
-  float radiance_clamp;
+  // Firefly suppression: indirect path contributions are clamped to this multiple of the
+  // metered mid-gray luminance (0 = off).
+  float firefly_clamp;
   // Paths per pixel this frame and their maximum length.
   uint samples;
   uint max_bounces;

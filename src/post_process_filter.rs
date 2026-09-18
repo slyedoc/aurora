@@ -1,6 +1,7 @@
 use ash::vk;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
+use crate::swapchain::DISPLAY_FORMAT;
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
 /// Must match `Registers` in quad.frag.
@@ -140,7 +141,7 @@ impl VulkanAsset for PostProcessFilter {
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
         let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&[vk::Format::B8G8R8A8_UNORM]);
+            .color_attachment_formats(&[DISPLAY_FORMAT]);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)

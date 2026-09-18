@@ -49,14 +49,14 @@ vec3 calcTangent(const Vertex v0, const Vertex v1, const Vertex v2) {
   return normalize(tangent);
 }
 
+// sRGB-encoded texels (colour textures are uploaded as UNORM) to linear; alpha untouched.
 vec4 toLinear(const vec4 sRGB)
 {
-  return pow(sRGB, vec4(2.2));
 	const bvec4 cutoff = lessThan(sRGB, vec4(0.04045));
 	const vec4 higher = pow((sRGB + vec4(0.055))/vec4(1.055), vec4(2.4));
 	const vec4 lower = sRGB/vec4(12.92);
 
-	return mix(higher, lower, cutoff);
+	return vec4(mix(higher, lower, cutoff).rgb, sRGB.a);
 }
 
 #define PACKED 1

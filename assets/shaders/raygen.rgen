@@ -447,6 +447,9 @@ void main() {
   vec3 acc = vec3(0.0);
   const uint SAMPLES = pc.uniforms.samples;
   const uint MAX_BOUNCES = pc.uniforms.max_bounces;
+  // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
+  // (0.18 / exposure), so it tracks the scene -- a sky, or a ceiling panel in a closed room.
+  const float radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.input_exposure, 1.0e-20);
   // The camera ray's first hit distance (0 = sky), for the atmosphere composite below.
   float primary_t = 0.0;
 
@@ -650,8 +653,8 @@ void main() {
         }
         // Firefly suppression: an indirect path that reaches an emitter far brighter than the
         // sky would take hundreds of frames to average out; clamp its luminance instead.
-        if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
-          contribution *= min(1.0, pc.uniforms.radiance_clamp / max(luma(contribution), 1.0e-6));
+        if (bounce_idx > 0 && radiance_clamp > 0.0) {
+          contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
         }
         acc += contribution;
         break;
@@ -910,8 +913,8 @@ void main() {
                         ray_mask, 0, 0, 0, origin, tmin, ldir, ldist - 2.0 * tmin, 0);
             if (payload.t == 0.0) {
               vec3 contribution = mask * val * (w / p_area);
-              if (bounce_idx > 0 && pc.uniforms.radiance_clamp > 0.0) {
-                contribution *= min(1.0, pc.uniforms.radiance_clamp / max(luma(contribution), 1.0e-6));
+              if (bounce_idx > 0 && radiance_clamp > 0.0) {
+                contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
               }
               acc += contribution;
             }
