@@ -118,9 +118,10 @@ impl Default for DevUIState {
     }
 }
 
-/// The panel root; `F2` flips its `Display`.
+/// The panel root; `F2` flips its `Display`. Public so apps can hang their own sections
+/// under it (a `Node` child + `BuildComponentInspector` / `BuildResourceInspector`).
 #[derive(Component, Default, Clone)]
-struct DevUIPanel;
+pub struct DevUIPanel;
 
 /// The live stats line (fps).
 #[derive(Component, Default, Clone)]

@@ -38,6 +38,7 @@ pub mod portal;
 pub mod terrain;
 pub mod tlas_builder;
 pub mod transform;
+pub mod ui_panel;
 pub mod ui_render;
 pub mod util;
 pub mod vk_init;

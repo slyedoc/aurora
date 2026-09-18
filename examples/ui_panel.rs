@@ -18,27 +18,26 @@
 //! garbage), its glow must tint the ground, and the top-left window HUD must coexist.
 
 use bevy::{
-    camera::{Camera, RenderTarget},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     feathers::{
         controls::{
-            ButtonBundleProps, ButtonVariant, FeathersSliderProps, button_bundle,
-            checkbox_bundle, slider_bundle, toggle_switch_bundle,
+            ButtonVariant, FeathersButton, FeathersCheckbox, FeathersSlider, FeathersToggleSwitch,
         },
+        display::caption,
         rounded_corners::RoundedCorners,
     },
     prelude::*,
-    ui::{Checked, UiTargetCamera},
+    ui::Checked,
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
 use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
-    dev_ui::DevUIPlugin,
+    dev_ui::{DevUIPlugin, DevUIState},
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     sky::Sky,
     sphere::Sphere as RtSphere,
-    ui_render::{UiSurfacePanel, ui_target_placeholder},
+    ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},
     util::{ScreenshotExt, TimeoutAppExt},
 };
 
@@ -58,7 +57,7 @@ fn main() {
             FreeCameraPlugin,
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, tick_counter)
+        .add_systems(Update, (populate_panel, tick_counter))
         // The widgets are headless: they EMIT events, the app applies the state. These three
         // observers make the panel's controls live (and prove clicks arrive from the world).
         .add_observer(|activate: On<Activate>| {
@@ -83,33 +82,23 @@ fn main() {
 }
 
 /// The live element on the panel: proof the surface re-renders per frame.
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 struct UptimeText;
+
+/// The hand-built panel; its UI tree is spawned once the panel's root exists.
+#[derive(Component)]
+struct DemoPanel;
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut images: ResMut<Assets<Image>>,
 ) {
     // Dim overcast void: bright enough to see the scene, dim enough that the panel's glow
     // reads on the ground.
     commands.insert_resource(Sky::Color {
         radiance: Vec3::splat(250.0),
     });
-
-    // ---- the offscreen UI target ------------------------------------------------------
-    let target = images.add(ui_target_placeholder(TARGET_SIZE));
-
-    // The routing/layout anchor: a camera whose render target is the image. It renders
-    // nothing itself — UI roots pointed at it lay out at the TEXTURE's resolution.
-    let panel_camera = commands
-        .spawn((
-            Name::new("panel surface"),
-            Camera::default(),
-            RenderTarget::Image(target.clone().into()),
-        ))
-        .id();
 
     // ---- the scene --------------------------------------------------------------------
     commands.spawn((
@@ -121,34 +110,39 @@ fn setup(
         })),
     ));
 
-    // THE PANEL: the UI texture as emissive. The surface stores straight-alpha sRGB with a
+    // THE PANEL: one component. `UiPanel3d` mints the offscreen target, the routing camera
+    // (UI roots pointed at it lay out at the TEXTURE's resolution), the flipped-V quad with
+    // the target as its emissive texture, and the `UiSurfacePanel` every pointer source
+    // (window mouse, VR controller) operates. The surface stores straight-alpha sRGB with a
     // transparent background, so only lit UI pixels emit.
-    // The UI target follows image convention (v=0 at the TOP); bevy's `Cuboid` maps its +Z
-    // face with v=0 at the bottom — flip V or the card reads upside down.
-    let mut panel: Mesh = Mesh::from(Cuboid::new(2.4, 1.35, 0.06));
-    if let Some(bevy::mesh::VertexAttributeValues::Float32x2(uvs)) =
-        panel.attribute_mut(Mesh::ATTRIBUTE_UV_0)
-    {
-        for uv in uvs.iter_mut() {
-            uv[1] = 1.0 - uv[1];
-        }
-    }
     commands.spawn((
         Name::new("panel"),
-        // The mouse bridge: cursor ray -> this plane -> texture-space pointer. Hover,
-        // click, and drag on the panel's widgets work like window UI.
-        UiSurfacePanel {
-            target: target.clone(),
+        DemoPanel,
+        UiPanel3d {
             size: Vec2::new(2.4, 1.35),
-        },
-        Mesh3d(meshes.add(panel)),
-        AuroraMaterial3d(materials.add(AuroraMaterial {
-            base_color: Color::BLACK,
-            emissive: LinearRgba::WHITE * PANEL_NITS,
-            emissive_texture: Some(target),
+            px: TARGET_SIZE,
+            nits: PANEL_NITS,
+            thickness: 0.06,
+            // The root below styles itself.
+            opaque: false,
             ..default()
-        })),
+        },
         Transform::from_xyz(0.0, 1.6, 0.0),
+    ));
+
+    // A second panel: the renderer's dev tunables as a feathers inspector, built from the
+    // reflected resource with no widget code at all (the XR wrist-panel posture).
+    commands.spawn((
+        Name::new("inspector panel"),
+        InspectorPanel3d::resource::<DevUIState>(),
+        UiPanel3d {
+            size: Vec2::new(1.2, 1.6),
+            px: UVec2::new(600, 800),
+            scale: 1.4,
+            nits: PANEL_NITS,
+            ..default()
+        },
+        Transform::from_xyz(-1.4, 1.5, 1.8).with_rotation(Quat::from_rotation_y(0.45)),
     ));
 
     // A chrome sphere beside the panel: its reflection shows the UI too.
@@ -173,81 +167,6 @@ fn setup(
         Transform::from_xyz(0.6, 2.0, 4.2).looking_at(Vec3::new(0.0, 1.5, 0.0), Vec3::Y),
     ));
 
-    // ---- the panel's UI (offscreen) ----------------------------------------------------
-    commands.spawn((
-        Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            padding: UiRect::all(Val::Px(36.0)),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(18.0),
-            border: UiRect::all(Val::Px(6.0)),
-            border_radius: BorderRadius::all(Val::Px(30.0)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.96)),
-        BorderColor::all(Color::srgb(0.35, 0.62, 0.95)),
-        UiTargetCamera(panel_camera),
-        children![
-            (
-                Text::new("[ Aurora ]"),
-                TextFont::from_font_size(72.0),
-                TextColor(Color::srgb(0.65, 0.85, 1.0)),
-            ),
-            (
-                Text::new("UI surface lane armed."),
-                TextFont::from_font_size(40.0),
-                TextColor(Color::WHITE),
-            ),
-            (
-                Text::new("uptime 0.0 s"),
-                TextFont::from_font_size(40.0),
-                TextColor(Color::srgb(0.55, 0.95, 0.65)),
-                UptimeText,
-            ),
-        ],
-    ))
-    // A row of REAL feathers widgets on the same surface: same theme, same extraction as
-    // the window lane. (They render; pointer interaction on world panels needs the
-    // ray->UV pointer bridge, not yet ported.)
-    .with_child({
-        #[allow(deprecated)]
-        (
-            Node {
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(18.0),
-                margin: UiRect::top(Val::Px(12.0)),
-                ..default()
-            },
-            children![
-                button_bundle(
-                    ButtonBundleProps {
-                        variant: ButtonVariant::Primary,
-                        corners: RoundedCorners::All,
-                    },
-                    (),
-                    Spawn((Text::new("Engage"),)),
-                ),
-                checkbox_bundle((), Spawn((Text::new("shields"),))),
-                toggle_switch_bundle(()),
-                (
-                    Node {
-                        width: Val::Px(260.0),
-                        ..default()
-                    },
-                    children![slider_bundle(
-                        FeathersSliderProps {
-                            min: 0.0,
-                            max: 100.0,
-                        },
-                        (),
-                    )],
-                ),
-            ],
-        )
-    });
-
     // ---- the window HUD (screen lane, unchanged) ---------------------------------------
     commands.spawn((
         Node {
@@ -260,6 +179,88 @@ fn setup(
         TextFont::from_font_size(18.0),
         TextColor(Color::WHITE),
     ));
+}
+
+/// The demo panel's UI (offscreen), spawned under the root `UiPanel3d` built for it.
+fn populate_panel(
+    mut commands: Commands,
+    fresh: Query<&UiPanel3dRoot, (Added<UiPanel3dRoot>, With<DemoPanel>)>,
+) {
+    let Some(built) = fresh.iter().next() else {
+        return;
+    };
+    commands
+        .spawn_scene(bsn! {
+            Node {
+                width: percent(100),
+                height: percent(100),
+                padding: UiRect::all(px(36)),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(18),
+                border: UiRect::all(px(6)),
+                border_radius: BorderRadius::all(px(30)),
+            }
+            BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.96))
+            BorderColor::all(Color::srgb(0.35, 0.62, 0.95))
+            Children [
+                (
+                    Text("[ Aurora ]")
+                    TextFont { font_size: FontSize::Px(72.0) }
+                    TextColor(Color::srgb(0.65, 0.85, 1.0))
+                ),
+                (
+                    Text("UI surface lane armed.")
+                    TextFont { font_size: FontSize::Px(40.0) }
+                    TextColor(Color::WHITE)
+                ),
+                (
+                    Text("uptime 0.0 s")
+                    TextFont { font_size: FontSize::Px(40.0) }
+                    TextColor(Color::srgb(0.55, 0.95, 0.65))
+                    UptimeText
+                ),
+                // A row of REAL feathers widgets on the same surface: same theme, same
+                // extraction as the window lane, and the mouse operates them through the
+                // panel's pointer bridge.
+                (
+                    Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(18),
+                        margin: UiRect::top(px(12)),
+                    }
+                    Children [
+                        (
+                            @FeathersButton {
+                                @caption: bsn! { caption("Engage") },
+                                @variant: ButtonVariant::Primary,
+                                @corners: RoundedCorners::All,
+                            }
+                        ),
+                        (
+                            @FeathersCheckbox {
+                                @caption: bsn! { caption("shields") },
+                            }
+                        ),
+                        (@FeathersToggleSwitch),
+                        (
+                            Node {
+                                width: px(260),
+                            }
+                            Children [
+                                (
+                                    @FeathersSlider {
+                                        @min: 0.0,
+                                        @max: 100.0,
+                                    }
+                                ),
+                            ]
+                        ),
+                    ]
+                ),
+            ]
+        })
+        .insert(ChildOf(built.root));
 }
 
 /// One text write per ~100 ms — visibly live without re-shaping glyphs every frame.

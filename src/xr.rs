@@ -17,11 +17,96 @@ use std::mem::transmute;
 
 use ash::vk;
 use ash::vk::Handle;
+use bevy::input::InputSystems;
 use bevy::prelude::*;
+use bevy::transform::TransformSystems;
 use openxr as xr;
 
 use crate::render_device::RenderDevice;
 use crate::vk_init;
+
+/// Which controller / hand.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Reflect)]
+pub enum XrHand {
+    Left,
+    Right,
+}
+
+impl XrHand {
+    pub const ALL: [XrHand; 2] = [XrHand::Left, XrHand::Right];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A pose the runtime tracks, mirrored into the ECS as a root entity whose `Transform` is
+/// `rig * pose` — the rig being the single `Camera3d` entity, exactly as the render path
+/// anchors the eyes. Roots, not children of the camera: with the default
+/// [`crate::transform::TransformPlugin`] (no CPU propagation) a camera that gained children
+/// would stop getting its `GlobalTransform` synced. Apps parent their own visuals (laser,
+/// wrist panel, controller model) under these; they persist across game states.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum XrTracked {
+    Head,
+    /// Where the controller physically is (OpenXR grip pose): attach hand-held visuals here.
+    Grip(XrHand),
+    /// The pointing ray (OpenXR aim pose): -Z forward, like a camera.
+    Aim(XrHand),
+}
+
+/// The tracked pose in rig (OpenXR LOCAL) space, as last located; `valid` is false while the
+/// runtime has no tracking for it (controller asleep, out of view), in which case
+/// `Transform` keeps its last good value.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct XrPose {
+    pub local: Transform,
+    pub valid: bool,
+}
+
+/// One controller's inputs, as synced this frame. Analog values are 0..1 / -1..1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrHandState {
+    /// The controller is bound and its inputs are live.
+    pub active: bool,
+    pub trigger: f32,
+    pub squeeze: f32,
+    pub thumbstick: Vec2,
+    pub thumbstick_click: bool,
+    /// A / X.
+    pub primary: bool,
+    /// B / Y.
+    pub secondary: bool,
+    /// Menu (left Touch controller; both hands on the simple profile).
+    pub menu: bool,
+}
+
+/// Raw XR controller input, written by [`XrSystems::Poll`] each frame. Exists (all zero)
+/// even without the `xr` feature so apps need no `Option`. Apps feed this into their own
+/// action layer; the engine reads none of it.
+#[derive(Resource, Clone, Debug, Default, PartialEq)]
+pub struct XrInput {
+    pub left: XrHandState,
+    pub right: XrHandState,
+    /// The session has input focus (a runtime overlay/menu steals it; inputs are zero then).
+    pub focused: bool,
+}
+
+impl XrInput {
+    pub fn hand(&self, hand: XrHand) -> &XrHandState {
+        match hand {
+            XrHand::Left => &self.left,
+            XrHand::Right => &self.right,
+        }
+    }
+}
+
+/// `PreUpdate`, before [`InputSystems`]: `Poll` syncs actions, locates the tracked poses and
+/// writes [`XrInput`] + the [`XrTracked`] entities' transforms.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum XrSystems {
+    Poll,
+}
 
 /// Pre-device XR state: loader, instance, system. Present only under the `xr` feature, and
 /// then only when the runtime came up. [`crate::render_device::RenderDevice::from_display`] consumes it to
@@ -52,11 +137,188 @@ pub struct XrState {
     blend_mode: xr::EnvironmentBlendMode,
     /// Session is between Begin and End (READY seen, STOPPING not yet).
     running: bool,
+    /// Session state FOCUSED: actions sync to real values.
+    focused: bool,
+    /// The last `xrWaitFrame` predicted display time; poses are located at it.
+    predicted_time: Option<xr::Time>,
+    /// VIEW reference space, located in `space` for the head pose.
+    view_space: xr::Space,
+    actions: XrActions,
 }
 
 struct EyeTarget {
     image: vk::Image,
     view: vk::ImageView,
+}
+
+/// The engine's one action set, attached to the session at creation. Bound for Quest Touch
+/// (WiVRn), Valve Index, and the KHR simple profile as the fallback every runtime accepts.
+struct XrActions {
+    set: xr::ActionSet,
+    hands: [xr::Path; 2],
+    aim: xr::Action<xr::Posef>,
+    /// Only read through `grip_spaces`, but dropping the action would destroy them.
+    _grip: xr::Action<xr::Posef>,
+    trigger: xr::Action<f32>,
+    squeeze: xr::Action<f32>,
+    thumbstick: xr::Action<xr::Vector2f>,
+    thumbstick_click: xr::Action<bool>,
+    primary: xr::Action<bool>,
+    secondary: xr::Action<bool>,
+    menu: xr::Action<bool>,
+    aim_spaces: [xr::Space; 2],
+    grip_spaces: [xr::Space; 2],
+}
+
+impl XrActions {
+    fn new(
+        instance: &xr::Instance,
+        session: &xr::Session<xr::Vulkan>,
+    ) -> Result<Self, xr::sys::Result> {
+        let set = instance.create_action_set("aurora", "Aurora", 0)?;
+        let hands = [
+            instance.string_to_path("/user/hand/left")?,
+            instance.string_to_path("/user/hand/right")?,
+        ];
+        let aim = set.create_action("aim", "Aim pose", &hands)?;
+        let grip = set.create_action("grip", "Grip pose", &hands)?;
+        let trigger = set.create_action("trigger", "Trigger", &hands)?;
+        let squeeze = set.create_action("squeeze", "Squeeze", &hands)?;
+        let thumbstick = set.create_action("thumbstick", "Thumbstick", &hands)?;
+        let thumbstick_click = set.create_action("thumbstick_click", "Thumbstick click", &hands)?;
+        let primary = set.create_action("primary", "Primary (A/X)", &hands)?;
+        let secondary = set.create_action("secondary", "Secondary (B/Y)", &hands)?;
+        let menu = set.create_action("menu", "Menu", &hands)?;
+
+        fn bind<'a, T: xr::ActionTy>(
+            instance: &xr::Instance,
+            action: &'a xr::Action<T>,
+            hand: &str,
+            input: &str,
+        ) -> Result<xr::Binding<'a>, xr::sys::Result> {
+            let path = instance.string_to_path(&format!("/user/hand/{hand}/input/{input}"))?;
+            Ok(xr::Binding::new(action, path))
+        }
+        fn both<'a, T: xr::ActionTy>(
+            instance: &xr::Instance,
+            action: &'a xr::Action<T>,
+            input: &str,
+        ) -> Result<[xr::Binding<'a>; 2], xr::sys::Result> {
+            Ok([
+                bind(instance, action, "left", input)?,
+                bind(instance, action, "right", input)?,
+            ])
+        }
+        // Suggestions are validated against the spec's profile tables, not the connected
+        // hardware; a rejection here is a typo'd path, so log it and keep the others.
+        let suggest = |profile: &str, bindings: Vec<xr::Binding>| match instance
+            .string_to_path(profile)
+            .and_then(|p| instance.suggest_interaction_profile_bindings(p, &bindings))
+        {
+            Ok(()) => debug!("xr: suggested {} bindings for {profile}", bindings.len()),
+            Err(e) => warn!("xr: binding suggestion for {profile} rejected: {e:?}"),
+        };
+
+        let mut touch = Vec::new();
+        touch.extend(both(instance, &aim, "aim/pose")?);
+        touch.extend(both(instance, &grip, "grip/pose")?);
+        touch.extend(both(instance, &trigger, "trigger/value")?);
+        touch.extend(both(instance, &squeeze, "squeeze/value")?);
+        touch.extend(both(instance, &thumbstick, "thumbstick")?);
+        touch.extend(both(instance, &thumbstick_click, "thumbstick/click")?);
+        touch.push(bind(instance, &primary, "left", "x/click")?);
+        touch.push(bind(instance, &primary, "right", "a/click")?);
+        touch.push(bind(instance, &secondary, "left", "y/click")?);
+        touch.push(bind(instance, &secondary, "right", "b/click")?);
+        touch.push(bind(instance, &menu, "left", "menu/click")?);
+        suggest("/interaction_profiles/oculus/touch_controller", touch);
+
+        let mut index = Vec::new();
+        index.extend(both(instance, &aim, "aim/pose")?);
+        index.extend(both(instance, &grip, "grip/pose")?);
+        index.extend(both(instance, &trigger, "trigger/value")?);
+        index.extend(both(instance, &squeeze, "squeeze/value")?);
+        index.extend(both(instance, &thumbstick, "thumbstick")?);
+        index.extend(both(instance, &thumbstick_click, "thumbstick/click")?);
+        index.extend(both(instance, &primary, "a/click")?);
+        index.extend(both(instance, &secondary, "b/click")?);
+        suggest("/interaction_profiles/valve/index_controller", index);
+
+        let mut simple = Vec::new();
+        simple.extend(both(instance, &aim, "aim/pose")?);
+        simple.extend(both(instance, &grip, "grip/pose")?);
+        // A boolean input bound to a float action reads as 0/1 per the spec.
+        simple.extend(both(instance, &trigger, "select/click")?);
+        simple.extend(both(instance, &menu, "menu/click")?);
+        suggest("/interaction_profiles/khr/simple_controller", simple);
+
+        session.attach_action_sets(&[&set])?;
+        let aim_spaces = [
+            aim.create_space(session, hands[0], xr::Posef::IDENTITY)?,
+            aim.create_space(session, hands[1], xr::Posef::IDENTITY)?,
+        ];
+        let grip_spaces = [
+            grip.create_space(session, hands[0], xr::Posef::IDENTITY)?,
+            grip.create_space(session, hands[1], xr::Posef::IDENTITY)?,
+        ];
+        Ok(Self {
+            set,
+            hands,
+            aim,
+            _grip: grip,
+            trigger,
+            squeeze,
+            thumbstick,
+            thumbstick_click,
+            primary,
+            secondary,
+            menu,
+            aim_spaces,
+            grip_spaces,
+        })
+    }
+
+    fn hand_state(&self, session: &xr::Session<xr::Vulkan>, hand: usize) -> XrHandState {
+        let p = self.hands[hand];
+        let f = |a: &xr::Action<f32>| a.state(session, p).map(|s| s.current_state).unwrap_or(0.0);
+        let b = |a: &xr::Action<bool>| {
+            a.state(session, p)
+                .map(|s| s.current_state)
+                .unwrap_or(false)
+        };
+        let stick = self
+            .thumbstick
+            .state(session, p)
+            .map(|s| Vec2::new(s.current_state.x, s.current_state.y))
+            .unwrap_or(Vec2::ZERO);
+        let active = self.aim.is_active(session, p).unwrap_or(false);
+        XrHandState {
+            active,
+            trigger: f(&self.trigger),
+            squeeze: f(&self.squeeze),
+            thumbstick: stick,
+            thumbstick_click: b(&self.thumbstick_click),
+            primary: b(&self.primary),
+            secondary: b(&self.secondary),
+            menu: b(&self.menu),
+        }
+    }
+}
+
+/// Located pose → rig-space transform, if the runtime vouches for both halves.
+fn locate(space: &xr::Space, base: &xr::Space, time: xr::Time) -> Option<Transform> {
+    let loc = space.locate(base, time).ok()?;
+    let want = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
+    if !loc.location_flags.contains(want) {
+        return None;
+    }
+    let o = loc.pose.orientation;
+    let p = loc.pose.position;
+    Some(Transform {
+        translation: Vec3::new(p.x, p.y, p.z),
+        rotation: Quat::from_xyzw(o.x, o.y, o.z, o.w),
+        scale: Vec3::ONE,
+    })
 }
 
 /// One in-flight XR frame: produced by [`XrState::begin_frame`], consumed by
@@ -91,7 +353,7 @@ fn pose_matrix(pose: xr::Posef) -> Mat4 {
 }
 
 /// Asymmetric-fov projection with infinite reverse z — the XR sibling of
-/// `Mat4::perspective_infinite_reverse_rh` (fov angles are signed, left/down negative).
+/// `bevy::math::proj::perspective_infinite_reverse` (fov angles are signed, left/down negative).
 fn projection(fov: xr::Fovf, near: f32) -> Mat4 {
     let left = fov.angle_left.tan();
     let right = fov.angle_right.tan();
@@ -111,6 +373,7 @@ pub struct XrPlugin;
 
 impl Plugin for XrPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<XrInput>();
         if !cfg!(feature = "xr") {
             return;
         }
@@ -127,8 +390,98 @@ impl Plugin for XrPlugin {
             }
             Err(err) => {
                 error!("xr feature on but OpenXR init failed, running flat: {err}");
+                return;
             }
         }
+        app.configure_sets(PreUpdate, XrSystems::Poll.before(InputSystems))
+            .add_systems(
+                PreUpdate,
+                (poll_input, follow_rig)
+                    .chain()
+                    .in_set(XrSystems::Poll)
+                    .run_if(resource_exists::<XrState>),
+            )
+            .add_systems(
+                PostUpdate,
+                (level_rig, follow_rig)
+                    .chain()
+                    .before(TransformSystems::Propagate)
+                    .run_if(resource_exists::<XrState>),
+            );
+    }
+}
+
+/// Syncs actions, mirrors poses into the [`XrTracked`] entities (spawning them on first
+/// use), and publishes [`XrInput`].
+fn poll_input(
+    mut commands: Commands,
+    mut state: ResMut<XrState>,
+    mut input: ResMut<XrInput>,
+    mut tracked: Query<(&XrTracked, &mut XrPose)>,
+) {
+    let (new_input, poses) = state.poll_input();
+    if *input != new_input {
+        trace!("xr input: {new_input:?}");
+        *input = new_input;
+    }
+    if tracked.is_empty() {
+        for kind in [
+            XrTracked::Head,
+            XrTracked::Aim(XrHand::Left),
+            XrTracked::Aim(XrHand::Right),
+            XrTracked::Grip(XrHand::Left),
+            XrTracked::Grip(XrHand::Right),
+        ] {
+            commands.spawn((
+                Name::new(format!("xr {kind:?}")),
+                kind,
+                XrPose::default(),
+                Transform::default(),
+                Visibility::default(),
+            ));
+        }
+        return;
+    }
+    for (kind, mut pose) in &mut tracked {
+        let Some((_, located)) = poses.iter().find(|(k, _)| k == kind) else {
+            continue;
+        };
+        match located {
+            Some(local) => {
+                pose.local = *local;
+                pose.valid = true;
+            }
+            None => pose.valid = false,
+        }
+    }
+}
+
+/// `Transform = rig * pose` for every tracked entity, the rig being the `Camera3d`'s own
+/// transform (a root, so that is its world transform). Runs after the poll so `PreUpdate`
+/// readers (pointer rays) see this frame's poses, and again before propagation so the render
+/// sees the rig where gameplay left it this frame.
+fn follow_rig(
+    rig: Option<Single<&Transform, (With<Camera3d>, Without<XrTracked>)>>,
+    mut tracked: Query<(&XrPose, &mut Transform), With<XrTracked>>,
+) {
+    let Some(rig) = rig else { return };
+    let rig = **rig;
+    for (pose, mut tf) in &mut tracked {
+        let world = rig * pose.local;
+        if *tf != world {
+            *tf = world;
+        }
+    }
+}
+
+/// Strips pitch and roll from the rig: the headset supplies those, and any tilt on the
+/// anchor tilts the whole world for the wearer. Camera controllers keep their own pitch
+/// state and re-write the transform each frame, so leveling after them is harmless.
+fn level_rig(rig: Option<Single<&mut Transform, With<Camera3d>>>) {
+    let Some(mut rig) = rig else { return };
+    let (yaw, pitch, roll) = rig.rotation.to_euler(EulerRot::YXZ);
+    if pitch != 0.0 || roll != 0.0 {
+        rig.rotation = Quat::from_rotation_y(yaw);
     }
 }
 
@@ -244,6 +597,9 @@ impl XrState {
         // no locomotion to anchor to the floor anyway.
         let space =
             session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)?;
+        let view_space =
+            session.create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)?;
+        let actions = XrActions::new(&instance, &session)?;
 
         let views = instance.enumerate_view_configuration_views(
             context.system,
@@ -331,7 +687,47 @@ impl XrState {
             eye_targets,
             blend_mode,
             running: false,
+            focused: false,
+            predicted_time: None,
+            view_space,
+            actions,
         })
+    }
+
+    /// Syncs the action set and locates head/aim/grip at the last predicted display time.
+    /// Returns the controller states plus, per [`XrTracked`], the rig-space pose when the
+    /// runtime has one. None of this touches the Vulkan queue; no mutex needed.
+    pub fn poll_input(&mut self) -> (XrInput, Vec<(XrTracked, Option<Transform>)>) {
+        let mut input = XrInput {
+            focused: self.focused,
+            ..Default::default()
+        };
+        if self.running && self.focused {
+            match self.session.sync_actions(&[(&self.actions.set).into()]) {
+                Ok(()) => {
+                    input.left = self.actions.hand_state(&self.session, 0);
+                    input.right = self.actions.hand_state(&self.session, 1);
+                }
+                Err(xr::sys::Result::SESSION_NOT_FOCUSED) => input.focused = false,
+                Err(e) => warn!("xr: sync_actions failed: {e:?}"),
+            }
+        }
+        let mut poses = Vec::with_capacity(5);
+        if let (true, Some(time)) = (self.running, self.predicted_time) {
+            poses.push((XrTracked::Head, locate(&self.view_space, &self.space, time)));
+            for hand in XrHand::ALL {
+                let i = hand.index();
+                poses.push((
+                    XrTracked::Aim(hand),
+                    locate(&self.actions.aim_spaces[i], &self.space, time),
+                ));
+                poses.push((
+                    XrTracked::Grip(hand),
+                    locate(&self.actions.grip_spaces[i], &self.space, time),
+                ));
+            }
+        }
+        (input, poses)
     }
 
     /// The image + view the post-process renders eye `eye` into.
@@ -374,6 +770,11 @@ impl XrState {
                     xr::SessionState::STOPPING => {
                         self.session.end().unwrap();
                         self.running = false;
+                        self.focused = false;
+                    }
+                    xr::SessionState::FOCUSED => self.focused = true,
+                    xr::SessionState::VISIBLE | xr::SessionState::SYNCHRONIZED => {
+                        self.focused = false
                     }
                     _ => {}
                 }
@@ -385,6 +786,7 @@ impl XrState {
 
         // Pacing wait outside the lock — it can block for most of a frame.
         let frame_state = self.frame_waiter.wait().unwrap();
+        self.predicted_time = Some(frame_state.predicted_display_time);
         {
             let _queue = device.queue.lock().unwrap();
             self.frame_stream.begin().unwrap();

@@ -19,9 +19,6 @@
 use ash::vk;
 use bevy::{
     asset::{AssetId, uuid::Uuid},
-    picking::pointer::{
-        Location, PointerAction, PointerButton, PointerId, PointerInput, PointerLocation,
-    },
     camera::{
         Camera, CameraProjectionPlugin, ClearColor, RenderTarget, RenderTargetInfo,
         visibility::{InheritedVisibility, VisibilityPropagatePlugin},
@@ -32,15 +29,18 @@ use bevy::{
     input_focus::{InputDispatchPlugin, InputFocusPlugin},
     math::{Affine2, FloatOrd, Rect, Vec2},
     picking::DefaultPickingPlugins,
+    picking::pointer::{
+        Location, PointerAction, PointerButton, PointerId, PointerInput, PointerLocation,
+    },
     prelude::*,
     sprite::BorderRect,
     text::{ComputedTextBlock, PositionedGlyph, TextColor, TextLayoutInfo, TextPlugin},
     ui::{
         BackgroundColor, BackgroundGradient, BorderColor, BorderGradient, CalculatedClip,
         ColorStop, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, ConicGradient,
-        Display, Gradient, InterpolationColorSpace, LinearGradient, Node, Outline, RadialGradient,
-        ResolvedBorderRadius, UiGlobalTransform, UiPlugin, UiSystems, Val, VisualBox,
+        ComputedUiTargetCamera, ConicGradient, Display, Gradient, InterpolationColorSpace,
+        LinearGradient, Node, Outline, RadialGradient, ResolvedBorderRadius, UiGlobalTransform,
+        UiPlugin, UiSystems, Val, VisualBox,
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
     },
     ui_widgets::UiWidgetsPlugins,
@@ -382,16 +382,28 @@ impl Plugin for UiRenderPlugin {
         app.init_resource::<UiVertexBuffers>();
         app.init_resource::<UiSurfaces>();
         app.init_resource::<UiSurfaceTargets>();
-        app.add_systems(
-            PostUpdate,
-            sync_ui_surfaces.before(UiSystems::Prepare),
-        );
-        app.add_systems(
+        app.add_systems(PostUpdate, sync_ui_surfaces.before(UiSystems::Prepare));
+        app.world_mut().spawn((
+            Name::new("window cursor pointer"),
+            WindowCursorPointer,
+            UiPointerSource::default(),
+            Transform::default(),
+        ));
+        app.configure_sets(
             PreUpdate,
-            drive_surface_pointers
+            (UiPointerSystems::Aim, UiPointerSystems::Drive)
+                .chain()
                 .after(bevy::input::InputSystems)
                 .before(bevy::picking::PickingSystems::ProcessInput),
         );
+        app.add_systems(
+            PreUpdate,
+            (
+                aim_window_cursor_pointer.in_set(UiPointerSystems::Aim),
+                drive_ui_pointers.in_set(UiPointerSystems::Drive),
+            ),
+        );
+        app.add_plugins(crate::ui_panel::UiPanelPlugin);
         app.add_systems(Last, extract_ui.in_set(RenderSet::Extract));
         app.add_systems(Last, prepare_ui_surfaces.in_set(RenderSet::Prepare));
         app.add_systems(
@@ -1365,7 +1377,12 @@ pub unsafe fn draw_ui(
 
     let vertices = &mut *params.vertices;
     vertices.clear();
-    build_vertices(render_device, &params.textures, &params.extracted.quads, vertices);
+    build_vertices(
+        render_device,
+        &params.textures,
+        &params.extracted.quads,
+        vertices,
+    );
 
     if vertices.is_empty() {
         if diag {
@@ -1899,14 +1916,22 @@ pub unsafe fn draw_ui_surfaces(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mouse -> surface pointer bridge
+// World rays -> surface pointers
 // ---------------------------------------------------------------------------------------------
+//
+// Any entity carrying `UiPointerSource` is a ray (its transform's origin, -Z forward) that
+// operates world UI: each frame `drive_ui_pointers` intersects it with every `UiSurfacePanel`
+// plane and drives that source's own bevy_picking pointer on the nearest hit surface
+// (texture-space position, image target), so the UI backend hit-tests the surface's nodes
+// exactly as it does window nodes. Two sources are typical: the window cursor (spawned here,
+// its ray re-aimed from the mouse every frame) and, in VR, each controller's aim pose (the app
+// adds the component to `XrTracked::Aim` and writes `buttons` from the trigger).
 
 /// Declares that this entity displays a UI surface on its local XY plane: the texture spans
 /// `size` meters centered on the origin (+X right, +Y up, plane z = 0, viewed from +Z), with
 /// the image's v = 0 row at the TOP — the same convention as the flipped-V panel quad. With
-/// this component on the panel mesh, [`drive_surface_pointers`] maps the window mouse through
-/// the main camera onto the surface, and the panel's widgets hover/click/drag like window UI.
+/// this component on the panel mesh, every [`UiPointerSource`] ray that crosses it drives the
+/// panel's widgets: hover, click and drag like window UI.
 #[derive(Component, Clone)]
 pub struct UiSurfacePanel {
     /// The surface's target image (the same handle the camera renders to and the material
@@ -1916,28 +1941,88 @@ pub struct UiSurfacePanel {
     pub size: Vec2,
 }
 
-/// `PreUpdate`, before picking processes input: cast the window cursor through the main
-/// camera, intersect every [`UiSurfacePanel`] plane, and drive a custom picking pointer on
-/// the nearest hit surface (texture-space position, image target). bevy_picking's UI backend
-/// then hit-tests the surface's nodes exactly as it does window nodes — hover, press, drag
-/// all flow. Off-panel the pointer parks outside the surface, ending any hover.
-fn drive_surface_pointers(
-    mut commands: Commands,
+/// `PreUpdate`, after `InputSystems`, before picking: `Aim` is where owners write their
+/// [`UiPointerSource`]s' transform and buttons (the window cursor source does so here; an
+/// app's controller sources should too), `Drive` casts them and emits pointer input.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum UiPointerSystems {
+    Aim,
+    Drive,
+}
+
+/// A ray that operates [`UiSurfacePanel`]s: origin at the entity's transform, pointing down
+/// its -Z (the OpenXR aim-pose convention, and a camera's). The owner writes `active` and
+/// `buttons`; [`drive_ui_pointers`] writes `hit`. A root entity's `Transform` is read
+/// directly (this runs in `PreUpdate`, before propagation, so a pose written this frame
+/// counts); a child's `GlobalTransform` is used instead -- which only updates under
+/// `TransformPlugin { propagate_on_cpu: true }` (aurora's default syncs roots only).
+#[derive(Component, Clone, Debug)]
+#[require(PointerLocation, UiPointerTrack)]
+pub struct UiPointerSource {
+    /// False parks the pointer (cursor left the window, controller asleep).
+    pub active: bool,
+    /// Primary / secondary / middle, held this frame. Presses are detected on the rising edge
+    /// while over a panel; a button held before the ray reached a panel never presses it.
+    pub buttons: [bool; 3],
+    /// Panels farther than this along the ray are ignored.
+    pub max_distance: f32,
+    /// The panel this ray landed on this frame, if any. World tools (the terrain brush) read
+    /// this to yield to the UI.
+    pub hit: Option<UiPointerHit>,
+}
+
+impl Default for UiPointerSource {
+    fn default() -> Self {
+        Self {
+            active: true,
+            buttons: [false; 3],
+            max_distance: 50.0,
+            hit: None,
+        }
+    }
+}
+
+/// Where a [`UiPointerSource`] ray met a panel.
+#[derive(Clone, Copy, Debug)]
+pub struct UiPointerHit {
+    pub panel: Entity,
+    /// World-space hit point.
+    pub point: Vec3,
+    pub distance: f32,
+    /// Texture-space (0..1, v = 0 at the top).
+    pub uv: Vec2,
+}
+
+/// Per-source picking bookkeeping.
+#[derive(Component, Default)]
+pub struct UiPointerTrack {
+    id: Option<PointerId>,
+    last: Option<Location>,
+    /// Buttons as seen last frame (edge detection).
+    prev: [bool; 3],
+    /// Buttons pressed *on a panel* and not yet released.
+    down: [bool; 3],
+}
+
+/// The window mouse as a [`UiPointerSource`]: one is spawned by [`UiRenderPlugin`], and
+/// [`aim_window_cursor_pointer`] points it through the `Camera3d` at the cursor each frame.
+#[derive(Component)]
+pub struct WindowCursorPointer;
+
+/// `PreUpdate`: the mouse's ray. Inactive (pointer parked) while the cursor is off the window.
+fn aim_window_cursor_pointer(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
-    panels: Query<(&GlobalTransform, &UiSurfacePanel)>,
-    targets: Res<UiSurfaceTargets>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut writer: MessageWriter<PointerInput>,
-    mut state: Local<Option<(PointerId, Option<Location>)>>,
+    mut pointer: Single<(&mut Transform, &mut UiPointerSource), With<WindowCursorPointer>>,
 ) {
-    const BUTTONS: [(MouseButton, PointerButton); 3] = [
-        (MouseButton::Left, PointerButton::Primary),
-        (MouseButton::Right, PointerButton::Secondary),
-        (MouseButton::Middle, PointerButton::Middle),
+    let (tf, source) = &mut *pointer;
+    source.buttons = [
+        mouse.pressed(MouseButton::Left),
+        mouse.pressed(MouseButton::Right),
+        mouse.pressed(MouseButton::Middle),
     ];
-
-    let hit = (|| {
+    let ray = (|| {
         let window = windows.iter().next()?;
         let cursor = window.cursor_position()?;
         let (cam_tf, projection) = cameras.iter().next()?;
@@ -1948,113 +2033,169 @@ fn drive_surface_pointers(
         if win.x <= 0.0 || win.y <= 0.0 {
             return None;
         }
-        let ndc = Vec2::new(
-            cursor.x / win.x * 2.0 - 1.0,
-            1.0 - cursor.y / win.y * 2.0,
-        );
+        let ndc = Vec2::new(cursor.x / win.x * 2.0 - 1.0, 1.0 - cursor.y / win.y * 2.0);
         let tan_half = (persp.fov * 0.5).tan();
         let aspect = win.x / win.y;
         let dir_view = Vec3::new(ndc.x * tan_half * aspect, ndc.y * tan_half, -1.0);
         let origin = cam_tf.translation();
         let dir = cam_tf.affine().transform_vector3(dir_view).normalize();
-
-        let mut best: Option<(f32, &UiSurfacePanel, Vec2)> = None;
-        for (panel_tf, panel) in &panels {
-            let inv = panel_tf.affine().inverse();
-            let o = inv.transform_point3(origin);
-            let d = inv.transform_vector3(dir);
-            // Front side only: the camera must sit on +Z and the ray must head towards the
-            // plane.
-            if o.z <= 0.0 || d.z >= -1.0e-6 {
-                continue;
-            }
-            let t = -o.z / d.z;
-            let p = o + d * t;
-            if p.x.abs() > panel.size.x * 0.5 || p.y.abs() > panel.size.y * 0.5 {
-                continue;
-            }
-            let dist = (panel_tf.affine().transform_point3(p) - origin).length();
-            if best.as_ref().is_none_or(|(b, _, _)| dist < *b) {
-                // Image convention: v = 0 at the top.
-                let uv = Vec2::new(p.x / panel.size.x + 0.5, 0.5 - p.y / panel.size.y);
-                best = Some((dist, panel, uv));
-            }
-        }
-        best.map(|(_, panel, uv)| (panel, uv))
+        Some((origin, dir, cam_tf.affine().transform_vector3(Vec3::Y)))
     })();
+    match ray {
+        Some((origin, dir, up)) => {
+            source.active = true;
+            **tf = Transform::from_translation(origin).looking_to(dir, up);
+        }
+        None => source.active = false,
+    }
+}
 
-    match hit {
-        Some((panel, uv)) => {
-            let Some((_, extent)) = targets.map.get(&panel.target.id()) else {
-                return;
-            };
-            let position = uv * Vec2::new(extent.width as f32, extent.height as f32);
-            let location = Location {
-                target: bevy::camera::NormalizedRenderTarget::Image(
-                    bevy::camera::ImageRenderTarget {
-                        handle: panel.target.clone(),
-                        scale_factor: 1.0,
-                    },
-                ),
-                position,
-            };
-            let (id, last) = state.get_or_insert_with(|| {
-                let id = PointerId::Custom(Uuid::new_v4());
-                commands.spawn((
-                    Name::new("ui surface pointer"),
-                    id,
-                    PointerLocation::new(location.clone()),
-                ));
-                (id, None)
-            });
-            let delta = match last {
-                Some(prev) if prev.target == location.target => position - prev.position,
-                _ => Vec2::ZERO,
-            };
-            writer.write(PointerInput::new(
-                *id,
-                location.clone(),
-                PointerAction::Move { delta },
-            ));
-            for (button, pointer_button) in BUTTONS {
-                if mouse.just_pressed(button) {
-                    writer.write(PointerInput::new(
-                        *id,
-                        location.clone(),
-                        PointerAction::Press(pointer_button),
-                    ));
+/// `PreUpdate`, before picking processes input: for every [`UiPointerSource`], intersect its
+/// ray with every [`UiSurfacePanel`] plane and drive its picking pointer on the nearest hit
+/// surface. Off-panel the pointer releases anything it held and parks outside the surface,
+/// ending any hover.
+fn drive_ui_pointers(
+    mut commands: Commands,
+    mut sources: Query<(
+        Entity,
+        &Transform,
+        &GlobalTransform,
+        Has<ChildOf>,
+        &mut UiPointerSource,
+        &mut UiPointerTrack,
+    )>,
+    panels: Query<(Entity, &GlobalTransform, &UiSurfacePanel)>,
+    targets: Res<UiSurfaceTargets>,
+    mut writer: MessageWriter<PointerInput>,
+) {
+    const BUTTONS: [PointerButton; 3] = [
+        PointerButton::Primary,
+        PointerButton::Secondary,
+        PointerButton::Middle,
+    ];
+
+    for (entity, local, global, is_child, mut source, mut track) in &mut sources {
+        let id = *track.id.get_or_insert_with(|| {
+            let id = PointerId::Custom(Uuid::new_v4());
+            commands.entity(entity).insert(id);
+            id
+        });
+        let ray_tf = if is_child {
+            global.affine()
+        } else {
+            local.compute_affine()
+        };
+        let origin = ray_tf.translation.into();
+        let dir = ray_tf.transform_vector3(Vec3::NEG_Z).normalize();
+
+        let mut best: Option<(UiPointerHit, &UiSurfacePanel)> = None;
+        if source.active {
+            for (panel_entity, panel_tf, panel) in &panels {
+                let inv = panel_tf.affine().inverse();
+                let o = inv.transform_point3(origin);
+                let d = inv.transform_vector3(dir);
+                // Front side only: the source must sit on +Z and the ray must head towards
+                // the plane.
+                if o.z <= 0.0 || d.z >= -1.0e-6 {
+                    continue;
                 }
-                if mouse.just_released(button) {
-                    writer.write(PointerInput::new(
-                        *id,
-                        location.clone(),
-                        PointerAction::Release(pointer_button),
+                let t = -o.z / d.z;
+                let p = o + d * t;
+                if p.x.abs() > panel.size.x * 0.5 || p.y.abs() > panel.size.y * 0.5 {
+                    continue;
+                }
+                let point = panel_tf.affine().transform_point3(p);
+                let distance = (point - origin).length();
+                if distance > source.max_distance {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(b, _)| distance < b.distance) {
+                    // Image convention: v = 0 at the top.
+                    let uv = Vec2::new(p.x / panel.size.x + 0.5, 0.5 - p.y / panel.size.y);
+                    best = Some((
+                        UiPointerHit {
+                            panel: panel_entity,
+                            point,
+                            distance,
+                            uv,
+                        },
+                        panel,
                     ));
                 }
             }
-            *last = Some(location);
         }
-        None => {
-            if let Some((id, last)) = state.as_mut()
-                && let Some(prev) = last.take()
-            {
+
+        let buttons = source.buttons;
+        let prev = track.prev;
+        track.prev = buttons;
+        match best {
+            Some((hit, panel)) => {
+                let Some((_, extent)) = targets.map.get(&panel.target.id()) else {
+                    source.hit = None;
+                    continue;
+                };
+                source.hit = Some(hit);
+                let position = hit.uv * Vec2::new(extent.width as f32, extent.height as f32);
+                let location = Location {
+                    target: bevy::camera::NormalizedRenderTarget::Image(
+                        bevy::camera::ImageRenderTarget {
+                            handle: panel.target.clone(),
+                            scale_factor: 1.0,
+                        },
+                    ),
+                    position,
+                };
+                let delta = match &track.last {
+                    Some(last) if last.target == location.target => position - last.position,
+                    _ => Vec2::ZERO,
+                };
+                writer.write(PointerInput::new(
+                    id,
+                    location.clone(),
+                    PointerAction::Move { delta },
+                ));
+                for (i, button) in BUTTONS.into_iter().enumerate() {
+                    if buttons[i] && !prev[i] && !track.down[i] {
+                        track.down[i] = true;
+                        writer.write(PointerInput::new(
+                            id,
+                            location.clone(),
+                            PointerAction::Press(button),
+                        ));
+                    } else if !buttons[i] && track.down[i] {
+                        track.down[i] = false;
+                        writer.write(PointerInput::new(
+                            id,
+                            location.clone(),
+                            PointerAction::Release(button),
+                        ));
+                    }
+                }
+                track.last = Some(location);
+            }
+            None => {
+                source.hit = None;
+                let Some(last) = track.last.take() else {
+                    continue;
+                };
                 // Let go of anything held at the last on-surface position, then park the
                 // pointer far outside the surface so hover ends cleanly.
-                for (button, pointer_button) in BUTTONS {
-                    if mouse.just_released(button) {
+                for (i, button) in BUTTONS.into_iter().enumerate() {
+                    if track.down[i] && !buttons[i] {
+                        track.down[i] = false;
                         writer.write(PointerInput::new(
-                            *id,
-                            prev.clone(),
-                            PointerAction::Release(pointer_button),
+                            id,
+                            last.clone(),
+                            PointerAction::Release(button),
                         ));
                     }
                 }
                 let parked = Location {
-                    target: prev.target,
+                    target: last.target,
                     position: Vec2::splat(-1.0e5),
                 };
                 writer.write(PointerInput::new(
-                    *id,
+                    id,
                     parked,
                     PointerAction::Move { delta: Vec2::ZERO },
                 ));
