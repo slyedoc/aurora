@@ -174,9 +174,9 @@ impl Plugin for RayRenderPlugin {
             Last,
             (
                 RenderSet::Shutdown,
-                RenderSet::Extract.run_if(run_if_render_device_exists),
-                RenderSet::Prepare.run_if(run_if_render_device_exists),
-                RenderSet::Render.run_if(run_if_render_device_exists),
+                RenderSet::Extract.run_if(render_device_exists),
+                RenderSet::Prepare.run_if(render_device_exists),
+                RenderSet::Render.run_if(render_device_exists),
             )
                 .chain(),
         );
@@ -194,25 +194,26 @@ impl Plugin for RayRenderPlugin {
 }
 
 /// Tears the renderer down (queue idle, then [`TeardownSchedule`]) when the window is closing
-/// or the app is exiting, and only then closes the window: the swapchain has to go before its
-/// surface does. Messages are peeked, not consumed, so bevy's own exit handling still sees them.
+/// or the app is exiting. The swapchain has to go before its surface does, so the window
+/// plugin's own close handling is off (`close_when_requested: false`) and a close request ends
+/// here as an `AppExit` written in the same frame: winit exits right after this update, the
+/// window entity is never despawned early, and no frame runs without a [`RenderDevice`].
+/// (Despawning the window instead left it alive but unregistered for a frame, and every cursor
+/// event the compositor still delivered to it logged a bevy_winit "unknown window" warning.)
+/// Messages are peeked, not consumed, so bevy's own exit handling still sees them.
 fn shutdown(world: &mut World) {
     if !world.contains_resource::<RenderDevice>() {
         return;
     }
-    let closing: Vec<Entity> = {
+    let closing = {
         let messages = world.resource::<Messages<WindowCloseRequested>>();
-        messages
-            .get_cursor()
-            .read(messages)
-            .map(|m| m.window)
-            .collect()
+        messages.get_cursor().read(messages).next().is_some()
     };
     let exiting = {
         let messages = world.resource::<Messages<AppExit>>();
         messages.get_cursor().read(messages).next().is_some()
     };
-    if closing.is_empty() && !exiting {
+    if !closing && !exiting {
         return;
     }
     log::info!("Shutting down the renderer");
@@ -222,10 +223,8 @@ fn shutdown(world: &mut World) {
         unsafe { render_device.queue_wait_idle(*queue).unwrap() };
     }
     world.run_schedule(TeardownSchedule);
-    for window in closing {
-        if let Ok(entity) = world.get_entity_mut(window) {
-            entity.despawn();
-        }
+    if !exiting {
+        world.write_message(AppExit::Success);
     }
 }
 
@@ -1216,6 +1215,8 @@ pub fn on_shutdown(world: &mut World) {
     world.remove_resource::<crate::swapchain::Swapchain>();
 }
 
-fn run_if_render_device_exists(device: Option<Res<RenderDevice>>) -> bool {
+/// Run condition for app systems that read [`RenderDevice`]: the device is removed by
+/// [`on_shutdown`] a frame before bevy's exit lands, and `Update` still runs that frame.
+pub fn render_device_exists(device: Option<Res<RenderDevice>>) -> bool {
     device.is_some()
 }

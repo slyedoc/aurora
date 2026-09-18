@@ -104,6 +104,8 @@ pub struct RenderDeviceData {
     pub linear_sampler: vk::Sampler,
     pub destroyer: ManuallyDrop<VkDestroyer>,
     pub allocator_state: Arc<Mutex<ManuallyDrop<AllocatorState>>>,
+    /// The validation messenger (debug / `dev` builds): destroyed right before the instance.
+    debug_messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
 impl std::ops::Deref for RenderDeviceData {
@@ -139,7 +141,7 @@ impl RenderDevice {
         crate::aftermath::enable();
         unsafe {
             let entry = ash::Entry::linked();
-            let instance = create_instance(display_handle, &entry, xr);
+            let (instance, debug_messenger) = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::new(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
             let (device, queue, micromaps) =
@@ -198,6 +200,7 @@ impl RenderDevice {
                 descriptor_pool,
                 linear_sampler,
                 destroyer,
+                debug_messenger,
                 allocator_state,
             }));
 
@@ -399,6 +402,9 @@ impl Drop for RenderDeviceData {
             }
             self.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
+            if let Some((debug_utils, messenger)) = &self.debug_messenger {
+                debug_utils.destroy_debug_utils_messenger(*messenger, None);
+            }
             self.instance.destroy_instance(None);
         }
     }
@@ -408,7 +414,7 @@ unsafe fn create_instance(
     display_handle: &DisplayHandle,
     entry: &ash::Entry,
     xr: Option<&XrContext>,
-) -> ash::Instance {
+) -> (ash::Instance, Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>) {
     unsafe {
         let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
         let mut layer_names: Vec<&CStr> = Vec::new();
@@ -488,8 +494,9 @@ unsafe fn create_instance(
         };
 
         // Route validation output through `log` and keep a tail for the crash reporter
-        // (dump_validation_tail). The messenger lives for the process; the layer's
-        // "messenger not destroyed" complaint at teardown lands in our own callback.
+        // (dump_validation_tail). The messenger is the instance's last child to go
+        // (RenderDeviceData::drop), so the layer's own leak check stays quiet.
+        let mut debug_messenger = None;
         if validate {
             let debug_utils = ash::ext::debug_utils::Instance::new(entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -504,11 +511,14 @@ unsafe fn create_instance(
                 )
                 .pfn_user_callback(Some(debug_utils_callback));
             match debug_utils.create_debug_utils_messenger(&info, None) {
-                Ok(_) => log::info!("validation messenger armed (tail kept for device loss)"),
+                Ok(messenger) => {
+                    log::info!("validation messenger armed (tail kept for device loss)");
+                    debug_messenger = Some((debug_utils, messenger));
+                }
                 Err(err) => log::warn!("validation messenger failed: {err:?}"),
             }
         }
-        instance
+        (instance, debug_messenger)
     }
 }
 
