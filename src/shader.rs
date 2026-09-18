@@ -74,11 +74,24 @@ impl AssetLoader for ShaderLoader {
             }
 
             if ext == "slang" {
-                let source_path = format!(
-                    "{}/{}",
-                    crate::assets::AURORA_ASSET_DIR,
-                    load_context.path().path().display()
-                );
+                // slangc wants a real file (module `import`s resolve beside it): the
+                // engine's own dir for `aurora://`, the app's assets dir otherwise.
+                let source_path = match load_context.path().source() {
+                    bevy::asset::io::AssetSourceId::Name(name)
+                        if name.as_ref() == crate::assets::AURORA_ASSET_SOURCE =>
+                    {
+                        format!(
+                            "{}/{}",
+                            crate::assets::AURORA_ASSET_DIR,
+                            load_context.path().path().display()
+                        )
+                    }
+                    _ => bevy::asset::io::file::FileAssetReader::get_base_path()
+                        .join("assets")
+                        .join(load_context.path().path())
+                        .display()
+                        .to_string(),
+                };
                 let spirv = compile_slang(&source_path)?;
                 log::info!("Loaded shader: {path} (slang)");
                 return Ok(Shader {
@@ -188,6 +201,17 @@ pub fn compile_slang(source_path: &str) -> Result<Vec<u8>, ShaderLoaderError> {
         .arg(source_path)
         .args(["-target", "spirv", "-profile", "spirv_1_6", "-O2"])
         .arg("-fvk-use-entrypoint-name")
+        // Engine modules (`import procedural;`) resolve from any asset source, and the app's
+        // own shader root so its modules import across directories (`import planet.noise;`).
+        .arg("-I")
+        .arg(format!("{}/shaders", crate::assets::AURORA_ASSET_DIR))
+        .arg("-I")
+        .arg(
+            bevy::asset::io::file::FileAssetReader::get_base_path()
+                .join("assets/shaders")
+                .display()
+                .to_string(),
+        )
         .arg("-o")
         .arg(&out_path)
         .output()?;

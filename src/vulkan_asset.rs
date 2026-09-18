@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::{
     app::App,
@@ -133,6 +133,22 @@ impl<A: VulkanAsset> Default for VulkanAssets<A> {
     }
 }
 
+/// Ids whose last handle dropped while their build was still in flight: the result is
+/// destroyed on arrival instead of being kept for nobody.
+#[derive(Resource)]
+pub struct VulkanAssetDropped<A: VulkanAsset>(HashSet<AssetId<A>>);
+
+impl<A: VulkanAsset> Default for VulkanAssetDropped<A> {
+    fn default() -> Self {
+        Self(HashSet::default())
+    }
+}
+
+/// Assets whose last handle dropped this frame (their GPU side is already on the destroyer);
+/// `prepare_instances` releases their SBT hit records.
+#[derive(Resource, Default)]
+pub struct DroppedAssets(pub Vec<UntypedAssetId>);
+
 /// Prepared assets replaced this frame (a re-prepare after `AssetEvent::Modified`, or a
 /// duplicate load). The old GPU objects are already queued on the destroyer, so anything
 /// holding their addresses -- TLAS instance rows above all -- must re-resolve THIS frame:
@@ -144,7 +160,10 @@ fn extract_vulkan_asset<A: VulkanAsset>(
     mut asset_events: MessageReader<AssetEvent<A>>,
     assets: Res<Assets<A>>,
     asset_server: Res<AssetServer>,
+    render_device: Res<RenderDevice>,
     mut render_assets: ResMut<VulkanAssets<A>>,
+    mut dropped: ResMut<VulkanAssetDropped<A>>,
+    mut dropped_ids: ResMut<DroppedAssets>,
     comms: Res<VulkanAssetComms<A>>,
     param: StaticSystemParam<A::ExtractParam>,
 ) {
@@ -185,17 +204,22 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     log::warn!("VulkanAsset could not find asset with id: {:?}", id);
                 }
             }
-            AssetEvent::Removed { id } => {
-                log::debug!(
-                    "VulkanAsset does not support AssetEvent::Removed for asset with id: {:?}",
-                    id
-                );
-            }
-            AssetEvent::Unused { id } => {
-                log::debug!(
-                    "VulkanAsset does not support AssetEvent::Unused for asset with id: {:?}",
-                    id
-                );
+            AssetEvent::Unused { id } | AssetEvent::Removed { id } => {
+                // No handle left: free the GPU side. Every instance built on it was
+                // despawned before its handle could drop, so the TLAS rows are already
+                // zero; the destroyer's delay covers the frame in flight.
+                match render_assets.0.remove(id) {
+                    Some(VulkanAssetLoadingState::Loaded(prepared)) => {
+                        log::debug!("VulkanAsset dropped {id:?}");
+                        A::destroy_asset(&render_device, &prepared);
+                        dropped_ids.0.push(id.untyped());
+                    }
+                    Some(VulkanAssetLoadingState::Loading) => {
+                        dropped.0.insert(*id);
+                        dropped_ids.0.push(id.untyped());
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -205,10 +229,16 @@ pub fn poll_for_asset<A: VulkanAsset>(
     render_device: Res<RenderDevice>,
     comms: Res<VulkanAssetComms<A>>,
     mut assets: ResMut<VulkanAssets<A>>,
+    mut dropped: ResMut<VulkanAssetDropped<A>>,
     mut replaced: ResMut<ReplacedAssets>,
 ) {
     while let Ok((id, prep)) = comms.recv_result.try_recv() {
         log::debug!("VulkanAsset received prepared asset for id: {:?}", id);
+        if dropped.0.remove(&id) {
+            log::debug!("VulkanAsset {id:?} dropped while building; destroying the result");
+            A::destroy_asset(&render_device, &prep);
+            continue;
+        }
         if let Some(old) = assets.0.insert(id, VulkanAssetLoadingState::Loaded(prep)) {
             match old {
                 VulkanAssetLoadingState::Loading => {}
@@ -226,9 +256,28 @@ pub fn poll_for_asset<A: VulkanAsset>(
 }
 
 fn on_shutdown_asset<A: VulkanAsset>(world: &mut World) {
-    world.remove_resource::<VulkanAssetComms<A>>();
+    let comms = world.remove_resource::<VulkanAssetComms<A>>();
     world.resource_scope(|world, mut assets: Mut<VulkanAssets<A>>| {
         let render_device = world.get_resource::<RenderDevice>().unwrap();
+        // Let the worker finish what it has (it records into the device and binds
+        // pipelines that are about to go); each job it took yields one result, and its
+        // result channel closes once it exits.
+        if let Some(VulkanAssetComms {
+            send_work,
+            recv_result,
+        }) = comms
+        {
+            drop(send_work);
+            let mut finished = 0usize;
+            while let Ok((id, prep)) = recv_result.recv() {
+                assets.0.remove(&id);
+                A::destroy_asset(&render_device, &prep);
+                finished += 1;
+            }
+            if finished > 0 {
+                log::info!("VulkanAsset: waited for {finished} in-flight build(s) at shutdown");
+            }
+        }
         for (_, prep) in assets.0.drain() {
             match prep {
                 VulkanAssetLoadingState::Loading => {
@@ -249,7 +298,9 @@ impl VulkanAssetExt for App {
         let render_device = self.world().resource::<RenderDevice>().clone();
         self.insert_resource(VulkanAssetComms::<A>::new(render_device));
         self.init_resource::<VulkanAssets<A>>();
+        self.init_resource::<VulkanAssetDropped<A>>();
         self.init_resource::<ReplacedAssets>();
+        self.init_resource::<DroppedAssets>();
         self.add_systems(
             Last,
             (

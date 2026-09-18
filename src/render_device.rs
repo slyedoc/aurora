@@ -562,7 +562,11 @@ pub fn dump_validation_tail() {
     }
     let dir = std::env::var_os("AURORA_AFTERMATH_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("crash-dumps"));
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("crash-dumps")
+        });
     let _ = std::fs::create_dir_all(&dir);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -571,10 +575,19 @@ pub fn dump_validation_tail() {
     let path = dir.join(format!("validation-tail-{ms}.log"));
     if let Ok(mut f) = std::fs::File::create(&path) {
         use std::io::Write as _;
-        let _ = f.write_all(tail.join("
-").as_bytes());
+        let _ = f.write_all(
+            tail.join(
+                "
+",
+            )
+            .as_bytes(),
+        );
         let _ = f.sync_all();
-        log::error!("wrote validation tail ({} messages) -> {}", tail.len(), path.display());
+        log::error!(
+            "wrote validation tail ({} messages) -> {}",
+            tail.len(),
+            path.display()
+        );
     }
 }
 
@@ -771,9 +784,11 @@ unsafe fn create_logical_device(
                 | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_ERROR_REPORTING,
         );
 
-        // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`.
+        // 64-bit integers: Slang kernels carry buffer addresses as `uint64_t`. 64-bit floats:
+        // planet-scale procedural kernels evaluate directions in f64.
         let core_features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
+            .shader_float64(true)
             .shader_int16(true);
 
         let device_info = vk::DeviceCreateInfo::default()

@@ -30,12 +30,13 @@ use crate::{
     gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::{GpuNode, GpuTransforms, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
+    procedural_mesh::{ProceduralMesh, ProceduralMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     sphere::{Sphere, SphereBLAS},
     vk_utils,
-    vulkan_asset::{ReplacedAssets, VulkanAssets, poll_for_asset},
+    vulkan_asset::{DroppedAssets, ReplacedAssets, VulkanAssets, poll_for_asset},
 };
 
 /// `VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR`.
@@ -99,7 +100,12 @@ fn assign_gpu_instances(
     unslotted: Query<
         Entity,
         (
-            Or<(With<Mesh3d>, With<GltfModelHandle>, With<Sphere>)>,
+            Or<(
+                With<Mesh3d>,
+                With<GltfModelHandle>,
+                With<ProceduralMesh3d>,
+                With<Sphere>,
+            )>,
             With<Transform>,
             Without<GpuInstance>,
         ),
@@ -137,6 +143,7 @@ fn clear_freed(mut slots: ResMut<GpuInstanceSlots>) {
 enum Geometry {
     Mesh(AssetId<Mesh>),
     Gltf(AssetId<GltfModel>),
+    Procedural(AssetId<ProceduralMesh>),
     Sphere,
 }
 
@@ -284,6 +291,7 @@ pub struct TLAS {
     /// SBT hit-group record per mesh asset / owning slot, stable for its lifetime (0 = spheres).
     pub hit_offsets: HashMap<HitKey, u32>,
     next_hit_offset: u32,
+    free_hit_offsets: Vec<u32>,
     overrides: HashMap<u32, InstanceOverride>,
     // Slot state.
     sources: Vec<Option<InstanceSource>>,
@@ -315,6 +323,7 @@ impl TLAS {
             scratch_alignment: 0,
             hit_offsets: HashMap::new(),
             next_hit_offset: 1,
+            free_hit_offsets: Vec::new(),
             overrides: HashMap::new(),
             sources: Vec::new(),
             mirror: Vec::new(),
@@ -355,11 +364,23 @@ impl TLAS {
     }
 
     fn hit_offset(&mut self, key: HitKey) -> u32 {
+        let free = &mut self.free_hit_offsets;
+        let next = &mut self.next_hit_offset;
         *self.hit_offsets.entry(key).or_insert_with(|| {
-            let o = self.next_hit_offset;
-            self.next_hit_offset += 1;
-            o
+            free.pop().unwrap_or_else(|| {
+                let o = *next;
+                *next += 1;
+                o
+            })
         })
+    }
+
+    /// A record whose owner is gone goes back to the pool (its SBT entry stays stale until
+    /// reused; no instance references it any more).
+    fn release_hit_offset(&mut self, key: HitKey) {
+        if let Some(offset) = self.hit_offsets.remove(&key) {
+            self.free_hit_offsets.push(offset);
+        }
     }
 
     /// The SBT hit record owned by `slot` itself (allocated on first use).
@@ -368,7 +389,7 @@ impl TLAS {
     }
 
     pub fn release_slot_hit_offset(&mut self, slot: u32) {
-        self.hit_offsets.remove(&HitKey::Slot(slot));
+        self.release_hit_offset(HitKey::Slot(slot));
     }
 
     /// Redirects (or restores) a slot's BLAS / hit record; the slot is re-resolved by
@@ -698,6 +719,7 @@ type ChangedInstances = Or<(
     Changed<GpuNode>,
     Changed<Mesh3d>,
     Changed<GltfModelHandle>,
+    Changed<ProceduralMesh3d>,
     Changed<AuroraMaterial3d>,
     Changed<InheritedVisibility>,
     Changed<bevy::camera::visibility::RenderLayers>,
@@ -732,6 +754,7 @@ fn extract_instances(
             &GpuNode,
             Option<&Mesh3d>,
             Option<&GltfModelHandle>,
+            Option<&ProceduralMesh3d>,
             Has<Sphere>,
             Option<&AuroraMaterial3d>,
             Option<&InheritedVisibility>,
@@ -744,11 +767,15 @@ fn extract_instances(
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
     }
-    for (instance, node, mesh, gltf, sphere, material, visibility, layers) in changed.iter() {
+    for (instance, node, mesh, gltf, procedural, sphere, material, visibility, layers) in
+        changed.iter()
+    {
         let geometry = if let Some(mesh) = mesh {
             Geometry::Mesh(mesh.id())
         } else if let Some(gltf) = gltf {
             Geometry::Gltf(gltf.0.id())
+        } else if let Some(procedural) = procedural {
+            Geometry::Procedural(procedural.0.id())
         } else if sphere {
             Geometry::Sphere
         } else {
@@ -777,14 +804,21 @@ pub fn prepare_instances(
     mut tlas: ResMut<TLAS>,
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    procedural_meshes: Res<VulkanAssets<ProceduralMesh>>,
     materials: Res<VulkanAssets<AuroraMaterial>>,
     textures: Res<VulkanAssets<Image>>,
     sphere_blas: Res<SphereBLAS>,
     mut replaced: ResMut<ReplacedAssets>,
+    mut dropped: ResMut<DroppedAssets>,
     dev_ui: Option<Res<crate::dev_ui::DevUIState>>,
     mut omm_enabled: Local<Option<bool>>,
 ) {
     let tlas = &mut *tlas;
+    // Assets with no handle left: their SBT hit record returns to the pool (a streaming
+    // scene otherwise grows the table forever).
+    for id in dropped.0.drain(..) {
+        tlas.release_hit_offset(HitKey::Asset(id));
+    }
     // A re-prepared mesh / gltf / material: every slot built on it re-resolves NOW, so the
     // rows scattered this frame carry the replacement's addresses before the old BLAS is
     // destroyed (the destroyer only outlives the in-flight frame). Rows left pointing at a
@@ -795,6 +829,7 @@ pub fn prepare_instances(
             let hit = match source.geometry {
                 Geometry::Mesh(m) => m.untyped() == id,
                 Geometry::Gltf(g) => g.untyped() == id,
+                Geometry::Procedural(m) => m.untyped() == id,
                 Geometry::Sphere => false,
             } || source.material.is_some_and(|m| {
                 // The material itself, or one of its textures (a re-uploaded image gets a
@@ -869,6 +904,16 @@ pub fn prepare_instances(
                         offset,
                         b.gltf_materials.clone(),
                     ),
+                    None => {
+                        complete = false;
+                        (0, offset, None)
+                    }
+                }
+            }
+            Geometry::Procedural(id) => {
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
+                match procedural_meshes.get_by_id(id) {
+                    Some(b) => (b.acceleration_structure.address, offset, None),
                     None => {
                         complete = false;
                         (0, offset, None)
@@ -969,6 +1014,7 @@ impl Plugin for TLASBuilderPlugin {
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<Mesh>)
                     .after(poll_for_asset::<GltfModel>)
+                    .after(poll_for_asset::<ProceduralMesh>)
                     .after(poll_for_asset::<AuroraMaterial>)
                     .after(poll_for_asset::<Image>),
             ),

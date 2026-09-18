@@ -252,6 +252,80 @@ pub fn build_blas_from_buffers(
     .unwrap()
 }
 
+/// A mesh whose streams already live on the device, written there by a compute kernel
+/// (`procedural_mesh.rs`): the same buffers a batch build creates in its upload stage.
+pub struct BlasDeviceInput {
+    pub vertex_buffer: Buffer<Vertex>,
+    pub index_buffer: Buffer<u32>,
+    pub triangle_buffer: Buffer<Triangle>,
+    pub geometry_to_index: Buffer<u32>,
+    pub geometry_to_triangle: Buffer<u32>,
+    pub geometries: Vec<GeometryDescr>,
+    pub vertex_count: usize,
+}
+
+/// Builds BLASes over device-resident streams (no upload stage; the caller's own submission
+/// wrote them and made them available to the acceleration-structure build), a few
+/// submissions for the whole batch. `compact` runs the compaction pass (a query round trip
+/// and a copy submission): worth it for long-lived meshes, not for streamed ones.
+pub fn build_blas_batch_device(
+    render_device: &RenderDevice,
+    inputs: Vec<BlasDeviceInput>,
+    compact: bool,
+) -> Vec<BLAS> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    let staging: Vec<BlasStaging> = inputs
+        .into_iter()
+        .map(|input| BlasStaging {
+            vertex_buffer: input.vertex_buffer,
+            index_buffer: input.index_buffer,
+            triangle_buffer: input.triangle_buffer,
+            geom_to_index: input.geometry_to_index,
+            geom_to_triangle: input.geometry_to_triangle,
+            skin: None,
+            omm: None,
+            geometries: input.geometries,
+            vertex_count: input.vertex_count,
+        })
+        .collect();
+    let as_properties = vk_utils::get_acceleration_structure_properties(render_device);
+    let scratch_alignment =
+        as_properties.min_acceleration_structure_scratch_offset_alignment as u64;
+    let mut build_flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    if compact {
+        build_flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
+    }
+    let mut out: Vec<BLAS> = Vec::with_capacity(staging.len());
+    let mut chunk: Vec<BlasStaging> = Vec::new();
+    let mut chunk_scratch = 0u64;
+    let mut queued = staging.into_iter().peekable();
+    while let Some(next) = queued.next() {
+        chunk_scratch += estimate_scratch(render_device, &next, build_flags) + scratch_alignment;
+        chunk.push(next);
+        let flush = queued.peek().is_none() || chunk_scratch >= BLAS_BATCH_SCRATCH_BUDGET;
+        if flush {
+            out.extend(build_chunk(
+                render_device,
+                std::mem::take(&mut chunk),
+                scratch_alignment,
+                build_flags,
+                compact,
+            ));
+            chunk_scratch = 0;
+        }
+    }
+    out
+}
+
+/// One BLAS over device-resident streams, uncompacted.
+pub fn build_blas_from_device(render_device: &RenderDevice, input: BlasDeviceInput) -> BLAS {
+    build_blas_batch_device(render_device, vec![input], false)
+        .pop()
+        .unwrap()
+}
+
 /// Per-mesh state between the upload and build stages of a batch.
 struct BlasStaging {
     vertex_buffer: Buffer<Vertex>,
@@ -484,6 +558,7 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
                 std::mem::take(&mut chunk),
                 scratch_alignment,
                 build_flags,
+                true,
             ));
             chunk_scratch = 0;
         }
@@ -584,6 +659,7 @@ fn build_chunk(
     chunk: Vec<BlasStaging>,
     scratch_alignment: u64,
     build_flags: vk::BuildAccelerationStructureFlagsKHR,
+    compact: bool,
 ) -> Vec<BLAS> {
     let n = chunk.len();
     let per_mesh: Vec<_> = chunk.iter().map(geometry_infos).collect();
@@ -631,20 +707,24 @@ fn build_chunk(
         .collect();
     let handles: Vec<vk::AccelerationStructureKHR> = structures.iter().map(|s| s.handle).collect();
 
-    let query_pool = unsafe {
-        render_device.device.create_query_pool(
-            &vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
-                .query_count(n as u32),
-            None,
-        )
-    }
-    .unwrap();
+    let query_pool = compact.then(|| {
+        unsafe {
+            render_device.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+                    .query_count(n as u32),
+                None,
+            )
+        }
+        .unwrap()
+    });
 
     render_device.run_transfer_commands(|cmd_buffer| unsafe {
-        render_device
-            .device
-            .cmd_reset_query_pool(cmd_buffer, query_pool, 0, n as u32);
+        if let Some(query_pool) = query_pool {
+            render_device
+                .device
+                .cmd_reset_query_pool(cmd_buffer, query_pool, 0, n as u32);
+        }
         // One vkCmdBuildAccelerationStructures per BLAS, a full build barrier between.
         // Batching N structures into one call device-losts on GB202/610.43.02: the driver's
         // internal AS-build shader reads a wild/misaligned address at glb hydration bursts
@@ -653,11 +733,13 @@ fn build_chunk(
         // A/B). Split builds ran 8/8 clean through the same frames. Costs build parallelism
         // within a worker batch only -- revisit if a future driver fixes the batched call.
         for (info, ranges) in build_infos.iter().zip(&build_ranges) {
-            render_device.ext_acc_struct.cmd_build_acceleration_structures(
-                cmd_buffer,
-                std::slice::from_ref(info),
-                std::slice::from_ref(ranges),
-            );
+            render_device
+                .ext_acc_struct
+                .cmd_build_acceleration_structures(
+                    cmd_buffer,
+                    std::slice::from_ref(info),
+                    std::slice::from_ref(ranges),
+                );
             let one = vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
                 .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
@@ -671,6 +753,9 @@ fn build_chunk(
                 &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&one)),
             );
         }
+        let Some(query_pool) = query_pool else {
+            return;
+        };
         // Builds must land before the compacted-size query reads them.
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
@@ -695,18 +780,21 @@ fn build_chunk(
         render_device.destroyer.destroy_buffer(scratch.handle);
     }
 
+    // Uncompacted builds leave the sizes at zero, which the loop below treats as "keep".
     let mut compacted_sizes = vec![0u64; n];
-    unsafe {
-        render_device
-            .device
-            .get_query_pool_results::<u64>(
-                query_pool,
-                0,
-                &mut compacted_sizes,
-                vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
-            )
-            .unwrap();
-        render_device.device.destroy_query_pool(query_pool, None);
+    if let Some(query_pool) = query_pool {
+        unsafe {
+            render_device
+                .device
+                .get_query_pool_results::<u64>(
+                    query_pool,
+                    0,
+                    &mut compacted_sizes,
+                    vk::QueryResultFlags::WAIT | vk::QueryResultFlags::TYPE_64,
+                )
+                .unwrap();
+            render_device.device.destroy_query_pool(query_pool, None);
+        }
     }
 
     // Compaction: copy every structure that shrinks into a right-sized buffer, in one submission.
@@ -715,6 +803,9 @@ fn build_chunk(
     // uncompacted structure instead of building on top of a bad query.
     let mut copies: Vec<(usize, AccelerationStructure)> = Vec::new();
     for (i, &compacted) in compacted_sizes.iter().enumerate() {
+        if !compact {
+            break;
+        }
         let full = sizes[i].acceleration_structure_size;
         log::debug!(
             "BLAS compaction: {} -> {} ({}%)",

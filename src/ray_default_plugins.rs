@@ -50,6 +50,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::material::MaterialPlugin);
         group = group.add(crate::vulkan_mesh::VulkanMeshPlugin);
         group = group.add(crate::gltf_mesh::GltfPlugin);
+        group = group.add(crate::procedural_mesh::ProceduralMeshPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::skinning::SkinningPlugin);

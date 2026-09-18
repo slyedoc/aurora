@@ -19,6 +19,7 @@ pub mod lights;
 pub mod material;
 pub mod omm;
 pub mod post_process_filter;
+pub mod procedural_mesh;
 pub mod ray_default_plugins;
 pub mod ray_render_plugin;
 pub mod raytracing_pipeline;

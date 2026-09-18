@@ -1,5 +1,6 @@
 use crate::{
     gltf_mesh::GltfModel,
+    procedural_mesh::ProceduralMesh,
     ray_render_plugin::{RenderConfig, RenderSet, TeardownSchedule, on_shutdown},
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
@@ -67,6 +68,7 @@ fn update_sbt(
     rtx_pipelines: Res<VulkanAssets<RaytracingPipeline>>,
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    procedural_meshes: Res<VulkanAssets<ProceduralMesh>>,
     skins: Res<Skins>,
     terrains: Res<crate::terrain::Terrains>,
     render_config: Res<RenderConfig>,
@@ -143,6 +145,28 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
 
+                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
+                    (dst.add(*offset as usize * sbt.hit_region.stride as usize)
+                        as *mut SBTRegionHitTriangle)
+                        .write(SBTRegionHitTriangle {
+                            handle: rtx_pipeline.hit_handle,
+                            vertex_buffer: mesh.vertex_buffer.address,
+                            triangle_buffer: mesh.triangle_buffer.address,
+                            index_buffer: mesh.index_buffer.address,
+                            geometry_to_index: mesh.geometry_to_index.address,
+                            geometry_to_triangle: mesh.geometry_to_triangle.address,
+                            prev_vertex_buffer: 0,
+                            flags: 0,
+                        });
+                }
+            }
+
+            // Procedural meshes: device-written streams, otherwise plain rigid meshes.
+            for (mesh_id, mesh) in procedural_meshes.iter() {
+                let mesh = match mesh {
+                    VulkanAssetLoadingState::Loading => continue,
+                    VulkanAssetLoadingState::Loaded(mesh) => mesh,
+                };
                 if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
