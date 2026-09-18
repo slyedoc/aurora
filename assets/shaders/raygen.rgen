@@ -244,23 +244,47 @@ vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const 
     pdf_solid = p_area * dist * dist / cos_l;
     return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (cos_l / (dist * dist));
   }
-  // Point / spot: a delta at the position (al.radius reserved for soft sampling later).
-  const vec3 to_light = al.position - sp;
-  dist = length(to_light);
-  if (dist <= 1.0e-4) { return vec3(0.0); }
-  dir = to_light / dist;
-  const float NoL = dot(n, dir);
-  if (NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+  // Point / spot. With a radius the light is a Lambertian sphere of that size (bevy's
+  // `radius`): its surface is sampled uniformly, and its radiance is the intensity spread
+  // over the projected disc, I / (pi r^2), so the total is unchanged and the shadows go
+  // soft. Radius 0 is the delta at the position.
+  const vec3 to_centre = al.position - sp;
+  const float centre_dist = length(to_centre);
+  if (centre_dist <= 1.0e-4) { return vec3(0.0); }
+  const vec3 centre_dir = to_centre / centre_dist;
   float atten = 1.0;
   if (al.kind == 1u) {
-    // Bevy's spot falloff: smooth between the inner and outer cone.
-    const float cos_a = dot(al.direction, -dir);
+    // Bevy's spot falloff: smooth between the inner and outer cone (about the centre).
+    const float cos_a = dot(al.direction, -centre_dir);
     if (cos_a <= al.cos_outer) { return vec3(0.0); }
     atten = smoothstep(al.cos_outer, max(al.cos_inner, al.cos_outer + 1.0e-4), cos_a);
   }
-  p_area = p_pick;
-  pdf_solid = 1.0e16;
-  return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (atten / (dist * dist));
+  if (al.radius <= 1.0e-4 || centre_dist <= al.radius) {
+    dist = centre_dist;
+    dir = centre_dir;
+    const float NoL = dot(n, dir);
+    if (NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+    p_area = p_pick;
+    pdf_solid = 1.0e16;
+    return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (atten / (dist * dist));
+  }
+  const float z = 1.0 - 2.0 * su;
+  const float rxy = sqrt(max(0.0, 1.0 - z * z));
+  const float phi = 2.0 * PI * sv;
+  const vec3 sn = vec3(rxy * cos(phi), rxy * sin(phi), z);
+  const vec3 point = al.position + sn * al.radius;
+  const vec3 to_light = point - sp;
+  dist = length(to_light);
+  if (dist <= 1.0e-4) { return vec3(0.0); }
+  dir = to_light / dist;
+  const float cos_l = dot(sn, -dir);
+  const float NoL = dot(n, dir);
+  if (cos_l <= 1.0e-4 || NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+  const float area = 4.0 * PI * al.radius * al.radius;
+  p_area = p_pick / area;
+  pdf_solid = p_area * dist * dist / cos_l;
+  const vec3 radiance = al.emission / (PI * al.radius * al.radius);
+  return evalDisneyBRDF(v, n, dir, mat) * NoL * radiance * (atten * cos_l / (dist * dist));
 }
 
 // Unshadowed contribution of the point (su, sv) on light-table entry `e`, in AREA measure:

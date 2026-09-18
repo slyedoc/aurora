@@ -1,0 +1,9 @@
+// A lantern pair as the wow importer writes them: an emissive core mesh and the point light
+// that carries its halo. Loaded by examples/point_lights.rs to exercise the scene path.
+#point_lights
+bevy_ecs::hierarchy::Children [
+    bevy_ecs::name::Name("bsn lantern light")
+    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 6.0, y: 2.2, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_light::point_light::PointLight { color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 1.0, green: 0.45, blue: 0.15, alpha: 1.0 }), intensity: 6000.0, radius: 0.25 },
+
+]

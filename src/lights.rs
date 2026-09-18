@@ -159,6 +159,11 @@ pub struct LightManager {
     needs_power_pass: bool,
     warned_module: bool,
     logged: (u32, u32),
+    /// Mean linear emission of each emissive texture (rgb x alpha, sRGB decoded): the
+    /// factor next-event estimation samples with is the material's emissive x this, so a
+    /// textured emitter (a glow card, a window) lights the scene with its average rather than
+    /// as a solid quad of its peak. Keyed by image id; dropped with the image.
+    texture_means: HashMap<AssetId<Image>, [f32; 3]>,
     /// Entries the frame uniform may expose (0 while the table is empty / not built).
     pub active_entries: u32,
     /// Bumped on every rebuild; reservoirs remember it so stale entry ids are dropped.
@@ -185,6 +190,7 @@ impl LightManager {
             needs_power_pass: false,
             warned_module: false,
             logged: (0, 0),
+            texture_means: HashMap::new(),
             active_entries: 0,
             epoch: 1,
         }
@@ -453,10 +459,12 @@ fn prepare_lights(
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
     materials: Res<Assets<AuroraMaterial>>,
+    images: Res<Assets<Image>>,
 ) {
     if !lights.dirty {
         return;
     }
+    let lights = &mut *lights;
 
     let mut linsts: Vec<LightInstGpu> = Vec::with_capacity(lights.sources.len());
     // Per-geometry emissions, concatenated; each linst's geom_emission starts as a float
@@ -477,14 +485,32 @@ fn prepare_lights(
                         waiting = true;
                         continue;
                     };
-                    // The emissive factor as the tracer multiplies it (linear radiance, nits).
-                    let Some(emission) = materials
-                        .get(material)
-                        .map(|m| [m.emissive.red, m.emissive.green, m.emissive.blue])
-                    else {
+                    // The emissive factor as the tracer multiplies it (linear radiance, nits),
+                    // times the emissive texture's mean where there is one.
+                    let Some(asset) = materials.get(material) else {
                         waiting = true;
                         continue;
                     };
+                    let mut emission = [asset.emissive.red, asset.emissive.green, asset.emissive.blue];
+                    if let Some(texture) = &asset.emissive_texture {
+                        let id = texture.id();
+                        let mean = match lights.texture_means.get(&id) {
+                            Some(mean) => *mean,
+                            None => match images.get(id).and_then(image_mean_emission) {
+                                Some(mean) => {
+                                    lights.texture_means.insert(id, mean);
+                                    mean
+                                }
+                                None => {
+                                    waiting = true;
+                                    continue;
+                                }
+                            },
+                        };
+                        for (e, m) in emission.iter_mut().zip(mean) {
+                            *e *= m;
+                        }
+                    }
                     let geoms = (blas.geometry_to_index.nr_elements as usize).max(1);
                     (blas, vec![emission; geoms])
                 }
@@ -601,6 +627,43 @@ fn prepare_lights(
 
 fn luma(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+/// Mean linear rgb x alpha of an 8-bit RGBA image (sRGB decoded when the image says so),
+/// sampled on a stride so a 4k texture costs a few thousand texels. `None` for formats the
+/// tracer does not upload as RGBA8 (they are treated as white) or an image without data.
+fn image_mean_emission(image: &Image) -> Option<[f32; 3]> {
+    let data = image.data.as_ref()?;
+    let (w, h) = (
+        image.texture_descriptor.size.width as usize,
+        image.texture_descriptor.size.height as usize,
+    );
+    if w == 0 || h == 0 || data.len() < w * h * 4 {
+        return Some([1.0; 3]);
+    }
+    let srgb = image.texture_descriptor.format.is_srgb();
+    let decode = |v: u8| {
+        let c = v as f32 / 255.0;
+        if !srgb {
+            c
+        } else if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let stride = ((w * h) / 4096).max(1);
+    let mut sum = [0.0f64; 3];
+    let mut n = 0u32;
+    for i in (0..w * h).step_by(stride) {
+        let px = &data[i * 4..i * 4 + 4];
+        let a = px[3] as f64 / 255.0;
+        for c in 0..3 {
+            sum[c] += decode(px[c]) as f64 * a;
+        }
+        n += 1;
+    }
+    Some(sum.map(|s| (s / n.max(1) as f64) as f32))
 }
 
 /// Extracts bevy's analytic lights (`PointLight` / `SpotLight` / `RectLight`) into the
@@ -742,6 +805,10 @@ impl Plugin for LightsPlugin {
         let shader = asset_server.load(aurora_asset("shaders/lights.slang"));
         let module = asset_server.add(ComputeModule::new(shader, &["light_powers", "light_scan"]));
         app.insert_resource(LightManager::new(module));
+        // Reflected, so scenes (`.bsn`) can place them.
+        app.register_type::<PointLight>();
+        app.register_type::<SpotLight>();
+        app.register_type::<RectLight>();
         app.add_observer(on_light_instance_removed);
         app.add_systems(
             Last,
