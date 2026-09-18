@@ -35,7 +35,7 @@ pub struct GltfModel {
 pub struct GltfModelHandle(pub Handle<GltfModel>);
 
 impl GltfModel {
-    pub fn single_mesh(&self) -> gltf::Mesh {
+    pub fn single_mesh(&self) -> gltf::Mesh<'_> {
         let scene = self.document.default_scene().unwrap();
         let mut node = scene.nodes().next().unwrap();
         while node.mesh().is_none() {

@@ -67,7 +67,7 @@ pub fn transition_image_layout(
 
 pub fn get_raytracing_properties(
     device: &RenderDevice,
-) -> vk::PhysicalDeviceRayTracingPipelinePropertiesKHR {
+) -> vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'_> {
     let mut raytracing_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
     let mut properties2 =
         vk::PhysicalDeviceProperties2KHR::default().push_next(&mut raytracing_properties);
@@ -81,7 +81,7 @@ pub fn get_raytracing_properties(
 
 pub fn get_acceleration_structure_properties(
     device: &RenderDevice,
-) -> vk::PhysicalDeviceAccelerationStructurePropertiesKHR {
+) -> vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'_> {
     let mut acceleration_structure_properties =
         vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
     let mut properties2 = vk::PhysicalDeviceProperties2KHR::default()

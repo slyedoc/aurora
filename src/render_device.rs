@@ -282,7 +282,7 @@ impl RenderDevice {
         &self,
         spirv: &[u8],
         stage: vk::ShaderStageFlags,
-    ) -> vk::PipelineShaderStageCreateInfo {
+    ) -> vk::PipelineShaderStageCreateInfo<'_> {
         let spirv: &[u32] =
             unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u32, spirv.len() / 4) };
         let shader_module = unsafe {

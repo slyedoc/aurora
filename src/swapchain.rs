@@ -136,7 +136,7 @@ impl Swapchain {
             }
 
             let surface_resolution = match surface_caps.current_extent.width {
-                std::u32::MAX => vk::Extent2D {
+                u32::MAX => vk::Extent2D {
                     width: window
                         .width
                         .min(surface_caps.max_image_extent.width)
@@ -278,7 +278,7 @@ impl Swapchain {
                         &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
                     ),
                     true,
-                    std::u64::MAX,
+                    u64::MAX,
                 )
                 .unwrap_or_else(|e| {
                     // Device loss surfaces here first: let the driver finish its crash dump.
@@ -296,7 +296,7 @@ impl Swapchain {
                 .ext_swapchain
                 .acquire_next_image(
                     self.swapchain,
-                    std::u64::MAX,
+                    u64::MAX,
                     self.image_available_semaphore,
                     vk::Fence::null(),
                 )
