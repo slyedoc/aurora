@@ -306,6 +306,15 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   return f * NoL * emission * (pc.uniforms.emissive_boost * cos_l / (dist * dist));
 }
 
+// The shading normal bent the least amount into the viewer's hemisphere: n' = n + v * (eps - n.v)
+// leaves n untouched when it already faces v and otherwise gives n'.v = eps (before the
+// renormalisation, which keeps the sign).
+vec3 bendTowardViewer(const vec3 n, const vec3 v) {
+  const float NoV = dot(n, v);
+  const float eps = 1.0e-3;
+  return NoV >= eps ? n : normalize(n + v * (eps - NoV));
+}
+
 // DLSS-RR specular albedo: pre-integrated environment BRDF (split-sum scale/bias
 // fit, Ray Tracing Gems ch. 32) -- the RR Integration Guide's EnvBRDFApprox2. RR
 // demodulates specular with this, NOT raw F0. `alpha` is GGX alpha (perceptual
@@ -501,7 +510,13 @@ void main() {
       if (sample_idx == 0u && bounce_idx == 0u) { primary_t = payload.t; }
 
       const vec3 surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
-      const vec3 world_normal = oct_to_float32x3(payload.surface_and_world_normal.zw);
+      // The shading normal (interpolated, normal-mapped) can face away from the ray at
+      // silhouettes, corners and grazing angles even though the geometric one faces it;
+      // bend it the least amount into the ray's hemisphere so every BRDF term sees a
+      // valid view direction. (Left alone, the sample failed and the path went on at
+      // full throughput: a mirror of the sky on every edge.)
+      const vec3 world_normal = bendTowardViewer(
+          oct_to_float32x3(payload.surface_and_world_normal.zw), -direction);
 
       // Ray portals: a portal-surface hit continues from the paired portal. A delta
       // teleport, not a scatter: guides stay deferred (the far side writes them at the
@@ -1002,17 +1017,16 @@ void main() {
 
       const vec4 brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
       want_sun = false;
-      // brdf.a is the lobe-weighted solid-angle pdf; ~0 marks a pure specular (delta) bounce.
+      // A failed sample (direction under the surface) carries nothing: the path ends.
+      if (brdf.a < 0.0) { break; }
+      // brdf.a is the lobe-weighted solid-angle pdf; 0 marks a delta (mirror) bounce whose
+      // weight is applied as is.
       prev_pdf = brdf.a > 0.0001 ? brdf.a : 0.0;
 
       // Prevent going into the surface (leaks light through walls)
       if (dot(direction, surface_normal) < 0) { break; }
 
-      // Note that an 'a' value of 0 does not mean that the bounce is impossible, but rather
-      // that the bounce is a pure specular bounce.
-      if (brdf.a > 0.0001) {
-        mask *= brdf.rgb / brdf.a;
-      }
+      mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
     }
 
     // The path ended: everything gathered after each cache vertex, divided by its mask

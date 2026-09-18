@@ -22,24 +22,27 @@ float F_Schlick(float f0, float f90, float theta) {
     return f0 + (f90 - f0) * pow(1.0-theta, 5.0);
 }
 
-float D_GTR(float roughness, float NoH, float k) {
-    float a2 = pow(roughness, 2.);
-    return a2 / (PI * pow((NoH*NoH)*(a2*a2-1.)+1., k));
+// GGX / GTR2 with `alpha` the microfacet width (perceptual roughness squared), the same
+// alpha SampleGGXVNDF draws from. (The shadertoy original squared alpha again in the
+// denominator: a lobe 1/alpha^2 too strong and far too narrow for every non-rough
+// material, which showed as white blasts where the sun's next-event estimate hit.)
+float D_GTR(float alpha, float NoH, float k) {
+    float a2 = alpha * alpha;
+    return a2 / (PI * pow((NoH*NoH)*(a2-1.)+1., k));
 }
 
-float SmithG(float NDotV, float alphaG)
+// Smith GGX G1 for the same `alpha` as D_GTR.
+float SmithG(float NDotV, float alpha)
 {
-    float a = alphaG * alphaG;
+    float a = alpha * alpha;
     float b = NDotV * NDotV;
     return (2.0 * NDotV) / (NDotV + sqrt(a + b - a * b));
 }
 
-float GeometryTerm(float NoL, float NoV, float roughness)
+// Separable Smith masking-shadowing, matching the VNDF sampler's G1.
+float GeometryTerm(float NoL, float NoV, float alpha)
 {
-    float a2 = roughness*roughness;
-    float G1 = SmithG(NoV, a2);
-    float G2 = SmithG(NoL, a2);
-    return G1*G2;
+    return SmithG(NoV, alpha) * SmithG(NoL, alpha);
 }
 
 vec3 SampleGGXVNDF(vec3 V, float ax, float ay, float r1, float r2)
@@ -62,10 +65,10 @@ vec3 SampleGGXVNDF(vec3 V, float ax, float ay, float r1, float r2)
     return normalize(vec3(ax * Nh.x, ay * Nh.y, max(0.0, Nh.z)));
 }
 
-float GGXVNDFPdf(float NoH, float NoV, float roughness)
+float GGXVNDFPdf(float NoH, float NoV, float alpha)
 {
- 	float D = D_GTR(roughness, NoH, 2.);
-    float G1 = SmithG(NoV, roughness*roughness);
+    float D = D_GTR(alpha, NoH, 2.);
+    float G1 = SmithG(NoV, alpha);
     return (D * G1) / max(0.00001, 4.0f * NoV);
 }
 
@@ -161,14 +164,22 @@ vec3 evalDisneyDiffuse(DisneyMaterial mat, float NoL, float NoV, float LoH, floa
 }
 
 vec3 evalDisneySpecular(DisneyMaterial mat, vec3 F, float NoH, float NoV, float NoL) {
-    float roughness = pow(mat.roughness, 2.);
-    float D = D_GTR(roughness, NoH,2.);
-    float G = GeometryTerm(NoL, NoV, pow(0.5+mat.roughness*.5,2.));
+    float alpha = pow(mat.roughness, 2.);
+    float D = D_GTR(alpha, NoH, 2.);
+    float G = GeometryTerm(NoL, NoV, alpha);
 
     vec3 spec = D*F*G / (4. * NoL * NoV);
 
     return spec;
 }
+
+// Below this alpha the lobe is a delta: sampled as a mirror with weight F and pdf 0.
+const float DELTA_ALPHA = 1.0e-3;
+
+// Returns (weight * NoL, lobe-weighted pdf). `a == 0` is a delta (mirror) bounce: apply
+// the weight as is. `a < 0` is a failed sample (the direction is under the surface):
+// the path carries nothing and must end.
+const vec4 BRDF_SAMPLE_FAILED = vec4(0.0, 0.0, 0.0, -1.0);
 
 vec4 sampleDisneyBRDF(const vec4 noise, const vec3 v, const vec3 n, const DisneyMaterial mat, inout vec3 l) {
 
@@ -204,7 +215,7 @@ vec4 sampleDisneyBRDF(const vec4 noise, const vec3 v, const vec3 n, const Disney
 
         float NoL = dot(n,l);
         float NoV = dot(n,v);
-        if ( NoL <= 0. || NoV <= 0. ) { return vec4(0.); }
+        if ( NoL <= 0. || NoV <= 0. ) { return BRDF_SAMPLE_FAILED; }
         float LoH = dot(l,h);
         float pdf = NoL/PI;
 
@@ -218,7 +229,13 @@ vec4 sampleDisneyBRDF(const vec4 noise, const vec3 v, const vec3 n, const Disney
 
         float NoL = dot(n,l);
         float NoV = dot(n,v);
-        if ( NoL <= 0. || NoV <= 0. ) { return vec4(0.); }
+        if ( NoL <= 0. || NoV <= 0. ) { return BRDF_SAMPLE_FAILED; }
+        if (roughness < DELTA_ALPHA) {
+            // Mirror: h == n, so F is the weight and there is no pdf to divide by.
+            brdf.rgb = F / specW;
+            brdf.a = 0.0;
+            return brdf;
+        }
         float NoH = min(dot(n,h),.99);
         float pdf = GGXVNDFPdf(NoH, NoV, roughness);
 
