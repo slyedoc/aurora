@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy::{
     app::App,
-    asset::{Asset, AssetEvent, AssetId, Assets, Handle},
+    asset::{Asset, AssetEvent, AssetId, AssetServer, Assets, Handle, UntypedAssetId},
     ecs::{
         message::MessageReader,
         resource::Resource,
@@ -133,9 +133,17 @@ impl<A: VulkanAsset> Default for VulkanAssets<A> {
     }
 }
 
+/// Prepared assets replaced this frame (a re-prepare after `AssetEvent::Modified`, or a
+/// duplicate load). The old GPU objects are already queued on the destroyer, so anything
+/// holding their addresses -- TLAS instance rows above all -- must re-resolve THIS frame:
+/// `prepare_instances` drains this after every `poll_for_asset`.
+#[derive(Resource, Default)]
+pub struct ReplacedAssets(pub Vec<UntypedAssetId>);
+
 fn extract_vulkan_asset<A: VulkanAsset>(
     mut asset_events: MessageReader<AssetEvent<A>>,
     assets: Res<Assets<A>>,
+    asset_server: Res<AssetServer>,
     mut render_assets: ResMut<VulkanAssets<A>>,
     comms: Res<VulkanAssetComms<A>>,
     param: StaticSystemParam<A::ExtractParam>,
@@ -143,28 +151,31 @@ fn extract_vulkan_asset<A: VulkanAsset>(
     let mut param = param.into_inner();
     for event in asset_events.read() {
         match event {
-            AssetEvent::Added { id } => {
-                log::debug!(
-                    "VulkanAsset received AssetEvent::Added for asset with id: {:?}",
-                    id
-                );
+            AssetEvent::Added { id } | AssetEvent::LoadedWithDependencies { id } => {
+                log::debug!("VulkanAsset received {event:?}");
+                // One build per asset: `Added` and `LoadedWithDependencies` both land here
+                // (often in the same frame), and a late `LoadedWithDependencies` must not
+                // overwrite an entry that already holds the prepared asset.
+                if render_assets.0.contains_key(id) {
+                    continue;
+                }
                 if let Some(asset) = assets.get(*id) {
                     if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
-                        if render_assets
-                            .insert(*id, VulkanAssetLoadingState::Loading)
-                            .is_none()
-                        {
-                            comms.send_work.send((*id, extracted)).unwrap();
-                        }
+                        render_assets.insert(*id, VulkanAssetLoadingState::Loading);
+                        comms.send_work.send((*id, extracted)).unwrap();
                     }
                 } else {
                     log::warn!("VulkanAsset could not find asset with id: {:?}", id);
                 }
             }
             AssetEvent::Modified { id } => {
+                // A re-prepare: the replacement lands through `poll_for_asset`, which
+                // reports it in `ReplacedAssets` so dependents re-resolve before the old
+                // GPU objects are destroyed.
                 log::debug!(
-                    "VulkanAsset received AssetEvent::Modified for asset with id: {:?}",
-                    id
+                    "VulkanAsset received AssetEvent::Modified for {:?} ({:?})",
+                    id,
+                    asset_server.get_path(*id)
                 );
                 if let Some(asset) = assets.get(*id) {
                     if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
@@ -180,24 +191,6 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     id
                 );
             }
-            AssetEvent::LoadedWithDependencies { id } => {
-                log::debug!(
-                    "VulkanAsset received AssetEvent::LoadedWithDependencies for asset with id: {:?}",
-                    id
-                );
-                if let Some(asset) = assets.get(*id) {
-                    if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
-                        if render_assets
-                            .insert(*id, VulkanAssetLoadingState::Loading)
-                            .is_none()
-                        {
-                            comms.send_work.send((*id, extracted)).unwrap();
-                        }
-                    }
-                } else {
-                    log::warn!("VulkanAsset could not find asset with id: {:?}", id);
-                }
-            }
             AssetEvent::Unused { id } => {
                 log::debug!(
                     "VulkanAsset does not support AssetEvent::Unused for asset with id: {:?}",
@@ -212,13 +205,21 @@ pub fn poll_for_asset<A: VulkanAsset>(
     render_device: Res<RenderDevice>,
     comms: Res<VulkanAssetComms<A>>,
     mut assets: ResMut<VulkanAssets<A>>,
+    mut replaced: ResMut<ReplacedAssets>,
 ) {
     while let Ok((id, prep)) = comms.recv_result.try_recv() {
         log::debug!("VulkanAsset received prepared asset for id: {:?}", id);
         if let Some(old) = assets.0.insert(id, VulkanAssetLoadingState::Loaded(prep)) {
             match old {
                 VulkanAssetLoadingState::Loading => {}
-                VulkanAssetLoadingState::Loaded(old) => A::destroy_asset(&render_device, &old),
+                VulkanAssetLoadingState::Loaded(old) => {
+                    // The destroyer delays this past the in-flight frame, but NOT past the
+                    // next one: whoever holds the old addresses (TLAS rows, SBT records)
+                    // must pick up the replacement in this frame's prepare.
+                    log::debug!("VulkanAsset replaced prepared asset {id:?}; old destroyed");
+                    replaced.0.push(id.untyped());
+                    A::destroy_asset(&render_device, &old);
+                }
             }
         }
     }
@@ -248,6 +249,7 @@ impl VulkanAssetExt for App {
         let render_device = self.world().resource::<RenderDevice>().clone();
         self.insert_resource(VulkanAssetComms::<A>::new(render_device));
         self.init_resource::<VulkanAssets<A>>();
+        self.init_resource::<ReplacedAssets>();
         self.add_systems(
             Last,
             (

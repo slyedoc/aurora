@@ -35,7 +35,7 @@ use crate::{
     render_device::RenderDevice,
     sphere::{Sphere, SphereBLAS},
     vk_utils,
-    vulkan_asset::{VulkanAssets, poll_for_asset},
+    vulkan_asset::{ReplacedAssets, VulkanAssets, poll_for_asset},
 };
 
 /// `VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR`.
@@ -780,10 +780,42 @@ pub fn prepare_instances(
     materials: Res<VulkanAssets<AuroraMaterial>>,
     textures: Res<VulkanAssets<Image>>,
     sphere_blas: Res<SphereBLAS>,
+    mut replaced: ResMut<ReplacedAssets>,
     dev_ui: Option<Res<crate::dev_ui::DevUIState>>,
     mut omm_enabled: Local<Option<bool>>,
 ) {
     let tlas = &mut *tlas;
+    // A re-prepared mesh / gltf / material: every slot built on it re-resolves NOW, so the
+    // rows scattered this frame carry the replacement's addresses before the old BLAS is
+    // destroyed (the destroyer only outlives the in-flight frame). Rows left pointing at a
+    // freed BLAS are how the TLAS build / traversal ends up dereferencing garbage.
+    for id in replaced.0.drain(..) {
+        for (slot, source) in tlas.sources.iter().enumerate() {
+            let Some(source) = source else { continue };
+            let hit = match source.geometry {
+                Geometry::Mesh(m) => m.untyped() == id,
+                Geometry::Gltf(g) => g.untyped() == id,
+                Geometry::Sphere => false,
+            } || source.material.is_some_and(|m| {
+                // The material itself, or one of its textures (a re-uploaded image gets a
+                // new bindless index; the record's old one is freed for reuse).
+                m.untyped() == id
+                    || materials.get_by_id(m).is_some_and(|prepared| {
+                        [
+                            prepared.base_color_texture,
+                            prepared.emissive_texture,
+                            prepared.metallic_roughness_texture,
+                            prepared.normal_map_texture,
+                        ]
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.untyped() == id))
+                    })
+            });
+            if hit {
+                tlas.dirty.push(slot as u32);
+            }
+        }
+    }
     // The micromap toggle lives in the instance flags: flipping it re-resolves every slot.
     let omm = dev_ui.as_ref().is_none_or(|d| d.omm);
     if *omm_enabled != Some(omm) {
