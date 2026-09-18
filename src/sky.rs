@@ -6,6 +6,7 @@
 //! - [`Sky::Hdr`]: an equirectangular image (a linear `.hdr` / `.exr`), texel × `scale`.
 //! - [`Sky::Procedural`]: an analytic clear sky from [`ProceduralSky`] -- zenith / horizon
 //!   gradient, ground, and a soft sun disc. The default: nothing to load.
+//! - [`Sky::Atmosphere`]: a planet's scattering air and cloud shell (src/atmosphere.rs).
 //!
 //! [`DevUIState::sky_brightness`](crate::dev_ui::DevUIState) multiplies whichever is active.
 //! The procedural sun is gathered by next-event estimation in the raygen (one shadow ray per
@@ -23,6 +24,10 @@ pub enum Sky {
     Hdr { image: Handle<Image>, scale: f32 },
     /// Analytic clear sky from the [`ProceduralSky`] resource.
     Procedural,
+    /// A planet's air and cloud shell ([`crate::atmosphere::Atmosphere`] /
+    /// [`crate::atmosphere::CloudLayer`]); the sun is the [`ProceduralSky`]'s, its radiance
+    /// taken at the top of the atmosphere.
+    Atmosphere,
 }
 
 impl Default for Sky {
@@ -45,6 +50,8 @@ impl Sky {
             Sky::Color { radiance } => luma(*radiance),
             Sky::Hdr { scale, .. } => *scale,
             Sky::Procedural => luma(procedural.zenith_radiance()),
+            // A clear daytime zenith; the LUTs are on the GPU, so this is a nominal value.
+            Sky::Atmosphere => 8000.0,
         }
     }
 }

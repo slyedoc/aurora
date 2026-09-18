@@ -102,6 +102,12 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint sky_layer_mode[8];
   uint sky_layer_tex[8];
   vec4 sky_layer_color[8];
+  // Terrain brush ring (terrain.rs TerrainCursor): world x/z, radius, emission (nits);
+  // the closest-hit draws it on terrain records while brush_active != 0.
+  vec2 brush_center;
+  float brush_radius;
+  uint brush_active;
+  vec3 brush_color;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -321,6 +327,65 @@ layout (buffer_reference, scalar, buffer_reference_align = 4) readonly restrict 
   float input_exposure;
 };
 
+// ---- Atmosphere + clouds (src/atmosphere.rs, atmosphere.glsl) ---------------------------
+
+// A W x H table of vec4 (the atmosphere LUTs), written by the atmo_*.comp kernels.
+layout (buffer_reference, scalar, buffer_reference_align = 16) buffer LutData {
+  vec4 data[];
+};
+
+// A tiling N^3 float table (the cloud noise), written once by cloud_noise.comp.
+layout (buffer_reference, scalar, buffer_reference_align = 4) buffer NoiseData {
+  float data[];
+};
+
+// Must match AtmosphereGpu in src/atmosphere.rs. Lengths in metres, coefficients per metre,
+// radiances in nits; the planet is a sphere at `planet_center`.
+layout (buffer_reference, scalar, buffer_reference_align = 8) buffer AtmosphereParams {
+  LutData transmittance;  // ATM_T_W x ATM_T_H
+  LutData multiscatter;   // ATM_MS_N x ATM_MS_N
+  LutData skyview_rad;    // ATM_SV_W x ATM_SV_H, radiance
+  LutData skyview_trn;    // same, transmittance to space
+  NoiseData noise;        // CLOUD_NOISE_N^3 Perlin-Worley base shape
+  NoiseData noise_detail; // CLOUD_DETAIL_N^3 Worley erosion
+  vec3 planet_center;
+  float planet_radius;
+  float atmosphere_height;
+  float rayleigh_h;
+  float mie_h;
+  float ozone_center;
+  float ozone_width;
+  vec3 rayleigh_scatter;
+  vec3 mie_scatter;
+  vec3 mie_absorb;
+  vec3 ozone_absorb;
+  float mie_g;
+  vec3 ground_albedo;
+  vec3 sun_direction;
+  vec3 sun_radiance;      // top-of-atmosphere disc radiance
+  float sun_cos_radius;
+  vec3 camera_pos;        // the sky-view LUT's viewpoint
+  uint clouds;
+  uint cloud_shadows;
+  uint cloud_steps;
+  uint cloud_light_steps;
+  float cloud_bottom;     // shell altitudes above the planet surface
+  float cloud_top;
+  float cloud_coverage;
+  float cloud_coverage_scale;
+  float cloud_density;
+  float cloud_extinction;
+  float cloud_detail;
+  float cloud_scale;
+  float cloud_detail_scale;
+  vec3 cloud_wind;        // accumulated offset (wind velocity x time)
+  float cloud_light_dist;
+  float cloud_max_dist;
+  float cloud_ambient;
+  float cloud_forward_g;
+  float cloud_back_g;
+};
+
 struct PushConstants {
   UniformData uniforms;
   MaterialData materials;
@@ -341,6 +406,8 @@ struct PushConstants {
   // Auto-exposure: per-pixel luminance out, smoothed exposure in (auto_exposure.slang).
   LumData lum;
   AeData ae;
+  // Atmosphere + cloud parameters and LUTs (valid whenever uniforms.sky_mode == 3).
+  AtmosphereParams atmo;
 };
 
 void hitPayloadSetRoughness(inout HitPayload p, float r) {

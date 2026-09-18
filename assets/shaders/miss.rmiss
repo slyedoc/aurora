@@ -11,7 +11,25 @@ layout(push_constant, std430) uniform Registers {
   PushConstants pc;
 };
 
+#include "atmosphere.glsl"
+
 const float PI = 3.14159265359;
+
+// Planetary atmosphere (atmosphere.glsl): the sky-view LUT, the sun disc through the air
+// on paths that may see it, and the space image (the layer's texture, colour = scale)
+// behind the atmosphere's transmittance.
+vec3 atmosphere_sky(const vec3 d, const bool want_sun, const uint tex, const vec3 scale) {
+  vec3 L, T;
+  bool ground;
+  atmoSkyView(d, L, T, ground);
+  if (!ground) {
+    if (want_sun) { L += atmoSunDisc(d, T); }
+    if (scale != vec3(0.0)) {
+      L += T * scale * min(texture(textures[tex], env_dir_to_uv(d)).rgb, vec3(300.0));
+    }
+  }
+  return L;
+}
 
 // Equirectangular lookup: texel (linear radiance) times the layer's scale.
 vec3 hdr_sky(const vec3 d, const uint tex, const vec3 scale, const bool cam_world) {
@@ -64,6 +82,10 @@ void main() {
                     lay == cam_lay);
       break;
     case 2u: sky = procedural_sky(d, want_sun); break;
+    case 3u:
+      sky = atmosphere_sky(d, want_sun, pc.uniforms.sky_layer_tex[lay],
+                           pc.uniforms.sky_layer_color[lay].rgb);
+      break;
     default: sky = pc.uniforms.sky_layer_color[lay].rgb; break;
   }
   payload.emission = sky * pc.uniforms.sky_brightness;

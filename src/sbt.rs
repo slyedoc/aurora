@@ -177,6 +177,7 @@ fn update_sbt(
 
             // Terrain tiles: their own deformed streams (static addresses; the previous
             // frame's positions come from the instance transform like any rigid mesh).
+            // Flag bit 1 marks terrain for the closest-hit's brush ring.
             for record in terrains.hit_records() {
                 (dst.add(record.hit_offset as usize * sbt.hit_region.stride as usize)
                     as *mut SBTRegionHitTriangle)
@@ -188,7 +189,7 @@ fn update_sbt(
                         geometry_to_index: record.geometry_to_index,
                         geometry_to_triangle: record.geometry_to_triangle,
                         prev_vertex_buffer: 0,
-                        flags: 0,
+                        flags: 2,
                     });
             }
 

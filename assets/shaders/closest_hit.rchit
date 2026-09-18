@@ -106,6 +106,16 @@ void main() {
   payload.emission *= toLinear(texture(textures[material.base_emissive_texture], uv)).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
 
+  // Terrain records (recordFlags.x bit 1): the editor's brush ring, emissive so it reads in
+  // every view (the spectator window and both eyes) without a gizmo pass.
+  if ((recordFlags.x & 2u) != 0u && pc.uniforms.brush_active != 0u) {
+    const vec3 world_p = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
+    const float d = length(world_p.xz - pc.uniforms.brush_center);
+    const float width = max(pc.uniforms.brush_radius * 0.04, 0.12);
+    const float ring = 1.0 - smoothstep(0.0, width, abs(d - pc.uniforms.brush_radius));
+    payload.emission += pc.uniforms.brush_color * ring;
+  }
+
   float transmission = material.specular_transmission_factor;
   transmission *= texture(textures[material.specular_transmission_texture], uv).r;
 

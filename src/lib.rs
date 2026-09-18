@@ -1,5 +1,6 @@
 pub mod aftermath;
 pub mod assets;
+pub mod atmosphere;
 pub mod auto_exposure;
 pub mod blas;
 pub mod bsn;

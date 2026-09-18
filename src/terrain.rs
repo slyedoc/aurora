@@ -1190,10 +1190,24 @@ pub fn terrain_mesh(heights: &[f32], resolution: u32, size: f32) -> Mesh {
 
 pub struct TerrainPlugin;
 
+/// The brush cursor: a ring the terrain closest-hit shader draws on every terrain tile
+/// around `center` (world x/z) at `radius`. A shader ring rather than a gizmo so it shows in
+/// every view — gizmos only reach the spectator window, not the headset. Gameplay writes it
+/// each frame; `active = false` hides it.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct TerrainCursor {
+    pub center: Vec2,
+    pub radius: f32,
+    /// Ring emission (nits).
+    pub color: LinearRgba,
+    pub active: bool,
+}
+
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainEdits>();
         app.init_resource::<TerrainPalette>();
+        app.init_resource::<TerrainCursor>();
         app.add_observer(on_instance_removed);
 
         let asset_server = app.world().resource::<AssetServer>();

@@ -73,6 +73,8 @@ pub struct RaytracingPushConstants {
     /// Auto-exposure: per-pixel luminance out, smoothed exposure in (`auto_exposure`).
     pub lum_buffer: u64,
     pub auto_exposure: u64,
+    /// Atmosphere + cloud parameter block (`atmosphere`; 0 until that sky first renders).
+    pub atmo: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {

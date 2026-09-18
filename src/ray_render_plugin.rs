@@ -12,6 +12,7 @@ use ash::vk;
 use crate::sky::{ProceduralSky, Sky};
 use crate::{
     bluenoise_plugin::BlueNoiseBuffer,
+    atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
     post_process_filter::PostProcessFilter,
     raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants},
     render_buffer::{Buffer, BufferProvider},
@@ -95,6 +96,12 @@ pub struct UniformData {
     sky_layer_mode: [u32; 8],
     sky_layer_tex: [u32; 8],
     sky_layer_color: [[f32; 4]; 8],
+    /// Terrain brush ring (terrain.rs `TerrainCursor`): world x/z, radius, emission; drawn
+    /// by the closest-hit shader on terrain records when `brush_active != 0`.
+    brush_center: [f32; 2],
+    brush_radius: f32,
+    brush_active: u32,
+    brush_color: [f32; 3],
 }
 
 #[repr(C)]
@@ -299,6 +306,9 @@ fn render_frame(
         Res<crate::env_light::EnvLight>,
         crate::gizmo_render::GizmoDrawParams,
         Res<crate::sky::LayerSkies>,
+        Res<crate::terrain::TerrainCursor>,
+        Res<Atmosphere>,
+        Res<CloudLayer>,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -320,6 +330,7 @@ fn render_frame(
         ResMut<crate::skinning::Skins>,
         Res<crate::portal::PortalTable>,
         ResMut<crate::terrain::Terrains>,
+        ResMut<AtmosphereState>,
     ),
     camera: Query<
         (
@@ -361,11 +372,22 @@ fn render_frame(
         mut skins,
         portal_table,
         mut terrains,
+        mut atmo,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
 
-    let (dev_ui_state, mut ui, sky, procedural, env_light, mut gizmos, layer_skies) =
-        dev_ui_stuff;
+    let (
+        dev_ui_state,
+        mut ui,
+        sky,
+        procedural,
+        env_light,
+        mut gizmos,
+        layer_skies,
+        terrain_cursor,
+        atmosphere,
+        clouds,
+    ) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     let camera = camera.single().unwrap();
@@ -396,7 +418,7 @@ fn render_frame(
                 vec![(
                     0,
                     anchor,
-                    Mat4::perspective_infinite_reverse_rh(
+                    bevy::math::proj::perspective_infinite_reverse(
                         perspective.fov,
                         (window.width as f32) / (window.height as f32),
                         perspective.near,
@@ -490,6 +512,19 @@ fn render_frame(
                 Vec4::splat(*scale),
             ),
             Sky::Procedural => (2, WHITE_TEXTURE_IDX, Vec4::ONE),
+            // The space image behind the air (colour = its scale; 0 = none).
+            Sky::Atmosphere => match atmosphere
+                .space
+                .as_ref()
+                .and_then(|image| textures.get(image))
+            {
+                Some(t) => (
+                    3,
+                    render_device.register_bindless_texture(t),
+                    Vec4::splat(atmosphere.space_scale),
+                ),
+                None => (3, WHITE_TEXTURE_IDX, Vec4::ZERO),
+            },
         }
     };
     let global_entry = sky_entry(&sky);
@@ -511,7 +546,7 @@ fn render_frame(
             sky_color: match &*sky {
                 Sky::Color { radiance } => radiance.extend(0.0),
                 Sky::Hdr { scale, .. } => Vec4::splat(*scale),
-                Sky::Procedural => Vec4::ONE,
+                Sky::Procedural | Sky::Atmosphere => Vec4::ONE,
             },
             inverse_view: view.inverse_view,
             inverse_projection: view.projection.inverse(),
@@ -544,6 +579,7 @@ fn render_frame(
                 Sky::Color { .. } => 0,
                 Sky::Hdr { .. } => 1,
                 Sky::Procedural => 2,
+                Sky::Atmosphere => 3,
             },
             sun_cos_radius: procedural.sun_cos_radius(),
             sun_direction: procedural.sun_direction().to_array(),
@@ -584,6 +620,10 @@ fn render_frame(
             sky_layer_mode,
             sky_layer_tex,
             sky_layer_color,
+            brush_center: terrain_cursor.center.to_array(),
+            brush_radius: terrain_cursor.radius,
+            brush_active: terrain_cursor.active as u32,
+            brush_color: terrain_cursor.color.to_vec3().to_array(),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -661,6 +701,19 @@ fn render_frame(
             &modules,
             trace_extent,
             &exposure,
+            time.delta_secs(),
+        );
+        // The atmosphere's LUTs for this frame's camera altitude and sun (the raygen and
+        // the miss shader read them); nothing unless the sky is the atmosphere.
+        atmo.record(
+            &render_device,
+            cmd_buffer,
+            &modules,
+            &sky,
+            &atmosphere,
+            &clouds,
+            &procedural,
+            camera.1.translation(),
             time.delta_secs(),
         );
 
@@ -766,6 +819,7 @@ fn render_frame(
                         sharc: sharc.address(),
                         lum_buffer: ae.addresses().0,
                         auto_exposure: ae.addresses().1,
+                        atmo: atmo.address(),
                     };
 
                     render_device.cmd_push_constants(
