@@ -51,6 +51,22 @@ impl AuroraDebugView {
         self as u32
     }
 
+    /// `$AURORA_DEBUG_VIEW` (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion`),
+    /// else the normal render: lets a headless run capture a guide view.
+    pub fn from_env() -> Self {
+        match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
+            Some("color") => Self::Color,
+            Some("normals") => Self::Normals,
+            Some("roughness") => Self::Roughness,
+            Some("diffuse") => Self::Diffuse,
+            Some("specular") => Self::Specular,
+            Some("depth") => Self::Depth,
+            Some("spec-hit") => Self::SpecHit,
+            Some("motion") => Self::Motion,
+            _ => Self::None,
+        }
+    }
+
     pub fn next(self) -> Self {
         let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
         Self::ALL[(i + 1) % Self::ALL.len()]
@@ -63,7 +79,7 @@ fn default_view(
     cameras: Query<Entity, (With<Camera3d>, Without<AuroraDebugView>)>,
 ) {
     for camera in &cameras {
-        commands.entity(camera).insert(AuroraDebugView::default());
+        commands.entity(camera).insert(AuroraDebugView::from_env());
     }
 }
 

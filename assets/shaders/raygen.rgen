@@ -458,9 +458,14 @@ void main() {
   const float tmax = 1.0e6;
 
   // A known sub-pixel jitter (told to NGX); the launch y is flipped into the NDC-up space
-  // here, so the image-space offset is +jitter.
+  // here, so the image-space offset is +jitter. Row 0 is the TOP row: its centre sits half
+  // a pixel below the top edge, (height - 1 - y) + 0.5 in the up-space. (An earlier
+  // `height - y + 0.5` put every sample one whole pixel above its pixel: the image was
+  // shifted a row against the depth/motion guides and the matrices Ray Reconstruction
+  // reprojects with, and edges crawled.)
   const vec2 subpixel = vec2(0.5 + pc.uniforms.jitter.x, 0.5 - pc.uniforms.jitter.y);
-  const vec2 pixel_center = vec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - gl_LaunchIDEXT.y) + subpixel;
+  const vec2 pixel_center =
+      vec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - 1u - gl_LaunchIDEXT.y) + subpixel;
   const vec2 inUV = pixel_center / vec2(gl_LaunchSizeEXT.xy);
   const vec2 d = inUV * 2.0 - 1.0;
 
@@ -471,6 +476,7 @@ void main() {
   const vec3 focalPoint = initial_origin + initial_direction * pc.focus.focal_distance;
 
   if (pc.uniforms.pull_focus_x == gl_LaunchIDEXT.x && pc.uniforms.pull_focus_y == gl_LaunchIDEXT.y) {
+    payload.cone = vec2(0.0);
     traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, initial_origin, tmin, initial_direction, tmax, 0);
     if (payload.t != 0.0) {
       pc.focus.focal_distance = payload.t;
@@ -513,6 +519,11 @@ void main() {
     // alpha-cutout edges first); the specular hit distance from the vertex after it.
     bool guides_written = false;
     uint primary_bounce = 0u;
+    // Ray cone for texture level of detail (closest_hit.rchit): width at the ray's origin
+    // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
+    // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
+    float cone_width = 0.0;
+    float cone_spread = 2.0 * pc.uniforms.inverse_projection[1][1] / float(gl_LaunchSizeEXT.y);
     // Stable guides (RTXPT "stable planes"): the guide chain follows the analytically
     // DOMINANT Fresnel lobe through glass. When the radiance path rolls the minority lobe
     // instead, this frame's guide writes are abandoned (the images keep last frame's
@@ -530,8 +541,10 @@ void main() {
       // Low bit: may this miss return the sun disc; high bits: the ray's world mask
       // (the miss picks that layer's sky).
       payload.want_sun = (want_sun ? 1u : 0u) | (ray_mask << 1);
+      payload.cone = vec2(cone_width, cone_spread);
       traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, ray_mask, 0, 0, 0, origin, tmin, direction, tmax, 0);
       if (sample_idx == 0u && bounce_idx == 0u) { primary_t = payload.t; }
+      cone_width += cone_spread * payload.t;
 
       const vec3 surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
       // The shading normal (interpolated, normal-mapped) can face away from the ray at
@@ -940,21 +953,49 @@ void main() {
           cur.frame = pc.uniforms.frame;
           pc.reservoirs_cur.data[px.y * int(gl_LaunchSizeEXT.x) + px.x] = cur;
         } else {
-          float p_pick;
-          const uint e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
-          float p_area, pdf_solid, ldist;
-          vec3 ldir;
-          const vec3 val = lightSampleEval(e, lightsFindInstance(e), p_pick, randf(), randf(),
-                                           origin, world_normal, surface_normal, -direction,
-                                           disney_mat, p_area, pdf_solid, ldir, ldist);
-          if (luma(val) > 0.0 && p_area > 0.0) {
-            const float w = pdf_solid / (pdf_solid + pdfDisneyBRDF(-direction, world_normal, ldir, disney_mat));
+          // Resampled importance sampling, no reuse: M candidates from the power CDF, each
+          // weighted by its MIS-weighted unshadowed contribution at THIS point over its
+          // source pdf; one survives and gets the shadow ray. The table's power knows
+          // nothing of distance, so with hundreds of lights a single sample nearly always
+          // lands on one that contributes nothing. The MIS weight rides inside the
+          // resampled integrand (against the candidate's own CDF pdf, which is what the
+          // emitter-hit side uses), so the two strategies still sum to one. M = 1 is the
+          // plain estimator.
+          const uint M = bounce_idx == 0u ? pc.uniforms.light_candidates
+                                          : max(1u, pc.uniforms.light_candidates / 4u);
+          float wsum = 0.0;
+          vec3 sel_val = vec3(0.0);
+          float sel_phat = 0.0;
+          vec3 ldir = vec3(0.0);
+          float ldist = 0.0;
+          for (uint c = 0u; c < M; c++) {
+            float p_pick;
+            const uint e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
+            float p_area, pdf_solid, cdist;
+            vec3 cdir;
+            const vec3 val = lightSampleEval(e, lightsFindInstance(e), p_pick, randf(), randf(),
+                                             origin, world_normal, surface_normal, -direction,
+                                             disney_mat, p_area, pdf_solid, cdir, cdist);
+            if (luma(val) <= 0.0 || p_area <= 0.0) { continue; }
+            const float w = pdf_solid / (pdf_solid + pdfDisneyBRDF(-direction, world_normal, cdir, disney_mat));
+            const vec3 g = val * w;
+            const float phat = luma(g);
+            const float wi = phat / p_area;
+            wsum += wi;
+            if (randf() * wsum < wi) {
+              sel_val = g;
+              sel_phat = phat;
+              ldir = cdir;
+              ldist = cdist;
+            }
+          }
+          if (wsum > 0.0 && sel_phat > 0.0) {
             payload.t = -1.0;
             traceRayEXT(topLevelAS,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                         ray_mask, 0, 0, 0, origin, tmin, ldir, ldist - 2.0 * tmin, 0);
             if (payload.t == 0.0) {
-              vec3 contribution = mask * val * (w / p_area);
+              vec3 contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
               if (bounce_idx > 0 && radiance_clamp > 0.0) {
                 contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
               }
@@ -1054,6 +1095,8 @@ void main() {
       if (dot(direction, surface_normal) < 0) { break; }
 
       mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+      // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
+      cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
     }
 
     // The path ended: everything gathered after each cache vertex, divided by its mask

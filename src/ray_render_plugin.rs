@@ -72,6 +72,10 @@ pub struct UniformData {
     light_entries: u32,
     /// ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
     restir_candidates: u32,
+    /// Light candidates resampled per shading point outside ReSTIR (1 = one CDF sample).
+    light_candidates: u32,
+    /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
+    lod_bias: f32,
     /// Light-table generation; reservoirs from another generation are dropped.
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
@@ -592,6 +596,11 @@ fn render_frame(
             } else {
                 0
             },
+            light_candidates: dev_ui_state.light_candidates.clamp(1, 32),
+            // DLSS guide 3.5: textures are picked for the OUTPUT resolution, not the trace
+            // resolution, so the upscaled image keeps its detail.
+            lod_bias: (trace_extent.width.max(1) as f32 / output_extent.width.max(1) as f32).log2()
+                + dev_ui_state.texture_lod_bias,
             light_epoch: lights.epoch,
             restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
                 .max(1.0),

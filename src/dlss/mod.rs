@@ -44,6 +44,19 @@ static DEV_SNIPPET: AtomicBool = AtomicBool::new(false);
 /// feature creation. Same pattern as [`DEV_SNIPPET`].
 static RR_PRESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The dev panel's jitter amplitude, as f32 bits (1 = the full +-0.5 traced pixel). The same
+/// scaled offset goes to the raygen and to NGX, so they always agree. Smaller covers less of
+/// the pixel: the raw guide views hop less (at ultra-performance half a traced pixel is one
+/// and a half screen pixels) and Ray Reconstruction has less sub-pixel coverage to anti-alias
+/// edges and recover upscaled detail from; 0 samples pixel centres every frame.
+static JITTER_SCALE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+
+pub fn set_jitter_scale(scale: f32) {
+    JITTER_SCALE.store(scale.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+
 /// Which Ray Reconstruction model the feature is created with (RR guide 3.13). Changing it
 /// at runtime (the dev panel has a row for it) rebuilds the feature.
 #[derive(Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -197,10 +210,38 @@ pub(crate) fn halton(mut index: u32, base: u32) -> f32 {
 
 /// `phase_count = max(8·ratio², 32)` (dlss_wgpu's `suggested_jitter`).
 pub(crate) fn suggested_jitter(frame: u32, render_width: u32, output_width: u32) -> [f32; 2] {
+    let scale = f32::from_bits(JITTER_SCALE.load(Ordering::Relaxed));
+    if scale <= 0.0 {
+        return [0.0; 2];
+    }
+    // `AURORA_JITTER_TEST=x,y[@seconds];...` pins the jitter on a schedule (the DLSS guide's
+    // single-quadrant test, 8.4.2): with NGX told the right offset, a pinned jitter leaves the
+    // output exactly where an unjittered frame is; uncompensated it shifts by the jitter, with
+    // the sign wrong by twice that. One run keeps one window and one camera across captures.
+    if let Ok(schedule) = std::env::var("AURORA_JITTER_TEST") {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32();
+        let mut pinned = None;
+        for entry in schedule.split(';') {
+            let (xy, from) = entry.split_once('@').unwrap_or((entry, "0"));
+            let Some((x, y)) = xy.split_once(',') else { continue };
+            let (Ok(x), Ok(y), Ok(from)) =
+                (x.trim().parse::<f32>(), y.trim().parse::<f32>(), from.trim().parse::<f32>())
+            else {
+                continue;
+            };
+            if elapsed >= from {
+                pinned = Some([x, y]);
+            }
+        }
+        if let Some(pinned) = pinned {
+            return pinned;
+        }
+    }
     let ratio = output_width.max(1) as f32 / render_width.max(1) as f32;
     let phase_count = ((8.0 * ratio * ratio) as u32).max(32);
     let i = frame % phase_count;
-    [halton(i, 2) - 0.5, halton(i, 3) - 0.5]
+    [(halton(i, 2) - 0.5) * scale, (halton(i, 3) - 0.5) * scale]
 }
 
 /// The one NGX session (`None` when the SDK is compiled out, the GPU/driver lacks DLSS, or

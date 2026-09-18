@@ -14,7 +14,8 @@ struct Triangle {
   uint tangent;
   uint normals[3];
   uint uvs[3];
-  uint padding;
+  // 0.5 * log2(uv area / object-space area): the ray-cone texture LOD's triangle term.
+  float lod;
 };
 
 vec3 unpackNormal(uint packed) {
@@ -76,6 +77,10 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint light_entries;
   // ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
   uint restir_candidates;
+  // Light candidates resampled per shading point outside ReSTIR (1 = one plain CDF sample).
+  uint light_candidates;
+  // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
+  float lod_bias;
   // Light-table generation; reservoirs from another generation are dropped.
   uint light_epoch;
   // Cap on temporal history, in candidate-samples.
@@ -309,6 +314,9 @@ struct HitPayload {
   // spheres) and the global triangle index within the BLAS.
   uint slot;
   uint prim_tri;
+  // Raygen -> hit: the ray cone at the ray's origin (x = width, y = spread angle, radians),
+  // for the texture level of detail.
+  vec2 cone;
 };
 
 // Per-pixel raw-radiance luminance, render resolution: the raygen writes it, the

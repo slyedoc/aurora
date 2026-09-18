@@ -26,7 +26,7 @@ use bevy::{
 };
 
 use crate::{
-    dlss::{AuroraDlss, RrPreset},
+    dlss::{AuroraDlss, RrPreset, set_jitter_scale},
     sky::ProceduralSky,
     ui_render::UiRenderPlugin,
 };
@@ -69,6 +69,17 @@ pub struct DevUIState {
     pub light_nee: bool,
     /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse). Off while
     /// accumulating, so Space stays the uncorrelated reference.
+    /// Added to the ray-cone texture level of detail, on top of the automatic
+    /// log2(render / output) term. The DLSS guide asks for -1 (sharper: accumulation over
+    /// jittered frames resolves the extra detail); 0 is the unbiased footprint, positive blurs.
+    #[reflect(@-3.0..=3.0_f32)]
+    pub texture_lod_bias: f32,
+    /// Light candidates resampled at every shading point (RIS): each is drawn from the
+    /// power-weighted table, weighted by what it would contribute HERE, one survives and
+    /// gets the shadow ray. 1 = a single table sample, which with hundreds of lights almost
+    /// always lands on one too far away to matter. Deeper bounces use a quarter.
+    #[reflect(@1.0..=32.0_f32)]
+    pub light_candidates: u32,
     pub restir: bool,
     /// Initial light candidates per pixel.
     #[reflect(@1.0..=32.0_f32)]
@@ -89,6 +100,13 @@ pub struct DevUIState {
     pub dlss: AuroraDlss,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
     pub rr_preset: RrPreset,
+    /// Sub-pixel camera jitter amplitude: 1 = the full +-0.5 traced pixel, 0 = pixel centres
+    /// every frame. Lower is calmer -- the raw guide views hop less (they are shown
+    /// unresolved; at ultra-performance half a traced pixel is one and a half screen pixels)
+    /// -- and gives Ray Reconstruction less sub-pixel coverage for anti-aliased edges and
+    /// upscaled detail. NGX is always told the same scaled offset.
+    #[reflect(@0.0..=1.0_f32)]
+    pub jitter_scale: f32,
 }
 
 impl Default for DevUIState {
@@ -105,6 +123,8 @@ impl Default for DevUIState {
             vignette: 0.0,
             light_nee: true,
             restir: false, // TODO
+            texture_lod_bias: -1.0,
+            light_candidates: 8,
             restir_candidates: 8,
             restir_history: 20.0,
             sharc: false, // TODO
@@ -112,6 +132,7 @@ impl Default for DevUIState {
             omm: true,
             dlss: AuroraDlss::from_env(),
             rr_preset: RrPreset::current(),
+            jitter_scale: 1.0,
         }
     }
 }
@@ -197,6 +218,7 @@ fn sync_rr_preset(state: Res<DevUIState>) {
     if state.rr_preset != RrPreset::current() {
         state.rr_preset.make_current();
     }
+    set_jitter_scale(state.jitter_scale);
 }
 
 fn spawn_panel(world: &mut World) {
