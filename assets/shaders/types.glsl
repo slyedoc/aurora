@@ -292,7 +292,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Bl
 struct HitPayload {
   float t;
   float refract_index;
-  // r = roughness, m = metallic, t = transmission, i = inside
+  // r = roughness, m = metallic, t = transmission, i = flags (bit 0 inside, bit 1 masked:
+  // the material has an alpha cutoff, so its texture alpha means coverage)
   int r_m_t_i;
   vec4 color;
   vec3 emission;
@@ -441,12 +442,19 @@ float hitPayloadGetTransmission(const HitPayload p) {
 }
 
 void hitPayloadSetInside(inout HitPayload p, bool i) {
-  p.r_m_t_i = (p.r_m_t_i & 0xFFFFFF00) | (i ? 0xFF : 0);
+  p.r_m_t_i = (p.r_m_t_i & ~0x01) | (i ? 0x01 : 0);
 }
 
 bool hitPayloadGetInside(const HitPayload p) {
-  int v = p.r_m_t_i % 256;
-  return v != 0;
+  return (p.r_m_t_i & 0x01) != 0;
+}
+
+void hitPayloadSetMasked(inout HitPayload p, bool m) {
+  p.r_m_t_i = (p.r_m_t_i & ~0x02) | (m ? 0x02 : 0);
+}
+
+bool hitPayloadGetMasked(const HitPayload p) {
+  return (p.r_m_t_i & 0x02) != 0;
 }
 
 

@@ -535,11 +535,14 @@ void main() {
       }
 
       // Alpha-cutout pass-through (stochastic alpha at the edge texels of a masked material,
-      // pure-black texels used as masks) is decided BEFORE the DLSS guides: a primary ray that
+      // pure-black texels used as masks) applies to MASKED materials only: an opaque
+      // material's texture alpha is data (WoW keeps gloss there) and its black texels are
+      // black. It is decided BEFORE the DLSS guides: a primary ray that
       // continues through a leaf must not leave the leaf's albedo / normal / depth behind for
       // Ray Reconstruction to demodulate the sky behind it with -- that reads as white,
       // smeared foliage whenever something bright sits behind it.
       const bool pass_through = payload.t != 0.0 && payload.emission == vec3(0.0)
+          && hitPayloadGetMasked(payload)
           && (payload.color.rgb == vec3(0.0)
               || (payload.color.a < 1.0 && randf() < 1.0 - payload.color.a));
 

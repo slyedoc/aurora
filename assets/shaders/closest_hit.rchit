@@ -154,4 +154,5 @@ void main() {
   hitPayloadSetRoughness(payload, roughness);
   hitPayloadSetMetallic(payload, metallic);
   hitPayloadSetInside(payload, inside);
+  hitPayloadSetMasked(payload, material.alpha_cutoff > 0.0);
 }
