@@ -190,6 +190,80 @@ void skin_vertices(uint3 gid: SV_DispatchThreadID) {
     skin_params.dst[i] = out;
 }
 
+// ---- wind_vertices ----------------------------------------------------------------------
+
+// `WindParams` in skinning.rs. The skin stream carries no joints here: `weights.x` is the
+// sway weight (0 at the anchored base, 1 at the tip) and `joints.x & 0xffff` a per-plant
+// phase id.
+struct WindParams {
+    Vertex* rest;
+    SkinVertex* skin;
+    World* world;
+    Vertex* dst;
+    uint count;
+    uint base;
+    uint mesh_node;
+    uint pad;
+    float4 wind;   // direction.x, direction.z (unit, the way it blows), speed m/s, time s
+    float4 shape;  // amplitude (m at 10 m/s, full weight), gust, wavelength m, turbulence
+};
+[[vk::push_constant]] WindParams wind_params;
+
+float hash01(uint n) {
+    n = (n ^ 61u) ^ (n >> 16);
+    n *= 9u;
+    n ^= n >> 4;
+    n *= 0x27d4eb2du;
+    n ^= n >> 15;
+    return float(n & 0xffffffu) / 16777216.0;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void wind_vertices(uint3 gid: SV_DispatchThreadID) {
+    let i = wind_params.base + gid.x;
+    if (i >= wind_params.count) {
+        return;
+    }
+    let rest = wind_params.rest[i];
+    let influence = wind_params.skin[i];
+    let weight = clamp(influence.weights.x, 0.0, 1.0);
+    let amplitude = wind_params.shape.x;
+    let speed = wind_params.wind.z;
+    Vertex out = rest;
+    if (weight > 0.0 && amplitude > 0.0 && speed > 0.0) {
+        let m = wind_params.world[wind_params.mesh_node];
+        let rest_pos = float3(rest.px, rest.py, rest.pz);
+        let p = affine_point(m, rest_pos);
+        let dir = float2(wind_params.wind.x, wind_params.wind.y);
+        let t = wind_params.wind.w;
+        let k = 6.2831853 / max(wind_params.shape.z, 0.1);
+        let phase_id = hash01(influence.joints.x & 0xffff) * 6.2831853;
+        // Waves travel downwind at the wind speed; a faster harmonic and a per-plant flutter
+        // break the sheet-like look.
+        let along = dot(p.xz, dir);
+        let phase = (along - t * speed) * k;
+        let sway = 0.55 * sin(phase + 0.3 * phase_id)
+                 + 0.30 * sin(phase * 2.17 + phase_id)
+                 + 0.15 * sin(t * (2.5 + hash01(influence.joints.x ^ 0x9e37u) * 2.0) + 3.0 * phase_id);
+        // A slow gust front: strength swells and fades as it rolls through.
+        let gust = 1.0 + wind_params.shape.y * (0.5 + 0.5 * sin((along - t * speed * 1.4) * k * 0.11 + 0.2 * phase_id));
+        let strength = amplitude * weight * (speed / 10.0) * gust;
+        // Lean downwind with the oscillation on top; flutter across the wind by turbulence.
+        let downwind = strength * (0.65 + 0.35 * sway);
+        let across = strength * wind_params.shape.w * 0.35 * sin(t * 3.7 + 2.0 * phase_id + phase * 0.5);
+        let offset_world = float3(dir.x, 0.0, dir.y) * downwind + float3(-dir.y, 0.0, dir.x) * across;
+        // A bent stalk drops as it leans (d^2 / 2h for a half-metre stalk), so tips do not
+        // stretch away from their bases.
+        let drop = -(downwind * downwind + across * across);
+        let offset_local = affine_dir(affine_inverse(m), offset_world + float3(0.0, drop, 0.0));
+        out.px = rest.px + offset_local.x;
+        out.py = rest.py + offset_local.y;
+        out.pz = rest.pz + offset_local.z;
+    }
+    wind_params.dst[i] = out;
+}
+
 // ---- pack_triangles ---------------------------------------------------------------------
 
 // `Triangle::pack_normal` in blas.rs.

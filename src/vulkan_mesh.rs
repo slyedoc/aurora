@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use bevy::{
-    ecs::system::{SystemParamItem, lifetimeless::SRes},
+    asset::AssetEvent,
+    ecs::{
+        message::MessageReader,
+        system::{SystemParamItem, lifetimeless::SRes},
+    },
     mesh::Indices,
     prelude::*,
 };
@@ -10,16 +14,45 @@ use crate::{
     blas::{BLAS, BlasBuildInput, GeometryDescr, SkinVertex, Vertex, build_blas_batch},
     bsn::ClusterMeshOmm,
     cluster_mesh::OmmSlices,
+    ray_render_plugin::RenderSet,
     render_buffer::BufferProvider,
     vulkan_asset::{VulkanAsset, VulkanAssetExt},
 };
 use ash::vk;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+/// Baked opacity micromaps for meshes built at runtime (no asset path to key
+/// [`ClusterMeshOmm`] by): an app that assembles a mesh from baked parts -- a clutter chunk
+/// tiled from plant `.cluster_mesh`es -- registers the matching slices here before the mesh
+/// is extracted. Entries go when their mesh asset does.
+#[derive(Resource, Default)]
+pub struct MeshOmm {
+    slices: HashMap<AssetId<Mesh>, Arc<OmmSlices>>,
+}
+
+impl MeshOmm {
+    pub fn insert(&mut self, mesh: AssetId<Mesh>, slices: Arc<OmmSlices>) {
+        self.slices.insert(mesh, slices);
+    }
+
+    pub fn remove(&mut self, mesh: AssetId<Mesh>) {
+        self.slices.remove(&mesh);
+    }
+}
+
+fn prune_mesh_omm(mut events: MessageReader<AssetEvent<Mesh>>, mut omm: ResMut<MeshOmm>) {
+    for event in events.read() {
+        if let AssetEvent::Removed { id } | AssetEvent::Unused { id } = event {
+            omm.remove(*id);
+        }
+    }
+}
+
 impl VulkanAsset for Mesh {
-    /// The mesh plus its baked opacity micromap, when it came from a `.cluster_mesh` with one.
+    /// The mesh plus its baked opacity micromap, when it came from a `.cluster_mesh` with one
+    /// or was registered in [`MeshOmm`].
     type ExtractedAsset = (Mesh, Option<Arc<OmmSlices>>);
-    type ExtractParam = (SRes<AssetServer>, SRes<ClusterMeshOmm>);
+    type ExtractParam = (SRes<AssetServer>, SRes<ClusterMeshOmm>, SRes<MeshOmm>);
     type PreparedAsset = BLAS;
 
     fn extract_asset(
@@ -32,11 +65,13 @@ impl VulkanAsset for Mesh {
     fn extract_asset_with_id(
         &self,
         id: AssetId<Self>,
-        (asset_server, registry): &mut SystemParamItem<Self::ExtractParam>,
+        (asset_server, registry, runtime): &mut SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let omm = asset_server
-            .get_path(id)
-            .and_then(|path| registry.0.lock().unwrap().get(&path).cloned());
+        let omm = runtime.slices.get(&id).cloned().or_else(|| {
+            asset_server
+                .get_path(id)
+                .and_then(|path| registry.0.lock().unwrap().get(&path).cloned())
+        });
         Some((self.clone(), omm))
     }
 
@@ -193,6 +228,8 @@ pub struct VulkanMeshPlugin;
 impl Plugin for VulkanMeshPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<Mesh>();
+        app.init_resource::<MeshOmm>();
+        app.add_systems(Last, prune_mesh_omm.in_set(RenderSet::Extract));
         app.init_vulkan_asset::<Mesh>();
     }
 }

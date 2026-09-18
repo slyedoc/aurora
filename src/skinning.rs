@@ -20,6 +20,13 @@
 //! Frame order: `GpuTransforms::record` -> [`Skins::record`] -> `TLAS::record` (the TLAS is
 //! rebuilt every frame a skinned instance deformed). Previous-frame deformed positions stay
 //! in the other half of the vertex ping-pong for the closest-hit's motion vectors.
+//!
+//! [`WindSway`] rides the same machinery with a different kernel: `wind_vertices` shears each
+//! vertex downwind by its sway weight (the skin stream's first joint weight, 0 at the anchored
+//! base, 1 at the tip; the first joint index is a per-plant phase id) under the global [`Wind`].
+//! No joints, no bind poses -- grass, crops, hanging cloth. A mesh's opacity micromap, when it
+//! has one, is attached to the per-instance BLAS as well, so cutout foliage keeps the
+//! hardware alpha test while it moves.
 
 use std::collections::HashMap;
 use std::mem::offset_of;
@@ -138,6 +145,74 @@ fn resolve_skin_joints(
     }
 }
 
+// ---- wind ----------------------------------------------------------------------------------
+
+/// Deform this `Mesh3d` with the global [`Wind`] instead of joints. The mesh must carry a skin
+/// stream (`JOINT_WEIGHT.x` = sway weight per vertex, `JOINT_INDEX.x` = phase id).
+#[derive(Component, Reflect, Clone, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct WindSway {
+    /// Tip displacement, metres, at a 10 m/s wind and full sway weight.
+    pub amplitude: f32,
+}
+
+impl Default for WindSway {
+    fn default() -> Self {
+        Self { amplitude: 0.25 }
+    }
+}
+
+/// The wind every [`WindSway`] instance feels.
+#[derive(Resource, Reflect, Clone, Debug, PartialEq)]
+#[reflect(Resource, Default)]
+pub struct Wind {
+    /// Heading the wind blows TOWARD, degrees clockwise from -Z.
+    #[reflect(@0.0..=360.0_f32)]
+    pub direction: f32,
+    /// Metres per second; 0 holds every plant still.
+    #[reflect(@0.0..=30.0_f32)]
+    pub speed: f32,
+    /// Strength of the slow gust front that rolls across the field (0 = steady).
+    #[reflect(@0.0..=2.0_f32)]
+    pub gust: f32,
+    /// Metres between wave crests of the main sway.
+    #[reflect(@0.5..=40.0_f32)]
+    pub wavelength: f32,
+    /// Per-plant flutter across the wind (0 = every plant moves as one).
+    #[reflect(@0.0..=1.0_f32)]
+    pub turbulence: f32,
+}
+
+impl Default for Wind {
+    fn default() -> Self {
+        Self {
+            direction: 45.0,
+            speed: 4.0,
+            gust: 0.6,
+            wavelength: 8.0,
+            turbulence: 0.5,
+        }
+    }
+}
+
+/// `WindParams` in skinning.slang.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WindParams {
+    rest: u64,
+    skin: u64,
+    world: u64,
+    dst: u64,
+    count: u32,
+    base: u32,
+    mesh_node: u32,
+    pad: u32,
+    /// direction.x, direction.z (unit), speed, time.
+    wind: [f32; 4],
+    /// amplitude, gust, wavelength, turbulence.
+    shape: [f32; 4],
+}
+
 // ---- inverse bind poses on the device -------------------------------------------------------
 
 /// Device copies of every loaded [`SkinnedMeshInverseBindposes`]: 16 floats per joint
@@ -217,11 +292,30 @@ struct PackParams {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum SkinKind {
+    Joints {
+        bindposes: AssetId<SkinnedMeshInverseBindposes>,
+        joints: Vec<Entity>,
+    },
+    Wind {
+        amplitude: f32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct SkinSource {
     mesh: AssetId<Mesh>,
-    bindposes: AssetId<SkinnedMeshInverseBindposes>,
-    joints: Vec<Entity>,
+    kind: SkinKind,
     node: u32,
+}
+
+impl SkinSource {
+    fn joints(&self) -> &[Entity] {
+        match &self.kind {
+            SkinKind::Joints { joints, .. } => joints,
+            SkinKind::Wind { .. } => &[],
+        }
+    }
 }
 
 /// The device half of a skinned instance, created once its mesh BLAS (with a skin stream) and
@@ -244,6 +338,9 @@ struct SkinnedGpu {
     joint_nodes: Buffer<u32>,
     joint_count: u32,
     inverse_bind: u64,
+    /// The mesh's opacity micromap (handle, per-triangle index address, usage counts):
+    /// attached to every build and refit, as the mesh BLAS attaches it.
+    micromap: Option<(vk::MicromapEXT, u64, Vec<vk::MicromapUsageEXT>)>,
     blas: AccelerationStructure,
     scratch: Buffer<u8>,
     scratch_alignment: u64,
@@ -266,6 +363,21 @@ impl SkinnedGpu {
         ] {
             rd.destroyer.destroy_buffer(b);
         }
+    }
+
+    /// The micromap attach for this instance's triangles; chain it as the triangles' `pNext`.
+    fn micromap_ext(&self) -> Option<vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>> {
+        self.micromap.as_ref().map(|(handle, index, usage)| {
+            vk::AccelerationStructureTrianglesOpacityMicromapEXT::default()
+                .index_type(vk::IndexType::UINT32)
+                .index_buffer(vk::DeviceOrHostAddressConstKHR {
+                    device_address: *index,
+                })
+                .index_stride(std::mem::size_of::<i32>() as u64)
+                .base_triangle(0)
+                .usage_counts(usage)
+                .micromap(*handle)
+        })
     }
 
     fn geometry(&self) -> vk::AccelerationStructureGeometryKHR<'static> {
@@ -317,6 +429,9 @@ pub struct SkinnedHitRecord {
 pub struct Skins {
     module: Handle<ComputeModule>,
     instances: HashMap<u32, SkinnedInstance>,
+    /// This frame's [`Wind`] (direction as a unit xz, speed, time; gust, wavelength,
+    /// turbulence), set by `extract_wind`.
+    wind: ([f32; 4], [f32; 3]),
     /// Slots whose skinned component or entity went away: drop everything.
     removed: Vec<u32>,
     /// Slots whose source changed: drop the device state, keep the record.
@@ -331,6 +446,7 @@ impl Skins {
         Self {
             module,
             instances: HashMap::new(),
+            wind: ([0.0, -1.0, 0.0, 0.0], [0.0, 8.0, 0.0]),
             removed: Vec::new(),
             rebuild: Vec::new(),
             frame: 0,
@@ -432,27 +548,55 @@ impl Skins {
             if inst.source.node >= node_count {
                 continue;
             }
-            let params = SkinParams {
-                rest: gpu.rest.address,
-                skin: gpu.skin,
-                world,
-                joint_nodes: gpu.joint_nodes.address,
-                inverse_bind: gpu.inverse_bind,
-                dst: gpu.vertices[cur].address,
-                count: gpu.vertex_count,
-                base: 0,
-                joint_count: gpu.joint_count,
-                mesh_node: inst.source.node,
-            };
-            record_dispatch(
-                rd,
-                cmd,
-                module,
-                "skin_vertices",
-                &params,
-                gpu.vertex_count,
-                Some(offset_of!(SkinParams, base)),
-            );
+            match inst.source.kind {
+                SkinKind::Joints { .. } => {
+                    let params = SkinParams {
+                        rest: gpu.rest.address,
+                        skin: gpu.skin,
+                        world,
+                        joint_nodes: gpu.joint_nodes.address,
+                        inverse_bind: gpu.inverse_bind,
+                        dst: gpu.vertices[cur].address,
+                        count: gpu.vertex_count,
+                        base: 0,
+                        joint_count: gpu.joint_count,
+                        mesh_node: inst.source.node,
+                    };
+                    record_dispatch(
+                        rd,
+                        cmd,
+                        module,
+                        "skin_vertices",
+                        &params,
+                        gpu.vertex_count,
+                        Some(offset_of!(SkinParams, base)),
+                    );
+                }
+                SkinKind::Wind { amplitude } => {
+                    let (wind, shape) = self.wind;
+                    let params = WindParams {
+                        rest: gpu.rest.address,
+                        skin: gpu.skin,
+                        world,
+                        dst: gpu.vertices[cur].address,
+                        count: gpu.vertex_count,
+                        base: 0,
+                        mesh_node: inst.source.node,
+                        pad: 0,
+                        wind,
+                        shape: [amplitude, shape[0], shape[1], shape[2]],
+                    };
+                    record_dispatch(
+                        rd,
+                        cmd,
+                        module,
+                        "wind_vertices",
+                        &params,
+                        gpu.vertex_count,
+                        Some(offset_of!(WindParams, base)),
+                    );
+                }
+            }
             any = true;
         }
         if !any {
@@ -493,37 +637,54 @@ impl Skins {
             vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
         );
 
-        // BLAS build / refit, one submission-free batch inside the frame.
-        let mut geometries: Vec<vk::AccelerationStructureGeometryKHR> = Vec::new();
-        let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::new();
-        let mut modes: Vec<(vk::AccelerationStructureKHR, bool, u64)> = Vec::new();
-        for inst in self.instances.values_mut() {
+        // BLAS build / refit, one submission-free batch inside the frame. Build-or-refit is
+        // decided (and counted) first; the geometries, whose micromap attach borrows the
+        // instance, are gathered after, with nothing mutated underneath them.
+        let mut modes: Vec<(u32, bool)> = Vec::new();
+        for (&slot, inst) in self.instances.iter_mut() {
             let Some(gpu) = inst.gpu.as_mut() else {
                 continue;
             };
             if inst.source.node >= node_count {
                 continue;
             }
+            let update = gpu.builds > 0 && gpu.builds % REBUILD_INTERVAL != 0;
+            gpu.builds = gpu.builds.wrapping_add(1).max(1);
+            modes.push((slot, update));
+        }
+        let mut geometries: Vec<vk::AccelerationStructureGeometryKHR> = Vec::with_capacity(modes.len());
+        let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::with_capacity(modes.len());
+        let mut targets: Vec<(vk::AccelerationStructureKHR, bool, u64)> = Vec::with_capacity(modes.len());
+        // The attach structs live here, unmoved, until the build is recorded.
+        let exts: Vec<Option<vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>>> = modes
+            .iter()
+            .map(|(slot, _)| self.instances[slot].gpu.as_ref().unwrap().micromap_ext())
+            .collect();
+        for ((slot, update), ext) in modes.iter().zip(&exts) {
+            let gpu = self.instances[slot].gpu.as_ref().unwrap();
             let mut geometry = gpu.geometry();
             geometry.geometry.triangles.vertex_data = vk::DeviceOrHostAddressConstKHR {
                 device_address: gpu.vertices[cur].address,
             };
-            let update = gpu.builds > 0 && gpu.builds % REBUILD_INTERVAL != 0;
-            gpu.builds = gpu.builds.wrapping_add(1).max(1);
+            if let Some(ext) = ext {
+                geometry.geometry.triangles.p_next =
+                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>)
+                        .cast();
+            }
             geometries.push(geometry);
             ranges.push(
                 vk::AccelerationStructureBuildRangeInfoKHR::default()
                     .primitive_count(gpu.triangle_count),
             );
-            modes.push((
+            targets.push((
                 gpu.blas.handle,
-                update,
+                *update,
                 vk_utils::aligned_size(gpu.scratch.address, gpu.scratch_alignment),
             ));
         }
         let infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR> = geometries
             .iter()
-            .zip(&modes)
+            .zip(&targets)
             .map(|(geometry, (handle, update, scratch))| {
                 let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                     .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
@@ -594,24 +755,61 @@ fn extract_skins(
     for (instance, node, mesh, skin) in changed.iter() {
         let source = SkinSource {
             mesh: mesh.id(),
-            bindposes: skin.inverse_bindposes.id(),
-            joints: skin.joints.clone(),
+            kind: SkinKind::Joints {
+                bindposes: skin.inverse_bindposes.id(),
+                joints: skin.joints.clone(),
+            },
             node: node.0,
         };
-        match skins.instances.get_mut(&instance.0) {
+        skins.set_source(instance.0, source);
+    }
+    // Joint palettes: joints get their transform-table slots the frame they spawn, and can
+    // be re-parented / respawned by gameplay, so re-resolve every frame (a few hundred
+    // lookups per skinned instance).
+    for inst in skins.instances.values_mut() {
+        let palette: Vec<u32> = inst
+            .source
+            .joints()
+            .iter()
+            .map(|&j| nodes.get(j).map_or(NO_NODE, |n| n.0))
+            .collect();
+        if palette != inst.joint_nodes {
+            inst.joint_nodes = palette;
+            inst.joints_dirty = true;
+        }
+    }
+}
+
+impl Skins {
+    /// Records a source for a slot: a changed mesh or kind drops the device state, a changed
+    /// pose parameter (joints re-resolved, wind amplitude) keeps it.
+    fn set_source(&mut self, slot: u32, source: SkinSource) {
+        match self.instances.get_mut(&slot) {
             Some(existing) if existing.source == source => {}
             Some(existing) => {
                 let rebuild = existing.source.mesh != source.mesh
-                    || existing.source.bindposes != source.bindposes
-                    || existing.source.joints.len() != source.joints.len();
+                    || match (&existing.source.kind, &source.kind) {
+                        (
+                            SkinKind::Joints {
+                                bindposes: a,
+                                joints: ja,
+                            },
+                            SkinKind::Joints {
+                                bindposes: b,
+                                joints: jb,
+                            },
+                        ) => a != b || ja.len() != jb.len(),
+                        (SkinKind::Wind { .. }, SkinKind::Wind { .. }) => false,
+                        _ => true,
+                    };
                 existing.source = source;
                 if rebuild {
-                    skins.rebuild.push(instance.0);
+                    self.rebuild.push(slot);
                 }
             }
             None => {
-                skins.instances.insert(
-                    instance.0,
+                self.instances.insert(
+                    slot,
                     SkinnedInstance {
                         source,
                         joint_nodes: Vec::new(),
@@ -622,20 +820,45 @@ fn extract_skins(
             }
         }
     }
-    // Joint palettes: joints get their transform-table slots the frame they spawn, and can
-    // be re-parented / respawned by gameplay, so re-resolve every frame (a few hundred
-    // lookups per skinned instance).
-    for inst in skins.instances.values_mut() {
-        let palette: Vec<u32> = inst
-            .source
-            .joints
-            .iter()
-            .map(|&j| nodes.get(j).map_or(NO_NODE, |n| n.0))
-            .collect();
-        if palette != inst.joint_nodes {
-            inst.joint_nodes = palette;
-            inst.joints_dirty = true;
+}
+
+type ChangedWind = Or<(
+    Added<GpuInstance>,
+    Changed<GpuNode>,
+    Changed<Mesh3d>,
+    Changed<WindSway>,
+)>;
+
+#[allow(clippy::type_complexity)]
+fn extract_wind(
+    mut skins: ResMut<Skins>,
+    wind: Res<Wind>,
+    time: Res<Time>,
+    changed: Query<(&GpuInstance, &GpuNode, &Mesh3d, &WindSway), ChangedWind>,
+    mut removed_components: RemovedComponents<WindSway>,
+    instances: Query<&GpuInstance>,
+) {
+    let heading = wind.direction.to_radians();
+    skins.wind = (
+        [heading.sin(), -heading.cos(), wind.speed, time.elapsed_secs_wrapped()],
+        [wind.gust, wind.wavelength, wind.turbulence],
+    );
+    for entity in removed_components.read() {
+        if let Ok(instance) = instances.get(entity) {
+            skins.removed.push(instance.0);
         }
+    }
+    for (instance, node, mesh, sway) in changed.iter() {
+        skins.set_source(
+            instance.0,
+            SkinSource {
+                mesh: mesh.id(),
+                kind: SkinKind::Wind {
+                    amplitude: sway.amplitude,
+                },
+                node: node.0,
+            },
+        );
     }
 }
 
@@ -654,7 +877,7 @@ pub fn prepare_skins(
     mut skins: ResMut<Skins>,
     mut tlas: ResMut<TLAS>,
     meshes: Res<VulkanAssets<Mesh>>,
-    bindposes: Res<BindposeBuffers>,
+    bindposes_buffers: Res<BindposeBuffers>,
 ) {
     let skins = &mut *skins;
     skins.frame = skins.frame.wrapping_add(1);
@@ -698,14 +921,20 @@ pub fn prepare_skins(
                 // Not a skinned mesh: rendered rigid off the shared BLAS.
                 continue;
             };
-            let Some((inverse_bind, bind_count)) = bindposes.buffers.get(&inst.source.bindposes)
-            else {
-                continue;
+            let (inverse_bind, joint_count) = match &inst.source.kind {
+                SkinKind::Joints { bindposes, joints } => {
+                    let Some((inverse_bind, bind_count)) = bindposes_buffers.buffers.get(bindposes)
+                    else {
+                        continue;
+                    };
+                    let joint_count = (joints.len() as u32).min(*bind_count);
+                    if joint_count == 0 {
+                        continue;
+                    }
+                    (inverse_bind.address, joint_count)
+                }
+                SkinKind::Wind { .. } => (0, 0),
             };
-            let joint_count = (inst.source.joints.len() as u32).min(*bind_count);
-            if joint_count == 0 {
-                continue;
-            }
             let vertex_count = blas.vertex_buffer.nr_elements as u32;
             let index_count = blas.index_buffer.nr_elements as u32;
             if vertex_count == 0 || index_count < 3 {
@@ -755,9 +984,13 @@ pub fn prepare_skins(
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
             let joint_nodes = render_device.create_host_buffer::<u32>(
-                inst.source.joints.len().max(1) as u64,
+                inst.source.joints().len().max(1) as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
+            let micromap = blas
+                .micromap
+                .as_ref()
+                .map(|m| (m.handle, m.index_address(), m.index_usage().to_vec()));
 
             let mut gpu = SkinnedGpu {
                 mesh_vertex_buffer: blas.vertex_buffer.handle,
@@ -772,7 +1005,8 @@ pub fn prepare_skins(
                 triangles,
                 joint_nodes,
                 joint_count,
-                inverse_bind: inverse_bind.address,
+                inverse_bind,
+                micromap,
                 blas: AccelerationStructure::default(),
                 scratch: Buffer::default(),
                 scratch_alignment: vk_utils::get_acceleration_structure_properties(&render_device)
@@ -781,7 +1015,13 @@ pub fn prepare_skins(
                 builds: 0,
                 hit_offset: tlas.slot_hit_offset(slot),
             };
-            let geometry = gpu.geometry();
+            let mut geometry = gpu.geometry();
+            let ext = gpu.micromap_ext();
+            if let Some(ext) = &ext {
+                geometry.geometry.triangles.p_next =
+                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>)
+                        .cast();
+            }
             let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
             unsafe {
                 render_device
@@ -806,9 +1046,10 @@ pub fn prepare_skins(
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
             inst.joints_dirty = true;
+            let omm = gpu.micromap.is_some();
             inst.gpu = Some(gpu);
             log::info!(
-                "skinning: slot {slot} -> {vertex_count} vertices, {triangle_count} triangles, {joint_count} joints"
+                "skinning: slot {slot} -> {vertex_count} vertices, {triangle_count} triangles, {joint_count} joints, omm {omm}"
             );
         }
         // Point the TLAS slot at the deformed BLAS once it has been built (the first build
@@ -846,6 +1087,9 @@ impl Plugin for SkinningPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<SkinnedMeshInverseBindposes>();
         app.register_type::<SkinJointsByName>();
+        app.register_type::<WindSway>();
+        app.register_type::<Wind>();
+        app.init_resource::<Wind>();
         app.init_resource::<BindposeBuffers>();
         app.add_systems(PreUpdate, resolve_skin_joints);
         app.add_observer(on_instance_removed);
@@ -854,13 +1098,13 @@ impl Plugin for SkinningPlugin {
         let shader = asset_server.load(aurora_asset("shaders/skinning.slang"));
         let module = asset_server.add(ComputeModule::new(
             shader,
-            &["skin_vertices", "pack_triangles"],
+            &["skin_vertices", "wind_vertices", "pack_triangles"],
         ));
         app.insert_resource(Skins::new(module));
         app.add_systems(
             Last,
             (
-                (upload_bindposes, extract_skins).in_set(RenderSet::Extract),
+                (upload_bindposes, extract_skins, extract_wind).in_set(RenderSet::Extract),
                 prepare_skins
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<Mesh>)

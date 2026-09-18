@@ -9,8 +9,10 @@
 //! micro-triangles never invoke the any-hit shader; `unknown` ones still do (4-state bakes), so
 //! the shader-side alpha test stays exact where the bake could not decide.
 //!
-//! The micromap is referenced by the BLAS at trace time and lives as long as it; the build
-//! inputs (array data, triangle descriptors, per-triangle index, scratch) are transient.
+//! The micromap is referenced by the BLAS at trace time and lives as long as it. The array
+//! build inputs (array data, triangle descriptors, scratch) are transient; the per-triangle
+//! index and its usage counts stay with the [`Micromap`], so another structure over the same
+//! triangles (a skinned instance's per-frame BLAS, skinning.rs) can attach it too.
 //! Instances can opt out per frame with `VK_GEOMETRY_INSTANCE_DISABLE_OPACITY_MICROMAPS_EXT`
 //! (the dev panel's `omm` toggle, `tlas_builder.rs`).
 
@@ -30,16 +32,44 @@ use crate::{
 /// validation error; 256 is safe on every driver.
 const SCRATCH_ALIGNMENT: u64 = 256;
 
-/// A built micromap: what the BLAS references while it is traced.
+/// A built micromap: what the BLAS references while it is traced, plus the per-triangle
+/// attach inputs any BLAS over the same triangle order needs.
 pub struct Micromap {
     pub handle: vk::MicromapEXT,
     pub buffer: Buffer<u8>,
+    index: Buffer<i32>,
+    index_usage: Vec<vk::MicromapUsageEXT>,
+    pub triangle_count: usize,
 }
 
 impl Micromap {
     pub fn destroy(&self, rd: &RenderDevice) {
         rd.destroyer.destroy_micromap(self.handle);
         rd.destroyer.destroy_buffer(self.buffer.handle);
+        rd.destroyer.destroy_buffer(self.index.handle);
+    }
+
+    pub fn index_address(&self) -> u64 {
+        self.index.address
+    }
+
+    pub fn index_usage(&self) -> &[vk::MicromapUsageEXT] {
+        &self.index_usage
+    }
+
+    /// The `pNext` for a `VkAccelerationStructureGeometryTrianglesDataKHR` whose triangles are
+    /// in this micromap's index order. The value borrows `self`: keep it (unmoved) until the
+    /// build that chains it has been recorded.
+    pub fn geometry_ext(&self) -> vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_> {
+        vk::AccelerationStructureTrianglesOpacityMicromapEXT::default()
+            .index_type(vk::IndexType::UINT32)
+            .index_buffer(vk::DeviceOrHostAddressConstKHR {
+                device_address: self.index.address,
+            })
+            .index_stride(std::mem::size_of::<i32>() as u64)
+            .base_triangle(0)
+            .usage_counts(&self.index_usage)
+            .micromap(self.handle)
     }
 }
 
@@ -67,10 +97,8 @@ pub struct MicromapBuild {
     array_data_address: u64,
     descs: Buffer<u8>,
     descs_address: u64,
-    index: Buffer<i32>,
     scratch: Buffer<u8>,
     usage: Vec<vk::MicromapUsageEXT>,
-    index_usage: Vec<vk::MicromapUsageEXT>,
     geometry_ext: vk::AccelerationStructureTrianglesOpacityMicromapEXT<'static>,
     pub triangle_count: usize,
 }
@@ -156,30 +184,35 @@ impl MicromapBuild {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         );
 
+        let triangle_count = slices.index.len();
         let mut build = Box::new(Self {
-            micromap: Micromap { handle, buffer },
+            micromap: Micromap {
+                handle,
+                buffer,
+                index,
+                index_usage,
+                triangle_count,
+            },
             array_data,
             array_data_address,
             descs,
             descs_address,
-            index,
             scratch,
             usage,
-            index_usage,
             geometry_ext: vk::AccelerationStructureTrianglesOpacityMicromapEXT::default(),
-            triangle_count: slices.index.len(),
+            triangle_count,
         });
         // Pointers into the box: stable from here on.
         build.geometry_ext = vk::AccelerationStructureTrianglesOpacityMicromapEXT::default()
             .index_type(vk::IndexType::UINT32)
             .index_buffer(vk::DeviceOrHostAddressConstKHR {
-                device_address: build.index.address,
+                device_address: build.micromap.index.address,
             })
             .index_stride(std::mem::size_of::<i32>() as u64)
             .base_triangle(0)
             .micromap(build.micromap.handle);
-        build.geometry_ext.usage_counts_count = build.index_usage.len() as u32;
-        build.geometry_ext.p_usage_counts = build.index_usage.as_ptr();
+        build.geometry_ext.usage_counts_count = build.micromap.index_usage.len() as u32;
+        build.geometry_ext.p_usage_counts = build.micromap.index_usage.as_ptr();
         Some(build)
     }
 
@@ -235,14 +268,10 @@ impl MicromapBuild {
         }
     }
 
-    /// Releases the build inputs once the BLAS build that read them has completed.
+    /// Releases the array build inputs once the BLAS build that read them has completed; the
+    /// per-triangle index stays with the micromap.
     pub fn finish(self: Box<Self>, rd: &RenderDevice) -> Micromap {
-        for b in [
-            self.array_data.handle,
-            self.descs.handle,
-            self.index.handle,
-            self.scratch.handle,
-        ] {
+        for b in [self.array_data.handle, self.descs.handle, self.scratch.handle] {
             rd.destroyer.destroy_buffer(b);
         }
         self.micromap
