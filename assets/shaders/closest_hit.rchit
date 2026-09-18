@@ -61,6 +61,12 @@ vec4 toLinear(const vec4 sRGB)
 
 #define PACKED 1
 
+// One texture read at the ray-cone level: `lod_base` plus half the log2 of the texel count.
+vec4 sampleLod(const uint index, const vec2 uv, const float lod_base) {
+  const vec2 size = vec2(textureSize(textures[index], 0));
+  return textureLod(textures[index], uv, lod_base + 0.5 * log2(size.x * size.y));
+}
+
 void main() {
   const vec3 baryCoords = vec3(1.0f - attribs.x - attribs.y, attribs.x, attribs.y);
   const Material material = pc.materials.materials[gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT];
@@ -78,6 +84,7 @@ void main() {
       unpackNormal(tri.normals[2])
   ) * baryCoords;
   const vec3 tangent = unpackNormal(tri.tangent);
+  const float tri_lod = tri.lod;
 #else
   const uint index_offset = geometries.index_offsets[gl_GeometryIndexEXT];
   const Vertex v0 = vertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 0]];
@@ -86,6 +93,7 @@ void main() {
   const vec2 uv = v0.texcoord * baryCoords.x + v1.texcoord * baryCoords.y + v2.texcoord * baryCoords.z;
   vec3 object_normal = v0.normal * baryCoords.x + v1.normal * baryCoords.y + v2.normal * baryCoords.z;
   const vec3 tangent = calcTangent(v0, v1, v2);
+  const float tri_lod = 0.0;
 #endif
 
 
@@ -100,10 +108,28 @@ void main() {
   payload.refract_index = material.refract_index;
   payload.absorption = material.absorption;
 
+  // Texture level of detail by ray cone (Akenine-Moller et al., Ray Tracing Gems ch. 20): a
+  // ray-tracing stage has no derivatives, so the footprint comes from the cone the raygen
+  // carries (width at the hit), the triangle's texel density (`tri_lod`, object space, so
+  // the instance scale comes off), and the incidence angle. Per texture, half the log of
+  // its texel count is added (`sampleLod`). Without this every read is level 0, and under
+  // sub-pixel jitter a minified texture lands on a different texel every frame.
+  const float cone_width = max(payload.cone.x + payload.cone.y * gl_HitTEXT, 1.0e-7);
+  const float object_scale = max(length(gl_ObjectToWorldEXT[0].xyz), 1.0e-6);
+  const float incidence = max(abs(dot(surface_normal, gl_WorldRayDirectionEXT)), 0.1);
+  const float lod_base = tri_lod - log2(object_scale) + log2(cone_width) - log2(incidence)
+      + pc.uniforms.lod_bias;
+
   payload.color = material.base_color_factor;
-  payload.color *= toLinear(texture(textures[material.base_color_texture], uv));
+  payload.color *= toLinear(sampleLod(material.base_color_texture, uv, lod_base));
+  if (material.alpha_cutoff > 0.0) {
+    // A cutout's coverage comes from level 0, like the any-hit test: a blurred alpha would
+    // thin foliage out with distance.
+    payload.color.a = material.base_color_factor.a
+        * texture(textures[material.base_color_texture], uv).a;
+  }
   payload.emission = material.base_emissive_factor.rgb;
-  payload.emission *= toLinear(texture(textures[material.base_emissive_texture], uv)).rgb;
+  payload.emission *= toLinear(sampleLod(material.base_emissive_texture, uv, lod_base)).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
 
   // Terrain records (recordFlags.x bit 1): the editor's brush ring, emissive so it reads in
@@ -117,16 +143,16 @@ void main() {
   }
 
   float transmission = material.specular_transmission_factor;
-  transmission *= texture(textures[material.specular_transmission_texture], uv).r;
+  transmission *= sampleLod(material.specular_transmission_texture, uv, lod_base).r;
 
-  const vec4 mr = texture(textures[material.metallic_roughness_texture], uv);
+  const vec4 mr = sampleLod(material.metallic_roughness_texture, uv, lod_base);
   const float roughness = material.roughness_factor * mr.g;
   const float metallic = material.metallic_factor * mr.b;
 
   const vec3 bitangent = cross(object_normal, tangent);
   const mat3 TBN = mat3(tangent, bitangent, object_normal);
 
-  const vec3 texture_normal = texture(textures[material.normal_texture], uv).xyz * 2.0 - 1.0;
+  const vec3 texture_normal = sampleLod(material.normal_texture, uv, lod_base).xyz * 2.0 - 1.0;
   const vec3 world_normal = normalize(mat3(gl_ObjectToWorldEXT) * TBN * texture_normal);
 
   payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);

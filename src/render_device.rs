@@ -954,7 +954,9 @@ fn create_linear_sampler(device: ash::Device) -> vk::Sampler {
         .anisotropy_enable(false)
         .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
         .unnormalized_coordinates(false)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        // The default max_lod of 0 would pin every read to level 0.
+        .max_lod(vk::LOD_CLAMP_NONE);
     unsafe { device.create_sampler(&linear_sampler_info, None).unwrap() }
 }
 

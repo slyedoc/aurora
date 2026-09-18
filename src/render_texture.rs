@@ -28,6 +28,100 @@ impl Plugin for RenderTexturePlugin {
 pub struct RenderTexture {
     pub image: vk::Image,
     pub image_view: vk::ImageView,
+    /// Levels in the image (and the view). 8-bit uploads carry a full chain, which the hit
+    /// shader selects from by ray cone; anything that rewrites level 0 on the GPU refreshes
+    /// the rest with [`record_mip_chain`].
+    pub mip_levels: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Records the blits that fill levels 1.. from level 0 and leaves every level in
+/// `final_layout`. `mip0_layout` is what level 0 is in on entry (TRANSFER_DST after an upload
+/// or a copy), `rest_layout` what the other levels are in (UNDEFINED on a fresh image).
+#[allow(clippy::too_many_arguments)]
+pub fn record_mip_chain(
+    device: &RenderDevice,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    mip0_layout: vk::ImageLayout,
+    rest_layout: vk::ImageLayout,
+    final_layout: vk::ImageLayout,
+) {
+    let barrier = |base: u32, count: u32, old, new, src_access, dst_access, dst_stage| {
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .image(image)
+            .old_layout(old)
+            .new_layout(new)
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(base)
+                    .level_count(count)
+                    .layer_count(1),
+            );
+        unsafe {
+            device.ext_sync2.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
+            );
+        }
+    };
+    let transfer = vk::PipelineStageFlags2::TRANSFER;
+    let read = vk::AccessFlags2::TRANSFER_READ;
+    let write = vk::AccessFlags2::TRANSFER_WRITE;
+    if mip_levels > 1 {
+        barrier(1, mip_levels - 1, rest_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags2::NONE, write, transfer);
+    }
+    for level in 1..mip_levels {
+        let src_layout = if level == 1 { mip0_layout } else { vk::ImageLayout::TRANSFER_DST_OPTIMAL };
+        barrier(level - 1, 1, src_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, write, read, transfer);
+        let size = |v: u32, l: u32| (v >> l).max(1) as i32;
+        let layers = |l: u32| {
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(l)
+                .layer_count(1)
+        };
+        let blit = vk::ImageBlit::default()
+            .src_subresource(layers(level - 1))
+            .src_offsets([
+                vk::Offset3D::default(),
+                vk::Offset3D { x: size(width, level - 1), y: size(height, level - 1), z: 1 },
+            ])
+            .dst_subresource(layers(level))
+            .dst_offsets([
+                vk::Offset3D::default(),
+                vk::Offset3D { x: size(width, level), y: size(height, level), z: 1 },
+            ]);
+        unsafe {
+            device.device.cmd_blit_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&blit),
+                vk::Filter::LINEAR,
+            );
+        }
+    }
+    let shader = vk::PipelineStageFlags2::ALL_COMMANDS;
+    let shader_read = vk::AccessFlags2::SHADER_READ;
+    if mip_levels > 1 {
+        barrier(0, mip_levels - 1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, final_layout, read, shader_read, shader);
+        barrier(mip_levels - 1, 1, vk::ImageLayout::TRANSFER_DST_OPTIMAL, final_layout, write, shader_read, shader);
+    } else {
+        barrier(0, 1, mip0_layout, final_layout, write, shader_read, shader);
+    }
 }
 
 impl VulkanAsset for bevy::prelude::Image {
@@ -128,6 +222,15 @@ pub fn load_texture_from_bytes(
         (width * height) as usize * target_bytes_per_pixel,
         bytes.len()
     );
+    // A ray-tracing stage has no derivatives: without a chain every texture is read at full
+    // resolution however far away it is, and under sub-pixel jitter a minified one lands on a
+    // different texel every frame. 8-bit textures get the whole chain (the float path is the
+    // sky, read by direction at its own resolution).
+    let mip_levels = if format == vk::Format::R8G8B8A8_UNORM {
+        32 - width.max(height).max(1).leading_zeros()
+    } else {
+        1
+    };
     let mut staging_buffer = device.create_host_buffer::<u8>(
         (width * height * target_bytes_per_pixel as u32) as u64,
         vk::BufferUsageFlags::TRANSFER_SRC,
@@ -145,11 +248,11 @@ pub fn load_texture_from_bytes(
             height,
             depth: 1,
         })
-        .mip_levels(1)
+        .mip_levels(mip_levels)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | usage_flags)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | usage_flags)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -219,29 +322,31 @@ pub fn load_texture_from_bytes(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             std::slice::from_ref(&copy_region),
         );
-        let to_final = vk_init::layout_transition2(
-            image_handle,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            desired_layout,
-        )
-        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .dst_access_mask(vk::AccessFlags2::SHADER_READ);
-        device.ext_sync2.cmd_pipeline_barrier2(
+        record_mip_chain(
+            device,
             cmd_buffer,
-            &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_final)),
+            image_handle,
+            width,
+            height,
+            mip_levels,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::UNDEFINED,
+            desired_layout,
         );
     });
 
     device.destroyer.destroy_buffer(staging_buffer.handle);
 
-    let view_info = vk_init::image_view_info(image_handle.clone(), format);
+    let mut view_info = vk_init::image_view_info(image_handle, format);
+    view_info.subresource_range.level_count = mip_levels;
     let view = unsafe { device.device.create_image_view(&view_info, None).unwrap() };
 
     RenderTexture {
         image: image_handle,
         image_view: view,
+        mip_levels,
+        width,
+        height,
     }
 }
 
@@ -340,5 +445,8 @@ pub fn create_blank_texture(
     RenderTexture {
         image: image_handle,
         image_view: view,
+        mip_levels: 1,
+        width,
+        height,
     }
 }

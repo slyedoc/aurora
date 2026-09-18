@@ -43,7 +43,7 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    render_texture::RenderTexture,
+    render_texture::{RenderTexture, record_mip_chain},
     tlas_builder::{GpuInstance, InstanceOverride, TLAS, prepare_instances},
     vk_utils,
     vulkan_asset::{VulkanAssets, poll_for_asset},
@@ -730,13 +730,17 @@ fn copy_compose_to_texture(
             std::slice::from_ref(&region),
         );
     }
-    transition(
+    // Level 0 changed: refresh the chain under it (the tracer reads the diffuse by ray cone).
+    record_mip_chain(
+        rd,
+        cmd,
+        texture.image,
+        texture.width,
+        texture.height,
+        texture.mip_levels,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::PipelineStageFlags2::TRANSFER,
-        vk::AccessFlags2::TRANSFER_WRITE,
-        vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-        vk::AccessFlags2::SHADER_READ,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     );
 }
 

@@ -59,9 +59,9 @@ pub struct Triangle {
     pub tangent: u32,
     pub normals: [u32; 3],
     pub uvs: [u32; 3],
-    // We get better cache aligment by making the struct
-    // 32 bytes instead of (3 + 3 + 1) * 4 = 28
-    pub padding: u32,
+    /// `0.5 * log2(uv area / object-space area)`: the triangle term of the ray-cone texture
+    /// level of detail (closest_hit.rchit). Also rounds the record to 32 bytes.
+    pub lod: f32,
 }
 
 impl Triangle {
@@ -913,7 +913,11 @@ fn pack_triangle(v0: &Vertex, v1: &Vertex, v2: &Vertex) -> Triangle {
 
     Triangle {
         tangent: Triangle::pack_normal(&tangent),
-        padding: 0,
+        lod: {
+            let uv_area = (delta_uv1.x * delta_uv2.y - delta_uv2.x * delta_uv1.y).abs();
+            let area = edge1.cross(edge2).length();
+            0.5 * (uv_area.max(1.0e-12) / area.max(1.0e-12)).log2()
+        },
         normals: [
             Triangle::pack_normal(&v0.normal),
             Triangle::pack_normal(&v1.normal),

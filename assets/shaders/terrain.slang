@@ -35,7 +35,7 @@ struct Triangle {
     uint tangent;
     uint n0, n1, n2;
     uint uv0, uv1, uv2;
-    uint padding;
+    float lod;
 };
 
 // ---- height sampling ---------------------------------------------------------------------
@@ -264,7 +264,8 @@ void terrain_pack(uint3 gid: SV_DispatchThreadID) {
     tri.uv0 = pack_uv(uv0);
     tri.uv1 = pack_uv(uv1);
     tri.uv2 = pack_uv(uv2);
-    tri.padding = 0;
+    // Texture LOD base: 0.5 * log2(uv area / surface area), both doubled (closest_hit).
+    tri.lod = 0.5 * log2(max(abs(denom), 1.0e-12) / max(length(cross(edge1, edge2)), 1.0e-12));
     pack_params.triangles[t] = tri;
 }
 
