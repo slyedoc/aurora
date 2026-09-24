@@ -20,6 +20,31 @@ layout(push_constant, std430) uniform Registers {
   uint debug_view;
 };
 
+// Scene luminance in NITS, false-coloured against the authoring reference bands in
+// aurora_files/lighting_units.md. One decade per band, with the boundary darkened so the
+// decades are countable rather than a smooth ramp you have to eyeball.
+//
+//   blue   <1        deep shadow          yellow  1e3..1e4  signage / overcast sky
+//   cyan    1..10    dim interior         orange  1e4..1e5  LUMINAIRE surface
+//   green  10..1e2                        red     1e5..1e6
+//   lime   1e2..1e3  screens              white   >1e6      sun disc
+vec3 nitsFalseColor(float nits) {
+  const float t = log2(max(nits, 1.0e-4)) / log2(10.0);   // log10 nits
+  vec3 c;
+  if      (t < 0.0) c = mix(vec3(0.02, 0.02, 0.10), vec3(0.15, 0.15, 0.65), clamp(t + 1.0, 0.0, 1.0));
+  else if (t < 1.0) c = mix(vec3(0.15, 0.15, 0.65), vec3(0.00, 0.60, 0.90), t);
+  else if (t < 2.0) c = mix(vec3(0.00, 0.60, 0.90), vec3(0.00, 0.85, 0.40), t - 1.0);
+  else if (t < 3.0) c = mix(vec3(0.00, 0.85, 0.40), vec3(0.85, 0.95, 0.00), t - 2.0);
+  else if (t < 4.0) c = mix(vec3(0.85, 0.95, 0.00), vec3(1.00, 0.60, 0.00), t - 3.0);
+  else if (t < 5.0) c = mix(vec3(1.00, 0.60, 0.00), vec3(1.00, 0.20, 0.05), t - 4.0);
+  else if (t < 6.0) c = mix(vec3(1.00, 0.20, 0.05), vec3(1.00, 0.00, 0.60), t - 5.0);
+  else              c = mix(vec3(1.00, 0.00, 0.60), vec3(1.00, 1.00, 1.00), clamp(t - 6.0, 0.0, 1.0));
+
+  const float f = fract(t);
+  const float edge = smoothstep(0.0, 0.035, f) * smoothstep(0.0, 0.035, 1.0 - f);
+  return c * (0.4 + 0.6 * edge);
+}
+
 vec3 acesFilm(const vec3 x) {
     const float a = 2.51;
     const float b = 0.03;
@@ -46,6 +71,19 @@ vec3 applyVignette(vec3 color, float strength) {
 }
 
 void main() {
+  // Luminance: the one view that must UNDO the exposure. The colour guide is what Ray
+  // Reconstruction ingests, pre-exposed at the quantised `input_exposure`; dividing that
+  // back out recovers the scene's physical radiance in nits, independent of the look and
+  // of whatever the metering is currently doing. That separation is the whole point --
+  // "emitter authored too dim" and "exposure keyed to something bright" are different
+  // bugs that look the same through a tonemapper.
+  if (debug_view == 9) {
+    const vec3 pre = texture(test[1], in_UV).rgb;
+    const float nits = dot(pre, vec3(0.2126, 0.7152, 0.0722)) / max(ae.input_exposure, 1.0e-12);
+    out_Color = vec4(nitsFalseColor(nits), 1.0);
+    return;
+  }
+
   // Data views: raw encodings, no exposure or tonemap -- a static scene shows a static
   // image (matches AuroraDebugView's variant order).
   if (debug_view >= 2) {

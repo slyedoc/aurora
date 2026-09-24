@@ -26,6 +26,11 @@ use crate::{
 /// Must match `AE_HISTOGRAM_THREADS` in auto_exposure.slang.
 const HISTOGRAM_THREADS: u32 = 16384;
 
+/// Side of the square patch of `lum` copied back for the centre-screen nits readout.
+/// A single pixel of 1-spp path radiance is mostly noise; a patch mean plus the temporal
+/// smoothing below gives a number that can actually be read off the panel.
+const PROBE_SIDE: u32 = 9;
+
 /// Histogram domain in log2 nits: bin 1 at 2^-5 (deep shadow) through 2^27 (the sun disk).
 const MIN_LOG_LUM: f32 = -5.0;
 const LOG_LUM_RANGE: f32 = 32.0;
@@ -48,6 +53,23 @@ impl Default for AuroraExposure {
     fn default() -> Self {
         Self::Auto(AutoExposureSettings::default())
     }
+}
+
+/// `log2(1.2)`. Aurora's `ev` is log2 of the multiplier applied to radiance in nits;
+/// EV100 is the photographic stop. Filament's mapping is `exposure = 1 / (1.2 * 2^EV100)`,
+/// so `ev = -EV100 - log2(1.2)` -- which is why [`AuroraExposure::SUNLIGHT`] is -15.26 and
+/// not -15. The panel speaks EV100 because that is the language of
+/// aurora_files/lighting_units.md and of every exposure reference.
+pub const EV100_OFFSET: f32 = 0.2630344;
+
+/// EV100 -> aurora's internal `ev`.
+pub fn ev_from_ev100(ev100: f32) -> f32 {
+    -ev100 - EV100_OFFSET
+}
+
+/// Aurora's internal `ev` -> EV100.
+pub fn ev100_from_ev(ev: f32) -> f32 {
+    -ev - EV100_OFFSET
 }
 
 impl AuroraExposure {
@@ -114,6 +136,23 @@ pub struct AutoExposureSettings {
     /// Artist EV offset on the mid-gray target.
     #[reflect(@-8.0..=8.0_f32)]
     pub compensation: f32,
+    /// The look adapts around this exposure...
+    #[reflect(@-30.0..=0.0_f32)]
+    pub reference_ev: f32,
+    /// ...by this fraction of the way to the metering: 1 = full auto (every scene lands at
+    /// the same brightness), 0 = locked at `reference_ev`. In between, dim scenes stay
+    /// dimmer than bright ones.
+    #[reflect(@0.0..=1.0_f32)]
+    pub adaptation: f32,
+    /// Ray Reconstruction's input exposure follows the full metering, but its history
+    /// cannot follow an exposure change: the input holds still within a quarter stop and
+    /// drifts at this many EV per second beyond it (slow enough to stay unseen)...
+    #[reflect(@0.0..=4.0_f32)]
+    pub input_speed: f32,
+    /// ...and snaps to the metering, with one visible pop, once it is this many EV off
+    /// (the light changed wholesale).
+    #[reflect(@0.25..=6.0_f32)]
+    pub input_deadband: f32,
 }
 
 impl Default for AutoExposureSettings {
@@ -132,6 +171,10 @@ impl Default for AutoExposureSettings {
             // Metering targets photographic mid-gray; ACES reads a couple of stops under
             // that as "well exposed" rather than washed out.
             compensation: -2.0,
+            reference_ev: -13.0,
+            adaptation: 0.8,
+            input_speed: 0.5,
+            input_deadband: 2.0,
         }
     }
 }
@@ -169,6 +212,10 @@ struct AeParams {
     compensation: f32,
     min_ev: f32,
     max_ev: f32,
+    input_deadband: f32,
+    input_speed: f32,
+    reference_ev: f32,
+    adaptation: f32,
     /// Keeps the struct free of implicit tail padding (u64 alignment) for `Pod`.
     _pad: u32,
 }
@@ -181,6 +228,12 @@ pub struct AutoExposureState {
     pixels: u64,
     histogram: Buffer<u32>,
     state: Buffer<AeGpu>,
+    /// Host-visible copy of a PROBE_SIDE^2 patch of `lum` at screen centre, for the panel
+    /// readout. One frame behind, like the metering.
+    probe: Buffer<f32>,
+    /// Smoothed centre-screen scene luminance, NITS -- physical, pre-exposure, so it reads
+    /// the same whatever the metering or the look is doing. See [`Self::probe_nits`].
+    probe_nits: f32,
     /// `lum` holds a full traced frame at the current size (metering skips until then).
     pub primed: bool,
 }
@@ -193,7 +246,65 @@ impl AutoExposureState {
             pixels: 0,
             histogram: Buffer::default(),
             state: Buffer::default(),
+            probe: Buffer::default(),
+            probe_nits: 0.0,
             primed: false,
+        }
+    }
+
+    /// Centre-screen scene luminance in nits: what the surface under the crosshair is
+    /// actually emitting or reflecting, independent of exposure and tonemap. Compare
+    /// against the bands in aurora_files/lighting_units.md.
+    pub fn probe_nits(&self) -> f32 {
+        self.probe_nits
+    }
+
+    /// Reads back the patch the PREVIOUS frame copied and folds it into the smoothed
+    /// value. Called at the top of `record`, by which point (one frame in flight) that
+    /// copy has landed.
+    fn read_probe(&mut self, rd: &RenderDevice) {
+        if self.probe.handle == vk::Buffer::null() || !self.primed {
+            return;
+        }
+        let mut view = rd.map_buffer(&mut self.probe);
+        let samples = view.as_slice_mut();
+        let sum: f32 = samples.iter().copied().filter(|v| v.is_finite()).sum();
+        let mean = sum / samples.len().max(1) as f32;
+        // Geometric-ish smoothing: luminance spans decades, so a linear EMA would be
+        // dominated by the brightest frames.
+        const ALPHA: f32 = 0.15;
+        self.probe_nits = if self.probe_nits > 0.0 && mean > 0.0 {
+            (self.probe_nits.ln() * (1.0 - ALPHA) + mean.ln() * ALPHA).exp()
+        } else {
+            mean
+        };
+    }
+
+    /// Copies the centre patch of `lum` into the host-visible probe buffer.
+    fn record_probe(&self, rd: &RenderDevice, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
+        if self.probe.handle == vk::Buffer::null() || extent.width == 0 || extent.height == 0 {
+            return;
+        }
+        let side = PROBE_SIDE.min(extent.width).min(extent.height);
+        let half = side / 2;
+        let cx = (extent.width / 2).saturating_sub(half);
+        let cy = (extent.height / 2).saturating_sub(half);
+        let stride = std::mem::size_of::<f32>() as u64;
+        // One region per row of the patch: `lum` is a flat row-major buffer, so a square
+        // is not contiguous.
+        let regions: Vec<vk::BufferCopy> = (0..side)
+            .map(|row| {
+                let src = ((cy + row) as u64 * extent.width as u64 + cx as u64) * stride;
+                vk::BufferCopy {
+                    src_offset: src,
+                    dst_offset: row as u64 * side as u64 * stride,
+                    size: side as u64 * stride,
+                }
+            })
+            .collect();
+        unsafe {
+            rd.device
+                .cmd_copy_buffer(cmd, self.lum.handle, self.probe.handle, &regions);
         }
     }
 
@@ -240,10 +351,17 @@ impl AutoExposureState {
         exposure: &AuroraExposure,
         dt: f32,
     ) {
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        self.read_probe(rd);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::TRANSFER_SRC;
         if self.state.handle == vk::Buffer::null() {
             self.histogram = rd.create_device_buffer(64, usage);
             self.state = rd.create_device_buffer(1, usage);
+            self.probe = rd.create_host_buffer(
+                (PROBE_SIDE * PROBE_SIDE) as u64,
+                vk::BufferUsageFlags::TRANSFER_DST,
+            );
             unsafe {
                 rd.device
                     .cmd_fill_buffer(cmd, self.histogram.handle, 0, vk::WHOLE_SIZE, 0);
@@ -294,18 +412,26 @@ impl AutoExposureState {
             compensation: settings.compensation,
             min_ev: settings.min_ev,
             max_ev: settings.max_ev.max(settings.min_ev),
+            input_deadband: settings.input_deadband.max(0.0),
+            input_speed: settings.input_speed.max(0.0),
+            reference_ev: settings.reference_ev,
+            adaptation: settings.adaptation.clamp(0.0, 1.0),
             _pad: 0,
         };
 
-        // Last frame's raygen wrote `lum`; this frame's raygen reads the exposure.
+        // Last frame's raygen wrote `lum`; this frame's raygen reads the exposure. The
+        // TRANSFER destination is the centre-patch probe copy below.
         memory_barrier(
             rd,
             cmd,
             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             vk::AccessFlags2::SHADER_WRITE,
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_READ
+                | vk::AccessFlags2::SHADER_WRITE
+                | vk::AccessFlags2::TRANSFER_READ,
         );
+        self.record_probe(rd, cmd, extent);
         record_dispatch(
             rd,
             cmd,
@@ -351,9 +477,11 @@ fn cleanup(mut state: ResMut<AutoExposureState>, rd: Res<RenderDevice>) {
     rd.destroyer.destroy_buffer(state.lum.handle);
     rd.destroyer.destroy_buffer(state.histogram.handle);
     rd.destroyer.destroy_buffer(state.state.handle);
+    rd.destroyer.destroy_buffer(state.probe.handle);
     state.lum = Buffer::default();
     state.histogram = Buffer::default();
     state.state = Buffer::default();
+    state.probe = Buffer::default();
 }
 
 pub struct AutoExposurePlugin;

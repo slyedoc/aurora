@@ -31,6 +31,11 @@ pub enum AuroraDebugView {
     SpecHit,
     /// Motion vectors (pixels), `mv * 0.1 + 0.5`.
     Motion,
+    /// Scene luminance in NITS, false-coloured against the authoring reference bands
+    /// (aurora_files/lighting_units.md). The instrument for "is this emitter authored at
+    /// the right magnitude, or is the exposure wrong?" -- two independent failures that
+    /// look identical through a tonemapper.
+    Luminance,
 }
 
 impl AuroraDebugView {
@@ -44,6 +49,7 @@ impl AuroraDebugView {
         Self::Depth,
         Self::SpecHit,
         Self::Motion,
+        Self::Luminance,
     ];
 
     /// The value quad.frag switches on.
@@ -51,7 +57,8 @@ impl AuroraDebugView {
         self as u32
     }
 
-    /// `$AURORA_DEBUG_VIEW` (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion`),
+    /// `$AURORA_DEBUG_VIEW`
+    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance`),
     /// else the normal render: lets a headless run capture a guide view.
     pub fn from_env() -> Self {
         match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
@@ -63,6 +70,7 @@ impl AuroraDebugView {
             Some("depth") => Self::Depth,
             Some("spec-hit") => Self::SpecHit,
             Some("motion") => Self::Motion,
+            Some("luminance") | Some("nits") => Self::Luminance,
             _ => Self::None,
         }
     }

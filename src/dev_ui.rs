@@ -26,6 +26,7 @@ use bevy::{
 };
 
 use crate::{
+    auto_exposure::{AuroraExposure, ev100_from_ev, ev_from_ev100},
     dlss::{AuroraDlss, RrPreset, set_jitter_scale},
     sky::ProceduralSky,
     ui_render::UiRenderPlugin,
@@ -67,19 +68,24 @@ pub struct DevUIState {
     /// Next-event estimation for emissive triangles (off = BRDF sampling only, the
     /// reference estimator).
     pub light_nee: bool,
-    /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse). Off while
-    /// accumulating, so Space stays the uncorrelated reference.
     /// Added to the ray-cone texture level of detail, on top of the automatic
     /// log2(render / output) term. The DLSS guide asks for -1 (sharper: accumulation over
     /// jittered frames resolves the extra detail); 0 is the unbiased footprint, positive blurs.
     #[reflect(@-3.0..=3.0_f32)]
     pub texture_lod_bias: f32,
+    /// Ray Reconstruction's specular hit distance comes from one extra mirror-direction ray
+    /// at the primary vertex, for surfaces up to this perceptual roughness; rougher ones
+    /// report 0 (the reflection moves with the surface). 0 = no guide rays.
+    #[reflect(@0.0..=1.0_f32)]
+    pub spec_hit_roughness: f32,
     /// Light candidates resampled at every shading point (RIS): each is drawn from the
     /// power-weighted table, weighted by what it would contribute HERE, one survives and
     /// gets the shadow ray. 1 = a single table sample, which with hundreds of lights almost
     /// always lands on one too far away to matter. Deeper bounces use a quarter.
     #[reflect(@1.0..=32.0_f32)]
     pub light_candidates: u32,
+    /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse). Off while
+    /// accumulating, so Space stays the uncorrelated reference.
     pub restir: bool,
     /// Initial light candidates per pixel.
     #[reflect(@1.0..=32.0_f32)]
@@ -100,6 +106,15 @@ pub struct DevUIState {
     pub dlss: AuroraDlss,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
     pub rr_preset: RrPreset,
+    /// Lock exposure to `ev100` instead of metering. The metering keeps running
+    /// underneath either way -- it is what normalises Ray Reconstruction's input -- so
+    /// this changes the LOOK only, instantly and at no cost to denoiser history.
+    pub ev100_lock: bool,
+    /// The locked exposure, EV100: the photographic stop, the same number
+    /// aurora_files/lighting_units.md uses. ~14-16 daylight exterior, ~5-9 interior.
+    /// Only read when `ev100_lock` is on.
+    #[reflect(@0.0..=20.0_f32)]
+    pub ev100: f32,
     /// Sub-pixel camera jitter amplitude: 1 = the full +-0.5 traced pixel, 0 = pixel centres
     /// every frame. Lower is calmer -- the raw guide views hop less (they are shown
     /// unresolved; at ultra-performance half a traced pixel is one and a half screen pixels)
@@ -107,6 +122,39 @@ pub struct DevUIState {
     /// upscaled detail. NGX is always told the same scaled offset.
     #[reflect(@0.0..=1.0_f32)]
     pub jitter_scale: f32,
+}
+
+impl DevUIState {
+    /// The defaults with `$AURORA_DEV_UI` applied: `field=value` pairs separated by commas
+    /// (`sky_brightness=0,emissive_boost=1,restir=true`), for headless runs that cannot
+    /// reach the panel. Unknown fields and unparsable values are logged and skipped.
+    pub fn from_env() -> Self {
+        let mut state = Self::default();
+        let Ok(overrides) = std::env::var("AURORA_DEV_UI") else {
+            return state;
+        };
+        for pair in overrides.split(',').filter(|pair| !pair.trim().is_empty()) {
+            let applied = pair.split_once('=').is_some_and(|(name, value)| {
+                let value = value.trim();
+                let Some(field) = state.field_mut(name.trim()) else {
+                    return false;
+                };
+                if let Some(field) = field.try_downcast_mut::<f32>() {
+                    value.parse().map(|v| *field = v).is_ok()
+                } else if let Some(field) = field.try_downcast_mut::<u32>() {
+                    value.parse().map(|v| *field = v).is_ok()
+                } else if let Some(field) = field.try_downcast_mut::<bool>() {
+                    value.parse().map(|v| *field = v).is_ok()
+                } else {
+                    false
+                }
+            });
+            if !applied {
+                warn!("AURORA_DEV_UI: cannot apply `{pair}`");
+            }
+        }
+        state
+    }
 }
 
 impl Default for DevUIState {
@@ -124,6 +172,7 @@ impl Default for DevUIState {
             light_nee: true,
             restir: false, // TODO
             texture_lod_bias: -1.0,
+            spec_hit_roughness: 0.6,
             light_candidates: 8,
             restir_candidates: 8,
             restir_history: 20.0,
@@ -132,6 +181,9 @@ impl Default for DevUIState {
             omm: true,
             dlss: AuroraDlss::from_env(),
             rr_preset: RrPreset::current(),
+            ev100_lock: false,
+            // Filament's indoor preset; matches AuroraExposure::INDOOR.
+            ev100: 7.0,
             jitter_scale: 1.0,
         }
     }
@@ -145,6 +197,13 @@ pub struct DevUIPanel;
 /// The live stats line (fps).
 #[derive(Component, Default, Clone)]
 struct DevUIStats;
+
+/// The exposure/luminance readout. Its OWN line on purpose: the panel is a fixed 340 px
+/// and text wider than that relayouts every frame, which reads as the whole panel
+/// flickering. Both lines are padded to a stable width for the same reason -- a readout
+/// that changes length as the number changes digits is the same bug, just intermittent.
+#[derive(Component, Default, Clone)]
+struct DevUIProbe;
 
 /// The node the resource inspector is built under.
 #[derive(Component, Default, Clone)]
@@ -179,11 +238,17 @@ impl Plugin for DevUIPlugin {
         // }
 
         app.register_type::<DevUIState>();
-        app.init_resource::<DevUIState>();
+        app.insert_resource(DevUIState::from_env());
         app.add_systems(Startup, spawn_panel);
         app.add_systems(
             Update,
-            (toggle_panel, update_stats, sync_dlss_mode, sync_rr_preset),
+            (
+                toggle_panel,
+                update_stats,
+                sync_dlss_mode,
+                sync_rr_preset,
+                sync_exposure,
+            ),
         );
     }
 }
@@ -213,6 +278,63 @@ fn sync_dlss_mode(
     *agreed = Some(last);
 }
 
+/// Keeps the panel's EV100 lock and the camera's [`AuroraExposure`] equal, in both
+/// directions, so a lock set here shows up in the F1 inspector and vice versa.
+///
+/// The panel speaks EV100; `AuroraExposure` stores log2 of the radiance multiplier. The
+/// two differ by `log2(1.2)` (Filament), which is why the presets are -15.26 rather than
+/// -15 -- see [`ev_from_ev100`].
+fn sync_exposure(
+    mut state: ResMut<DevUIState>,
+    mut cameras: Query<&mut AuroraExposure, With<Camera3d>>,
+    mut agreed: Local<Option<(bool, f32)>>,
+) {
+    let want = (state.ev100_lock, state.ev100);
+    let Some(last) = *agreed else {
+        // First run. The camera starts on Auto while the panel may already say "locked"
+        // (DevUIState::from_env), so seeding `agreed` from the PANEL would make the two
+        // look agreed, and the pull-back branch below would then quietly clobber the lock
+        // off. The panel is authoritative on frame one; push it out.
+        for mut exposure in &mut cameras {
+            *exposure = if want.0 {
+                AuroraExposure::fixed(ev_from_ev100(want.1))
+            } else {
+                AuroraExposure::default()
+            };
+        }
+        *agreed = Some(want);
+        return;
+    };
+
+    if want != last {
+        // Panel moved: push it out.
+        for mut exposure in &mut cameras {
+            *exposure = if want.0 {
+                AuroraExposure::fixed(ev_from_ev100(want.1))
+            } else {
+                AuroraExposure::default()
+            };
+        }
+        *agreed = Some(want);
+        return;
+    }
+
+    // Component moved (F1 inspector, or an app setting it): pull it back.
+    if let Some(exposure) = cameras.iter().next() {
+        let now = match exposure {
+            AuroraExposure::Fixed(fixed) => (true, ev100_from_ev(fixed.ev)),
+            AuroraExposure::Auto(_) => (false, state.ev100),
+        };
+        if now.0 != state.ev100_lock || (now.0 && (now.1 - state.ev100).abs() > 1.0e-3) {
+            state.ev100_lock = now.0;
+            state.ev100 = now.1;
+            *agreed = Some(now);
+            return;
+        }
+    }
+    *agreed = Some(want);
+}
+
 /// Applies the panel's preset row; the renderer rebuilds the feature on the next frame.
 fn sync_rr_preset(state: Res<DevUIState>) {
     if state.rr_preset != RrPreset::current() {
@@ -239,6 +361,7 @@ fn spawn_panel(world: &mut World) {
             Children [
                 caption("aurora  (F2: panel, F1: world inspector)"),
                 (caption("fps: -") DevUIStats),
+                (caption("centre: -") DevUIProbe),
                 (
                     Node {
                         flex_direction: FlexDirection::Column,
@@ -303,14 +426,57 @@ fn toggle_panel(
 
 fn update_stats(
     time: Res<Time>,
-    mut stats: Query<&mut Text, With<DevUIStats>>,
+    ae: Option<Res<crate::auto_exposure::AutoExposureState>>,
+    cameras: Query<&AuroraExposure, With<Camera3d>>,
+    mut stats: Query<&mut Text, (With<DevUIStats>, Without<DevUIProbe>)>,
+    mut probe: Query<&mut Text, (With<DevUIProbe>, Without<DevUIStats>)>,
     mut fps_avg: Local<f32>,
 ) {
     let dt = time.delta_secs();
     if dt > 0.0 {
         *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
     }
+    // Centre-screen luminance in NITS and the EV100 in force. Physical and
+    // exposure-independent, so an emitter authored too dim and a look keyed to something
+    // bright stop being the same symptom.
+    let nits = ae.as_ref().map_or(0.0, |ae| ae.probe_nits());
+    let ev100 = cameras.iter().next().map(|exposure| match exposure {
+        AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), true),
+        AuroraExposure::Auto(_) => (f32::NAN, false),
+    });
     for mut text in &mut stats {
-        text.0 = format!("fps: {:.1}", *fps_avg);
+        text.0 = format!("fps: {:>6.1}", *fps_avg);
+    }
+    // Both halves padded to a FIXED width, and the whole line kept inside the panel's
+    // 340 px: a line that grows as the numbers change digits relayouts the panel every
+    // frame, which reads as a flicker.
+    let exposure = match ev100 {
+        Some((ev, true)) => format!("EV100 {ev:.1}L", ev = ev),
+        Some((_, false)) => "EV100 auto".to_string(),
+        None => String::new(),
+    };
+    for mut text in &mut probe {
+        text.0 = format!("{:<11}{:>11}", fmt_nits(nits), exposure);
+    }
+}
+
+/// Nits with a magnitude suffix and the reference class from
+/// aurora_files/lighting_units.md, so the number is readable without the table to hand.
+fn fmt_nits(nits: f32) -> String {
+    if !nits.is_finite() || nits <= 0.0 {
+        return "-".to_string();
+    }
+    let class = match nits {
+        n if n < 1.0 => "shdw",
+        n if n < 100.0 => "dim",
+        n if n < 600.0 => "scrn",
+        n if n < 8_000.0 => "sky",
+        n if n < 100_000.0 => "lum",
+        _ => "sun",
+    };
+    if nits >= 1000.0 {
+        format!("{:.0}k nt {}", nits / 1000.0, class)
+    } else {
+        format!("{nits:.0} nt {class}")
     }
 }
