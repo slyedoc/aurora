@@ -1,8 +1,9 @@
 //! The light table for next-event estimation: emissive triangles + analytic lights.
 //!
-//! Entries `[0, analytic_count)` are analytic lights extracted from bevy's `PointLight` /
-//! `SpotLight` / `RectLight` components (sampled NEE-only -- they have no geometry, so BRDF
-//! rays never find them). The rest: every instance whose [`AuroraMaterial`] has a non-zero
+//! Entries `[0, analytic_count)` are analytic lights: bevy's `PointLight` / `SpotLight` /
+//! `RectLight` components (sampled NEE-only -- they have no geometry, so BRDF rays never
+//! find them) and every emissive [`Sphere`], which IS geometry: the slot map points its
+//! instance at its entry so a BRDF hit shares credit with the estimate. The rest: every instance whose [`AuroraMaterial`] has a non-zero
 //! emissive colour contributes all of its BLAS triangles as one contiguous range. The CPU
 //! only tracks *which* instances are emissive and uploads the per-instance records;
 //! geometry and world transforms stay on the GPU, so the per-entry sampling weights (world
@@ -18,8 +19,7 @@
 //! Sources are `Mesh3d` + emissive [`AuroraMaterial`] instances and `GltfModelHandle`
 //! instances whose bundle has emissive primitives (emission per geometry, from the glTF
 //! emissive factors). Animated cluster deformations are not accounted for (their BLAS-space
-//! positions are pre-deform); sphere emissives are not in the table. Both still glow through
-//! BRDF hits at full weight.
+//! positions are pre-deform); they still glow through BRDF hits at full weight.
 
 use std::collections::HashMap;
 
@@ -42,6 +42,7 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
+    sphere::Sphere,
     tlas_builder::{GpuInstance, TLAS},
     vulkan_asset::{VulkanAssets, poll_for_asset},
 };
@@ -82,19 +83,23 @@ struct LightsHeaderGpu {
     analytics: u64,
 }
 
-/// One analytic light (point / spot / rect). Must match `AnalyticLight` in types.glsl /
+/// `slot_map` values with this bit are a sphere emitter's analytic entry rather than a light
+/// instance index (must match `LIGHT_SLOT_ANALYTIC` in types.glsl).
+const SLOT_ANALYTIC: u32 = 0x8000_0000;
+
+/// One analytic light (point / spot / rect / sphere emitter). Must match `AnalyticLight` in types.glsl /
 /// lights.slang. 80 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct AnalyticLightGpu {
     position: [f32; 3],
-    /// 0 point, 1 spot, 2 rect.
+    /// 0 point, 1 spot, 2 rect, 3 sphere emitter (an emissive [`Sphere`]).
     kind: u32,
     direction: [f32; 3],
     radius: f32,
     tangent: [f32; 3],
     cos_inner: f32,
-    /// Point/spot: luminous intensity I (nit*m^2); rect: emitted radiance L (nits).
+    /// Point/spot: luminous intensity I (nit*m^2); rect/sphere: emitted radiance L (nits).
     emission: [f32; 3],
     cos_outer: f32,
     half_extents: [f32; 2],
@@ -152,6 +157,9 @@ pub struct LightManager {
     analytics: Buffer<AnalyticLightGpu>,
     /// The analytic lights as last extracted (entry order); re-uploaded when they move.
     analytic_cache: Vec<AnalyticLightGpu>,
+    /// Per analytic entry, the instance slot of the geometry it stands for (sphere
+    /// emitters; `u32::MAX` for lights without geometry).
+    analytic_slots: Vec<u32>,
     /// The cache changed in-place (same set): re-upload in `record` without a rebuild.
     analytic_upload: bool,
     entry_count: u32,
@@ -184,6 +192,7 @@ impl LightManager {
             emissions: Buffer::default(),
             analytics: Buffer::default(),
             analytic_cache: Vec::new(),
+            analytic_slots: Vec::new(),
             analytic_upload: false,
             entry_count: 0,
             linst_count: 0,
@@ -575,9 +584,16 @@ fn prepare_lights(
         return;
     }
 
+    let sphere_slots = lights.analytic_slots.iter().filter(|slot| **slot != u32::MAX);
+    let max_slot = sphere_slots.fold(max_slot, |max, slot| max.max(*slot));
     let mut slot_map = vec![u32::MAX; max_slot as usize + 1];
     for (i, li) in linsts.iter().enumerate() {
         slot_map[li.slot as usize] = i as u32;
+    }
+    for (entry, slot) in lights.analytic_slots.iter().enumerate() {
+        if *slot != u32::MAX {
+            slot_map[*slot as usize] = SLOT_ANALYTIC | entry as u32;
+        }
     }
 
     let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
@@ -680,6 +696,8 @@ fn track_analytic_lights(
     points: Query<(Entity, &PointLight)>,
     spots: Query<(Entity, &SpotLight)>,
     rects: Query<(Entity, &RectLight)>,
+    spheres: Query<(Entity, &GpuInstance, &AuroraMaterial3d), With<Sphere>>,
+    materials: Res<Assets<AuroraMaterial>>,
     nodes: Query<(&Transform, Option<&ChildOf>)>,
 ) {
     use std::f32::consts::PI;
@@ -698,13 +716,46 @@ fn track_analytic_lights(
         }
         m
     };
-    let mut found: Vec<(Entity, AnalyticLightGpu)> = Vec::new();
+    let mut found: Vec<(Entity, u32, AnalyticLightGpu)> = Vec::new();
+    for (entity, instance, material) in &spheres {
+        let Some(material) = materials.get(&material.0) else {
+            continue;
+        };
+        let emission = material.emissive.to_f32_array();
+        let emission = [emission[0], emission[1], emission[2]];
+        if luma(emission) <= 0.0 {
+            continue;
+        }
+        // The unit `Sphere` has radius 0.5; the intersection shader keeps it round only
+        // under a uniform scale, so one axis speaks for all.
+        let m = world_of(entity);
+        let radius = 0.5 * m.x_axis.truncate().length();
+        found.push((
+            entity,
+            instance.0,
+            AnalyticLightGpu {
+                position: m.w_axis.truncate().to_array(),
+                kind: 3,
+                direction: [0.0, -1.0, 0.0],
+                radius,
+                tangent: [1.0, 0.0, 0.0],
+                cos_inner: 1.0,
+                emission,
+                cos_outer: -1.0,
+                half_extents: [0.0; 2],
+                // Lambertian sphere: flux / pi = 4 pi r^2 L.
+                power: 4.0 * PI * radius * radius * luma(emission),
+                flags: 0,
+            },
+        ));
+    }
     for (entity, light) in &points {
         let c = light.color.to_linear();
         let i = light.intensity / (4.0 * PI);
         let emission = [c.red * i, c.green * i, c.blue * i];
         found.push((
             entity,
+            u32::MAX,
             AnalyticLightGpu {
                 position: world_of(entity).w_axis.truncate().to_array(),
                 kind: 0,
@@ -729,6 +780,7 @@ fn track_analytic_lights(
         let m = world_of(entity);
         found.push((
             entity,
+            u32::MAX,
             AnalyticLightGpu {
                 position: m.w_axis.truncate().to_array(),
                 kind: 1,
@@ -758,6 +810,7 @@ fn track_analytic_lights(
         let emission = [c.red * l, c.green * l, c.blue * l];
         found.push((
             entity,
+            u32::MAX,
             AnalyticLightGpu {
                 position: m.w_axis.truncate().to_array(),
                 kind: 2,
@@ -776,15 +829,18 @@ fn track_analytic_lights(
             },
         ));
     }
-    found.sort_by_key(|(entity, _)| *entity);
-    let found: Vec<AnalyticLightGpu> = found.into_iter().map(|(_, l)| l).collect();
-    if found != lights.analytic_cache {
+    found.sort_by_key(|(entity, ..)| *entity);
+    let slots: Vec<u32> = found.iter().map(|(_, slot, _)| *slot).collect();
+    let found: Vec<AnalyticLightGpu> = found.into_iter().map(|(.., l)| l).collect();
+    if found != lights.analytic_cache || slots != lights.analytic_slots {
         for l in &found {
             log::debug!("analytic light: {l:?}");
         }
-        if found.len() != lights.analytic_cache.len() {
-            // The entry layout shifts: full rebuild, reservoirs dropped via the epoch.
+        if slots != lights.analytic_slots {
+            // The entry layout or the slot map shifts: full rebuild, reservoirs dropped
+            // via the epoch.
             lights.dirty = true;
+            lights.analytic_slots = slots;
         } else {
             lights.analytic_upload = true;
             lights.needs_power_pass = true;

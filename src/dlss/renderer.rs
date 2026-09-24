@@ -298,16 +298,8 @@ impl DlssRenderer {
         // mode switch or a resize the previous frame (a full trace + TLAS build) is still
         // executing when NGX would otherwise record and submit its feature creation alongside
         // it. This only moves on a mode change or a resize, so the cost is nil.
-        log::info!(
-            "dlss: rebuild -> {mode} {}x{} -> {}x{}: draining the device",
-            render.width,
-            render.height,
-            output.width,
-            output.height
-        );
         Self::wait_idle(rd);
         self.release_view(rd, slot);
-        log::info!("dlss: rebuild: creating images + feature (view {slot})");
         let one = vk::Extent2D {
             width: 1,
             height: 1,
@@ -363,7 +355,7 @@ impl DlssRenderer {
             }
         };
         if let Ok((bytes, opt_level, dev_branch)) = unsafe { ngx::get_stats(self.params, true) } {
-            log::info!(
+            log::debug!(
                 "dlss: {mode} feature {}x{} -> {}x{}, VRAM {:.1} MiB, snippet opt level \
                  {opt_level}, dev branch {dev_branch}",
                 render.width,
@@ -398,10 +390,6 @@ impl DlssRenderer {
         let Some(view) = self.views[slot].take() else {
             return;
         };
-        log::info!(
-            "dlss: releasing the {} feature (draining the device)",
-            view.mode
-        );
         {
             // Queue lock held across the release too: NGX may use the queue while tearing the
             // feature down, and a worker upload must not race it.
@@ -409,7 +397,6 @@ impl DlssRenderer {
             let _ = unsafe { rd.device.device_wait_idle() };
             unsafe { NVSDK_NGX_VULKAN_ReleaseFeature(view.handle) };
         }
-        log::info!("dlss: feature released");
         for image in view
             .guides()
             .into_iter()

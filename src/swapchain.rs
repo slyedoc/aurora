@@ -98,11 +98,6 @@ impl Swapchain {
     }
 
     pub unsafe fn on_resize(&mut self, window: &RenderWindow) {
-        log::info!(
-            "swapchain: recreating for {}x{} (draining the queue first)",
-            window.width,
-            window.height
-        );
         unsafe {
             {
                 let queue = self.device.queue.lock().unwrap();
@@ -123,7 +118,6 @@ impl Swapchain {
                     panic!("surface does not offer {DISPLAY_FORMAT:?}; it has {formats:?}")
                 });
 
-            log::info!("Surface format: {:?}", surface_format);
 
             let surface_caps = self
                 .device
@@ -189,7 +183,6 @@ impl Swapchain {
                 .find(|&mode| mode == wanted)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
 
-            log::info!("Present mode: {:?}", present_mode);
 
             let old_swapchain = self.swapchain;
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
@@ -251,7 +244,7 @@ impl Swapchain {
                 })
                 .collect();
 
-            log::info!(
+            log::debug!(
                 "swapchain: created {}x{} {:?}",
                 surface_resolution.width,
                 surface_resolution.height,
@@ -275,6 +268,7 @@ impl Swapchain {
             // `image_available_semaphore`, and the semaphore may only be reused once that wait
             // has completed. This is also the point after which the frame's resources (TLAS,
             // instance buffers, per-frame command buffer) can be rewritten in place.
+            let wait = info_span!("frame_fence_wait").entered();
             self.device
                 .wait_for_fences(
                     std::slice::from_ref(
@@ -293,9 +287,11 @@ impl Swapchain {
                     &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
                 ))
                 .unwrap();
+            drop(wait);
 
             // A swapchain the compositor already invalidated (a fullscreen window settling
             // in) surfaces here; rebuild it and acquire again.
+            let _acquire = info_span!("acquire_next_image").entered();
             self.current_image_idx = loop {
                 match self.device.ext_swapchain.acquire_next_image(
                     self.swapchain,
@@ -336,7 +332,10 @@ impl Swapchain {
                     &self.render_finished_semaphores[self.current_image_idx as usize],
                 ));
 
+            let queue_lock = info_span!("queue_lock").entered();
             let queue = self.device.queue.lock().unwrap();
+            drop(queue_lock);
+            let submit = info_span!("queue_submit").entered();
             self.device
                 .queue_submit(
                     *queue,
@@ -347,6 +346,7 @@ impl Swapchain {
                     crate::aftermath::note_device_lost(e);
                     panic!("frame submit failed: {e:?}");
                 });
+            drop(submit);
 
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(std::slice::from_ref(
@@ -355,10 +355,12 @@ impl Swapchain {
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&self.current_image_idx));
 
+            let present = info_span!("queue_present").entered();
             let present_result = self
                 .device
                 .ext_swapchain
                 .queue_present(*queue, &present_info);
+            drop(present);
 
             drop(queue);
 

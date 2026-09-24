@@ -39,6 +39,10 @@ struct AeParams {
     float compensation;    // Artist EV offset on the mid-gray target.
     float min_ev;
     float max_ev;
+    float input_deadband;  // EV off the metering at which the input exposure snaps to it.
+    float input_speed;     // EV per second the input exposure drifts towards the metering.
+    float reference_ev;    // The look adapts around this exposure...
+    float adaptation;      // ...by this fraction of the metered difference (1 = full auto).
 };
 [[vk::push_constant]] AeParams p;
 
@@ -94,23 +98,37 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
     var state = p.state[0];
     if (count > 0) {
         let avg_log_lum = weighted / (float(count) * 63.0) * p.log_lum_range + p.min_log_lum;
-        // Put the trimmed average at photographic mid-gray (0.18), plus compensation.
-        let target = clamp(p.compensation + log2(0.18) - avg_log_lum, p.min_ev, p.max_ev);
-        // Linear-capped exponential approach (bevy's speed / exponential_transition pair).
+        // The exposure that puts the trimmed average at photographic mid-gray (0.18), plus
+        // compensation.
+        let metered = clamp(p.compensation + log2(0.18) - avg_log_lum, p.min_ev, p.max_ev);
+
+        // The LOOK goes only part of the way from the reference exposure to the metering,
+        // so a night scene still reads darker than a sunlit one (a full-auto look renders
+        // both the same). Linear-capped exponential approach (bevy's speed /
+        // exponential_transition pair).
+        let target = clamp(lerp(p.reference_ev, metered, p.adaptation), p.min_ev, p.max_ev);
         let speed = (target > state.ev) ? p.speed_brighten : p.speed_darken;
         let step_ = speed * p.dt;
         let d = target - state.ev;
         state.ev = clamp(state.ev + clamp(d * step_ / p.exp_transition, -step_, step_),
                          p.min_ev, p.max_ev);
+
+        // The raygen's INPUT exposure follows the full metering -- Ray Reconstruction wants
+        // mid-gray whatever the look -- but RR cannot be told about exposure changes: a
+        // step rings through its temporal history as a full-screen transient (measured
+        // 16% frame RMSE while tracking at look speed, 0.7% held). So it holds still
+        // within a quarter stop, drifts slowly enough beyond that for the history to keep
+        // up unseen, and snaps -- one honest pop, straight to the metered value -- only
+        // when the light changed wholesale.
+        let off = metered - state.input_ev;
+        if (abs(off) > p.input_deadband) {
+            state.input_ev = metered;
+        } else if (abs(off) > 0.25) {
+            let drift = p.input_speed * p.dt;
+            state.input_ev += clamp(off, -drift, drift);
+        }
     }
     state.exposure = exp2(state.ev);
-    // The raygen's exposure is FROZEN: any change to RR's input exposure rings through its
-    // temporal history as a full-screen transient (measured 16% frame RMSE while tracking,
-    // 0.7% frozen). Re-snap only when metering says the operating point is hopelessly off
-    // (one honest pop instead of a wrong range).
-    if (abs(state.ev - state.input_ev) > 4.0) {
-        state.input_ev = state.ev;
-    }
     state.input_exposure = exp2(state.input_ev);
     p.state[0] = state;
 }

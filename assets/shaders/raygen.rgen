@@ -33,6 +33,9 @@ const bool ENABLE_BLUENOISE = true;
 // / `max_bounces`); the DLSS path runs 1 spp with a short cap.
 
 const float g_extinction = 0.03;
+// Specular hit distance of a reflection that reaches the sky: far enough to move like the
+// sky does (rotation only), and still a finite half float.
+const float SPEC_HIT_FAR = 65504.0;
 
 float sampleDistanceInFog() {
   return -log(randf()) / pc.uniforms.foginess;
@@ -211,10 +214,10 @@ uint lightsFindInstance(const uint e) {
 }
 
 // Unshadowed contribution of analytic light `e` (same contract as lightSampleEval below).
-// Point and spot are sampled as deltas: `p_area` is just the pick probability and
-// `pdf_solid` is a huge sentinel so the MIS weight against BRDF sampling goes to 1 (a BRDF
-// ray can never hit them -- they have no geometry; same for rects, which are one-entry
-// area lights sampled uniformly).
+// A radius-0 point or spot is a delta: `p_area` is just the pick probability and
+// `pdf_solid` a huge sentinel, so the MIS weight against BRDF sampling goes to 1. Points,
+// spots and rects have no geometry -- a BRDF ray never finds them, so nothing takes the
+// complementary weight. A sphere emitter (kind 3) does: see sphereEmitterPdf.
 vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const float sv,
                         const vec3 sp, const vec3 n, const vec3 ns, const vec3 v,
                         const DisneyMaterial mat,
@@ -244,10 +247,11 @@ vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const 
     pdf_solid = p_area * dist * dist / cos_l;
     return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (cos_l / (dist * dist));
   }
-  // Point / spot. With a radius the light is a Lambertian sphere of that size (bevy's
-  // `radius`): its surface is sampled uniformly, and its radiance is the intensity spread
-  // over the projected disc, I / (pi r^2), so the total is unchanged and the shadows go
-  // soft. Radius 0 is the delta at the position.
+  // Point / spot / sphere emitter. With a radius the light is a Lambertian sphere of that
+  // size: a point or spot (bevy's `radius`) has no geometry and spreads its intensity over
+  // the projected disc, L = I / (pi r^2), so the total is unchanged and the shadows go
+  // soft; a sphere emitter (kind 3) IS an emissive `Sphere` in the scene and carries its
+  // radiance directly. Radius 0 is the delta at the position.
   const vec3 to_centre = al.position - sp;
   const float centre_dist = length(to_centre);
   if (centre_dist <= 1.0e-4) { return vec3(0.0); }
@@ -260,6 +264,8 @@ vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const 
     atten = smoothstep(al.cos_outer, max(al.cos_inner, al.cos_outer + 1.0e-4), cos_a);
   }
   if (al.radius <= 1.0e-4 || centre_dist <= al.radius) {
+    // Inside a sphere emitter every direction sees it: BRDF hits carry it at full weight.
+    if (al.kind == 3u) { return vec3(0.0); }
     dist = centre_dist;
     dir = centre_dir;
     const float NoL = dot(n, dir);
@@ -268,23 +274,45 @@ vec3 analyticSampleEval(const uint e, const float p_pick, const float su, const 
     pdf_solid = 1.0e16;
     return evalDisneyBRDF(v, n, dir, mat) * NoL * al.emission * (atten / (dist * dist));
   }
-  const float z = 1.0 - 2.0 * su;
-  const float rxy = sqrt(max(0.0, 1.0 - z * z));
+  // Uniform over the CONE the sphere subtends from here: every sample lands on the visible
+  // cap, where uniform-area sampling threw the far half away and piled variance onto
+  // whatever stood close to the light.
+  const float sin2_max = (al.radius * al.radius) / (centre_dist * centre_dist);
+  const float cos_max = sqrt(max(0.0, 1.0 - sin2_max));
+  const float one_minus_cos_max = sin2_max / (1.0 + cos_max);  // no cancellation far away
+  const float cos_t = 1.0 - su * one_minus_cos_max;
+  const float sin2_t = max(0.0, 1.0 - cos_t * cos_t);
   const float phi = 2.0 * PI * sv;
-  const vec3 sn = vec3(rxy * cos(phi), rxy * sin(phi), z);
-  const vec3 point = al.position + sn * al.radius;
-  const vec3 to_light = point - sp;
-  dist = length(to_light);
-  if (dist <= 1.0e-4) { return vec3(0.0); }
-  dir = to_light / dist;
-  const float cos_l = dot(sn, -dir);
+  dir = normalize(orthonormalBasis(centre_dir) * vec3(sqrt(sin2_t) * cos(phi), sqrt(sin2_t) * sin(phi), cos_t));
+  const float surface_dist = centre_dist * cos_t
+      - sqrt(max(0.0, al.radius * al.radius - centre_dist * centre_dist * sin2_t));
+  if (surface_dist <= 1.0e-4) { return vec3(0.0); }
   const float NoL = dot(n, dir);
-  if (cos_l <= 1.0e-4 || NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
-  const float area = 4.0 * PI * al.radius * al.radius;
-  p_area = p_pick / area;
-  pdf_solid = p_area * dist * dist / cos_l;
-  const vec3 radiance = al.emission / (PI * al.radius * al.radius);
-  return evalDisneyBRDF(v, n, dir, mat) * NoL * radiance * (atten * cos_l / (dist * dist));
+  if (NoL <= 0.0 || dot(dir, ns) <= 0.0) { return vec3(0.0); }
+  const vec3 sn = (sp + dir * surface_dist - al.position) / al.radius;
+  const float cos_l = max(dot(sn, -dir), 1.0e-4);
+  pdf_solid = p_pick / (2.0 * PI * one_minus_cos_max);
+  p_area = pdf_solid * cos_l / (surface_dist * surface_dist);
+  // The shadow ray stops short of the surface: a sphere emitter's own geometry is there.
+  dist = surface_dist * 0.9995;
+  const vec3 radiance = al.kind == 3u ? al.emission : al.emission / (PI * al.radius * al.radius);
+  return evalDisneyBRDF(v, n, dir, mat) * NoL * radiance
+      * (atten * cos_l / (surface_dist * surface_dist));
+}
+
+// Solid-angle pdf with which next-event estimation at `from` would have sampled sphere
+// emitter `e` (analyticSampleEval's cone); 0 inside it. The MIS partner of a BRDF ray that
+// hit the sphere.
+float sphereEmitterPdf(const uint e, const vec3 from) {
+  AnalyticLight al = pc.lights.analytics.data[e];
+  const vec3 to_centre = al.position - from;
+  const float d2 = dot(to_centre, to_centre);
+  const float r2 = al.radius * al.radius;
+  if (d2 <= r2 || r2 <= 0.0) { return 0.0; }
+  const float p_pick = (pc.lights.cdf.data[e] - (e > 0u ? pc.lights.cdf.data[e - 1u] : 0.0))
+                       / pc.lights.total_power;
+  const float sin2_max = r2 / d2;
+  return p_pick * (1.0 + sqrt(1.0 - sin2_max)) / (2.0 * PI * sin2_max);
 }
 
 // Unshadowed contribution of the point (su, sv) on light-table entry `e`, in AREA measure:
@@ -488,7 +516,9 @@ void main() {
   const uint MAX_BOUNCES = pc.uniforms.max_bounces;
   // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
   // (0.18 / exposure), so it tracks the scene -- a sky, or a ceiling panel in a closed room.
-  const float radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.input_exposure, 1.0e-20);
+  // From the SMOOTH metered exposure, not the held input one: that lags the scene by up to
+  // its deadband, and a clamp that many stops too loose lets every emitter speckle through.
+  const float radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
   // The camera ray's first hit distance (0 = sky), for the atmosphere composite below.
   float primary_t = 0.0;
 
@@ -516,9 +546,8 @@ void main() {
     vec3 sh_acc[4];
     uint sh_n = 0u;
     // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
-    // alpha-cutout edges first); the specular hit distance from the vertex after it.
+    // alpha-cutout edges first).
     bool guides_written = false;
-    uint primary_bounce = 0u;
     // Ray cone for texture level of detail (closest_hit.rchit): width at the ray's origin
     // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
     // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
@@ -594,7 +623,6 @@ void main() {
       if (sample_idx == 0 && guide_live) {
         if (!guides_written && !pass_through && !guide_defer) {
           guides_written = true;
-          primary_bounce = bounce_idx;
           if (payload.t == 0.0) {
             imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
             imageStore(guide_diffuse, px, vec4(0.0));
@@ -651,10 +679,26 @@ void main() {
               motion = clamp(cur_uv - prev_uv, vec2(-2.0), vec2(2.0));
             }
             imageStore(guide_motion, px, vec4(motion, 0.0, 0.0));
-            imageStore(guide_spec_hit, px, vec4(0.0));
+            // Specular hit distance (RR guide 3.4.9): how far the REFLECTION sits behind
+            // the surface, which RR turns into the reflection's own motion. It comes from a
+            // dedicated ray along the lobe's mirror direction, never from the path: the
+            // path leaves a dielectric on its diffuse lobe nine times in ten, and a
+            // hemisphere ray's length is per-pixel static. Past the panel's roughness
+            // cutoff the reflection is too wide to have a motion of its own: 0 pins it to
+            // the surface and the ray is saved.
+            float spec_hit = 0.0;
+            if (g_roughness <= pc.uniforms.spec_hit_roughness) {
+              vec3 mirror = reflect(direction, world_normal);
+              if (dot(mirror, surface_normal) <= 0.0) { mirror = reflect(direction, surface_normal); }
+              const HitPayload vertex = payload;
+              payload.want_sun = ray_mask << 1;
+              payload.cone = vec2(cone_width, cone_spread);
+              traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, ray_mask, 0, 0, 0, hit_pos, tmin, mirror, tmax, 0);
+              spec_hit = payload.t == 0.0 ? SPEC_HIT_FAR : min(payload.t, SPEC_HIT_FAR);
+              payload = vertex;
+            }
+            imageStore(guide_spec_hit, px, vec4(spec_hit, 0.0, 0.0, 0.0));
           }
-        } else if (guides_written && bounce_idx == primary_bounce + 1u) {
-          imageStore(guide_spec_hit, px, vec4(min(payload.t, 1.0e7), 0.0, 0.0, 0.0));
         }
       }
       if (!guides_written) {
@@ -686,7 +730,13 @@ void main() {
         if (payload.t != 0.0 && prev_pdf > 0.0 && pc.uniforms.light_entries > 0u
             && payload.slot < pc.lights.slot_map_count && pc.lights.total_power > 0.0) {
           const uint linst_idx = pc.lights.slot_to_linst.data[payload.slot];
-          if (linst_idx != 0xFFFFFFFFu) {
+          if (linst_idx != 0xFFFFFFFFu && (linst_idx & LIGHT_SLOT_ANALYTIC) != 0u) {
+            // A sphere emitter: `origin` is still the vertex the ray left.
+            const float pdf_light = sphereEmitterPdf(linst_idx & ~LIGHT_SLOT_ANALYTIC, origin);
+            if (pdf_light > 0.0) {
+              contribution *= prev_pdf / (prev_pdf + pdf_light);
+            }
+          } else if (linst_idx != 0xFFFFFFFFu) {
             LightInstance li = pc.lights.linsts.data[linst_idx];
             if (payload.prim_tri < li.tri_count) {
               const uint e = li.entry_base + payload.prim_tri;

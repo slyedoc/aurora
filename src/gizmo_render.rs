@@ -14,9 +14,11 @@
 //! `bevy_render`. Without it this module idles: every extract param is `Option`-guarded, the
 //! frame stays empty, and the draw records nothing.
 //!
-//! Lines are constant 1 px wide, never lit and never in the acceleration structure. The
-//! swapchain pass has no depth attachment, so gizmos always paint over the scene:
-//! `GizmoConfig::depth_bias`, line width and `perspective` are ignored.
+//! Lines are constant 1 px wide, never lit and never in the acceleration structure; line
+//! width and `perspective` are ignored. The swapchain pass has no depth attachment -- the
+//! scene is traced -- so `gizmo.frag` tests each line against the raygen's linear depth guide
+//! instead, with `GizmoConfig::depth_bias` (and a retained `Gizmo`'s own) carried per vertex:
+//! -1 always in front, 0 the plain test, towards 1 pushed behind.
 
 use ash::vk;
 use bevy::{
@@ -52,6 +54,8 @@ pub struct GizmoVertex {
     pub position: [f32; 3],
     /// Packed RGBA8 (`r | g<<8 | b<<16 | a<<24`), linear.
     pub color: u32,
+    /// The line's `depth_bias` (bevy's convention, see the module docs).
+    pub depth_bias: f32,
 }
 
 /// Must match `gizmo.vert`'s `Registers`.
@@ -61,6 +65,8 @@ struct GizmoPushConstants {
     /// Unjittered clip-from-world (glam column order).
     view_proj: [f32; 16],
     vertex_buffer: u64,
+    /// 1 / swapchain size: the fragment's position to the depth guide's uv.
+    inv_extent: [f32; 2],
 }
 
 /// Linear RGBA → packed RGBA8, clamped — gizmo colors are debug paint, not radiance, so HDR
@@ -86,6 +92,9 @@ pub struct GizmoPipeline {
 pub struct CompiledGizmoPipeline {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    /// The scene depth binding, one set per frame in flight.
+    pub descriptor_sets: [vk::DescriptorSet; 2],
 }
 
 impl VulkanAsset for GizmoPipeline {
@@ -116,13 +125,41 @@ impl VulkanAsset for GizmoPipeline {
         let (vertex_shader, fragment_shader) = asset;
 
         let push_constant_info = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(std::mem::size_of::<GizmoPushConstants>() as u32);
 
-        // No descriptor sets: the vertices arrive through a buffer reference in the push
-        // constants, and the fragment shader samples nothing.
+        // The vertices arrive through a buffer reference in the push constants; the one
+        // descriptor is the scene depth the fragment shader tests against.
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .binding(0)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let descriptor_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let descriptor_set_layout = unsafe {
+            render_device
+                .create_descriptor_set_layout(&descriptor_layout_info, None)
+                .unwrap()
+        };
+        let descriptor_sets = {
+            let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
+            let layouts = [descriptor_set_layout; 2];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(*descriptor_pool)
+                .set_layouts(&layouts);
+            unsafe {
+                render_device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            }
+        };
+
         let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant_info));
         let pipeline_layout = unsafe {
             render_device
@@ -200,6 +237,8 @@ impl VulkanAsset for GizmoPipeline {
         CompiledGizmoPipeline {
             pipeline,
             pipeline_layout,
+            descriptor_set_layout,
+            descriptor_sets,
         }
     }
 
@@ -210,6 +249,9 @@ impl VulkanAsset for GizmoPipeline {
         render_device
             .destroyer
             .destroy_pipeline(prepared_asset.pipeline);
+        render_device
+            .destroyer
+            .destroy_descriptor_set_layout(prepared_asset.descriptor_set_layout);
     }
 }
 
@@ -264,17 +306,15 @@ fn extract_gizmo_lines(
     // Immediate mode: every group's lines land in the handles map.
     for (type_id, handle) in handles.handles() {
         let Some(handle) = handle else { continue };
-        if store
-            .as_ref()
-            .and_then(|s| s.get_config_dyn(type_id))
-            .is_some_and(|(config, _)| !config.enabled)
-        {
+        let config = store.as_ref().and_then(|s| s.get_config_dyn(type_id));
+        if config.is_some_and(|(config, _)| !config.enabled) {
             continue;
         }
+        let depth_bias = config.map_or(0.0, |(config, _)| config.depth_bias);
         let Some(asset) = assets.get(handle) else {
             continue;
         };
-        append_buffer(&mut frame, asset.buffer().buffer(), None);
+        append_buffer(&mut frame, asset.buffer().buffer(), None, depth_bias);
     }
 
     // Retained `Gizmo` components.
@@ -285,7 +325,12 @@ fn extract_gizmo_lines(
         let Some(asset) = assets.get(&gizmo.handle) else {
             continue;
         };
-        append_buffer(&mut frame, asset.buffer().buffer(), Some(transform));
+        append_buffer(
+            &mut frame,
+            asset.buffer().buffer(),
+            Some(transform),
+            gizmo.depth_bias,
+        );
     }
 }
 
@@ -295,6 +340,7 @@ fn append_buffer(
     frame: &mut GizmoLineFrame,
     buffer: GizmoBufferView<'_>,
     transform: Option<&GlobalTransform>,
+    depth_bias: f32,
 ) {
     let world = |v: Vec3| -> Option<[f32; 3]> {
         if !v.is_finite() {
@@ -324,10 +370,12 @@ fn append_buffer(
         frame.vertices.push(GizmoVertex {
             position: a,
             color: pack_rgba8(ca),
+            depth_bias,
         });
         frame.vertices.push(GizmoVertex {
             position: b,
             color: pack_rgba8(cb),
+            depth_bias,
         });
     };
 
@@ -373,12 +421,16 @@ pub struct GizmoDrawParams<'w> {
 }
 
 /// Records the gizmo line draw into `cmd_buffer`. Must be called inside the swapchain's
-/// dynamic rendering pass, with viewport and scissor already set to the full swapchain.
-/// Records nothing when there are no lines or the pipeline is not compiled yet.
+/// dynamic rendering pass, with viewport and scissor already set to the full swapchain
+/// (`extent`). `scene_depth` is the raygen's linear view depth in SHADER_READ_ONLY_OPTIMAL,
+/// covering the same window. Records nothing when there are no lines or the pipeline is not
+/// compiled yet.
 pub unsafe fn draw_gizmos(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
     view_proj: Mat4,
+    extent: vk::Extent2D,
+    scene_depth: vk::ImageView,
     frame_slot: usize,
     params: &mut GizmoDrawParams,
 ) {
@@ -412,9 +464,32 @@ pub unsafe fn draw_gizmos(
     let push_constants = GizmoPushConstants {
         view_proj: view_proj.to_cols_array(),
         vertex_buffer: buffer.address,
+        inv_extent: [
+            1.0 / extent.width.max(1) as f32,
+            1.0 / extent.height.max(1) as f32,
+        ],
     };
+    let set = pipeline.descriptor_sets[frame_slot % 2];
+    let depth_info = vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image_view(scene_depth)
+        .sampler(render_device.linear_sampler);
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(std::slice::from_ref(&depth_info))];
 
     unsafe {
+        render_device.update_descriptor_sets(&writes, &[]);
+        render_device.cmd_bind_descriptor_sets(
+            cmd_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline_layout,
+            0,
+            std::slice::from_ref(&set),
+            &[],
+        );
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
@@ -423,7 +498,7 @@ pub unsafe fn draw_gizmos(
         render_device.cmd_push_constants(
             cmd_buffer,
             pipeline.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             0,
             bytemuck::bytes_of(&push_constants),
         );
@@ -490,26 +565,28 @@ mod tests {
     use super::*;
     use bytemuck::Zeroable as _;
 
-    /// The vertex is a tightly-packed 16 bytes -- `gizmo.vert` reads a scalar-layout
+    /// The vertex is a tightly-packed 20 bytes -- `gizmo.vert` reads a scalar-layout
     /// `GizmoVertex[]`, so any padding here would shear every vertex after the first.
     #[test]
     fn gizmo_vertex_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<GizmoVertex>(), 16);
+        assert_eq!(std::mem::size_of::<GizmoVertex>(), 20);
         let vertex = GizmoVertex::zeroed();
         let base = &vertex as *const GizmoVertex as usize;
         assert_eq!(vertex.position.as_ptr() as usize - base, 0);
         assert_eq!(&vertex.color as *const u32 as usize - base, 12);
+        assert_eq!(&vertex.depth_bias as *const f32 as usize - base, 16);
     }
 
     /// Scalar-layout mirror of `gizmo.vert`'s `Registers`: mat4 at 0, the buffer reference
-    /// behind it, 72 bytes total.
+    /// behind it, then the extent; 80 bytes.
     #[test]
     fn gizmo_push_constants_match_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<GizmoPushConstants>(), 72);
+        assert_eq!(std::mem::size_of::<GizmoPushConstants>(), 80);
         let pc = GizmoPushConstants::zeroed();
         let base = &pc as *const GizmoPushConstants as usize;
         assert_eq!(pc.view_proj.as_ptr() as usize - base, 0);
         assert_eq!(&pc.vertex_buffer as *const u64 as usize - base, 64);
+        assert_eq!(pc.inv_extent.as_ptr() as usize - base, 72);
     }
 
     /// Packed color order is `r | g<<8 | b<<16 | a<<24` with round-to-nearest, mirrored by the

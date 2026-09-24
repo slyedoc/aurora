@@ -63,6 +63,8 @@ use crate::{
 
 /// Frames between full BLAS rebuilds of a skinned instance; refits in between. A refit keeps
 /// the tree topology of the last build, so trace quality drifts as the pose moves away from it.
+/// Instances take turns (by slot): a level's worth of them rebuilding in one frame is a hitch
+/// every interval. Wind never rebuilds -- sway stays around the pose it was built in.
 const REBUILD_INTERVAL: u32 = 16;
 
 // ---- baked prefabs: joints by name ----------------------------------------------------------
@@ -648,7 +650,13 @@ impl Skins {
             if inst.source.node >= node_count {
                 continue;
             }
-            let update = gpu.builds > 0 && gpu.builds % REBUILD_INTERVAL != 0;
+            let update = gpu.builds > 0
+                && match inst.source.kind {
+                    SkinKind::Joints { .. } => {
+                        gpu.builds.wrapping_add(slot) % REBUILD_INTERVAL != 0
+                    }
+                    SkinKind::Wind { .. } => true,
+                };
             gpu.builds = gpu.builds.wrapping_add(1).max(1);
             modes.push((slot, update));
         }
@@ -1046,11 +1054,7 @@ pub fn prepare_skins(
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
             inst.joints_dirty = true;
-            let omm = gpu.micromap.is_some();
             inst.gpu = Some(gpu);
-            log::info!(
-                "skinning: slot {slot} -> {vertex_count} vertices, {triangle_count} triangles, {joint_count} joints, omm {omm}"
-            );
         }
         // Point the TLAS slot at the deformed BLAS once it has been built (the first build
         // lands in this frame's `record`; the override takes effect from the next).

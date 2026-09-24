@@ -81,6 +81,9 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint light_candidates;
   // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
   float lod_bias;
+  // Perceptual roughness up to which the primary vertex traces a specular hit-distance ray
+  // for Ray Reconstruction; rougher surfaces report 0 (0 = no guide rays at all).
+  float spec_hit_roughness;
   // Light-table generation; reservoirs from another generation are dropped.
   uint light_epoch;
   // Cap on temporal history, in candidate-samples.
@@ -230,17 +233,21 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) buffer ReservoirDa
   Reservoir data[];
 };
 
-// One analytic light (point / spot / rect): table entries [0, analytic_count). Positions
+// `slot_to_linst` values with this bit are a sphere emitter's ANALYTIC entry, not a light
+// instance index (0xFFFFFFFF stays "not a light").
+const uint LIGHT_SLOT_ANALYTIC = 0x80000000u;
+
+// One analytic light (point / spot / rect / sphere emitter): table entries [0, analytic_count). Positions
 // and orientations are world-space, refreshed from the CPU every frame they change.
 // 80 bytes; must match AnalyticLightGpu in lights.rs and AnalyticLight in lights.slang.
 struct AnalyticLight {
   vec3 position;
-  uint kind;          // 0 point, 1 spot, 2 rect
+  uint kind;          // 0 point, 1 spot, 2 rect, 3 sphere emitter (an emissive `Sphere`)
   vec3 direction;     // spot axis / rect normal
-  float radius;       // point/spot emitter radius (reserved; sampled as a delta for now)
+  float radius;       // point/spot/sphere emitter radius (0 = delta)
   vec3 tangent;       // rect: +X edge direction
   float cos_inner;    // spot: full-intensity cone
-  // point/spot: luminous intensity I (nit*m^2); rect: emitted radiance L (nits).
+  // point/spot: luminous intensity I (nit*m^2); rect/sphere: emitted radiance L (nits).
   vec3 emission;
   float cos_outer;    // spot: falloff limit
   vec2 half_extents;  // rect half sizes along tangent / bitangent

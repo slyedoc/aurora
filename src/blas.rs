@@ -530,9 +530,6 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
         // Micromaps build here too (host-visible inputs), ahead of the BLAS builds.
         MicromapBuild::record(render_device, cmd_buffer, &micromap_builds);
     });
-    if !micromap_builds.is_empty() {
-        log::info!("Built {} opacity micromaps", micromap_builds.len());
-    }
     for handle in host_buffers {
         render_device.destroyer.destroy_buffer(handle);
     }

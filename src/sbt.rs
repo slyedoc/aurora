@@ -113,8 +113,6 @@ fn update_sbt(
         render_device.destroyer.destroy_buffer(sbt.data.handle);
         sbt.data = render_device
             .create_host_buffer(total_size, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR);
-
-        log::info!("Reallocated SBT buffer to {} bytes", total_size);
     }
 
     {

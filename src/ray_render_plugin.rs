@@ -76,6 +76,9 @@ pub struct UniformData {
     light_candidates: u32,
     /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
     lod_bias: f32,
+    /// Perceptual roughness up to which the primary vertex traces a specular hit-distance
+    /// ray for Ray Reconstruction; rougher surfaces report 0.
+    spec_hit_roughness: f32,
     /// Light-table generation; reservoirs from another generation are dropped.
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
@@ -601,6 +604,7 @@ fn render_frame(
             // resolution, so the upscaled image keeps its detail.
             lod_bias: (trace_extent.width.max(1) as f32 / output_extent.width.max(1) as f32).log2()
                 + dev_ui_state.texture_lod_bias,
+            spec_hit_roughness: dev_ui_state.spec_hit_roughness,
             light_epoch: lights.epoch,
             restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
                 .max(1.0),
@@ -650,6 +654,7 @@ fn render_frame(
 
         frame.swapchain_image = swapchain_image;
         frame.swapchain_view = swapchain_view;
+        let record = info_span!("record_frame").entered();
 
         render_device
             .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
@@ -665,6 +670,7 @@ fn render_frame(
 
         // Offscreen UI surfaces (world panels) render first, so this frame's trace samples
         // this frame's UI.
+        let section = info_span!("record_ui_surfaces").entered();
         crate::ui_render::draw_ui_surfaces(
             &render_device,
             cmd_buffer,
@@ -675,9 +681,17 @@ fn render_frame(
         // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place -- all inside this command buffer.
+        drop(section);
+        let section = info_span!("record_transforms").entered();
         let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
+        drop(section);
+        let section = info_span!("record_skins").entered();
         let skinned = skins.record(&render_device, cmd_buffer, &modules, &transforms);
+        drop(section);
+        let section = info_span!("record_terrains").entered();
         let terrain_changed = terrains.record(&render_device, cmd_buffer, &modules, &textures);
+        drop(section);
+        let section = info_span!("record_tlas").entered();
         tlas.record(
             &render_device,
             cmd_buffer,
@@ -687,8 +701,12 @@ fn render_frame(
         );
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).
+        drop(section);
+        let section = info_span!("record_lights").entered();
         lights.record(&render_device, cmd_buffer, &modules, &tlas);
         // The radiance cache's per-frame resolve (and its first-use allocation).
+        drop(section);
+        let section = info_span!("record_sharc").entered();
         sharc.record(
             &render_device,
             cmd_buffer,
@@ -698,6 +716,8 @@ fn render_frame(
         );
         // Exposure: meter last frame's luminance into this frame's exposure (the raygen
         // reads it), or write the camera's fixed EV.
+        drop(section);
+        let section = info_span!("record_exposure_atmo").entered();
         let exposure = camera.3.cloned().unwrap_or_default();
         ae.record(
             &render_device,
@@ -721,6 +741,8 @@ fn render_frame(
             time.delta_secs(),
         );
 
+        drop(section);
+        let section = info_span!("record_trace_dlss").entered();
         if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
                 && sbt.data.address != 0
@@ -864,6 +886,8 @@ fn render_frame(
             }
         }
 
+        drop(section);
+        let section = info_span!("record_present_pass").entered();
         let parity = swapchain.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
         let debug_view = camera.4.copied().unwrap_or_default().shader_index();
@@ -1012,14 +1036,23 @@ fn render_frame(
                     .max_depth(1.0),
             ),
         );
-        // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI.
+        // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI,
+        // depth-tested against the traced frame's depth guide (so not before there is one).
         // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
         // full-window projection.
-        if xr_frame.is_none() {
+        let scene_depth = dlss
+            .renderer
+            .as_ref()
+            .filter(|_| dlss_ran)
+            .and_then(|r| r.guide_views(0))
+            .map(|g| g.depth);
+        if let (None, Some(scene_depth)) = (&xr_frame, scene_depth) {
             crate::gizmo_render::draw_gizmos(
                 &render_device,
                 cmd_buffer,
                 views[0].view_proj,
+                swapchain.swapchain_extent,
+                scene_depth,
                 swapchain.frame_count % 2,
                 &mut gizmos,
             );
@@ -1087,6 +1120,8 @@ fn render_frame(
         );
 
         render_device.end_command_buffer(cmd_buffer).unwrap();
+        drop(section);
+        drop(record);
         swapchain.submit_presentation(&window, cmd_buffer);
         // The XR side of the submit: release the image and hand the compositor its layer.
         if let (Some(xr_state), Some(xr_frame)) = (xr.as_deref_mut(), xr_frame) {

@@ -1059,10 +1059,6 @@ pub fn prepare_terrains(
             inst.geo_dirty = true;
             inst.compose_dirty = Some([0, 0, tile.diffuse_px, tile.diffuse_px]);
             inst.layers_dirty = false;
-            log::info!(
-                "terrain: slot {slot} -> {vertex_count} vertices, {triangle_count} triangles, \
-                 res {res}"
-            );
         } else if inst.layers_dirty {
             // Chunk-table edit from the CPU (adding a layer while painting): re-map + recompose.
             if let Ok(tile) = tiles.get(inst.entity)
