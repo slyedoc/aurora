@@ -22,7 +22,7 @@ use bevy::{
         build_resource_inspector,
     },
     prelude::*,
-    ui::Display,
+    ui::{Display, GlobalZIndex},
 };
 
 use crate::{
@@ -343,6 +343,10 @@ fn sync_rr_preset(state: Res<DevUIState>) {
     set_jitter_scale(state.jitter_scale);
 }
 
+/// Stacking order for aurora's own debug overlays: above any app UI, which sits at 0 unless it
+/// says otherwise.
+pub const DEV_UI_Z: i32 = 1_000;
+
 fn spawn_panel(world: &mut World) {
     let panel = world
         .spawn_scene(bsn! {
@@ -356,6 +360,12 @@ fn spawn_panel(world: &mut World) {
                 row_gap: px(6),
                 border_radius: BorderRadius::all(px(6)),
             }
+            // Above whatever the app puts on screen. UI with no z-index stacks by SPAWN ORDER,
+            // so a debug overlay would otherwise win or lose the race depending on which
+            // startup system ran last -- and an app whose own panel covers this one leaves no
+            // way to reach the controls that would tell you why. `GlobalZIndex` escapes the
+            // local stacking context, so nesting cannot bury it either.
+            GlobalZIndex({DEV_UI_Z})
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
