@@ -545,6 +545,29 @@ impl ClusterMeshData {
             }
             _ => vec![Vec4::new(1.0, 0.0, 0.0, 1.0); positions.len()],
         };
+        // Skin, when the source has one. Both streams must cover every vertex or neither is
+        // kept: `to_mesh` gates on exactly that, and half a palette skins garbage.
+        let joint_indices: Option<Vec<[u16; 4]>> =
+            match mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX) {
+                Some(bevy::mesh::VertexAttributeValues::Uint16x4(j)) => Some(j.clone()),
+                Some(bevy::mesh::VertexAttributeValues::Uint8x4(j)) => {
+                    Some(j.iter().map(|j| j.map(u16::from)).collect())
+                }
+                _ => None,
+            };
+        let joint_weights: Option<Vec<Vec4>> = match mesh.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x4(w)) => {
+                Some(w.iter().map(|w| Vec4::from(*w)).collect())
+            }
+            _ => None,
+        };
+        let skin = match (joint_indices, joint_weights) {
+            (Some(j), Some(w)) if j.len() == positions.len() && w.len() == positions.len() => {
+                Some((j, w))
+            }
+            _ => None,
+        };
+
         let source_indices: Vec<u32> = match mesh.indices() {
             Some(Indices::U32(i)) => i.clone(),
             Some(Indices::U16(i)) => i.iter().map(|&i| i as u32).collect(),
@@ -555,6 +578,8 @@ impl ClusterMeshData {
         let mut out_normals = Vec::new();
         let mut out_tangents = Vec::new();
         let mut out_uvs = Vec::new();
+        let mut out_joints: Vec<[u16; 4]> = Vec::new();
+        let mut out_weights: Vec<Vec4> = Vec::new();
         let mut out_indices = Vec::new();
         let mut clusters = Vec::new();
 
@@ -579,6 +604,10 @@ impl ClusterMeshData {
                         out_normals.push(pack_normal(normals[c as usize]));
                         out_tangents.push(tangents[c as usize]);
                         out_uvs.push(uvs[c as usize]);
+                        if let Some((j, w)) = &skin {
+                            out_joints.push(j[c as usize]);
+                            out_weights.push(w[c as usize]);
+                        }
                         next
                     });
                     out_indices.push(idx);
@@ -628,6 +657,8 @@ impl ClusterMeshData {
             vertex_normals: out_normals.into(),
             vertex_tangents: out_tangents.into(),
             vertex_uvs: out_uvs.into(),
+            vertex_joint_indices: out_joints.into(),
+            vertex_joint_weights: out_weights.into(),
             indices: out_indices.into(),
             clusters: clusters.into(),
             groups: vec![group].into(),
