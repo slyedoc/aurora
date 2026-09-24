@@ -5,6 +5,7 @@ pub mod atmosphere;
 pub mod auto_exposure;
 pub mod blas;
 pub mod bsn;
+pub mod collision;
 pub mod compute;
 pub use aurora_cluster_mesh as cluster_mesh;
 pub mod bluenoise_plugin;
