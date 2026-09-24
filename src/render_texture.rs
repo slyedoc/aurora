@@ -140,15 +140,10 @@ impl VulkanAsset for bevy::prelude::Image {
         if self.data.is_none() {
             return None;
         }
-        // The upload path knows RGBA8 and RGBA32F. Anything else (RGB / grey / 16-bit PNGs,
-        // which scene textures frequently are) is converted here, on the main thread's copy.
-        let bytes_per_pixel = self.data.as_ref().map(|d| {
-            d.len()
-                / (self.texture_descriptor.size.width as usize
-                    * self.texture_descriptor.size.height as usize)
-                    .max(1)
-        });
-        if matches!(bytes_per_pixel, Some(4) | Some(16)) {
+        // Formats the upload path takes as-is (see `vk_format_for`) go straight
+        // through, 16-bit included. Anything else -- RGB, grey, palette -- is
+        // converted to RGBA8 here, on the main thread's copy.
+        if vk_format_for(self.texture_descriptor.format).is_some() {
             return Some(self.clone());
         }
         match self.convert(wgpu_types::TextureFormat::Rgba8UnormSrgb) {
@@ -167,15 +162,12 @@ impl VulkanAsset for bevy::prelude::Image {
         asset: Self::ExtractedAsset,
         render_device: &RenderDevice,
     ) -> Self::PreparedAsset {
-        let bytes_per_pixel = asset.data.as_ref().unwrap().len()
-            / (asset.texture_descriptor.size.width as usize
-                * asset.texture_descriptor.size.height as usize);
-
-        let format = match bytes_per_pixel {
-            4 => vk::Format::R8G8B8A8_UNORM,
-            16 => vk::Format::R32G32B32A32_SFLOAT,
-            _ => panic!("unsupported bytes per pixel: {}", bytes_per_pixel),
-        };
+        let format = vk_format_for(asset.texture_descriptor.format).unwrap_or_else(|| {
+            panic!(
+                "unsupported texture format {:?} reached prepare_asset",
+                asset.texture_descriptor.format
+            )
+        });
 
         let res = load_texture_from_bytes(
             render_device,
@@ -201,6 +193,28 @@ impl VulkanAsset for bevy::prelude::Image {
     }
 }
 
+/// The Vulkan format for a wgpu texture format the upload path can take as-is.
+///
+/// `None` means it has to be converted to RGBA8 first. Keyed on the FORMAT, not on
+/// bytes-per-pixel: `Rgba16Unorm` and `Rgba16Float` are both 8 bytes and need
+/// different Vulkan formats, and size alone cannot tell them apart.
+///
+/// 16-bit is worth carrying rather than flattening. An 8-bit normal map quantises
+/// the surface normal to roughly 0.4-degree steps, which terraces visibly on large
+/// smooth surfaces at grazing incidence -- a concrete wall in raking sun is the
+/// worst case for it. Poly Haven and other libraries ship 16-bit maps routinely.
+pub fn vk_format_for(format: wgpu_types::TextureFormat) -> Option<vk::Format> {
+    use wgpu_types::TextureFormat as F;
+    Some(match format {
+        // NB: UNORM, not SRGB -- the shading path expects these linear.
+        F::Rgba8Unorm | F::Rgba8UnormSrgb => vk::Format::R8G8B8A8_UNORM,
+        F::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+        F::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        F::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+        _ => return None,
+    })
+}
+
 pub fn load_texture_from_bytes(
     device: &RenderDevice,
     format: vk::Format,
@@ -212,8 +226,9 @@ pub fn load_texture_from_bytes(
 ) -> RenderTexture {
     let target_bytes_per_pixel = match format {
         vk::Format::R8G8B8A8_UNORM => 4,
+        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => 8,
         vk::Format::R32G32B32A32_SFLOAT => 16,
-        _ => panic!("unsupported format"),
+        _ => panic!("unsupported format: {format:?}"),
     };
 
     assert!(
