@@ -1,4 +1,5 @@
 pub mod aftermath;
+pub mod animclip;
 pub mod assets;
 pub mod atmosphere;
 pub mod auto_exposure;

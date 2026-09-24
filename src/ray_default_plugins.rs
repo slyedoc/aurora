@@ -68,6 +68,7 @@ impl PluginGroup for RayDefaultPlugins {
         group = group.add(crate::gizmo_render::GizmoRenderPlugin);
         group = group.add(crate::bluenoise_plugin::BlueNoisePlugin);
         group = group.add(crate::bsn::BsnPlugin);
+        group = group.add(crate::animclip::AnimClipPlugin);
 
         group
     }
