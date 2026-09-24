@@ -71,7 +71,8 @@ pub struct DevUIState {
     /// Added to the ray-cone texture level of detail, on top of the automatic
     /// log2(render / output) term. The DLSS guide asks for -1 (sharper: accumulation over
     /// jittered frames resolves the extra detail); 0 is the unbiased footprint, positive blurs.
-    #[reflect(@-3.0..=3.0_f32)]
+    // Past -2 textureLod clamps to mip 0: dead travel, and mip 0 under jitter feeds RR noise.
+    #[reflect(@-2.0..=1.0_f32)]
     pub texture_lod_bias: f32,
     /// Ray Reconstruction's specular hit distance comes from one extra mirror-direction ray
     /// at the primary vertex, for surfaces up to this perceptual roughness; rougher ones
