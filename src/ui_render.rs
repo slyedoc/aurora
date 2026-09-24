@@ -408,7 +408,12 @@ impl Plugin for UiRenderPlugin {
             ),
         );
         app.add_plugins(crate::ui_panel::UiPanelPlugin);
-        app.add_systems(Last, extract_ui.in_set(RenderSet::Extract));
+        app.add_systems(
+            Last,
+            (extract_ui, extract_ui_polylines)
+                .chain()
+                .in_set(RenderSet::Extract),
+        );
         app.add_systems(Last, prepare_ui_surfaces.in_set(RenderSet::Prepare));
         app.add_systems(
             TeardownSchedule,
@@ -805,6 +810,157 @@ fn extract_ui(
 }
 
 const UNTEXTURED_UVS: [Vec2; 4] = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y];
+
+// ---------------------------------------------------------------------------------------------
+// Polylines
+// ---------------------------------------------------------------------------------------------
+
+/// A polyline drawn inside a UI node: curves, links, sparklines — anything `bevy_ui`'s
+/// axis-aligned rectangles cannot express.
+///
+/// It needs no shader and no pass of its own, because [`UiQuad::transform`] is an arbitrary
+/// [`Affine2`]: a segment is ONE ROTATED QUAD through the ordinary node path. The rounded ends
+/// come free from the same corner-radius the shader already applies in node-local space, and
+/// overlapping them by half a thickness at each end makes the joins continuous.
+///
+/// Points are in the node's own LOGICAL pixels with the origin at its top-left — the same space
+/// a child's `left` / `top` lives in — so a caller never deals in physical pixels or in the
+/// centered space the renderer works in.
+#[derive(Component, Clone, Debug)]
+pub struct UiPolyline {
+    pub points: Vec<Vec2>,
+    /// Logical pixels. Anything under a pixel is widened to one, so a hairline never drops out.
+    pub thickness: f32,
+    pub color: Color,
+    /// Join the last point back to the first.
+    pub closed: bool,
+}
+
+impl Default for UiPolyline {
+    fn default() -> Self {
+        Self {
+            points: Vec::new(),
+            thickness: 1.0,
+            color: Color::WHITE,
+            closed: false,
+        }
+    }
+}
+
+impl UiPolyline {
+    /// A cubic bezier sampled into `segments` line segments.
+    ///
+    /// The sampling is uniform in `t`, which is not uniform in arc length — fine for a link
+    /// between two pins, where the control points are close to the curve's own scale.
+    pub fn bezier(p0: Vec2, c0: Vec2, c1: Vec2, p1: Vec2, segments: usize) -> Vec<Vec2> {
+        let segments = segments.max(1);
+        (0..=segments)
+            .map(|i| {
+                let t = i as f32 / segments as f32;
+                let u = 1.0 - t;
+                p0 * (u * u * u)
+                    + c0 * (3.0 * u * u * t)
+                    + c1 * (3.0 * u * t * t)
+                    + p1 * (t * t * t)
+            })
+            .collect()
+    }
+}
+
+type UiPolylineQuery = (
+    &'static UiPolyline,
+    &'static ComputedNode,
+    &'static ComputedStackIndex,
+    &'static UiGlobalTransform,
+    &'static InheritedVisibility,
+    Option<&'static Node>,
+    Option<&'static ComputedUiTargetCamera>,
+    Option<&'static CalculatedClip>,
+);
+
+/// Emit one rotated quad per polyline segment. Runs after [`extract_ui`], which is what clears
+/// the buffers and builds the surface list this appends to.
+fn extract_ui_polylines(
+    mut extracted: ResMut<ExtractedUi>,
+    surfaces_res: Res<UiSurfaces>,
+    lines: Query<UiPolylineQuery>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let ExtractedUi {
+        quads: window_quads,
+        surfaces,
+        ..
+    } = &mut *extracted;
+    // Same routing as `extract_ui`, resolved by asset rather than by insertion order so it does
+    // not depend on two iterations of the same map agreeing.
+    let mut surface_index: HashMap<Entity, usize> = HashMap::default();
+    for (camera, (asset, _)) in surfaces_res.by_camera.iter() {
+        if let Some(i) = surfaces.iter().position(|s| s.asset == *asset) {
+            surface_index.insert(*camera, i);
+        }
+    }
+
+    for (line, uinode, stack_index, transform, inherited_visibility, node, target_camera, clip) in
+        lines.iter()
+    {
+        if !inherited_visibility.get()
+            || node.is_some_and(|node| node.display == Display::None)
+            || line.points.len() < 2
+            || line.color.is_fully_transparent()
+        {
+            continue;
+        }
+        let quads: &mut Vec<UiQuad> = match target_camera
+            .and_then(|c| c.get())
+            .and_then(|camera| surface_index.get(&camera))
+        {
+            Some(&i) => &mut surfaces[i].quads,
+            None => &mut *window_quads,
+        };
+
+        // The component speaks logical pixels from the node's top-left; the renderer works in
+        // physical pixels from the node's centre.
+        let scale = 1.0 / uinode.inverse_scale_factor();
+        let half = uinode.size() * 0.5;
+        let local = |p: Vec2| p * scale - half;
+        let thickness = (line.thickness * scale).max(1.0);
+        let color = line.color.to_linear().to_f32_array();
+        let transform = Affine2::from(*transform);
+        let z = stack_index.0 as f32 + z_offsets::BACKGROUND_COLOR;
+
+        let count = line.points.len();
+        let segments = if line.closed { count } else { count - 1 };
+        for i in 0..segments {
+            let a = local(line.points[i]);
+            let b = local(line.points[(i + 1) % count]);
+            let delta = b - a;
+            let length = delta.length();
+            if length < f32::EPSILON {
+                continue;
+            }
+            quads.push(UiQuad {
+                z,
+                image: None,
+                clip: clip.cloned(),
+                transform: transform
+                    * Affine2::from_translation((a + b) * 0.5)
+                    * Affine2::from_angle(delta.to_angle()),
+                item: UiItem::Node {
+                    color,
+                    // Overlong by half a thickness at each end so the round caps of adjacent
+                    // segments meet, instead of leaving a notch on the outside of every bend.
+                    size: Vec2::new(length + thickness, thickness),
+                    uvs: UNTEXTURED_UVS,
+                    border_radius: [[thickness * 0.5; 4]; 2],
+                    border: [0.0; 4],
+                    flags: shader_flags::UNTEXTURED,
+                },
+            });
+        }
+    }
+}
 
 fn border_array(border: BorderRect) -> [f32; 4] {
     [

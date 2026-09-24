@@ -20,6 +20,8 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     ray_default_plugins::RayDefaultPlugins,
     sphere::Sphere,
+    ui_render::UiPolyline,
+    util::{ScreenshotExt, TimeoutAppExt},
 };
 
 #[derive(Resource, Default)]
@@ -41,6 +43,10 @@ fn main() {
         Update,
         update_counter_text.run_if(resource_changed::<Counter>),
     );
+    // Every other example has these; this one did not, so it had no F12 and ran forever under
+    // the screenshot recipe.
+    app.add_screenshot(KeyCode::F12);
+    app.add_timeout_exit(None, 30.0);
     app.run();
 }
 
@@ -82,6 +88,8 @@ fn setup(
         ));
     }
 
+    commands.spawn(curves());
+
     // glowing sphere
     commands.spawn((
         Transform::from_xyz(0.0, 6.0, -2.0).with_scale(Vec3::splat(2.0)),
@@ -92,6 +100,54 @@ fn setup(
             ..default()
         })),
     ));
+}
+
+/// `UiPolyline` in the bottom-left: a sine wave and a bezier, both drawn through the ordinary
+/// quad path as rotated capsules — no line primitive, no shader, no pass of their own.
+fn curves() -> impl Bundle {
+    let wave: Vec<Vec2> = (0..=96)
+        .map(|i| {
+            let t = i as f32 / 96.0;
+            Vec2::new(t * 300.0, 60.0 + (t * std::f32::consts::TAU * 2.0).sin() * 44.0)
+        })
+        .collect();
+    (
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(16.0),
+            bottom: Val::Px(16.0),
+            width: Val::Px(300.0),
+            height: Val::Px(160.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.06, 0.07, 0.09, 0.85)),
+        children![
+            (
+                Node::default(),
+                UiPolyline {
+                    points: wave,
+                    thickness: 3.0,
+                    color: Color::srgb(0.45, 0.75, 1.0),
+                    closed: false,
+                },
+            ),
+            (
+                Node::default(),
+                UiPolyline {
+                    points: UiPolyline::bezier(
+                        Vec2::new(10.0, 150.0),
+                        Vec2::new(150.0, 150.0),
+                        Vec2::new(150.0, 110.0),
+                        Vec2::new(290.0, 110.0),
+                        24,
+                    ),
+                    thickness: 2.0,
+                    color: Color::srgb(1.0, 0.72, 0.35),
+                    closed: false,
+                },
+            ),
+        ],
+    )
 }
 
 fn panel() -> impl Scene {

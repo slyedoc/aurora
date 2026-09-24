@@ -120,6 +120,14 @@ slider, text) drawn by this crate's own Vulkan UI pass (`src/ui_render.rs`): the
 `bevy_feathers_core` feature, so bevy lays out and picks the UI and no `bevy_ui_render`/wgpu
 code runs.
 
+That example also shows `UiPolyline` (`src/ui_render.rs`): a polyline component on any UI node,
+for curves, links and sparklines that `bevy_ui`'s axis-aligned rectangles cannot express. It
+needs no shader and no pass of its own, because a `UiQuad` carries an arbitrary `Affine2` — a
+segment is one ROTATED quad through the ordinary node path, and the rounded ends come free from
+the corner radius the shader already applies in node-local space. Points are in the node's own
+logical pixels from its top-left, the same space a child's `left`/`top` lives in;
+`UiPolyline::bezier` samples a cubic into them.
+
 Every example has the dev panel (`DevUIPlugin`): a `bevy_feathers_inspector` card over the
 renderer's tunables (gamma, exposure, aperture, fog, sky) plus fps. `F2` toggles it, `F1` opens
 the world inspector, `Space` toggles accumulation.
