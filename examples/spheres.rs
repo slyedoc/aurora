@@ -9,7 +9,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -27,7 +27,7 @@ const EMISSIVE_NITS: f32 = 1_000_000.0;
 fn main() {
     App::new()
         .add_plugins((
-            RayDefaultPlugins,
+            AuroraDefaultPlugins,
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,

@@ -5,13 +5,13 @@ use bevy_aurora::{
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
     material::{AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sphere::Sphere,
 };
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
+    app.add_plugins(AuroraDefaultPlugins);
     app.add_plugins(DevShaderPlugin);
     app.add_plugins(DevUIPlugin);
     app.add_plugins(FreeCameraPlugin::default());

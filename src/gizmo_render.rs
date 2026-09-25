@@ -523,7 +523,7 @@ fn cleanup_gizmos(world: &mut World) {
 // ---------------------------------------------------------------------------------------------
 
 /// The Vulkan draw half of `bevy_gizmos`. Part of
-/// [`RayDefaultPlugins`](crate::ray_default_plugins::RayDefaultPlugins); add
+/// [`AuroraDefaultPlugins`](crate::AuroraDefaultPlugins); add
 /// `bevy::gizmos::GizmoPlugin` yourself to switch gizmos on (without it, this idles).
 pub struct GizmoRenderPlugin;
 

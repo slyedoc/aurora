@@ -7,14 +7,14 @@ use bevy_aurora::{
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
     material::{AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sphere::Sphere,
 };
 
 fn main() {
     App::new()
         .add_plugins((
-            RayDefaultPlugins,
+            AuroraDefaultPlugins,
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin::default(),

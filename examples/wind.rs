@@ -17,7 +17,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     skinning::{Wind, WindSway},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -31,7 +31,7 @@ const HEIGHT: f32 = 0.6;
 fn main() {
     App::new()
         .add_plugins((
-            RayDefaultPlugins,
+            AuroraDefaultPlugins,
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,

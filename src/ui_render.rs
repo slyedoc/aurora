@@ -327,7 +327,7 @@ pub struct UiRenderConfig {
 }
 
 /// Adds the render-free bevy UI stack (text, layout, widgets, picking, focus) and the Vulkan
-/// pass that draws it. Add after [`crate::ray_default_plugins::RayDefaultPlugins`]; add
+/// pass that draws it. Add after [`crate::AuroraDefaultPlugins`]; add
 /// `bevy::feathers::FeathersPlugins` yourself if you want feathers widgets.
 pub struct UiRenderPlugin;
 

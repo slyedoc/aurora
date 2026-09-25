@@ -18,7 +18,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sphere::Sphere,
     ui_render::UiPolyline,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -32,7 +32,7 @@ struct CounterText;
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
+    app.add_plugins(AuroraDefaultPlugins);
     app.add_plugins(DevShaderPlugin);
     // DevUIPlugin brings the UI stack (UiRenderPlugin, FeathersPlugins) and the dark theme.
     app.add_plugins(DevUIPlugin);

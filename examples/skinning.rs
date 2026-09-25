@@ -19,7 +19,7 @@ use bevy_aurora::{
     dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     util::screenshot::ScreenshotExt,
 };
 
@@ -32,7 +32,7 @@ struct FoxClips {
 fn main() {
     App::new()
         .add_plugins((
-            RayDefaultPlugins,
+            AuroraDefaultPlugins,
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin::default(),

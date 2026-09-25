@@ -28,7 +28,7 @@ pub fn aurora_asset(path: &str) -> AssetPath<'static> {
 }
 
 /// Registers the `aurora://` source. Must run before bevy's `AssetPlugin` builds (it is the first
-/// plugin in [`crate::ray_default_plugins::RayDefaultPlugins`]).
+/// plugin in [`crate::AuroraDefaultPlugins`]).
 pub struct AuroraAssetSourcePlugin;
 
 impl Plugin for AuroraAssetSourcePlugin {

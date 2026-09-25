@@ -12,7 +12,7 @@ use bevy_aurora::{
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     portal::AuroraPortal,
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -21,7 +21,7 @@ const SKY_SCALE_NITS: f32 = 8000.0;
 
 fn main() {
     App::new()
-        .add_plugins((RayDefaultPlugins, DevShaderPlugin, DevUIPlugin, FreeCameraPlugin))
+        .add_plugins((AuroraDefaultPlugins, DevShaderPlugin, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)

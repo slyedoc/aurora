@@ -15,7 +15,7 @@ use bevy_aurora::{
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
-    ray_default_plugins::RayDefaultPlugins,
+    AuroraDefaultPlugins,
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -43,7 +43,7 @@ struct Spawned(bool);
 fn main() {
     App::new()
         .add_plugins((
-            RayDefaultPlugins,
+            AuroraDefaultPlugins,
             DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,
