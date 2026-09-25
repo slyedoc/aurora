@@ -153,6 +153,9 @@ struct InstanceSource {
     material: Option<AssetId<AuroraMaterial>>,
     node: u32,
     mask: u8,
+    /// Which hit group shades this instance; see [`crate::surface_group`]. Part of the
+    /// instance's hit-record key, so changing it moves the instance to another record.
+    class: u32,
 }
 
 /// Material records for all instances, packed into one device buffer; an instance's
@@ -267,9 +270,14 @@ impl MaterialArena {
 
 /// Who an SBT hit-group record belongs to: a mesh asset (its BLAS streams), or one TLAS slot
 /// whose streams are its own (a skinned instance, skinning.rs).
+///
+/// `Asset` carries the [`SurfaceClass`](crate::surface_group::SurfaceClass) too, because the
+/// class picks the record's hit-group handle: one mesh drawn as both opaque and water needs
+/// two records over the same streams. Meshes are usually one class, so this costs nothing
+/// until something asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HitKey {
-    Asset(UntypedAssetId),
+    Asset(UntypedAssetId, u32),
     Slot(u32),
 }
 
@@ -759,6 +767,7 @@ fn extract_instances(
             Option<&AuroraMaterial3d>,
             Option<&InheritedVisibility>,
             Option<&bevy::camera::visibility::RenderLayers>,
+            Option<&crate::surface_group::SurfaceClass>,
         ),
         ChangedInstances,
     >,
@@ -767,7 +776,7 @@ fn extract_instances(
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
     }
-    for (instance, node, mesh, gltf, procedural, sphere, material, visibility, layers) in
+    for (instance, node, mesh, gltf, procedural, sphere, material, visibility, layers, class) in
         changed.iter()
     {
         let geometry = if let Some(mesh) = mesh {
@@ -792,6 +801,7 @@ fn extract_instances(
                 } else {
                     0x00
                 },
+                class: class.copied().unwrap_or_default().0,
             }),
         );
     }
@@ -817,7 +827,16 @@ pub fn prepare_instances(
     // Assets with no handle left: their SBT hit record returns to the pool (a streaming
     // scene otherwise grows the table forever).
     for id in dropped.0.drain(..) {
-        tlas.release_hit_offset(HitKey::Asset(id));
+        // Every class this asset was drawn with, not just the opaque one.
+        let keys: Vec<HitKey> = tlas
+            .hit_offsets
+            .keys()
+            .copied()
+            .filter(|key| matches!(key, HitKey::Asset(asset, _) if *asset == id))
+            .collect();
+        for key in keys {
+            tlas.release_hit_offset(key);
+        }
     }
     // A re-prepared mesh / gltf / material: every slot built on it re-resolves NOW, so the
     // rows scattered this frame carry the replacement's addresses before the old BLAS is
@@ -887,7 +906,7 @@ pub fn prepare_instances(
         let mut complete = true;
         let (mut blas, mut hit_offset, gltf_materials) = match source.geometry {
             Geometry::Mesh(id) => {
-                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
                 match meshes.get_by_id(id) {
                     Some(b) => (b.acceleration_structure.address, offset, None),
                     None => {
@@ -897,7 +916,7 @@ pub fn prepare_instances(
                 }
             }
             Geometry::Gltf(id) => {
-                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
                 match gltf_meshes.get_by_id(id) {
                     Some(b) => (
                         b.acceleration_structure.address,
@@ -911,7 +930,7 @@ pub fn prepare_instances(
                 }
             }
             Geometry::Procedural(id) => {
-                let offset = tlas.hit_offset(HitKey::Asset(id.untyped()));
+                let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
                 match procedural_meshes.get_by_id(id) {
                     Some(b) => (b.acceleration_structure.address, offset, None),
                     None => {

@@ -1,3 +1,17 @@
+/// How many views one frame can render.
+///
+/// A view owns per-view GPU state -- uniform buffer, descriptor set, ReSTIR reservoir pair,
+/// DLSS feature and its temporal history -- so views do NOT share denoiser history and each
+/// costs its own raygen dispatch. What they DO share is everything world-scale: the TLAS,
+/// the light table, GPU transforms and the SHARC cache are built once per frame regardless.
+/// So frame cost tracks total PIXELS traced, not view count.
+///
+/// Slots are allocated per frame in order. Four covers the cases that exist: an editor
+/// viewport plus two XR eyes, with one spare for a second viewport or a preview camera.
+/// Raising it costs one descriptor set per frame-in-flight per slot and nothing else --
+/// reservoirs and DLSS features are allocated lazily, so an unused slot holds no memory.
+pub const MAX_VIEWS: usize = 4;
+
 pub mod aftermath;
 pub mod animclip;
 pub mod assets;
@@ -5,6 +19,7 @@ pub mod atmosphere;
 pub mod auto_exposure;
 pub mod blas;
 pub mod bsn;
+pub mod camera_target;
 pub mod collision;
 pub mod compute;
 pub use aurora_cluster_mesh as cluster_mesh;
@@ -33,6 +48,7 @@ pub mod sbt;
 pub mod shader;
 pub mod sharc;
 pub mod skinning;
+pub mod surface_group;
 pub mod sky;
 pub mod sphere;
 pub mod swapchain;
@@ -148,9 +164,17 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
         group = group.add(crate::atmosphere::AtmospherePlugin);
         group = group.add(crate::debug_view::DebugViewPlugin);
+        group = group.add(crate::surface_group::SurfaceGroupPlugin);
         group = group.add(crate::sbt::SBTPlugin);
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);
+        // Rasterizes the `bevy_ui` node tree. It belongs here rather than behind
+        // `DevUIPlugin`, which is where it used to live: the dev panel is a debug tool, but
+        // any app with a UI needs the renderer, and reaching it through a debug plugin
+        // meant an app that did not want the F2 panel silently had no UI at all -- not even
+        // `Assets<Font>`, since this is what pulls `TextPlugin` in.
+        group = group.add(crate::ui_render::UiRenderPlugin);
+        group = group.add(crate::camera_target::CameraTargetPlugin);
         // Draws bevy_gizmos lines (add `bevy::gizmos::GizmoPlugin` yourself to switch them on).
         group = group.add(crate::gizmo_render::GizmoRenderPlugin);
         group = group.add(crate::bluenoise_plugin::BlueNoisePlugin);

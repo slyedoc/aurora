@@ -225,6 +225,8 @@ impl Plugin for DevUIPlugin {
         if !app.world().contains_resource::<UiTheme>() {
             app.insert_resource(UiTheme(create_dark_theme()));
         }
+        // `AuroraDefaultPlugins` carries `UiRenderPlugin` now; this keeps the panel
+        // standalone for an app that builds its own group.
         if !app.is_plugin_added::<UiRenderPlugin>() {
             app.add_plugins(UiRenderPlugin);
         }

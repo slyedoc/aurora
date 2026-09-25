@@ -6,130 +6,29 @@
 #include "types.glsl"
 #include "common.glsl"
 
-layout(set=1, binding=200) uniform sampler2D textures[];
-
-layout(shaderRecordEXT, scalar) buffer ShaderRecord
-{
-	VertexData vertexData;
-  TriangleData triangleData;
-  IndexData  indexData;
-  GeometryData geometries;
-  GeometryData triangles;
-  // Skinned instances (sbt.rs): last frame's deformed stream, flagged in recordFlags.x.
-  VertexData prevVertexData;
-  uvec2 recordFlags;
-};
-
-layout(push_constant, std430) uniform Registers {
-  PushConstants pc;
-};
-
-layout(location = 0) rayPayloadInEXT HitPayload payload;
-
-hitAttributeEXT vec2 attribs;
-
-vec3 calcTangent(const Vertex v0, const Vertex v1, const Vertex v2) {
-  const vec3 edge1 = v1.position - v0.position;
-  const vec3 edge2 = v2.position - v0.position;
-  const vec2 deltaUV1 = v1.texcoord - v0.texcoord;
-  const vec2 deltaUV2 = v2.texcoord - v0.texcoord;
-
-
-  const float denom = deltaUV1.x * deltaUV2.y - deltaUV2.x * deltaUV1.y;
-  if (abs(denom) < 0.00001f) {
-    return vec3(0.0, 0.0, 1.0);
-  }
-
-  vec3 tangent;
-  const float f = 1.0 / denom;
-  tangent.x = f * (deltaUV2.y * edge1.x - deltaUV1.y * edge2.x);
-  tangent.y = f * (deltaUV2.y * edge1.y - deltaUV1.y * edge2.y);
-  tangent.z = f * (deltaUV2.y * edge1.z - deltaUV1.y * edge2.z);
-
-  return normalize(tangent);
-}
-
-// sRGB-encoded texels (colour textures are uploaded as UNORM) to linear; alpha untouched.
-vec4 toLinear(const vec4 sRGB)
-{
-	const bvec4 cutoff = lessThan(sRGB, vec4(0.04045));
-	const vec4 higher = pow((sRGB + vec4(0.055))/vec4(1.055), vec4(2.4));
-	const vec4 lower = sRGB/vec4(12.92);
-
-	return vec4(mix(higher, lower, cutoff).rgb, sRGB.a);
-}
-
 #define PACKED 1
+#include "surface_common.glsl"
 
-// One texture read at the ray-cone level: `lod_base` plus half the log2 of the texel count.
-vec4 sampleLod(const uint index, const vec2 uv, const float lod_base) {
-  const vec2 size = vec2(textureSize(textures[index], 0));
-  return textureLod(textures[index], uv, lod_base + 0.5 * log2(size.x * size.y));
-}
-
+// The OPAQUE surface class (`SurfaceClass::OPAQUE`): standard PBR out of the material
+// record. Every other class is a sibling of this file -- same `surfaceHit()` and
+// `surfaceWritePayload()`, a different middle.
 void main() {
-  const vec3 baryCoords = vec3(1.0f - attribs.x - attribs.y, attribs.x, attribs.y);
-  const Material material = pc.materials.materials[gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT];
+  const SurfaceHit hit = surfaceHit();
+  const Material material = hit.material;
 
-#if PACKED
-  Triangle tri = triangleData.data[triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID];
-  const vec2 uv = mat3x2(
-      unpackUv(tri.uvs[0]),
-      unpackUv(tri.uvs[1]),
-      unpackUv(tri.uvs[2])
-  ) * baryCoords;
-  vec3 object_normal = mat3(
-      unpackNormal(tri.normals[0]),
-      unpackNormal(tri.normals[1]),
-      unpackNormal(tri.normals[2])
-  ) * baryCoords;
-  const vec3 tangent = unpackNormal(tri.tangent);
-  const float tri_lod = tri.lod;
-#else
-  const uint index_offset = geometries.index_offsets[gl_GeometryIndexEXT];
-  const Vertex v0 = vertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 0]];
-  const Vertex v1 = vertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 1]];
-  const Vertex v2 = vertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 2]];
-  const vec2 uv = v0.texcoord * baryCoords.x + v1.texcoord * baryCoords.y + v2.texcoord * baryCoords.z;
-  vec3 object_normal = v0.normal * baryCoords.x + v1.normal * baryCoords.y + v2.normal * baryCoords.z;
-  const vec3 tangent = calcTangent(v0, v1, v2);
-  const float tri_lod = 0.0;
-#endif
-
-
-  // Which side of the triangle was hit: the hardware's geometric answer, stable under
-  // camera motion. A smooth-normal dot test here flips front-face grazing hits, which made
-  // foliage normals (and the medium side for glass) swim with the camera.
-  const bool inside = gl_HitKindEXT == gl_HitKindBackFacingTriangleEXT;
-  if (inside) { object_normal = -object_normal; }
-
-  const vec3 surface_normal = normalize((gl_ObjectToWorldEXT * vec4(object_normal, 0.0)).xyz);
-  payload.t = gl_HitTEXT;
   payload.refract_index = material.refract_index;
   payload.absorption = material.absorption;
 
-  // Texture level of detail by ray cone (Akenine-Moller et al., Ray Tracing Gems ch. 20): a
-  // ray-tracing stage has no derivatives, so the footprint comes from the cone the raygen
-  // carries (width at the hit), the triangle's texel density (`tri_lod`, object space, so
-  // the instance scale comes off), and the incidence angle. Per texture, half the log of
-  // its texel count is added (`sampleLod`). Without this every read is level 0, and under
-  // sub-pixel jitter a minified texture lands on a different texel every frame.
-  const float cone_width = max(payload.cone.x + payload.cone.y * gl_HitTEXT, 1.0e-7);
-  const float object_scale = max(length(gl_ObjectToWorldEXT[0].xyz), 1.0e-6);
-  const float incidence = max(abs(dot(surface_normal, gl_WorldRayDirectionEXT)), 0.1);
-  const float lod_base = tri_lod - log2(object_scale) + log2(cone_width) - log2(incidence)
-      + pc.uniforms.lod_bias;
-
   payload.color = material.base_color_factor;
-  payload.color *= toLinear(sampleLod(material.base_color_texture, uv, lod_base));
+  payload.color *= toLinear(sampleLod(material.base_color_texture, hit.uv, hit.lod_base));
   if (material.alpha_cutoff > 0.0) {
     // A cutout's coverage comes from level 0, like the any-hit test: a blurred alpha would
     // thin foliage out with distance.
     payload.color.a = material.base_color_factor.a
-        * texture(textures[material.base_color_texture], uv).a;
+        * texture(textures[material.base_color_texture], hit.uv).a;
   }
   payload.emission = material.base_emissive_factor.rgb;
-  payload.emission *= toLinear(sampleLod(material.base_emissive_texture, uv, lod_base)).rgb;
+  payload.emission *= toLinear(sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base)).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
 
   // Terrain records (recordFlags.x bit 1): the editor's brush ring, emissive so it reads in
@@ -143,42 +42,15 @@ void main() {
   }
 
   float transmission = material.specular_transmission_factor;
-  transmission *= sampleLod(material.specular_transmission_texture, uv, lod_base).r;
+  transmission *= sampleLod(material.specular_transmission_texture, hit.uv, hit.lod_base).r;
 
-  const vec4 mr = sampleLod(material.metallic_roughness_texture, uv, lod_base);
+  const vec4 mr = sampleLod(material.metallic_roughness_texture, hit.uv, hit.lod_base);
   const float roughness = material.roughness_factor * mr.g;
   const float metallic = material.metallic_factor * mr.b;
 
-  const vec3 bitangent = cross(object_normal, tangent);
-  const mat3 TBN = mat3(tangent, bitangent, object_normal);
-
-  const vec3 texture_normal = sampleLod(material.normal_texture, uv, lod_base).xyz * 2.0 - 1.0;
-  const vec3 world_normal = normalize(mat3(gl_ObjectToWorldEXT) * TBN * texture_normal);
-
-  payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);
-  payload.slot = gl_InstanceID;
-  payload.prim_tri = triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID;
-  {
-    // Object-space hit point through last frame's instance transform. A skinned instance
-    // takes the point from last frame's deformed vertices instead (object motion).
-    vec3 object_p = gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT;
-    if ((recordFlags.x & 1u) != 0u) {
-      const uint index_offset = geometries.index_offsets[gl_GeometryIndexEXT];
-      const vec3 q0 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 0]].position;
-      const vec3 q1 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 1]].position;
-      const vec3 q2 = prevVertexData.data[indexData.data[index_offset + gl_PrimitiveID * 3 + 2]].position;
-      object_p = q0 * baryCoords.x + q1 * baryCoords.y + q2 * baryCoords.z;
-    }
-    const vec4 p = vec4(object_p, 1.0);
-    const uint base = gl_InstanceID * 4;
-    const vec4 r0 = pc.prev_instances.data[base + 0];
-    const vec4 r1 = pc.prev_instances.data[base + 1];
-    const vec4 r2 = pc.prev_instances.data[base + 2];
-    payload.prev_world_pos = vec3(dot(r0, p), dot(r1, p), dot(r2, p));
-  }
+  surfaceWritePayload(hit, surfaceShadingNormal(hit));
   hitPayloadSetTransmission(payload, transmission);
   hitPayloadSetRoughness(payload, roughness);
   hitPayloadSetMetallic(payload, metallic);
-  hitPayloadSetInside(payload, inside);
   hitPayloadSetMasked(payload, material.alpha_cutoff > 0.0);
 }

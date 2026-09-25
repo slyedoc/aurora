@@ -1,0 +1,51 @@
+// A row of spheres whose materials are spelled entirely in `.bsn`, to prove the widened
+// `AuroraMaterial` still loads through reflection: every field added for the jackdaw port
+// (reflectance, occlusion_texture, double_sided, cull_mode, flip_normal_map_y, unlit,
+// fog_enabled, depth_bias, the three parallax terms, uv_transform) is reflected, so an
+// unregistered one fails the whole scene rather than that field.
+//
+// Left to right: rough dielectric, polished metal, emissive, glass. The glass sphere is
+// the one that exercises the transmission path the tracer actually reads.
+#material_matrix
+bevy_ecs::hierarchy::Children [
+    bevy_ecs::name::Name("bsn rough dielectric")
+    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: -3.0, y: 1.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_aurora::sphere::Sphere
+    bevy_aurora::material::AuroraMaterial3d(bevy_aurora::material::AuroraMaterial {
+        base_color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 0.65, green: 0.18, blue: 0.16, alpha: 1.0 }),
+        perceptual_roughness: 0.85,
+        metallic: 0.0,
+        reflectance: 0.35,
+    }),
+
+    bevy_ecs::name::Name("bsn polished metal")
+    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: -1.0, y: 1.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_aurora::sphere::Sphere
+    bevy_aurora::material::AuroraMaterial3d(bevy_aurora::material::AuroraMaterial {
+        base_color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 0.95, green: 0.78, blue: 0.35, alpha: 1.0 }),
+        perceptual_roughness: 0.12,
+        metallic: 1.0,
+    }),
+
+    bevy_ecs::name::Name("bsn emissive")
+    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 1.0, y: 1.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_aurora::sphere::Sphere
+    bevy_aurora::material::AuroraMaterial3d(bevy_aurora::material::AuroraMaterial {
+        base_color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 0.02, green: 0.02, blue: 0.02, alpha: 1.0 }),
+        emissive: bevy_color::linear_rgba::LinearRgba { red: 12000.0, green: 4000.0, blue: 1200.0, alpha: 1.0 },
+        perceptual_roughness: 0.5,
+    }),
+
+    bevy_ecs::name::Name("bsn glass")
+    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 3.0, y: 1.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_aurora::sphere::Sphere
+    bevy_aurora::material::AuroraMaterial3d(bevy_aurora::material::AuroraMaterial {
+        base_color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 0.95, green: 0.98, blue: 1.0, alpha: 1.0 }),
+        perceptual_roughness: 0.03,
+        specular_transmission: 1.0,
+        ior: 1.52,
+        attenuation_distance: 1.5,
+        attenuation_color: bevy_color::color::Color::LinearRgba(bevy_color::linear_rgba::LinearRgba { red: 0.55, green: 0.85, blue: 0.75, alpha: 1.0 }),
+    }),
+
+]

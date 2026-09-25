@@ -30,9 +30,18 @@ struct ReservoirView {
     bytes: u64,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct RestirState {
-    views: [ReservoirView; 2],
+    views: [ReservoirView; crate::MAX_VIEWS],
+}
+
+impl Default for RestirState {
+    fn default() -> Self {
+        // `[T; N]: Default` stops at 32 and reads worse than saying it outright.
+        Self {
+            views: std::array::from_fn(|_| ReservoirView::default()),
+        }
+    }
 }
 
 impl RestirState {

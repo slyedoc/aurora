@@ -9,6 +9,8 @@ use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
 
+use crate::post_process_filter::POST_TARGETS;
+
 use crate::sky::{ProceduralSky, Sky};
 use crate::{
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
@@ -116,17 +118,41 @@ pub struct FocusData {
     focal_distance: f32,
 }
 
-/// One rendered view this frame: XR renders one per eye, flat renders one for the window.
-/// `slot` indexes the per-view resources (uniform buffer, DLSS feature, reservoirs,
-/// descriptor sets).
+/// One rendered view this frame: XR renders one per eye, a flat frame renders one per
+/// active camera in `Camera::order`. `slot` indexes the per-view resources (uniform buffer,
+/// DLSS feature, reservoirs, descriptor sets).
 struct ViewFrame {
     slot: usize,
+    /// Where this view's result goes.
+    target: ViewTarget,
+    /// The view's final resolution. Per view, not per frame: two cameras can have targets
+    /// of completely different sizes, and this drives the reservoir extent, the DLSS plan
+    /// and the texture LOD bias.
+    output_extent: vk::Extent2D,
+    /// The resolution rays are actually traced at -- below `output_extent` when DLSS is
+    /// upscaling, equal to it otherwise.
+    trace_extent: vk::Extent2D,
+    /// `RenderLayers` as a bitmask: which instances this view can see.
+    camera_mask: u32,
+    /// `AuroraDebugView`'s shader index for this view.
+    debug_view: u32,
     inverse_view: Mat4,
     view_matrix: Mat4,
     projection: Mat4,
     view_proj: Mat4,
     last_view_proj: Mat4,
     plan: Option<crate::dlss::DlssPlan>,
+}
+
+/// Where a view's composited image lands.
+#[derive(Clone, Copy)]
+enum ViewTarget {
+    /// The window, at this rect. Unset `Camera::viewport` gives the whole window; a docked
+    /// editor viewport gives its panel's rect.
+    Window { rect: vk::Rect2D },
+    /// An offscreen image (`RenderTarget::Image`). The asset id resolves to a texture in
+    /// `VulkanAssets<Image>`, so whatever samples the handle sees this view's result.
+    Image { asset: AssetId<Image> },
 }
 
 /// The renderer's teardown: every plugin that owns Vulkan objects destroys them here, and
@@ -290,13 +316,41 @@ fn set_focus_pulling(
     }
 }
 
+/// The window rect a flat view occupies, in physical pixels.
+///
+/// `Camera::viewport` set means the host is placing this view somewhere specific -- an
+/// editor's docked viewport, one pane of a split screen. Unset means the whole window.
+/// The rect is clamped to the swapchain, because a UI-driven rect can lag a resize by a
+/// frame and a viewport past the swapchain is a validation error.
+fn view_rect(camera: Option<&Camera>, window: vk::Extent2D) -> vk::Rect2D {
+    let full = vk::Rect2D::default().extent(window);
+    let Some(viewport) = camera.and_then(|c| c.viewport.as_ref()) else {
+        return full;
+    };
+    let max = UVec2::new(window.width, window.height);
+    let origin = viewport.physical_position.min(max);
+    let size = viewport.physical_size.min(max - origin);
+    if size.x == 0 || size.y == 0 {
+        return full;
+    }
+    vk::Rect2D::default()
+        .offset(vk::Offset2D {
+            x: origin.x as i32,
+            y: origin.y as i32,
+        })
+        .extent(vk::Extent2D {
+            width: size.x,
+            height: size.y,
+        })
+}
+
 #[derive(Resource, Default)]
 pub struct Frame {
     pub swapchain_image: vk::Image,
     pub swapchain_view: vk::ImageView,
-    /// One per rendered view (XR eyes; flat uses `[0]`): every trace dispatch in the frame
-    /// needs its own matrices.
-    pub uniform_buffers: [Buffer<UniformData>; 2],
+    /// One per view slot ([`crate::MAX_VIEWS`]): every trace dispatch in the frame needs
+    /// its own matrices.
+    pub uniform_buffers: [Buffer<UniformData>; crate::MAX_VIEWS],
     pub focus_data: Buffer<FocusData>,
 }
 
@@ -340,20 +394,28 @@ fn render_frame(
     ),
     camera: Query<
         (
+            Entity,
             &Projection,
             &GlobalTransform,
             Option<&crate::dlss::AuroraDlss>,
             Option<&crate::auto_exposure::AuroraExposure>,
             Option<&crate::debug_view::AuroraDebugView>,
             Option<&bevy::camera::visibility::RenderLayers>,
+            // `Camera::viewport` is how a host says "put this view in that rect of the
+            // window" -- an editor's docked viewport, or a split screen. None means the
+            // whole window, which is what a plain app wants. `order` sorts the views and
+            // `is_active` skips them.
+            Option<&Camera>,
         ),
         With<Camera3d>,
     >,
     mut frame_counter: Local<u32>,
     dlss_stuff: (
         ResMut<crate::dlss::DlssState>,
-        Local<[Option<Mat4>; 2]>,
+        Local<[Option<Mat4>; crate::MAX_VIEWS]>,
         Local<bool>,
+        // Rides along here because a system's parameter list stops at 16.
+        Res<crate::camera_target::CameraTargets>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -380,7 +442,7 @@ fn render_frame(
         mut terrains,
         mut atmo,
     ) = gpu;
-    let (mut dlss, mut prev_view_proj, mut dlss_was_active) = dlss_stuff;
+    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
     let (
         dev_ui_state,
@@ -396,52 +458,140 @@ fn render_frame(
     ) = dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
-    let camera = camera.single().unwrap();
+    // Every active Camera3d becomes a view, lowest `Camera::order` first -- so a camera
+    // whose target another camera samples renders before it, which is what `order` means
+    // everywhere else in bevy. Entity breaks ties because query iteration order is not
+    // stable and a flickering slot assignment would throw away temporal history.
+    // MAX_VIEWS caps it; the rest are dropped with a warning rather than silently.
+    let mut cameras: Vec<_> = camera
+        .iter()
+        .filter(|c| c.7.is_none_or(|cam| cam.is_active))
+        .collect();
+    cameras.sort_by_key(|c| (c.7.map_or(0, |cam| cam.order), c.0));
+    if cameras.len() > crate::MAX_VIEWS {
+        log::warn!(
+            "{} active cameras but MAX_VIEWS is {}; rendering the {} lowest-order",
+            cameras.len(),
+            crate::MAX_VIEWS,
+            crate::MAX_VIEWS,
+        );
+        cameras.truncate(crate::MAX_VIEWS);
+    }
+    // NO early return when there is no camera. An editor's project picker, a main menu and
+    // a loading screen are UI with no scene to trace, and this function owns the whole
+    // frame -- swapchain acquire, the UI pass, gizmos, present. Returning here drew
+    // nothing at all, which looks exactly like a hung window. `views` simply ends up empty
+    // and every scene-only stage below skips itself.
+    let camera = cameras.first().copied();
     // XR: the camera entity's transform anchors the headset's LOCAL space in the world (the
     // fly-cam still moves it); each eye's pose and asymmetric fov come from the runtime.
     // Flat (and an XR session that produced no frame): the entity transform is the whole
     // camera and the window is the one view.
-    let anchor = camera.1.to_matrix();
-    let (output_extent, cameras): (vk::Extent2D, Vec<(usize, Mat4, Mat4)>) =
-        match (&xr_frame, xr.as_deref(), camera.0) {
-            (Some(xr_frame), Some(xr_state), projection) => {
-                let near = match projection {
-                    Projection::Perspective(perspective) => perspective.near,
-                    _ => 0.1,
+    let anchor = camera.map_or(Mat4::IDENTITY, |c| c.2.to_matrix());
+    /// One camera's contribution before DLSS has had its say.
+    struct PlannedView {
+        slot: usize,
+        inverse_view: Mat4,
+        projection: Mat4,
+        output_extent: vk::Extent2D,
+        target: ViewTarget,
+        dlss_mode: crate::dlss::AuroraDlss,
+        camera_mask: u32,
+        debug_view: u32,
+    }
+
+    let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {
+        // A headset with no camera has nothing to anchor to.
+        (Some(_), _) if camera.is_none() => Vec::new(),
+        // A headset is one camera's two eyes, not one view per camera: the primary camera
+        // anchors the headset's local space and the runtime supplies each eye's pose.
+        (Some(xr_frame), Some(xr_state)) => {
+            let camera = camera.expect("guarded by the arm above");
+            let near = match camera.1 {
+                Projection::Perspective(perspective) => perspective.near,
+                _ => 0.1,
+            };
+            (0..2)
+                .map(|eye| {
+                    let (head, projection) = xr_frame.eye_camera(eye, near);
+                    PlannedView {
+                        slot: eye,
+                        inverse_view: anchor * head,
+                        projection,
+                        output_extent: xr_state.extent,
+                        // The window shows a letterboxed eye; the headset's own swapchain
+                        // is written separately by the XR path.
+                        target: ViewTarget::Window {
+                            rect: vk::Rect2D::default().extent(swapchain.swapchain_extent),
+                        },
+                        dlss_mode: camera.3.copied().unwrap_or_default(),
+                        camera_mask: crate::tlas_builder::layers_mask(camera.6) as u32,
+                        debug_view: camera.5.copied().unwrap_or_default().shader_index(),
+                    }
+                })
+                .collect()
+        }
+        _ => cameras
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, c)| {
+                let Projection::Perspective(perspective) = c.1 else {
+                    // Orthographic and custom projections have no raygen yet; skipping is
+                    // better than the `todo!()` that used to take the whole frame down.
+                    log::warn!("aurora: only perspective cameras render; skipping {:?}", c.0);
+                    return None;
                 };
-                (
-                    xr_state.extent,
-                    (0..2)
-                        .map(|eye| {
-                            let (head, projection) = xr_frame.eye_camera(eye, near);
-                            (eye, anchor * head, projection)
-                        })
-                        .collect(),
-                )
-            }
-            (_, _, Projection::Perspective(perspective)) => (
-                swapchain.swapchain_extent,
-                vec![(
-                    0,
-                    anchor,
-                    bevy::math::proj::perspective_infinite_reverse(
+                // An offscreen camera is sized by its target texture; a window camera by
+                // its rect. Tracing at the rect's size rather than the window's is the
+                // whole point of the latter: a docked viewport costs its own pixels, not
+                // the window's, and never pays for a copy into a UI texture.
+                let (target, extent) = match camera_targets.by_camera.get(&c.0) {
+                    Some((asset, size)) => (
+                        ViewTarget::Image { asset: *asset },
+                        vk::Extent2D {
+                            width: size.x,
+                            height: size.y,
+                        },
+                    ),
+                    None => {
+                        let rect = view_rect(c.7, swapchain.swapchain_extent);
+                        (ViewTarget::Window { rect }, rect.extent)
+                    }
+                };
+                Some(PlannedView {
+                    slot,
+                    inverse_view: c.2.to_matrix(),
+                    projection: bevy::math::proj::perspective_infinite_reverse(
                         perspective.fov,
-                        (window.width as f32) / (window.height as f32),
+                        extent.width.max(1) as f32 / extent.height.max(1) as f32,
                         perspective.near,
                     ),
-                )],
-            ),
-            (_, _, Projection::Orthographic(_)) => todo!("orthographic camera"),
-            (_, _, Projection::Custom(_)) => todo!("custom_projection"),
-        };
+                    output_extent: extent,
+                    target,
+                    dlss_mode: c.3.copied().unwrap_or_default(),
+                    camera_mask: crate::tlas_builder::layers_mask(c.6) as u32,
+                    debug_view: c.5.copied().unwrap_or_default().shader_index(),
+                })
+            })
+            .collect(),
+    };
 
     // DLSS: settle each view's trace resolution and jitter before recording (feature
     // creation, when the mode or output size changed, submits and waits on its own).
-    let dlss_mode = camera.2.copied().unwrap_or_default();
     let reset_requested = std::mem::take(&mut dlss.reset_requested);
-    let views: Vec<ViewFrame> = cameras
+    let views: Vec<ViewFrame> = planned
         .into_iter()
-        .map(|(slot, inverse_view, projection)| {
+        .map(|p| {
+            let PlannedView {
+                slot,
+                inverse_view,
+                projection,
+                output_extent,
+                target,
+                dlss_mode,
+                camera_mask,
+                debug_view,
+            } = p;
             let plan = dlss
                 .renderer
                 .as_mut()
@@ -452,6 +602,11 @@ fn render_frame(
             prev_view_proj[slot] = Some(view_proj);
             ViewFrame {
                 slot,
+                target,
+                output_extent,
+                trace_extent: plan.map_or(output_extent, |p| p.render),
+                camera_mask,
+                debug_view,
                 inverse_view,
                 view_matrix,
                 projection,
@@ -464,7 +619,9 @@ fn render_frame(
     let plan = views.first().and_then(|v| v.plan);
     let dlss_reset = plan.is_some() && (!*dlss_was_active || reset_requested);
     *dlss_was_active = plan.is_some();
-    let trace_extent = plan.map_or(output_extent, |p| p.render);
+    // The primary view drives the frame-wide passes (auto-exposure, the atmosphere LUTs).
+    // Per-view work reads the view's own extents.
+    let primary_trace_extent = views.first().map_or(swapchain.swapchain_extent, |v| v.trace_extent);
     // Set once an evaluate has been recorded this frame: only then does a blit read a DLSS
     // output (before the RT pipeline is compiled nothing has written them).
     let mut dlss_ran = false;
@@ -602,7 +759,9 @@ fn render_frame(
             light_candidates: dev_ui_state.light_candidates.clamp(1, 32),
             // DLSS guide 3.5: textures are picked for the OUTPUT resolution, not the trace
             // resolution, so the upscaled image keeps its detail.
-            lod_bias: (trace_extent.width.max(1) as f32 / output_extent.width.max(1) as f32).log2()
+            lod_bias: (view.trace_extent.width.max(1) as f32
+                / view.output_extent.width.max(1) as f32)
+                .log2()
                 + dev_ui_state.texture_lod_bias,
             spec_hit_roughness: dev_ui_state.spec_hit_roughness,
             light_epoch: lights.epoch,
@@ -624,7 +783,7 @@ fn render_frame(
             emissive_boost: dev_ui_state.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
-            camera_mask: crate::tlas_builder::layers_mask(camera.5) as u32,
+            camera_mask: view.camera_mask,
             sky_layer_mode,
             sky_layer_tex,
             sky_layer_color,
@@ -718,12 +877,12 @@ fn render_frame(
         // reads it), or write the camera's fixed EV.
         drop(section);
         let section = info_span!("record_exposure_atmo").entered();
-        let exposure = camera.3.cloned().unwrap_or_default();
+        let exposure = camera.and_then(|c| c.4.cloned()).unwrap_or_default();
         ae.record(
             &render_device,
             cmd_buffer,
             &modules,
-            trace_extent,
+            primary_trace_extent,
             &exposure,
             time.delta_secs(),
         );
@@ -737,7 +896,7 @@ fn render_frame(
             &atmosphere,
             &clouds,
             &procedural,
-            camera.1.translation(),
+            camera.map_or(Vec3::ZERO, |c| c.2.translation()),
             time.delta_secs(),
         );
 
@@ -767,7 +926,7 @@ fn render_frame(
                             &tlas.acceleration_structure.handle,
                         ));
                     let set =
-                        rtx_pipeline.descriptor_sets[(swapchain.frame_count % 2) * 2 + view.slot];
+                        rtx_pipeline.descriptor_sets[(swapchain.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
                     let mut writes = vec![
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
@@ -826,7 +985,7 @@ fn render_frame(
                     let (reservoirs_prev, reservoirs_cur) = restir.ensure(
                         &render_device,
                         cmd_buffer,
-                        trace_extent,
+                        view.trace_extent,
                         *frame_counter,
                         view.slot,
                     );
@@ -890,7 +1049,10 @@ fn render_frame(
         let section = info_span!("record_present_pass").entered();
         let parity = swapchain.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
-        let debug_view = camera.4.copied().unwrap_or_default().shader_index();
+        let debug_view = camera
+            .and_then(|c| c.5.copied())
+            .unwrap_or_default()
+            .shader_index();
 
         // XR: resolve each eye through the post-process into its target and hand it to the
         // compositor layer, before the window's own pass.
@@ -934,7 +1096,7 @@ fn render_frame(
                         &render_device,
                         cmd_buffer,
                         pipeline,
-                        pipeline.descriptor_sets[parity * 3 + eye],
+                        pipeline.descriptor_sets[parity * POST_TARGETS + eye],
                         source_view,
                         dlss.renderer.as_ref().and_then(|r| r.guide_views(eye)),
                         &crate::post_process_filter::PostProcessPushConstants {
@@ -947,6 +1109,84 @@ fn render_frame(
                 }
                 render_device.cmd_end_rendering(cmd_buffer);
                 xr_state.record_eye_to_layer(&render_device, cmd_buffer, xr_frame, eye);
+            }
+        }
+
+        // Offscreen camera targets, each in its own pass BEFORE the window's. Ordering
+        // matters twice over: this pass cannot share the swapchain's attachment, and a
+        // lower-`Camera::order` view whose target a later view samples must land first.
+        // Each image ends back in SHADER_READ_ONLY_OPTIMAL, which is where anything
+        // resolving the asset -- a UI node, a material, a hit shader -- expects it.
+        if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
+            for view in &views {
+                let ViewTarget::Image { asset } = view.target else {
+                    continue;
+                };
+                let Some((texture, extent)) = camera_targets.map.get(&asset) else {
+                    continue;
+                };
+                let Some(source_view) = dlss
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.output_view(view.slot))
+                else {
+                    continue;
+                };
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    texture.image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                );
+                let area = vk::Rect2D::default().extent(*extent);
+                let attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(texture.image_view)
+                    .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue { float32: [0.0; 4] },
+                    });
+                let info = vk::RenderingInfo::default()
+                    .layer_count(1)
+                    .render_area(area)
+                    .color_attachments(std::slice::from_ref(&attachment));
+                render_device.cmd_begin_rendering(cmd_buffer, &info);
+                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&area));
+                render_device.cmd_set_viewport(
+                    cmd_buffer,
+                    0,
+                    std::slice::from_ref(
+                        &vk::Viewport::default()
+                            .width(extent.width as f32)
+                            .height(extent.height as f32)
+                            .min_depth(0.0)
+                            .max_depth(1.0),
+                    ),
+                );
+                record_post_draw(
+                    &render_device,
+                    cmd_buffer,
+                    pipeline,
+                    pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
+                    source_view,
+                    dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
+                    &crate::post_process_filter::PostProcessPushConstants {
+                        uniforms: frame.uniform_buffers[view.slot].address,
+                        auto_exposure: ae.addresses().1,
+                        display_exposure: exposure.display_exposure(),
+                        debug_view: view.debug_view,
+                    },
+                );
+                render_device.cmd_end_rendering(cmd_buffer);
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    texture.image,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
             }
         }
 
@@ -977,54 +1217,101 @@ fn render_frame(
 
         // Until the RT pipeline compiles and the first evaluate lands there is nothing to
         // sample -- leave the clear (the UI still draws).
-        let source_view = dlss
-            .renderer
-            .as_ref()
-            .filter(|_| dlss_ran)
-            .and_then(|r| r.output_view(0));
-        if let (Some(pipeline), Some(source_view)) = (postprocess, source_view) {
+        if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
             let (window_w, window_h) = (
                 swapchain.swapchain_extent.width as f32,
                 swapchain.swapchain_extent.height as f32,
             );
-            // Spectator: letterbox the eye image instead of stretching it.
-            let viewport = if xr_frame.is_some() {
-                let source_aspect = output_extent.width as f32 / output_extent.height as f32;
-                let (w, h) = if source_aspect > window_w / window_h {
-                    (window_w, window_w / source_aspect)
-                } else {
-                    (window_h * source_aspect, window_h)
-                };
-                vk::Viewport::default()
-                    .x((window_w - w) * 0.5)
-                    .y((window_h - h) * 0.5)
-                    .width(w)
-                    .height(h)
+            // XR draws ONE letterboxed eye as the spectator image; a flat frame composites
+            // every window-targeted view into its own rect.
+            let composited: &[ViewFrame] = if xr_frame.is_some() {
+                &views[..1.min(views.len())]
             } else {
-                vk::Viewport::default().width(window_w).height(window_h)
-            }
-            .min_depth(0.0)
-            .max_depth(1.0);
-            render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
+                &views[..]
+            };
+            for view in composited {
+                let Some(source_view) = dlss
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.output_view(view.slot))
+                else {
+                    continue;
+                };
+                let ViewTarget::Window { rect } = view.target else {
+                    // Image targets are composited in their own pass, outside this one:
+                    // this render pass has the swapchain attached.
+                    continue;
+                };
+                let viewport = if xr_frame.is_some() {
+                    // Spectator: letterbox the eye image instead of stretching it.
+                    let source_aspect =
+                        view.output_extent.width as f32 / view.output_extent.height as f32;
+                    let (w, h) = if source_aspect > window_w / window_h {
+                        (window_w, window_w / source_aspect)
+                    } else {
+                        (window_h * source_aspect, window_h)
+                    };
+                    vk::Viewport::default()
+                        .x((window_w - w) * 0.5)
+                        .y((window_h - h) * 0.5)
+                        .width(w)
+                        .height(h)
+                } else {
+                    // Land the traced image on the rect it was traced for. Unset
+                    // `Camera::viewport` gives the whole window, so a plain app is
+                    // unchanged.
+                    vk::Viewport::default()
+                        .x(rect.offset.x as f32)
+                        .y(rect.offset.y as f32)
+                        .width(rect.extent.width as f32)
+                        .height(rect.extent.height as f32)
+                }
+                .min_depth(0.0)
+                .max_depth(1.0);
+                render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
+                // The composite is an OVERSIZED fullscreen triangle -- NDC
+                // (-1,-1)(3,-1)(-1,3) in quad.vert -- so a viewport smaller than the window
+                // is not enough on its own: the vertices past NDC map past the viewport rect
+                // and would paint over roughly twice it, straight across the editor's UI (or
+                // over the view composited before it). Clip to the rect; the UI pass below
+                // puts the full scissor back.
+                let scissor = vk::Rect2D::default()
+                    .offset(vk::Offset2D {
+                        x: viewport.x as i32,
+                        y: viewport.y as i32,
+                    })
+                    .extent(vk::Extent2D {
+                        width: viewport.width as u32,
+                        height: viewport.height as u32,
+                    });
+                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&scissor));
 
-            let target = if xr_frame.is_some() { 2 } else { 0 };
-            record_post_draw(
-                &render_device,
-                cmd_buffer,
-                pipeline,
-                pipeline.descriptor_sets[parity * 3 + target],
-                source_view,
-                dlss.renderer.as_ref().and_then(|r| r.guide_views(0)),
-                &crate::post_process_filter::PostProcessPushConstants {
-                    uniforms: frame.uniform_buffers[0].address,
-                    auto_exposure: ae.addresses().1,
-                    display_exposure: exposure.display_exposure(),
-                    debug_view,
-                },
-            );
+                // The spectator gets its own set; a flat view uses its slot's.
+                let target = if xr_frame.is_some() {
+                    crate::MAX_VIEWS
+                } else {
+                    view.slot
+                };
+                record_post_draw(
+                    &render_device,
+                    cmd_buffer,
+                    pipeline,
+                    pipeline.descriptor_sets[parity * POST_TARGETS + target],
+                    source_view,
+                    dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
+                    &crate::post_process_filter::PostProcessPushConstants {
+                        uniforms: frame.uniform_buffers[view.slot].address,
+                        auto_exposure: ae.addresses().1,
+                        display_exposure: exposure.display_exposure(),
+                        debug_view: view.debug_view,
+                    },
+                );
+            }
         }
 
         // bevy_ui / feathers (including the dev panel), drawn over the scene, full-window.
+        // Restore the full scissor: the composite above narrowed it to the view's rect.
+        render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
         render_device.cmd_set_viewport(
             cmd_buffer,
             0,
@@ -1046,11 +1333,15 @@ fn render_frame(
             .filter(|_| dlss_ran)
             .and_then(|r| r.guide_views(0))
             .map(|g| g.depth);
-        if let (None, Some(scene_depth)) = (&xr_frame, scene_depth) {
+        // `views.first()` rather than `views[0]`: a frame with no camera at all (an
+        // editor's project picker) traces nothing and has no view to project through.
+        // `scene_depth` is already None then, but an index that only avoids panicking
+        // because of an unrelated condition is a trap for the next edit.
+        if let (None, Some(scene_depth), Some(view)) = (&xr_frame, scene_depth, views.first()) {
             crate::gizmo_render::draw_gizmos(
                 &render_device,
                 cmd_buffer,
-                views[0].view_proj,
+                view.view_proj,
                 swapchain.swapchain_extent,
                 scene_depth,
                 swapchain.frame_count % 2,
@@ -1259,4 +1550,69 @@ pub fn on_shutdown(world: &mut World) {
 /// [`on_shutdown`] a frame before bevy's exit lands, and `Update` still runs that frame.
 pub fn render_device_exists(device: Option<Res<RenderDevice>>) -> bool {
     device.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::camera::Viewport;
+
+    fn window() -> vk::Extent2D {
+        vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    fn with_viewport(position: UVec2, size: UVec2) -> Camera {
+        Camera {
+            viewport: Some(Viewport {
+                physical_position: position,
+                physical_size: size,
+                ..default()
+            }),
+            ..default()
+        }
+    }
+
+    #[test]
+    fn no_camera_or_no_viewport_fills_the_window() {
+        assert_eq!(view_rect(None, window()).extent, window());
+        let camera = Camera::default();
+        assert_eq!(view_rect(Some(&camera), window()).extent, window());
+    }
+
+    #[test]
+    fn a_viewport_becomes_its_own_rect() {
+        let camera = with_viewport(UVec2::new(300, 40), UVec2::new(1200, 900));
+        let rect = view_rect(Some(&camera), window());
+        assert_eq!((rect.offset.x, rect.offset.y), (300, 40));
+        assert_eq!((rect.extent.width, rect.extent.height), (1200, 900));
+    }
+
+    #[test]
+    fn a_rect_past_the_window_is_clamped_not_left_overhanging() {
+        // A UI-driven rect can lag a window resize by a frame; a viewport past the
+        // swapchain is a validation error, not a stretched image.
+        let camera = with_viewport(UVec2::new(1800, 1000), UVec2::new(800, 600));
+        let rect = view_rect(Some(&camera), window());
+        assert_eq!(rect.offset.x + rect.extent.width as i32, 1920);
+        assert_eq!(rect.offset.y + rect.extent.height as i32, 1080);
+    }
+
+    #[test]
+    fn a_collapsed_dock_falls_back_to_the_window() {
+        // Zero width would be a validation error too, and a collapsed panel is a normal
+        // thing for a dock to report for a frame.
+        let camera = with_viewport(UVec2::new(10, 10), UVec2::ZERO);
+        assert_eq!(view_rect(Some(&camera), window()).extent, window());
+    }
+
+    #[test]
+    fn an_origin_past_the_window_does_not_underflow() {
+        // `max - origin` would wrap if the origin were not clamped first.
+        let camera = with_viewport(UVec2::new(4000, 4000), UVec2::new(100, 100));
+        let rect = view_rect(Some(&camera), window());
+        assert_eq!(rect.extent, window());
+    }
 }

@@ -7,16 +7,21 @@ use crate::{
     render_device::RenderDevice,
 };
 
-#[derive(Component, Default, Clone)]
+#[derive(Component, Default, Clone, Reflect)]
+#[reflect(Component, Default)]
 #[require(Transform, Visibility)]
 pub struct Sphere;
 
 pub struct SpherePlugin;
 
 impl Plugin for SpherePlugin {
-    /// `Sphere` needs nothing registered: its BLAS is built with the device and its entities
-    /// go through the instance table like meshes.
-    fn build(&self, _app: &mut App) {}
+    /// The BLAS is built with the device and sphere entities go through the instance table
+    /// like meshes, so the only registration is the reflection one -- without it `Sphere`
+    /// can be spawned from Rust but not spelled in a `.bsn`, and a scene naming it fails
+    /// to load with `unknown type`.
+    fn build(&self, app: &mut App) {
+        app.register_type::<Sphere>();
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

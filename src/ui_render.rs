@@ -41,7 +41,7 @@ use bevy::{
         ComputedUiTargetCamera, ConicGradient, Display, Gradient, InterpolationColorSpace,
         LinearGradient, Node, Outline, RadialGradient, ResolvedBorderRadius, UiGlobalTransform,
         UiPlugin, UiSystems, Val, VisualBox,
-        widget::{ImageNode, ImageNodeSize, NodeImageMode},
+        widget::{ImageNode, ImageNodeSize, NodeImageMode, ViewportNode},
     },
     ui_widgets::UiWidgetsPlugins,
     window::{PrimaryWindow, WindowRef},
@@ -532,11 +532,20 @@ type UiNodeQuery = (
     Option<&'static BackgroundGradient>,
     Option<&'static BorderGradient>,
     Option<(&'static ImageNode, &'static ImageNodeSize)>,
-    Option<(
-        &'static ComputedTextBlock,
-        &'static TextColor,
-        &'static TextLayoutInfo,
-    )>,
+    // Nested because a `Query`'s data tuple stops at 16 elements. `ViewportNode` is the
+    // 3D-scene-in-a-UI-node widget, the mirror image of `crate::ui_panel` which puts a UI
+    // tree into the world. `bevy_ui` owns everything about it except the draw --
+    // `viewport_picking` forwards pointer events into the camera's space and
+    // `update_viewport_render_target_size` resizes the target image when the node resizes,
+    // both render-free -- so this is the only half aurora has to supply.
+    (
+        Option<(
+            &'static ComputedTextBlock,
+            &'static TextColor,
+            &'static TextLayoutInfo,
+        )>,
+        Option<&'static ViewportNode>,
+    ),
 );
 
 fn extract_ui(
@@ -548,6 +557,7 @@ fn extract_ui(
     windows: Query<&Window, With<PrimaryWindow>>,
     nodes: Query<UiNodeQuery>,
     all_nodes: Query<(&ComputedNode, Option<&InheritedVisibility>)>,
+    camera_targets: Query<&RenderTarget>,
     mut diag_tick: Local<u32>,
 ) {
     extracted.window_size = windows
@@ -588,7 +598,7 @@ fn extract_ui(
         background_gradient,
         border_gradient,
         image_node,
-        text,
+        (text, viewport_node),
     ) in nodes.iter()
     {
         if !inherited_visibility.get() || node.is_some_and(|node| node.display == Display::None) {
@@ -669,6 +679,42 @@ fn extract_ui(
                     item: quad.item,
                 });
             }
+        }
+
+        // Viewport: the node shows what its camera rendered. The camera traced into the
+        // asset this frame (`crate::camera_target`), which left it in
+        // SHADER_READ_ONLY_OPTIMAL before the window pass began, so there is nothing to
+        // order here beyond the camera's own `Camera::order`.
+        if let Some(viewport) = viewport_node
+            && !uinode.is_empty()
+            && let Some(camera) = viewport.camera
+            && let Ok(RenderTarget::Image(target)) = camera_targets.get(camera)
+        {
+            let size = uinode.size();
+            quads.push(UiQuad {
+                z: z(z_offsets::IMAGE),
+                image: Some(target.handle.id()),
+                clip: clip.cloned(),
+                transform,
+                item: UiItem::Node {
+                    color: [1.0; 4],
+                    size,
+                    uvs: rect_uvs(
+                        Rect {
+                            min: Vec2::ZERO,
+                            max: size,
+                        },
+                        size,
+                        false,
+                        false,
+                    ),
+                    border_radius: uinode.border_radius().into(),
+                    border: [0.0; 4],
+                    // The composite wrote display-encoded colour into a UNORM image, so it
+                    // decodes like any other sRGB texture on the way back to linear.
+                    flags: shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
+                },
+            });
         }
 
         // Border: one quad per distinct edge color, edges sharing a color are merged.
@@ -1877,7 +1923,11 @@ pub fn ui_target_placeholder(size: UVec2) -> Image {
 /// alone; this is its other half).
 pub fn sync_ui_surfaces(
     mut surfaces: ResMut<UiSurfaces>,
-    mut cameras: Query<(Entity, &mut Camera, &RenderTarget)>,
+    // `Without<Camera3d>`: a 3D camera with an image target is a SCENE target
+    // (`crate::camera_target`), not a UI surface. Both scans key off the same asset, so
+    // without the split they would each create a texture for it and one would clobber the
+    // other in `VulkanAssets`. A UI panel camera is a plain `Camera`; this is its half.
+    mut cameras: Query<(Entity, &mut Camera, &RenderTarget), Without<Camera3d>>,
     images: Res<Assets<Image>>,
 ) {
     surfaces.by_camera.clear();

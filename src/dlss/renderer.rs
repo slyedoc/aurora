@@ -107,10 +107,11 @@ impl DlssView {
     }
 }
 
-/// View slots: 0 = the flat window (or left eye in XR), 1 = the right eye. Each slot is a
-/// full RR feature with its own guides, output and temporal history; the NGX session is
-/// shared.
-pub const DLSS_VIEWS: usize = 2;
+/// View slots, indexed as the frame allocates them: the flat window or editor viewport
+/// takes one, an XR session takes one per eye. Each slot is a full RR feature with its own
+/// guides, output and temporal history; the NGX session is shared. Features are created on
+/// demand, so an unused slot costs nothing.
+pub const DLSS_VIEWS: usize = crate::MAX_VIEWS;
 
 pub struct DlssRenderer {
     params: *mut NgxParameter,
@@ -213,7 +214,7 @@ impl DlssRenderer {
         Some(Self {
             params,
             rr_available,
-            views: [None, None],
+            views: std::array::from_fn(|_| None),
             frame: 0,
         })
     }

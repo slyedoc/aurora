@@ -28,11 +28,15 @@ pub struct CompiledPostProcessFilter {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    /// One set per frame parity and target: `[frame_parity * 3 + target]`, targets being
-    /// 0 = flat window / XR left eye, 1 = XR right eye, 2 = the XR spectator window. Every
-    /// draw in a frame needs its own set — a set already recorded must not be rewritten.
-    pub descriptor_sets: [vk::DescriptorSet; 6],
+    /// One set per frame parity and target: `[frame_parity * POST_TARGETS + target]`,
+    /// targets being one per view slot (`0..MAX_VIEWS`) plus `MAX_VIEWS` for the XR
+    /// spectator window. Every draw in a frame needs its own set — a set already recorded
+    /// must not be rewritten.
+    pub descriptor_sets: [vk::DescriptorSet; 2 * POST_TARGETS],
 }
+
+/// Composite targets per frame parity: one per view slot, plus the XR spectator window.
+pub const POST_TARGETS: usize = crate::MAX_VIEWS + 1;
 
 impl VulkanAsset for PostProcessFilter {
     type ExtractedAsset = (crate::shader::Shader, crate::shader::Shader);
@@ -95,7 +99,7 @@ impl VulkanAsset for PostProcessFilter {
 
         let descriptor_sets = {
             let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 6];
+            let layouts = [descriptor_set_layout; 2 * POST_TARGETS];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(*descriptor_pool)
                 .set_layouts(&layouts);

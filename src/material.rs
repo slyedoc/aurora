@@ -27,6 +27,32 @@ use crate::{
 
 /// How a surface's alpha is treated. Only `Mask` changes tracing (any-hit cutout, once the
 /// hit shaders support it); `Blend` is carried for authoring and currently traces as opaque.
+/// Which side of a surface is culled.
+///
+/// Aurora's own rather than bevy's: bevy's `Face` lives in `bevy_render::render_resource`,
+/// a wgpu type this crate cannot reach. Same variants, so an editor's material inspector
+/// matches on it unchanged.
+#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[reflect(Clone, PartialEq)]
+pub enum Face {
+    Front,
+    Back,
+}
+
+/// How a height map is stepped through when parallax mapping.
+///
+/// Aurora's own for the same reason as [`Face`] -- bevy's lives behind `bevy_pbr`. Carried
+/// for authoring round-trip; the tracer does no parallax mapping, it traces the geometry.
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq)]
+#[reflect(Default, Clone, PartialEq)]
+pub enum ParallaxMappingMethod {
+    #[default]
+    Occlusion,
+    Relief {
+        max_steps: u32,
+    },
+}
+
 #[derive(Reflect, Clone, Copy, Debug, Default, PartialEq)]
 #[reflect(Default, Clone, PartialEq)]
 pub enum AlphaMode {
@@ -34,6 +60,13 @@ pub enum AlphaMode {
     Opaque,
     Mask(f32),
     Blend,
+    // The raster blend modes, carried so an authored material round-trips. The tracer
+    // treats each as `Blend` -- it resolves transparency by tracing through the surface,
+    // not by a framebuffer blend equation, so the distinctions have no analogue.
+    Premultiplied,
+    AlphaToCoverage,
+    Add,
+    Multiply,
 }
 
 #[derive(Asset, Reflect, Clone, Debug, PartialEq)]
@@ -58,6 +91,46 @@ pub struct AuroraMaterial {
     pub attenuation_color: Color,
     pub attenuation_distance: f32,
     pub alpha_mode: AlphaMode,
+
+    // --- Authoring surface -------------------------------------------------------------
+    // Carried so a `StandardMaterial` round-trips through this type without losing what an
+    // editor lets you set. NONE of them reach the tracer yet: they are saved, reflected and
+    // re-loaded, but do not change the image. Each notes what wiring it would take, so the
+    // gap is a task rather than a surprise.
+    /// Dielectric specular at normal incidence, 0.5 mapping to 4% like bevy. The hit
+    /// shaders hardcode 4%; wiring it is a field on `RTXMaterial`.
+    pub reflectance: f32,
+    /// Ambient occlusion map. A path tracer computes occlusion by tracing it, so a baked AO
+    /// map would double-darken -- this is carried for round-trip and for whatever a surface
+    /// group wants to do with it, not as something the opaque shader should start reading.
+    pub occlusion_texture: Option<Handle<Image>>,
+    /// Shade back faces instead of culling them. Wiring it means clearing
+    /// `VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT` per instance in
+    /// `tlas_builder`, not a material-record change.
+    pub double_sided: bool,
+    /// Which face is culled when `double_sided` is false.
+    pub cull_mode: Option<Face>,
+    /// Green channel of the normal map is inverted (DirectX-style maps). Wiring it means a
+    /// flag in `RTXMaterial` and a sign flip in the hit shaders' normal decode -- a
+    /// coordinated change to the GPU record and `types.glsl`.
+    pub flip_normal_map_y: bool,
+    /// Emit `base_color` directly with no lighting.
+    pub unlit: bool,
+    /// Whether distance fog applies. Aurora has no fog pass -- atmosphere and participating
+    /// media are the physical equivalents -- so this is round-trip only.
+    pub fog_enabled: bool,
+    /// Depth-sort nudge for coplanar raster geometry. A ray tracer has no depth buffer to
+    /// bias -- it intersects the geometry -- so this is round-trip only.
+    pub depth_bias: f32,
+    /// Parallax mapping, all three round-trip only: parallax fakes displacement in a
+    /// fragment shader, and the tracer traces the real surface. `depth_map` is the height
+    /// map these steer.
+    pub parallax_depth_scale: f32,
+    pub parallax_mapping_method: ParallaxMappingMethod,
+    pub max_parallax_layer_count: f32,
+    /// Affine transform applied to every UV before sampling. Round-trip only: the hit
+    /// shaders sample the mesh's UVs directly.
+    pub uv_transform: bevy::math::Affine2,
 }
 
 impl Default for AuroraMaterial {
@@ -77,6 +150,18 @@ impl Default for AuroraMaterial {
             attenuation_color: Color::WHITE,
             attenuation_distance: f32::INFINITY,
             alpha_mode: AlphaMode::Opaque,
+            reflectance: 0.5,
+            occlusion_texture: None,
+            double_sided: false,
+            cull_mode: Some(Face::Back),
+            flip_normal_map_y: false,
+            unlit: false,
+            fog_enabled: true,
+            depth_bias: 0.0,
+            parallax_depth_scale: 0.1,
+            parallax_mapping_method: ParallaxMappingMethod::Occlusion,
+            max_parallax_layer_count: 16.0,
+            uv_transform: bevy::math::Affine2::IDENTITY,
         }
     }
 }
@@ -149,8 +234,13 @@ impl RTXMaterial {
                 AlphaMode::Opaque => 0.0,
                 AlphaMode::Mask(cutoff) => cutoff.max(1.0 / 255.0),
                 // Blend traces as a 0.5 cutout for shadow rays; the raygen's stochastic
-                // alpha still handles the camera-visible transparency.
-                AlphaMode::Blend => 0.5,
+                // alpha still handles the camera-visible transparency. The raster blend
+                // modes have no tracing analogue and take the same path.
+                AlphaMode::Blend
+                | AlphaMode::Premultiplied
+                | AlphaMode::AlphaToCoverage
+                | AlphaMode::Add
+                | AlphaMode::Multiply => 0.5,
             },
         }
     }
@@ -241,6 +331,10 @@ impl Plugin for MaterialPlugin {
         app.init_asset::<AuroraMaterial>();
         app.register_type::<AuroraMaterial>();
         app.register_type::<AlphaMode>();
+        // Reflected fields of `AuroraMaterial`: without these a material
+        // round-trip through reflection fails on an unregistered type.
+        app.register_type::<Face>();
+        app.register_type::<ParallaxMappingMethod>();
         app.register_type::<AuroraMaterial3d>();
         app.register_asset_reflect::<AuroraMaterial>();
         app.init_vulkan_asset::<AuroraMaterial>();

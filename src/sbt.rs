@@ -13,6 +13,8 @@ use crate::{
 use ash::vk;
 use bevy::prelude::*;
 
+use crate::surface_group::{SurfaceClass, SurfaceGroupData};
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SBTRegionRaygen {
@@ -38,6 +40,9 @@ pub struct SBTRegionHitTriangle {
     pub prev_vertex_buffer: vk::DeviceAddress,
     /// Bit 0: `prev_vertex_buffer` is valid.
     pub flags: u64,
+    /// This record's surface class's parameter buffer (`SurfaceGroupData`), or 0 when the
+    /// class published none. The built-in opaque group ignores it.
+    pub surface_data: vk::DeviceAddress,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +70,7 @@ fn update_sbt(
     render_device: Res<RenderDevice>,
     mut sbt: ResMut<SBT>,
     tlas: Res<TLAS>,
+    surface_data: Res<SurfaceGroupData>,
     rtx_pipelines: Res<VulkanAssets<RaytracingPipeline>>,
     meshes: Res<VulkanAssets<Mesh>>,
     gltf_meshes: Res<VulkanAssets<GltfModel>>,
@@ -115,6 +121,21 @@ fn update_sbt(
             .create_host_buffer(total_size, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR);
     }
 
+    // Records grouped by their asset. Built once: probing `hit_offsets` per mesh per class
+    // would be quadratic in a scene with many meshes.
+    let mut records_by_asset: bevy::platform::collections::HashMap<
+        bevy::asset::UntypedAssetId,
+        Vec<(u32, u32)>,
+    > = bevy::platform::collections::HashMap::default();
+    for (key, offset) in &tlas.hit_offsets {
+        if let HitKey::Asset(asset, class) = key {
+            records_by_asset
+                .entry(*asset)
+                .or_default()
+                .push((*class, *offset));
+        }
+    }
+
     {
         let mut data = render_device.map_buffer(&mut sbt.data);
         unsafe {
@@ -143,11 +164,14 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
 
-                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
+                for (class, offset) in records_by_asset
+                    .get(&mesh_id.untyped())
+                    .map_or(&[][..], Vec::as_slice)
+                {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
                         .write(SBTRegionHitTriangle {
-                            handle: rtx_pipeline.hit_handle,
+                            handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
                             vertex_buffer: mesh.vertex_buffer.address,
                             triangle_buffer: mesh.triangle_buffer.address,
                             index_buffer: mesh.index_buffer.address,
@@ -155,6 +179,7 @@ fn update_sbt(
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
                             prev_vertex_buffer: 0,
                             flags: 0,
+                            surface_data: surface_data.get(SurfaceClass(*class)),
                         });
                 }
             }
@@ -165,11 +190,14 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loading => continue,
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
-                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
+                for (class, offset) in records_by_asset
+                    .get(&mesh_id.untyped())
+                    .map_or(&[][..], Vec::as_slice)
+                {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
                         .write(SBTRegionHitTriangle {
-                            handle: rtx_pipeline.hit_handle,
+                            handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
                             vertex_buffer: mesh.vertex_buffer.address,
                             triangle_buffer: mesh.triangle_buffer.address,
                             index_buffer: mesh.index_buffer.address,
@@ -177,6 +205,7 @@ fn update_sbt(
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
                             prev_vertex_buffer: 0,
                             flags: 0,
+                            surface_data: surface_data.get(SurfaceClass(*class)),
                         });
                 }
             }
@@ -194,6 +223,7 @@ fn update_sbt(
                         geometry_to_triangle: record.geometry_to_triangle,
                         prev_vertex_buffer: record.prev_vertex_buffer,
                         flags: 1,
+                        surface_data: 0,
                     });
             }
 
@@ -212,6 +242,7 @@ fn update_sbt(
                         geometry_to_triangle: record.geometry_to_triangle,
                         prev_vertex_buffer: 0,
                         flags: 2,
+                        surface_data: 0,
                     });
             }
 
@@ -221,11 +252,14 @@ fn update_sbt(
                     VulkanAssetLoadingState::Loaded(mesh) => mesh,
                 };
 
-                if let Some(offset) = tlas.hit_offsets.get(&HitKey::Asset(mesh_id.untyped())) {
+                for (class, offset) in records_by_asset
+                    .get(&mesh_id.untyped())
+                    .map_or(&[][..], Vec::as_slice)
+                {
                     (dst.add(*offset as usize * sbt.hit_region.stride as usize)
                         as *mut SBTRegionHitTriangle)
                         .write(SBTRegionHitTriangle {
-                            handle: rtx_pipeline.hit_handle,
+                            handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
                             vertex_buffer: mesh.vertex_buffer.address,
                             triangle_buffer: mesh.triangle_buffer.address,
                             index_buffer: mesh.index_buffer.address,
@@ -233,6 +267,7 @@ fn update_sbt(
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
                             prev_vertex_buffer: 0,
                             flags: 0,
+                            surface_data: surface_data.get(SurfaceClass(*class)),
                         });
                 }
             }
