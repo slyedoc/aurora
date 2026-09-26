@@ -67,6 +67,9 @@ struct GizmoPushConstants {
     vertex_buffer: u64,
     /// 1 / swapchain size: the fragment's position to the depth guide's uv.
     inv_extent: [f32; 2],
+    /// 0 when no view traced, so `scene_depth` holds a placeholder and cannot be read.
+    depth_guide: u32,
+    _pad: u32,
 }
 
 /// Linear RGBA → packed RGBA8, clamped — gizmo colors are debug paint, not radiance, so HDR
@@ -96,6 +99,9 @@ pub struct CompiledGizmoPipeline {
     /// The scene depth binding, `[frame_parity * MAX_VIEWS + view_slot]`: a set already
     /// recorded into this command buffer must not be rewritten.
     pub descriptor_sets: [vk::DescriptorSet; 2 * crate::MAX_VIEWS],
+    /// Bound when no view traced: binding 0 needs a live image even though the fragment
+    /// shader will not sample it.
+    pub depth_placeholder: crate::render_texture::RenderTexture,
 }
 
 impl VulkanAsset for GizmoPipeline {
@@ -124,6 +130,16 @@ impl VulkanAsset for GizmoPipeline {
         render_device: &RenderDevice,
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
+
+        let depth_placeholder = crate::render_texture::load_texture_from_bytes(
+            render_device,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::SAMPLED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            &[0, 0, 0, 0],
+            1,
+            1,
+        );
 
         let push_constant_info = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
@@ -240,6 +256,7 @@ impl VulkanAsset for GizmoPipeline {
             pipeline_layout,
             descriptor_set_layout,
             descriptor_sets,
+            depth_placeholder,
         }
     }
 
@@ -253,6 +270,12 @@ impl VulkanAsset for GizmoPipeline {
         render_device
             .destroyer
             .destroy_descriptor_set_layout(prepared_asset.descriptor_set_layout);
+        render_device
+            .destroyer
+            .destroy_image_view(prepared_asset.depth_placeholder.image_view);
+        render_device
+            .destroyer
+            .destroy_image(prepared_asset.depth_placeholder.image);
     }
 }
 
@@ -415,7 +438,7 @@ pub struct GizmoRenderConfig {
 /// Everything [`draw_gizmos`] needs.
 #[derive(SystemParam)]
 pub struct GizmoDrawParams<'w> {
-    frame: Res<'w, GizmoLineFrame>,
+    pub frame: Res<'w, GizmoLineFrame>,
     buffers: ResMut<'w, GizmoVertexBuffers>,
     config: Option<Res<'w, GizmoRenderConfig>>,
     pipelines: Res<'w, VulkanAssets<GizmoPipeline>>,
@@ -431,7 +454,7 @@ pub unsafe fn draw_gizmos(
     cmd_buffer: vk::CommandBuffer,
     view_proj: Mat4,
     extent: vk::Extent2D,
-    scene_depth: vk::ImageView,
+    scene_depth: Option<vk::ImageView>,
     frame_slot: usize,
     view_slot: usize,
     params: &mut GizmoDrawParams,
@@ -470,11 +493,13 @@ pub unsafe fn draw_gizmos(
             1.0 / extent.width.max(1) as f32,
             1.0 / extent.height.max(1) as f32,
         ],
+        depth_guide: u32::from(scene_depth.is_some()),
+        _pad: 0,
     };
     let set = pipeline.descriptor_sets[(frame_slot % 2) * crate::MAX_VIEWS + view_slot];
     let depth_info = vk::DescriptorImageInfo::default()
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .image_view(scene_depth)
+        .image_view(scene_depth.unwrap_or(pipeline.depth_placeholder.image_view))
         .sampler(render_device.linear_sampler);
     let writes = [vk::WriteDescriptorSet::default()
         .dst_set(set)

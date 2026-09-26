@@ -1049,11 +1049,12 @@ fn render_frame(
         // A view that renders nothing has several indistinguishable causes; name them.
         {
             let summary = format!(
-                "views={} tlas={} sbt={} traced={} | {}",
+                "views={} tlas={} sbt={} traced={} gizmo_verts={} | {}",
                 views.len(),
                 tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null(),
                 sbt.data.address != 0,
                 dlss_ran,
+                gizmos.frame.vertices.len(),
                 views
                     .iter()
                     .map(|v| format!(
@@ -1215,27 +1216,24 @@ fn render_frame(
                             debug_view: view.debug_view,
                         },
                     );
-                    // Gizmos belong to the surface their camera rendered into; drawn
-                    // full-window the UI pass covers them. Inside the composite branch
-                    // because the fragment test reads the traced depth guide.
-                    if let Some(depth) = dlss
-                        .renderer
-                        .as_ref()
-                        .and_then(|r| r.guide_views(view.slot))
-                        .map(|g| g.depth)
-                    {
-                        crate::gizmo_render::draw_gizmos(
-                            &render_device,
-                            cmd_buffer,
-                            view.view_proj,
-                            *extent,
-                            depth,
-                            swapchain.frame_count % 2,
-                            view.slot,
-                            &mut gizmos,
-                        );
-                    }
                 }
+                // Gizmos belong to the surface their camera rendered into; drawn
+                // full-window the UI pass covers them. No depth guide means nothing traced,
+                // and then nothing can occlude them either.
+                crate::gizmo_render::draw_gizmos(
+                    &render_device,
+                    cmd_buffer,
+                    view.view_proj,
+                    *extent,
+                    dlss.renderer
+                        .as_ref()
+                        .filter(|_| composite.is_some())
+                        .and_then(|r| r.guide_views(view.slot))
+                        .map(|g| g.depth),
+                    swapchain.frame_count % 2,
+                    view.slot,
+                    &mut gizmos,
+                );
                 render_device.cmd_end_rendering(cmd_buffer);
                 vk_utils::transition_image_layout(
                     &render_device,
@@ -1395,7 +1393,7 @@ fn render_frame(
                 .and_then(|r| r.guide_views(view.slot))
                 .map(|g| g.depth)
         });
-        if let (None, Some(scene_depth), Some(view)) = (&xr_frame, scene_depth, window_view) {
+        if let (None, Some(view)) = (&xr_frame, window_view) {
             crate::gizmo_render::draw_gizmos(
                 &render_device,
                 cmd_buffer,

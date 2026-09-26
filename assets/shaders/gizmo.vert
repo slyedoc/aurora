@@ -18,6 +18,7 @@ layout(push_constant, scalar) uniform Registers {
   mat4 view_proj;  // unjittered clip-from-world
   GizmoVertices vertices;
   vec2 inv_extent;  // 1 / swapchain size
+  uint depth_guide;
 } pc;
 
 layout(location = 0) out vec4 out_color;

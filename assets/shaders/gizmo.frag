@@ -11,6 +11,7 @@ layout(push_constant, scalar) uniform Registers {
   mat4 view_proj;
   GizmoVertices vertices;
   vec2 inv_extent;  // 1 / swapchain size
+  uint depth_guide;
 } pc;
 
 // The raygen's linear view depth guide (render resolution, jittered; the sky is far away).
@@ -23,7 +24,7 @@ layout(location = 0) out vec4 out_color;
 
 void main() {
   float visible = 1.0;
-  if (in_tested != 0u) {
+  if (in_tested != 0u && pc.depth_guide != 0u) {
     // There is no depth attachment -- the scene is traced -- so the test is done here. The
     // guide is coarser than the window and shifts with the sub-pixel jitter, so the test is
     // against the FARTHEST of the four texels around the fragment (a line on a silhouette
