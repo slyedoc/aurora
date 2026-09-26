@@ -13,7 +13,6 @@ use bevy::prelude::*;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
-    dev_shaders::DevShaderPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -21,7 +20,7 @@ use bevy_aurora::{
 
 fn main() {
     App::new()
-        .add_plugins((AuroraDefaultPlugins, DevShaderPlugin, FreeCameraPlugin))
+        .add_plugins((AuroraDefaultPlugins, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 14.0)

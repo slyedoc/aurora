@@ -6,7 +6,6 @@
 use bevy::prelude::*;
 use bevy_aurora::{
     assets::aurora_asset,
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     AuroraDefaultPlugins,
@@ -24,7 +23,7 @@ const EMISSIVE_NITS: f32 = 1_000_000.0;
 
 fn main() {
     App::new()
-        .add_plugins((AuroraDefaultPlugins, DevShaderPlugin, DevUIPlugin))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)

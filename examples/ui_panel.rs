@@ -31,7 +31,6 @@ use bevy::{
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
 use bevy_aurora::{
-    dev_shaders::DevShaderPlugin,
     dev_ui::{DevUIPlugin, DevUIState},
     material::{AuroraMaterial, AuroraMaterial3d},
     AuroraDefaultPlugins,
@@ -52,7 +51,6 @@ fn main() {
     App::new()
         .add_plugins((
             AuroraDefaultPlugins,
-            DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,
         ))

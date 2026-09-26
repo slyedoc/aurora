@@ -13,7 +13,6 @@ use bevy::prelude::*;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
-    dev_shaders::DevShaderPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -49,7 +48,7 @@ struct LayeredClass(SurfaceClass);
 
 fn main() {
     App::new()
-        .add_plugins((AuroraDefaultPlugins, DevShaderPlugin, FreeCameraPlugin))
+        .add_plugins((AuroraDefaultPlugins, FreeCameraPlugin))
         .add_systems(Startup, (register_layered, setup).chain())
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 14.0)

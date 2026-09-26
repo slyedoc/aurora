@@ -1046,6 +1046,37 @@ fn render_frame(
         }
 
         drop(section);
+        // A view that renders nothing has several indistinguishable causes; name them.
+        {
+            let summary = format!(
+                "views={} tlas={} sbt={} traced={} | {}",
+                views.len(),
+                tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null(),
+                sbt.data.address != 0,
+                dlss_ran,
+                views
+                    .iter()
+                    .map(|v| format!(
+                        "slot{} {} {}x{} plan={}",
+                        v.slot,
+                        match v.target {
+                            ViewTarget::Window { .. } => "window",
+                            ViewTarget::Image { .. } => "image",
+                        },
+                        v.output_extent.width,
+                        v.output_extent.height,
+                        v.plan.is_some()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let mut last = LAST.lock().unwrap();
+            if *last != summary {
+                log::info!("frame: {summary}");
+                *last = summary;
+            }
+        }
         let section = info_span!("record_present_pass").entered();
         let parity = swapchain.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
@@ -1117,7 +1148,9 @@ fn render_frame(
         // lower-`Camera::order` view whose target a later view samples must land first.
         // Each image ends back in SHADER_READ_ONLY_OPTIMAL, which is where anything
         // resolving the asset -- a UI node, a material, a hit shader -- expects it.
-        if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
+        // The pass runs even with nothing to composite: an untraceable scene still owes its
+        // target a clear, which a window camera gets free from the window's own pass.
+        {
             for view in &views {
                 let ViewTarget::Image { asset } = view.target else {
                     continue;
@@ -1125,13 +1158,15 @@ fn render_frame(
                 let Some((texture, extent)) = camera_targets.map.get(&asset) else {
                     continue;
                 };
-                let Some(source_view) = dlss
-                    .renderer
-                    .as_ref()
-                    .and_then(|r| r.output_view(view.slot))
-                else {
-                    continue;
-                };
+                // `dlss_ran` is frame-wide; the view's own plan says whether its slot holds
+                // an output.
+                let composite = postprocess.filter(|_| dlss_ran).and_then(|pipeline| {
+                    dlss.renderer
+                        .as_ref()
+                        .filter(|_| view.plan.is_some())
+                        .and_then(|r| r.output_view(view.slot))
+                        .map(|source_view| (pipeline, source_view))
+                });
                 vk_utils::transition_image_layout(
                     &render_device,
                     cmd_buffer,
@@ -1165,20 +1200,42 @@ fn render_frame(
                             .max_depth(1.0),
                     ),
                 );
-                record_post_draw(
-                    &render_device,
-                    cmd_buffer,
-                    pipeline,
-                    pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
-                    source_view,
-                    dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
-                    &crate::post_process_filter::PostProcessPushConstants {
-                        uniforms: frame.uniform_buffers[view.slot].address,
-                        auto_exposure: ae.addresses().1,
-                        display_exposure: exposure.display_exposure(),
-                        debug_view: view.debug_view,
-                    },
-                );
+                if let Some((pipeline, source_view)) = composite {
+                    record_post_draw(
+                        &render_device,
+                        cmd_buffer,
+                        pipeline,
+                        pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
+                        source_view,
+                        dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
+                        &crate::post_process_filter::PostProcessPushConstants {
+                            uniforms: frame.uniform_buffers[view.slot].address,
+                            auto_exposure: ae.addresses().1,
+                            display_exposure: exposure.display_exposure(),
+                            debug_view: view.debug_view,
+                        },
+                    );
+                    // Gizmos belong to the surface their camera rendered into; drawn
+                    // full-window the UI pass covers them. Inside the composite branch
+                    // because the fragment test reads the traced depth guide.
+                    if let Some(depth) = dlss
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.guide_views(view.slot))
+                        .map(|g| g.depth)
+                    {
+                        crate::gizmo_render::draw_gizmos(
+                            &render_device,
+                            cmd_buffer,
+                            view.view_proj,
+                            *extent,
+                            depth,
+                            swapchain.frame_count % 2,
+                            view.slot,
+                            &mut gizmos,
+                        );
+                    }
+                }
                 render_device.cmd_end_rendering(cmd_buffer);
                 vk_utils::transition_image_layout(
                     &render_device,
@@ -1327,17 +1384,18 @@ fn render_frame(
         // depth-tested against the traced frame's depth guide (so not before there is one).
         // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
         // full-window projection.
-        let scene_depth = dlss
-            .renderer
-            .as_ref()
-            .filter(|_| dlss_ran)
-            .and_then(|r| r.guide_views(0))
-            .map(|g| g.depth);
-        // `views.first()` rather than `views[0]`: a frame with no camera at all (an
-        // editor's project picker) traces nothing and has no view to project through.
-        // `scene_depth` is already None then, but an index that only avoids panicking
-        // because of an unrelated condition is a trap for the next edit.
-        if let (None, Some(scene_depth), Some(view)) = (&xr_frame, scene_depth, views.first()) {
+        // Window-targeted views only; an image target drew its own above. `.find()` because
+        // the lowest-order view may be an image target, or there may be no view at all.
+        let window_view = views
+            .iter()
+            .find(|v| matches!(v.target, ViewTarget::Window { .. }));
+        let scene_depth = window_view.filter(|_| dlss_ran).and_then(|view| {
+            dlss.renderer
+                .as_ref()
+                .and_then(|r| r.guide_views(view.slot))
+                .map(|g| g.depth)
+        });
+        if let (None, Some(scene_depth), Some(view)) = (&xr_frame, scene_depth, window_view) {
             crate::gizmo_render::draw_gizmos(
                 &render_device,
                 cmd_buffer,
@@ -1345,6 +1403,7 @@ fn render_frame(
                 swapchain.swapchain_extent,
                 scene_depth,
                 swapchain.frame_count % 2,
+                view.slot,
                 &mut gizmos,
             );
         }

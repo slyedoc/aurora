@@ -8,7 +8,6 @@ use bevy::{
 };
 use bevy_aurora::{
     assets::aurora_asset,
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     portal::AuroraPortal,
@@ -21,7 +20,7 @@ const SKY_SCALE_NITS: f32 = 8000.0;
 
 fn main() {
     App::new()
-        .add_plugins((AuroraDefaultPlugins, DevShaderPlugin, DevUIPlugin, FreeCameraPlugin))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)

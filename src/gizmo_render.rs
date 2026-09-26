@@ -93,8 +93,9 @@ pub struct CompiledGizmoPipeline {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
-    /// The scene depth binding, one set per frame in flight.
-    pub descriptor_sets: [vk::DescriptorSet; 2],
+    /// The scene depth binding, `[frame_parity * MAX_VIEWS + view_slot]`: a set already
+    /// recorded into this command buffer must not be rewritten.
+    pub descriptor_sets: [vk::DescriptorSet; 2 * crate::MAX_VIEWS],
 }
 
 impl VulkanAsset for GizmoPipeline {
@@ -145,7 +146,7 @@ impl VulkanAsset for GizmoPipeline {
         };
         let descriptor_sets = {
             let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 2];
+            let layouts = [descriptor_set_layout; 2 * crate::MAX_VIEWS];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(*descriptor_pool)
                 .set_layouts(&layouts);
@@ -432,6 +433,7 @@ pub unsafe fn draw_gizmos(
     extent: vk::Extent2D,
     scene_depth: vk::ImageView,
     frame_slot: usize,
+    view_slot: usize,
     params: &mut GizmoDrawParams,
 ) {
     let vertices = &params.frame.vertices;
@@ -469,7 +471,7 @@ pub unsafe fn draw_gizmos(
             1.0 / extent.height.max(1) as f32,
         ],
     };
-    let set = pipeline.descriptor_sets[frame_slot % 2];
+    let set = pipeline.descriptor_sets[(frame_slot % 2) * crate::MAX_VIEWS + view_slot];
     let depth_info = vk::DescriptorImageInfo::default()
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .image_view(scene_depth)

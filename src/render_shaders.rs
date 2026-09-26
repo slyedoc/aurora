@@ -5,9 +5,10 @@ use crate::{
     raytracing_pipeline::RaytracingPipeline,
 };
 
-pub struct DevShaderPlugin;
+/// Publishes `RenderConfig`; override it after the group to supply your own shaders.
+pub struct RenderShadersPlugin;
 
-impl Plugin for DevShaderPlugin {
+impl Plugin for RenderShadersPlugin {
     fn build(&self, app: &mut App) {
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();
 

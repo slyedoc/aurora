@@ -1716,7 +1716,16 @@ fn build_vertices(
             Some(id) => match textures.get_by_id(id) {
                 Some(texture) => render_device.register_bindless_texture(texture),
                 // Not uploaded yet (atlas / image still in flight); skip this frame.
-                None => continue,
+                None => {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!(
+                            "ui: quad dropped, no VulkanAssets<Image> entry for {id:?} (first occurrence only)"
+                        );
+                    }
+                    continue;
+                }
             },
         };
 

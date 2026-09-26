@@ -1,7 +1,6 @@
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::prelude::*;
 use bevy_aurora::{
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
     AuroraDefaultPlugins,
@@ -10,7 +9,6 @@ use bevy_aurora::{
 fn main() {
     let mut app = App::new();
     app.add_plugins(AuroraDefaultPlugins);
-    app.add_plugins(DevShaderPlugin);
     app.add_plugins(DevUIPlugin);
     app.add_plugins(FreeCameraPlugin::default());
     app.add_systems(Startup, setup);

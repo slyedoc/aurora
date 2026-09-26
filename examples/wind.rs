@@ -14,7 +14,6 @@ use bevy::{
 };
 use bevy_aurora::{
     assets::aurora_asset,
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
     AuroraDefaultPlugins,
@@ -32,7 +31,6 @@ fn main() {
     App::new()
         .add_plugins((
             AuroraDefaultPlugins,
-            DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,
         ))

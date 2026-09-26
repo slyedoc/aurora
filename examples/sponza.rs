@@ -3,7 +3,6 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     gltf_mesh::{GltfModel, GltfModelHandle},
     material::{AuroraMaterial, AuroraMaterial3d},
@@ -15,7 +14,6 @@ fn main() {
     App::new()
         .add_plugins((
             AuroraDefaultPlugins,
-            DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin::default(),
         ))

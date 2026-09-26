@@ -16,7 +16,6 @@ use bevy::{
     world_serialization::WorldAssetRoot,
 };
 use bevy_aurora::{
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     AuroraDefaultPlugins,
@@ -33,7 +32,6 @@ fn main() {
     App::new()
         .add_plugins((
             AuroraDefaultPlugins,
-            DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin::default(),
         ))

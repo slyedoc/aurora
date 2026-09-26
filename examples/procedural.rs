@@ -11,7 +11,6 @@ use bevy::{
 use bevy_aurora::{
     assets::aurora_asset,
     compute::{ComputeModule, ComputeModules},
-    dev_shaders::DevShaderPlugin,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
@@ -44,7 +43,6 @@ fn main() {
     App::new()
         .add_plugins((
             AuroraDefaultPlugins,
-            DevShaderPlugin,
             DevUIPlugin,
             FreeCameraPlugin,
         ))

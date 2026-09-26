@@ -25,7 +25,7 @@ pub mod compute;
 pub use aurora_cluster_mesh as cluster_mesh;
 pub mod bluenoise_plugin;
 pub mod debug_view;
-pub mod dev_shaders;
+pub mod render_shaders;
 pub mod dev_ui;
 pub mod dlss;
 pub mod env_light;
@@ -85,7 +85,6 @@ pub mod prelude {
         collision::{CollisionMesh, CollisionShape},
         compute::{ComputeModule, ComputeModules},
         debug_view::AuroraDebugView,
-        dev_shaders::DevShaderPlugin,
         dev_ui::{DevUIPanel, DevUIPlugin, DevUIState},
         dlss::{AuroraDlss, RrPreset},
         env_light::EnvLight,
@@ -165,6 +164,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::atmosphere::AtmospherePlugin);
         group = group.add(crate::debug_view::DebugViewPlugin);
         group = group.add(crate::surface_group::SurfaceGroupPlugin);
+        group = group.add(crate::render_shaders::RenderShadersPlugin);
         group = group.add(crate::sbt::SBTPlugin);
         group = group.add(crate::sphere::SpherePlugin);
         group = group.add(crate::render_texture::RenderTexturePlugin);
