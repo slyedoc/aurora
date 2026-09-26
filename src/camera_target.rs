@@ -14,7 +14,7 @@
 //! successive frames rather than raising it.
 
 use bevy::{
-    camera::{Camera, Camera3d, RenderTarget, RenderTargetInfo},
+    camera::{Camera, Camera3d, Projection, RenderTarget, RenderTargetInfo},
     image::Image,
     platform::collections::HashMap,
     prelude::*,
@@ -153,6 +153,36 @@ pub fn prepare_camera_targets(
     }
 }
 
+/// `PostUpdate`, after every `target_info` writer: fills `Camera::computed.clip_from_view`
+/// from the `Projection`.
+///
+/// Only `bevy_render`'s `camera_system` writes that field, and aurora replaces
+/// `bevy_render`. Left at its default, `Camera::viewport_to_world` returns the same ray for
+/// every cursor position -- an editor's click-to-place lands everything on one spot.
+///
+/// The probe copy keeps an unchanged viewport from flagging `Camera` and `Projection`
+/// changed every frame.
+pub fn sync_camera_projections(mut cameras: Query<(&mut Camera, &mut Projection)>) {
+    for (mut camera, mut projection) in &mut cameras {
+        let Some(size) = camera.logical_viewport_size() else {
+            continue;
+        };
+        if size.x == 0.0 || size.y == 0.0 {
+            continue;
+        }
+        let mut probe = projection.clone();
+        probe.update(size.x, size.y);
+        let clip_from_view = match &camera.sub_camera_view {
+            Some(sub_view) => probe.get_clip_from_view_for_sub(sub_view),
+            None => probe.get_clip_from_view(),
+        };
+        if camera.computed.clip_from_view != clip_from_view {
+            *projection = probe;
+            camera.computed.clip_from_view = clip_from_view;
+        }
+    }
+}
+
 /// Registers the offscreen camera-target scan and allocation. Mirrors
 /// [`crate::ui_render`]'s surface half, in the same schedule slots.
 pub struct CameraTargetPlugin;
@@ -161,6 +191,13 @@ impl Plugin for CameraTargetPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CameraTargets>()
             .add_systems(PostUpdate, sync_camera_targets)
+            .add_systems(
+                PostUpdate,
+                sync_camera_projections
+                    .after(sync_camera_targets)
+                    .after(crate::ui_render::sync_ui_surfaces)
+                    .after(crate::ui_render::ui_camera_target_system),
+            )
             .add_systems(
                 Last,
                 prepare_camera_targets.in_set(crate::ray_render_plugin::RenderSet::Prepare),

@@ -425,7 +425,7 @@ impl Plugin for UiRenderPlugin {
 /// `bevy_ui` sizes its layout from `Camera::computed.target_info`, which is normally filled in
 /// by `bevy_render`'s `camera_system`. Without `bevy_render` nothing writes it, so mirror the
 /// window-target half of that system here.
-fn ui_camera_target_system(
+pub(crate) fn ui_camera_target_system(
     primary_window: Query<Entity, With<PrimaryWindow>>,
     windows: Query<&Window>,
     mut cameras: Query<(&mut Camera, Option<&RenderTarget>)>,
