@@ -133,11 +133,24 @@ impl VulkanAsset for bevy::prelude::Image {
         &self,
         _param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        // A data-less image is a render target (a UI surface placeholder -- see
-        // `ui_render::ui_target_placeholder`): its GPU side is created and registered by its
-        // owner, never uploaded from bytes. Skipping here keeps the owner's entry in
-        // `VulkanAssets<Image>` from being clobbered by the asset worker.
-        if self.data.is_none() {
+        // Render targets are owned by camera_target / ui_render; uploading one here would
+        // replace and destroy the owner's image. `new_target_texture` allocates data, so
+        // RENDER_ATTACHMENT is the test rather than `data.is_none()`.
+        if self.data.is_none()
+            || self
+                .texture_descriptor
+                .usage
+                .contains(wgpu_types::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return None;
+        }
+        // The upload path below is 2D and single-layer; asserting on the byte count instead
+        // would kill the asset worker thread and with it every later upload.
+        let layers = self.texture_descriptor.size.depth_or_array_layers;
+        if layers > 1 {
+            log::warn!(
+                "texture has {layers} layers (cubemap or array); aurora uploads 2D textures only, skipping"
+            );
             return None;
         }
         // Formats the upload path takes as-is (see `vk_format_for`) go straight

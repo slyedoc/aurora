@@ -181,7 +181,12 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                 if let Some(asset) = assets.get(*id) {
                     if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
                         render_assets.insert(*id, VulkanAssetLoadingState::Loading);
-                        comms.send_work.send((*id, extracted)).unwrap();
+                        // Runs every frame: an unwrap here turns one dead worker into a
+                        // panic per asset per frame.
+                        if comms.send_work.send((*id, extracted)).is_err() {
+                            log::error!("VulkanAsset build thread is gone; dropping {id:?}");
+                            render_assets.0.remove(id);
+                        }
                     }
                 } else {
                     log::warn!("VulkanAsset could not find asset with id: {:?}", id);
@@ -198,7 +203,9 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                 );
                 if let Some(asset) = assets.get(*id) {
                     if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
-                        comms.send_work.send((*id, extracted)).unwrap();
+                        if comms.send_work.send((*id, extracted)).is_err() {
+                            log::error!("VulkanAsset build thread is gone; {id:?} stays stale");
+                        }
                     }
                 } else {
                     log::warn!("VulkanAsset could not find asset with id: {:?}", id);
