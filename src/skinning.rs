@@ -1,6 +1,6 @@
 //! GPU skinning: skeletal animation for ray-traced meshes.
 //!
-//! An entity with `Mesh3d` + bevy's [`SkinnedMesh`] (joint entities + inverse bind poses) is
+//! An entity with `AuroraMesh3d` + bevy's [`SkinnedMesh`] (joint entities + inverse bind poses) is
 //! rendered through a per-instance deformed copy of its mesh: every frame the
 //! `skin_vertices` kernel (skinning.slang) linear-blend-skins the rest-pose stream into a
 //! mesh-local deformed stream, `pack_triangles` rebuilds the per-triangle shading records
@@ -53,6 +53,7 @@ use crate::{
         ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
     },
     gpu_transform::{GpuNode, GpuTransforms, NO_NODE},
+    mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -149,7 +150,7 @@ fn resolve_skin_joints(
 
 // ---- wind ----------------------------------------------------------------------------------
 
-/// Deform this `Mesh3d` with the global [`Wind`] instead of joints. The mesh must carry a skin
+/// Deform this `AuroraMesh3d` with the global [`Wind`] instead of joints. The mesh must carry a skin
 /// stream (`JOINT_WEIGHT.x` = sway weight per vertex, `JOINT_INDEX.x` = phase id).
 #[derive(Component, Reflect, Clone, Debug, PartialEq)]
 #[reflect(Component, Default)]
@@ -306,7 +307,7 @@ enum SkinKind {
 
 #[derive(Clone, Debug, PartialEq)]
 struct SkinSource {
-    mesh: AssetId<Mesh>,
+    mesh: AssetId<AuroraMesh>,
     kind: SkinKind,
     node: u32,
 }
@@ -660,9 +661,12 @@ impl Skins {
             gpu.builds = gpu.builds.wrapping_add(1).max(1);
             modes.push((slot, update));
         }
-        let mut geometries: Vec<vk::AccelerationStructureGeometryKHR> = Vec::with_capacity(modes.len());
-        let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = Vec::with_capacity(modes.len());
-        let mut targets: Vec<(vk::AccelerationStructureKHR, bool, u64)> = Vec::with_capacity(modes.len());
+        let mut geometries: Vec<vk::AccelerationStructureGeometryKHR> =
+            Vec::with_capacity(modes.len());
+        let mut ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR> =
+            Vec::with_capacity(modes.len());
+        let mut targets: Vec<(vk::AccelerationStructureKHR, bool, u64)> =
+            Vec::with_capacity(modes.len());
         // The attach structs live here, unmoved, until the build is recorded.
         let exts: Vec<Option<vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>>> = modes
             .iter()
@@ -676,8 +680,7 @@ impl Skins {
             };
             if let Some(ext) = ext {
                 geometry.geometry.triangles.p_next =
-                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>)
-                        .cast();
+                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>).cast();
             }
             geometries.push(geometry);
             ranges.push(
@@ -743,14 +746,14 @@ impl Skins {
 type ChangedSkins = Or<(
     Added<GpuInstance>,
     Changed<GpuNode>,
-    Changed<Mesh3d>,
+    Changed<AuroraMesh3d>,
     Changed<SkinnedMesh>,
 )>;
 
 #[allow(clippy::type_complexity)]
 fn extract_skins(
     mut skins: ResMut<Skins>,
-    changed: Query<(&GpuInstance, &GpuNode, &Mesh3d, &SkinnedMesh), ChangedSkins>,
+    changed: Query<(&GpuInstance, &GpuNode, &AuroraMesh3d, &SkinnedMesh), ChangedSkins>,
     mut removed_components: RemovedComponents<SkinnedMesh>,
     instances: Query<&GpuInstance>,
     nodes: Query<&GpuNode>,
@@ -762,7 +765,7 @@ fn extract_skins(
     }
     for (instance, node, mesh, skin) in changed.iter() {
         let source = SkinSource {
-            mesh: mesh.id(),
+            mesh: mesh.0.id(),
             kind: SkinKind::Joints {
                 bindposes: skin.inverse_bindposes.id(),
                 joints: skin.joints.clone(),
@@ -833,7 +836,7 @@ impl Skins {
 type ChangedWind = Or<(
     Added<GpuInstance>,
     Changed<GpuNode>,
-    Changed<Mesh3d>,
+    Changed<AuroraMesh3d>,
     Changed<WindSway>,
 )>;
 
@@ -842,13 +845,18 @@ fn extract_wind(
     mut skins: ResMut<Skins>,
     wind: Res<Wind>,
     time: Res<Time>,
-    changed: Query<(&GpuInstance, &GpuNode, &Mesh3d, &WindSway), ChangedWind>,
+    changed: Query<(&GpuInstance, &GpuNode, &AuroraMesh3d, &WindSway), ChangedWind>,
     mut removed_components: RemovedComponents<WindSway>,
     instances: Query<&GpuInstance>,
 ) {
     let heading = wind.direction.to_radians();
     skins.wind = (
-        [heading.sin(), -heading.cos(), wind.speed, time.elapsed_secs_wrapped()],
+        [
+            heading.sin(),
+            -heading.cos(),
+            wind.speed,
+            time.elapsed_secs_wrapped(),
+        ],
         [wind.gust, wind.wavelength, wind.turbulence],
     );
     for entity in removed_components.read() {
@@ -860,7 +868,7 @@ fn extract_wind(
         skins.set_source(
             instance.0,
             SkinSource {
-                mesh: mesh.id(),
+                mesh: mesh.0.id(),
                 kind: SkinKind::Wind {
                     amplitude: sway.amplitude,
                 },
@@ -884,7 +892,7 @@ pub fn prepare_skins(
     render_device: Res<RenderDevice>,
     mut skins: ResMut<Skins>,
     mut tlas: ResMut<TLAS>,
-    meshes: Res<VulkanAssets<Mesh>>,
+    meshes: Res<VulkanAssets<AuroraMesh>>,
     bindposes_buffers: Res<BindposeBuffers>,
 ) {
     let skins = &mut *skins;
@@ -1027,8 +1035,7 @@ pub fn prepare_skins(
             let ext = gpu.micromap_ext();
             if let Some(ext) = &ext {
                 geometry.geometry.triangles.p_next =
-                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>)
-                        .cast();
+                    (ext as *const vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>).cast();
             }
             let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
             unsafe {
@@ -1085,15 +1092,27 @@ fn cleanup_skins(world: &mut World) {
     });
 }
 
-pub struct SkinningPlugin;
+/// The skinning types a scene can name, with nothing that skins: the bindpose asset, the
+/// reflected components and the wind resource. [`SkinningPlugin`] is the GPU half on top.
+pub struct SkinTypesPlugin;
 
-impl Plugin for SkinningPlugin {
+impl Plugin for SkinTypesPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<SkinnedMeshInverseBindposes>();
         app.register_type::<SkinJointsByName>();
         app.register_type::<WindSway>();
         app.register_type::<Wind>();
         app.init_resource::<Wind>();
+    }
+}
+
+pub struct SkinningPlugin;
+
+impl Plugin for SkinningPlugin {
+    fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<SkinTypesPlugin>() {
+            app.add_plugins(SkinTypesPlugin);
+        }
         app.init_resource::<BindposeBuffers>();
         app.add_systems(PreUpdate, resolve_skin_joints);
         app.add_observer(on_instance_removed);
@@ -1111,7 +1130,7 @@ impl Plugin for SkinningPlugin {
                 (upload_bindposes, extract_skins, extract_wind).in_set(RenderSet::Extract),
                 prepare_skins
                     .in_set(RenderSet::Prepare)
-                    .after(poll_for_asset::<Mesh>)
+                    .after(poll_for_asset::<AuroraMesh>)
                     .before(prepare_instances),
             ),
         );

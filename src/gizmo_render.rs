@@ -33,11 +33,11 @@ use bevy::{
 };
 
 use crate::{
-    swapchain::DISPLAY_FORMAT,
     assets::aurora_asset,
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
+    swapchain::DISPLAY_FORMAT,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
 };
 
@@ -221,8 +221,8 @@ impl VulkanAsset for GizmoPipeline {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&[DISPLAY_FORMAT]);
+        let mut pipeline_rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
@@ -407,7 +407,12 @@ fn append_buffer(
     let fallback = LinearRgba::WHITE;
     let list_color = |i: usize| buffer.list_colors.get(i).copied().unwrap_or(fallback);
     for (i, points) in buffer.list_positions.chunks_exact(2).enumerate() {
-        push(points[0], points[1], list_color(2 * i), list_color(2 * i + 1));
+        push(
+            points[0],
+            points[1],
+            list_color(2 * i),
+            list_color(2 * i + 1),
+        );
     }
 
     // Line strips: consecutive vertices, runs separated by NaN sentinels (one is pushed after
@@ -605,15 +610,17 @@ mod tests {
     }
 
     /// Scalar-layout mirror of `gizmo.vert`'s `Registers`: mat4 at 0, the buffer reference
-    /// behind it, then the extent; 80 bytes.
+    /// behind it, the extent, then the depth-guide flag. The shader's block is 84 bytes;
+    /// the struct pads to 88 for its u64 alignment, which the trailing bytes cover.
     #[test]
     fn gizmo_push_constants_match_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<GizmoPushConstants>(), 80);
+        assert_eq!(std::mem::size_of::<GizmoPushConstants>(), 88);
         let pc = GizmoPushConstants::zeroed();
         let base = &pc as *const GizmoPushConstants as usize;
         assert_eq!(pc.view_proj.as_ptr() as usize - base, 0);
         assert_eq!(&pc.vertex_buffer as *const u64 as usize - base, 64);
         assert_eq!(pc.inv_extent.as_ptr() as usize - base, 72);
+        assert_eq!(&pc.depth_guide as *const u32 as usize - base, 80);
     }
 
     /// Packed color order is `r | g<<8 | b<<16 | a<<24` with round-to-nearest, mirrored by the
@@ -625,6 +632,9 @@ mod tests {
         assert_eq!(pack_rgba8(LinearRgba::rgb(0.0, 1.0, 0.0)), 0xFF00_FF00);
         assert_eq!(pack_rgba8(LinearRgba::rgb(0.0, 0.0, 1.0)), 0xFFFF_0000);
         // HDR clamps, negatives clamp, and alpha rides bits 24..32.
-        assert_eq!(pack_rgba8(LinearRgba::new(2.0, -1.0, 0.5, 0.0)), 0x0080_00FF);
+        assert_eq!(
+            pack_rgba8(LinearRgba::new(2.0, -1.0, 0.5, 0.0)),
+            0x0080_00FF
+        );
     }
 }

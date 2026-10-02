@@ -70,7 +70,8 @@ pub fn record_mip_chain(
         unsafe {
             device.ext_sync2.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier)),
             );
         }
     };
@@ -78,12 +79,31 @@ pub fn record_mip_chain(
     let read = vk::AccessFlags2::TRANSFER_READ;
     let write = vk::AccessFlags2::TRANSFER_WRITE;
     if mip_levels > 1 {
-        barrier(1, mip_levels - 1, rest_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags2::NONE, write, transfer);
+        barrier(
+            1,
+            mip_levels - 1,
+            rest_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags2::NONE,
+            write,
+            transfer,
+        );
     }
     for level in 1..mip_levels {
-        let src_layout = if level == 1 { mip0_layout } else { vk::ImageLayout::TRANSFER_DST_OPTIMAL };
-        barrier(level - 1, 1, src_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, write, read, transfer);
+        let src_layout = if level == 1 {
+            mip0_layout
+        } else {
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        };
+        barrier(
+            level - 1,
+            1,
+            src_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            write,
+            read,
+            transfer,
+        );
         let size = |v: u32, l: u32| (v >> l).max(1) as i32;
         let layers = |l: u32| {
             vk::ImageSubresourceLayers::default()
@@ -95,12 +115,20 @@ pub fn record_mip_chain(
             .src_subresource(layers(level - 1))
             .src_offsets([
                 vk::Offset3D::default(),
-                vk::Offset3D { x: size(width, level - 1), y: size(height, level - 1), z: 1 },
+                vk::Offset3D {
+                    x: size(width, level - 1),
+                    y: size(height, level - 1),
+                    z: 1,
+                },
             ])
             .dst_subresource(layers(level))
             .dst_offsets([
                 vk::Offset3D::default(),
-                vk::Offset3D { x: size(width, level), y: size(height, level), z: 1 },
+                vk::Offset3D {
+                    x: size(width, level),
+                    y: size(height, level),
+                    z: 1,
+                },
             ]);
         unsafe {
             device.device.cmd_blit_image(
@@ -117,8 +145,24 @@ pub fn record_mip_chain(
     let shader = vk::PipelineStageFlags2::ALL_COMMANDS;
     let shader_read = vk::AccessFlags2::SHADER_READ;
     if mip_levels > 1 {
-        barrier(0, mip_levels - 1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, final_layout, read, shader_read, shader);
-        barrier(mip_levels - 1, 1, vk::ImageLayout::TRANSFER_DST_OPTIMAL, final_layout, write, shader_read, shader);
+        barrier(
+            0,
+            mip_levels - 1,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            final_layout,
+            read,
+            shader_read,
+            shader,
+        );
+        barrier(
+            mip_levels - 1,
+            1,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            final_layout,
+            write,
+            shader_read,
+            shader,
+        );
     } else {
         barrier(0, 1, mip0_layout, final_layout, write, shader_read, shader);
     }
@@ -452,15 +496,12 @@ pub fn create_blank_texture(
     }
 
     device.run_transfer_commands(|cmd_buffer| unsafe {
-        let to_final = vk_init::layout_transition2(
-            image_handle,
-            vk::ImageLayout::UNDEFINED,
-            desired_layout,
-        )
-        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::MEMORY_WRITE);
+        let to_final =
+            vk_init::layout_transition2(image_handle, vk::ImageLayout::UNDEFINED, desired_layout)
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::MEMORY_WRITE);
         device.ext_sync2.cmd_pipeline_barrier2(
             cmd_buffer,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_final)),

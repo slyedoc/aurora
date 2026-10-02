@@ -5,10 +5,11 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -45,7 +46,7 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     // HDR environment sky (equirectangular), texel x scale = nits.
     commands.insert_resource(Sky::Hdr {
@@ -66,7 +67,7 @@ fn setup(
 
     // plane
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(100.0, 100.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(100.0, 100.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.1, 0.2, 0.1),
             perceptual_roughness: 1.0,
@@ -107,7 +108,7 @@ fn setup(
     ));
 
     let mut rng = ChaCha8Rng::seed_from_u64(42);
-    let cuboid = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let cuboid = meshes.add(AuroraMesh::from_shape(Cuboid::new(1.0, 1.0, 1.0)));
 
     for x in -11..11 {
         for y in -11..11 {
@@ -157,7 +158,7 @@ fn setup(
             if choose_shape < 0.9 {
                 entity_builder.insert(Sphere);
             } else {
-                entity_builder.insert(Mesh3d(cuboid.clone()));
+                entity_builder.insert(AuroraMesh3d(cuboid.clone()));
             }
         }
     }

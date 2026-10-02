@@ -538,7 +538,10 @@ fn render_frame(
                 let Projection::Perspective(perspective) = c.1 else {
                     // Orthographic and custom projections have no raygen yet; skipping is
                     // better than the `todo!()` that used to take the whole frame down.
-                    log::warn!("aurora: only perspective cameras render; skipping {:?}", c.0);
+                    log::warn!(
+                        "aurora: only perspective cameras render; skipping {:?}",
+                        c.0
+                    );
                     return None;
                 };
                 // An offscreen camera is sized by its target texture; a window camera by
@@ -621,7 +624,9 @@ fn render_frame(
     *dlss_was_active = plan.is_some();
     // The primary view drives the frame-wide passes (auto-exposure, the atmosphere LUTs).
     // Per-view work reads the view's own extents.
-    let primary_trace_extent = views.first().map_or(swapchain.swapchain_extent, |v| v.trace_extent);
+    let primary_trace_extent = views
+        .first()
+        .map_or(swapchain.swapchain_extent, |v| v.trace_extent);
     // Set once an evaluate has been recorded this frame: only then does a blit read a DLSS
     // output (before the RT pipeline is compiled nothing has written them).
     let mut dlss_ran = false;
@@ -925,8 +930,8 @@ fn render_frame(
                         .acceleration_structures(std::slice::from_ref(
                             &tlas.acceleration_structure.handle,
                         ));
-                    let set =
-                        rtx_pipeline.descriptor_sets[(swapchain.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
+                    let set = rtx_pipeline.descriptor_sets
+                        [(swapchain.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
                     let mut writes = vec![
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
@@ -1048,12 +1053,16 @@ fn render_frame(
         drop(section);
         // A view that renders nothing has several indistinguishable causes; name them.
         {
+            let (slots, drawn, waiting) = tlas.instance_summary();
             let summary = format!(
-                "views={} tlas={} sbt={} traced={} gizmo_verts={} | {}",
+                "views={} tlas={} sbt={} traced={} instances={}/{} waiting={} gizmo_verts={} | {}",
                 views.len(),
                 tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null(),
                 sbt.data.address != 0,
                 dlss_ran,
+                drawn,
+                slots,
+                waiting,
                 gizmos.frame.vertices.len(),
                 views
                     .iter()
@@ -1208,7 +1217,9 @@ fn render_frame(
                         pipeline,
                         pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
                         source_view,
-                        dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
+                        dlss.renderer
+                            .as_ref()
+                            .and_then(|r| r.guide_views(view.slot)),
                         &crate::post_process_filter::PostProcessPushConstants {
                             uniforms: frame.uniform_buffers[view.slot].address,
                             auto_exposure: ae.addresses().1,
@@ -1353,7 +1364,9 @@ fn render_frame(
                     pipeline,
                     pipeline.descriptor_sets[parity * POST_TARGETS + target],
                     source_view,
-                    dlss.renderer.as_ref().and_then(|r| r.guide_views(view.slot)),
+                    dlss.renderer
+                        .as_ref()
+                        .and_then(|r| r.guide_views(view.slot)),
                     &crate::post_process_filter::PostProcessPushConstants {
                         uniforms: frame.uniform_buffers[view.slot].address,
                         auto_exposure: ae.addresses().1,
@@ -1489,12 +1502,16 @@ fn render_frame(
                 let _ = render_device.device.device_wait_idle();
             }
             let mut view = render_device.map_buffer(&mut buffer);
-            crate::util::screenshot::save_png(
+            let wrote = crate::util::screenshot::save_png(
                 view.as_slice_mut(),
                 swapchain.swapchain_format,
                 capture_extent,
                 &path,
             );
+            drop(view);
+            if wrote {
+                screenshots.record_written(path, capture_extent);
+            }
             render_device.destroyer.destroy_buffer(buffer.handle);
         }
     }

@@ -15,9 +15,9 @@ use bevy::{
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
     sphere::Sphere,
     ui_render::UiPolyline,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -106,7 +106,10 @@ fn curves() -> impl Bundle {
     let wave: Vec<Vec2> = (0..=96)
         .map(|i| {
             let t = i as f32 / 96.0;
-            Vec2::new(t * 300.0, 60.0 + (t * std::f32::consts::TAU * 2.0).sin() * 44.0)
+            Vec2::new(
+                t * 300.0,
+                60.0 + (t * std::f32::consts::TAU * 2.0).sin() * 44.0,
+            )
         })
         .collect();
     (

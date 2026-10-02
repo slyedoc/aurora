@@ -52,12 +52,12 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::platform::collections::HashMap;
 
 use crate::{
-    swapchain::DISPLAY_FORMAT,
     assets::aurora_asset,
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_texture::{RenderTexture, create_blank_texture},
+    swapchain::DISPLAY_FORMAT,
     vk_utils,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssetLoadingState, VulkanAssets},
 };
@@ -254,8 +254,8 @@ impl VulkanAsset for UiPipeline {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&[DISPLAY_FORMAT]);
+        let mut pipeline_rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
@@ -331,7 +331,13 @@ pub struct UiRenderConfig {
 /// `bevy::feathers::FeathersPlugins` yourself if you want feathers widgets.
 pub struct UiRenderPlugin;
 
-impl Plugin for UiRenderPlugin {
+/// The UI node tree with nothing that draws it: layout, text, picking and the widget
+/// behaviours. This is the half of bevy's `DefaultPlugins` a render-free app still needs --
+/// `Assets<Font>`, `Node` layout, `Pointer` events -- and [`UiRenderPlugin`] is the draw
+/// half stacked on top.
+pub struct UiTreePlugin;
+
+impl Plugin for UiTreePlugin {
     fn build(&self, app: &mut App) {
         // Only the pieces the app has not already added: several of these pull each
         // other in (TextPlugin adds TextureAtlasPlugin, for example).
@@ -362,6 +368,14 @@ impl Plugin for UiRenderPlugin {
         }
         if !app.is_plugin_added::<bevy::ui_widgets::ButtonPlugin>() {
             app.add_plugins(UiWidgetsPlugins);
+        }
+    }
+}
+
+impl Plugin for UiRenderPlugin {
+    fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<UiTreePlugin>() {
+            app.add_plugins(UiTreePlugin);
         }
 
         app.init_asset::<UiPipeline>();

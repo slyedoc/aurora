@@ -1,5 +1,5 @@
 use crate::{
-    gltf_mesh::GltfModel,
+    mesh::AuroraMesh,
     procedural_mesh::ProceduralMesh,
     ray_render_plugin::{RenderConfig, RenderSet, TeardownSchedule, on_shutdown},
     raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
@@ -72,8 +72,7 @@ fn update_sbt(
     tlas: Res<TLAS>,
     surface_data: Res<SurfaceGroupData>,
     rtx_pipelines: Res<VulkanAssets<RaytracingPipeline>>,
-    meshes: Res<VulkanAssets<Mesh>>,
-    gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    meshes: Res<VulkanAssets<AuroraMesh>>,
     procedural_meshes: Res<VulkanAssets<ProceduralMesh>>,
     skins: Res<Skins>,
     terrains: Res<crate::terrain::Terrains>,
@@ -244,32 +243,6 @@ fn update_sbt(
                         flags: 2,
                         surface_data: 0,
                     });
-            }
-
-            for (mesh_id, mesh) in gltf_meshes.iter() {
-                let mesh = match mesh {
-                    VulkanAssetLoadingState::Loading => continue,
-                    VulkanAssetLoadingState::Loaded(mesh) => mesh,
-                };
-
-                for (class, offset) in records_by_asset
-                    .get(&mesh_id.untyped())
-                    .map_or(&[][..], Vec::as_slice)
-                {
-                    (dst.add(*offset as usize * sbt.hit_region.stride as usize)
-                        as *mut SBTRegionHitTriangle)
-                        .write(SBTRegionHitTriangle {
-                            handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
-                            vertex_buffer: mesh.vertex_buffer.address,
-                            triangle_buffer: mesh.triangle_buffer.address,
-                            index_buffer: mesh.index_buffer.address,
-                            geometry_to_index: mesh.geometry_to_index.address,
-                            geometry_to_triangle: mesh.geometry_to_triangle.address,
-                            prev_vertex_buffer: 0,
-                            flags: 0,
-                            surface_data: surface_data.get(SurfaceClass(*class)),
-                        });
-                }
             }
         }
     }

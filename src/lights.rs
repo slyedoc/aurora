@@ -16,9 +16,7 @@
 //! slightly wrong rates). MIS against BRDF sampling looks an emissive hit up through
 //! `slot_to_linst` + the hit's global triangle index.
 //!
-//! Sources are `Mesh3d` + emissive [`AuroraMaterial`] instances and `GltfModelHandle`
-//! instances whose bundle has emissive primitives (emission per geometry, from the glTF
-//! emissive factors). Animated cluster deformations are not accounted for (their BLAS-space
+//! Sources are `AuroraMesh3d` + emissive [`AuroraMaterial`] instances. Animated cluster deformations are not accounted for (their BLAS-space
 //! positions are pre-deform); they still glow through BRDF hits at full weight.
 
 use std::collections::HashMap;
@@ -36,9 +34,9 @@ use crate::{
     compute::{
         ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
     },
-    gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::upload_slice,
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -131,13 +129,12 @@ struct LightScanParams {
     pad: u32,
 }
 
-/// What an emissive instance's geometry and emission come from.
+/// An emissive instance: its mesh and its [`AuroraMaterial`] (one emission for every
+/// geometry).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LightSource {
-    /// A `Mesh3d` with an emissive [`AuroraMaterial`] (one emission for every geometry).
-    Mesh(AssetId<Mesh>, AssetId<AuroraMaterial>),
-    /// A glTF bundle; emission per geometry from its materials, resolved once the BLAS is.
-    Gltf(AssetId<GltfModel>),
+struct LightSource {
+    mesh: AssetId<AuroraMesh>,
+    material: AssetId<AuroraMaterial>,
 }
 
 #[derive(Resource)]
@@ -333,21 +330,18 @@ fn track_lights(
     changed: Query<
         (
             &GpuInstance,
-            Option<&Mesh3d>,
-            Option<&GltfModelHandle>,
+            Option<&AuroraMesh3d>,
             Option<&AuroraMaterial3d>,
         ),
         Or<(
             Added<GpuInstance>,
             Changed<AuroraMaterial3d>,
-            Changed<Mesh3d>,
-            Changed<GltfModelHandle>,
+            Changed<AuroraMesh3d>,
         )>,
     >,
     all: Query<(
         &GpuInstance,
-        Option<&Mesh3d>,
-        Option<&GltfModelHandle>,
+        Option<&AuroraMesh3d>,
         Option<&AuroraMaterial3d>,
     )>,
 ) {
@@ -360,26 +354,18 @@ fn track_lights(
 
     let lights = &mut *lights;
     let consider = |slot: u32,
-                    mesh: Option<&Mesh3d>,
-                    gltf: Option<&GltfModelHandle>,
+                    mesh: Option<&AuroraMesh3d>,
                     material: Option<&AuroraMaterial3d>,
                     sources: &mut HashMap<u32, LightSource>,
                     pending: &mut HashMap<u32, LightSource>,
                     dirty: &mut bool| {
-        // glTF bundles carry their own materials; whether any geometry is emissive is
-        // resolved against the prepared BLAS in prepare_lights.
-        if let Some(gltf) = gltf {
-            let source = LightSource::Gltf(gltf.0.id());
-            pending.remove(&slot);
-            if sources.insert(slot, source) != Some(source) {
-                *dirty = true;
-            }
-            return;
-        }
         let (Some(mesh), Some(material)) = (mesh, material) else {
             return;
         };
-        let source = LightSource::Mesh(mesh.id(), material.0.id());
+        let source = LightSource {
+            mesh: mesh.0.id(),
+            material: material.0.id(),
+        };
         let Some(asset) = materials.get(&material.0) else {
             pending.insert(slot, source);
             return;
@@ -397,11 +383,10 @@ fn track_lights(
     };
 
     if rescan {
-        for (instance, mesh, gltf, material) in all.iter() {
+        for (instance, mesh, material) in all.iter() {
             consider(
                 instance.0,
                 mesh,
-                gltf,
                 material,
                 &mut lights.sources,
                 &mut lights.pending,
@@ -409,11 +394,10 @@ fn track_lights(
             );
         }
     } else {
-        for (instance, mesh, gltf, material) in changed.iter() {
+        for (instance, mesh, material) in changed.iter() {
             consider(
                 instance.0,
                 mesh,
-                gltf,
                 material,
                 &mut lights.sources,
                 &mut lights.pending,
@@ -426,10 +410,7 @@ fn track_lights(
     if !lights.pending.is_empty() {
         let retry: Vec<(u32, LightSource)> = lights.pending.iter().map(|(s, v)| (*s, *v)).collect();
         for (slot, source) in retry {
-            let LightSource::Mesh(_, material) = source else {
-                continue;
-            };
-            let Some(asset) = materials.get(material) else {
+            let Some(asset) = materials.get(source.material) else {
                 continue;
             };
             let e = asset.emissive;
@@ -465,8 +446,7 @@ fn on_light_instance_removed(
 fn prepare_lights(
     render_device: Res<RenderDevice>,
     mut lights: ResMut<LightManager>,
-    meshes: Res<VulkanAssets<Mesh>>,
-    gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    meshes: Res<VulkanAssets<AuroraMesh>>,
     materials: Res<Assets<AuroraMaterial>>,
     images: Res<Assets<Image>>,
 ) {
@@ -487,67 +467,47 @@ fn prepare_lights(
     let mut slots: Vec<u32> = lights.sources.keys().copied().collect();
     slots.sort_unstable();
     for slot in slots {
-        let (blas, geom_emissions): (&crate::blas::BLAS, Vec<[f32; 3]>) =
-            match lights.sources[&slot] {
-                LightSource::Mesh(mesh, material) => {
-                    let Some(blas) = meshes.get_by_id(mesh) else {
-                        waiting = true;
-                        continue;
+        let (blas, geom_emissions): (&crate::blas::BLAS, Vec<[f32; 3]>) = {
+            let LightSource { mesh, material } = lights.sources[&slot];
+            {
+                let Some(blas) = meshes.get_by_id(mesh) else {
+                    waiting = true;
+                    continue;
+                };
+                // The emissive factor as the tracer multiplies it (linear radiance, nits),
+                // times the emissive texture's mean where there is one.
+                let Some(asset) = materials.get(material) else {
+                    waiting = true;
+                    continue;
+                };
+                let mut emission = [
+                    asset.emissive.red,
+                    asset.emissive.green,
+                    asset.emissive.blue,
+                ];
+                if let Some(texture) = &asset.emissive_texture {
+                    let id = texture.id();
+                    let mean = match lights.texture_means.get(&id) {
+                        Some(mean) => *mean,
+                        None => match images.get(id).and_then(image_mean_emission) {
+                            Some(mean) => {
+                                lights.texture_means.insert(id, mean);
+                                mean
+                            }
+                            None => {
+                                waiting = true;
+                                continue;
+                            }
+                        },
                     };
-                    // The emissive factor as the tracer multiplies it (linear radiance, nits),
-                    // times the emissive texture's mean where there is one.
-                    let Some(asset) = materials.get(material) else {
-                        waiting = true;
-                        continue;
-                    };
-                    let mut emission = [asset.emissive.red, asset.emissive.green, asset.emissive.blue];
-                    if let Some(texture) = &asset.emissive_texture {
-                        let id = texture.id();
-                        let mean = match lights.texture_means.get(&id) {
-                            Some(mean) => *mean,
-                            None => match images.get(id).and_then(image_mean_emission) {
-                                Some(mean) => {
-                                    lights.texture_means.insert(id, mean);
-                                    mean
-                                }
-                                None => {
-                                    waiting = true;
-                                    continue;
-                                }
-                            },
-                        };
-                        for (e, m) in emission.iter_mut().zip(mean) {
-                            *e *= m;
-                        }
+                    for (e, m) in emission.iter_mut().zip(mean) {
+                        *e *= m;
                     }
-                    let geoms = (blas.geometry_to_index.nr_elements as usize).max(1);
-                    (blas, vec![emission; geoms])
                 }
-                LightSource::Gltf(gltf) => {
-                    let Some(blas) = gltf_meshes.get_by_id(gltf) else {
-                        waiting = true;
-                        continue;
-                    };
-                    let Some(bundle) = &blas.gltf_materials else {
-                        continue;
-                    };
-                    let geom_emissions: Vec<[f32; 3]> = bundle
-                        .iter()
-                        .map(|m| {
-                            let e = m.base_emissive_factor;
-                            [e[0], e[1], e[2]]
-                        })
-                        .collect();
-                    // A bundle with no emissive geometry lights nothing.
-                    if !geom_emissions
-                        .iter()
-                        .any(|e| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2] > 0.0)
-                    {
-                        continue;
-                    }
-                    (blas, geom_emissions)
-                }
-            };
+                let geoms = (blas.geometry_to_index.nr_elements as usize).max(1);
+                (blas, vec![emission; geoms])
+            }
+        };
         let tri_count = (blas.index_buffer.nr_elements / 3) as u32;
         if tri_count == 0 {
             continue;
@@ -584,7 +544,10 @@ fn prepare_lights(
         return;
     }
 
-    let sphere_slots = lights.analytic_slots.iter().filter(|slot| **slot != u32::MAX);
+    let sphere_slots = lights
+        .analytic_slots
+        .iter()
+        .filter(|slot| **slot != u32::MAX);
     let max_slot = sphere_slots.fold(max_slot, |max, slot| max.max(*slot));
     let mut slot_map = vec![u32::MAX; max_slot as usize + 1];
     for (i, li) in linsts.iter().enumerate() {
@@ -872,8 +835,7 @@ impl Plugin for LightsPlugin {
                 (track_lights, track_analytic_lights).in_set(RenderSet::Extract),
                 prepare_lights
                     .in_set(RenderSet::Prepare)
-                    .after(poll_for_asset::<Mesh>)
-                    .after(poll_for_asset::<GltfModel>)
+                    .after(poll_for_asset::<AuroraMesh>)
                     .after(poll_for_asset::<AuroraMaterial>),
             ),
         );

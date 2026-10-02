@@ -1,6 +1,6 @@
 //! GPU-editable heightmap terrain (core's tile system, ported onto the ray tracer).
 //!
-//! A terrain tile is an entity with `Mesh3d` (built by [`terrain_mesh`] from the tile's height
+//! A terrain tile is an entity with `AuroraMesh3d` (built by [`terrain_mesh`] from the tile's height
 //! grid — the same center-vertex pattern core used, no folded quads for RT) plus a
 //! [`TerrainTile`] component carrying the editable state: the height grid, the WoW-style
 //! alphamap atlas (16×16 subchunk cells, up to 4 texture layers per chunk — layer 0 base,
@@ -29,7 +29,7 @@ use bevy::{
     asset::{AssetId, RenderAssetUsages},
     ecs::lifecycle::Remove,
     ecs::observer::On,
-    mesh::{Indices, Mesh, Mesh3d, PrimitiveTopology},
+    mesh::{Indices, Mesh, PrimitiveTopology},
     prelude::*,
 };
 use bytemuck::{Pod, Zeroable};
@@ -40,6 +40,7 @@ use crate::{
     compute::{
         ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
     },
+    mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -56,7 +57,7 @@ const REBUILD_INTERVAL: u32 = 16;
 
 // ---- authoring-side components / resources ---------------------------------------------------
 
-/// One terrain tile's editable state. Spawn together with `Mesh3d(terrain_mesh(..))` and an
+/// One terrain tile's editable state. Spawn together with `AuroraMesh3d(terrain_mesh(..))` and an
 /// `AuroraMaterial3d` whose `base_color_texture` is `diffuse`.
 #[derive(Component)]
 pub struct TerrainTile {
@@ -219,7 +220,7 @@ struct PaletteEntryGpu {
 
 #[derive(Clone, PartialEq)]
 struct TerrainSource {
-    mesh: AssetId<Mesh>,
+    mesh: AssetId<AuroraMesh>,
     image: AssetId<Image>,
     resolution: u32,
     size: f32,
@@ -464,10 +465,8 @@ impl Terrains {
                         let to_px = |v: f32| ((v / size + 0.5) * px).floor();
                         let x0 = (to_px(op.center.x - op.radius).max(0.0)) as u32;
                         let y0 = (to_px(op.center.y - op.radius).max(0.0)) as u32;
-                        let x1 =
-                            (to_px(op.center.x + op.radius) + 2.0).min(px) as u32;
-                        let y1 =
-                            (to_px(op.center.y + op.radius) + 2.0).min(px) as u32;
+                        let x1 = (to_px(op.center.x + op.radius) + 2.0).min(px) as u32;
+                        let y1 = (to_px(op.center.y + op.radius) + 2.0).min(px) as u32;
                         if x1 > x0 && y1 > y0 {
                             let r = inst.compose_dirty.get_or_insert([x0, y0, x1, y1]);
                             r[0] = r[0].min(x0);
@@ -487,7 +486,9 @@ impl Terrains {
         // Stream rebuild + BLAS build/refit for geometry-dirty tiles.
         let mut deformed: Vec<u32> = Vec::new();
         for (&slot, inst) in self.instances.iter() {
-            let Some(gpu) = inst.gpu.as_ref() else { continue };
+            let Some(gpu) = inst.gpu.as_ref() else {
+                continue;
+            };
             if !(inst.geo_dirty || gpu.builds == 0) {
                 continue;
             }
@@ -602,8 +603,12 @@ impl Terrains {
 
         // Diffuse compose + copy into the material's texture, tile by tile.
         for inst in self.instances.values_mut() {
-            let Some(gpu) = inst.gpu.as_ref() else { continue };
-            let Some(rect) = inst.compose_dirty else { continue };
+            let Some(gpu) = inst.gpu.as_ref() else {
+                continue;
+            };
+            let Some(rect) = inst.compose_dirty else {
+                continue;
+            };
             let Some(palette) = palette else { continue };
             // The texture must be uploaded before we can copy into it; keep the rect dirty
             // until it is.
@@ -691,7 +696,8 @@ fn copy_compose_to_texture(
         unsafe {
             rd.ext_sync2.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier)),
             );
         }
     };
@@ -748,7 +754,7 @@ fn copy_compose_to_texture(
 
 type ChangedTerrains = Or<(
     Added<GpuInstance>,
-    Changed<Mesh3d>,
+    Changed<AuroraMesh3d>,
     Changed<TerrainTile>,
 )>;
 
@@ -756,7 +762,7 @@ type ChangedTerrains = Or<(
 fn extract_terrains(
     mut terrains: ResMut<Terrains>,
     mut edits: ResMut<TerrainEdits>,
-    changed: Query<(Entity, &GpuInstance, &Mesh3d, &TerrainTile), ChangedTerrains>,
+    changed: Query<(Entity, &GpuInstance, &AuroraMesh3d, &TerrainTile), ChangedTerrains>,
     mut removed_components: RemovedComponents<TerrainTile>,
     instances: Query<&GpuInstance>,
 ) {
@@ -767,7 +773,7 @@ fn extract_terrains(
     }
     for (entity, instance, mesh, tile) in changed.iter() {
         let source = TerrainSource {
-            mesh: mesh.id(),
+            mesh: mesh.0.id(),
             image: tile.diffuse.id(),
             resolution: tile.resolution,
             size: tile.size,
@@ -833,7 +839,9 @@ fn sync_terrain_cpu(
 ) {
     let frame = terrains.frame;
     for inst in terrains.instances.values_mut() {
-        let due = inst.sync_at.is_some_and(|at| frame.wrapping_sub(at) < 0x8000_0000);
+        let due = inst
+            .sync_at
+            .is_some_and(|at| frame.wrapping_sub(at) < 0x8000_0000);
         if !due {
             continue;
         }
@@ -871,7 +879,7 @@ pub fn prepare_terrains(
     render_device: Res<RenderDevice>,
     mut terrains: ResMut<Terrains>,
     mut tlas: ResMut<TLAS>,
-    meshes: Res<VulkanAssets<Mesh>>,
+    meshes: Res<VulkanAssets<AuroraMesh>>,
     palette: Option<Res<TerrainPalette>>,
     tiles: Query<&TerrainTile>,
 ) {
@@ -911,7 +919,9 @@ pub fn prepare_terrains(
         }
         let mut table_buf: Buffer<PaletteEntryGpu> = render_device
             .create_host_buffer(table.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
-        render_device.map_buffer(&mut table_buf).copy_from_slice(&table);
+        render_device
+            .map_buffer(&mut table_buf)
+            .copy_from_slice(&table);
         terrains.palette = Some((table_buf, texture_bufs));
         log::info!("terrain: palette uploaded ({} textures)", table.len());
     }
@@ -941,7 +951,9 @@ pub fn prepare_terrains(
         }
         if inst.gpu.is_none() {
             let Some(blas) = mesh_blas else { continue };
-            let Ok(tile) = tiles.get(inst.entity) else { continue };
+            let Ok(tile) = tiles.get(inst.entity) else {
+                continue;
+            };
             let res = inst.source.resolution;
             let expected = res * res + (res - 1) * (res - 1);
             let vertex_count = blas.vertex_buffer.nr_elements as u32;
@@ -969,16 +981,22 @@ pub fn prepare_terrains(
                 tile.heights.len() as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
-            render_device.map_buffer(&mut heights).copy_from_slice(&tile.heights);
+            render_device
+                .map_buffer(&mut heights)
+                .copy_from_slice(&tile.heights);
             let alpha_words: &[u32] = bytemuck::cast_slice(&tile.alpha);
             let mut alpha: Buffer<u32> = render_device.create_host_buffer(
                 alpha_words.len() as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
-            render_device.map_buffer(&mut alpha).copy_from_slice(alpha_words);
-            let mut chunk_layers: Buffer<[u32; 4]> = render_device
-                .create_host_buffer(256, vk::BufferUsageFlags::STORAGE_BUFFER);
-            render_device.map_buffer(&mut chunk_layers).copy_from_slice(&tile.chunk_layers);
+            render_device
+                .map_buffer(&mut alpha)
+                .copy_from_slice(alpha_words);
+            let mut chunk_layers: Buffer<[u32; 4]> =
+                render_device.create_host_buffer(256, vk::BufferUsageFlags::STORAGE_BUFFER);
+            render_device
+                .map_buffer(&mut chunk_layers)
+                .copy_from_slice(&tile.chunk_layers);
 
             // Own copy of the index stream (the mesh asset can be dropped/reloaded).
             let index_buffer = render_device.create_device_buffer::<u32>(
@@ -1101,7 +1119,7 @@ fn cleanup_terrains(world: &mut World) {
 /// Heights are `resolution`² row-major; the mesh spans ±size/2 in x/z. The vertex ORDER is
 /// the contract with `terrain_vertices` in terrain.slang: `res`² corners then `(res-1)`²
 /// centers.
-pub fn terrain_mesh(heights: &[f32], resolution: u32, size: f32) -> Mesh {
+pub fn terrain_mesh(heights: &[f32], resolution: u32, size: f32) -> AuroraMesh {
     let res = resolution as usize;
     assert_eq!(heights.len(), res * res, "heights must be resolution^2");
     let cells = res - 1;
@@ -1171,7 +1189,10 @@ pub fn terrain_mesh(heights: &[f32], resolution: u32, size: f32) -> Mesh {
     }
     for cz in 0..cells {
         for cx in 0..cells {
-            normals.push(normal_at((cx as f32 + 0.5) / fcells, (cz as f32 + 0.5) / fcells));
+            normals.push(normal_at(
+                (cx as f32 + 0.5) / fcells,
+                (cz as f32 + 0.5) / fcells,
+            ));
         }
     }
 
@@ -1183,7 +1204,8 @@ pub fn terrain_mesh(heights: &[f32], resolution: u32, size: f32) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh
+    // One cluster in exactly this vertex order: the GPU edit addresses vertices by index.
+    AuroraMesh::from_mesh(&mesh).expect("terrain mesh has positions")
 }
 
 // ---- plugin --------------------------------------------------------------------------------------
@@ -1231,7 +1253,7 @@ impl Plugin for TerrainPlugin {
                     .in_set(RenderSet::Extract),
                 prepare_terrains
                     .in_set(RenderSet::Prepare)
-                    .after(poll_for_asset::<Mesh>)
+                    .after(poll_for_asset::<AuroraMesh>)
                     .before(prepare_instances),
             ),
         );

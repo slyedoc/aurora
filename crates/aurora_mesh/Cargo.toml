@@ -1,16 +1,19 @@
-# The `.cluster_mesh` wire format (read / write / flat bake / bevy asset loader) on its own, so the
-# offline importers in aurora_files can depend on it without pulling the Vulkan renderer.
+# The mesh as data: the `.aurora_mesh` format, the `AuroraMesh` asset and loader, and the
+# `AuroraMesh3d` component, with no Vulkan. The aurora_files importers write it; an editor or a
+# headless tool names meshes through it; `bevy_aurora::mesh` re-exports it and builds the BLAS.
 [package]
-name = "aurora_cluster_mesh"
+name = "aurora_mesh"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [dependencies]
+aurora_material = { path = "../aurora_material" }
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [
     "std",
     "bevy_asset",
     "bevy_mesh",
+    "bevy_camera",
 ] }
 bytemuck = { version = "1.14.3", features = ["derive"] }
 # 0.13 for byte-identity with the shipped files.

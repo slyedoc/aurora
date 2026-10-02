@@ -48,7 +48,12 @@ struct GpuPortal {
 }
 
 impl GpuPortal {
-    const INVALID: Self = Self { instance_slot: 0, target_slot: 0, valid: 0, pad: 0 };
+    const INVALID: Self = Self {
+        instance_slot: 0,
+        target_slot: 0,
+        valid: 0,
+        pad: 0,
+    };
 }
 
 /// The uploaded pair table; the frame uniform carries its address + count.
@@ -63,7 +68,11 @@ pub struct PortalTable {
 
 impl PortalTable {
     pub fn address(&self) -> u64 {
-        if self.count == 0 { 0 } else { self.buffer.as_ref().map_or(0, |b| b.address) }
+        if self.count == 0 {
+            0
+        } else {
+            self.buffer.as_ref().map_or(0, |b| b.address)
+        }
     }
     pub fn count(&self) -> u32 {
         self.count

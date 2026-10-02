@@ -31,6 +31,7 @@ use crate::{
         COMPUTE_PUSH_CONSTANT_SIZE, CompiledComputeModule, ComputeModule, memory_barrier,
         record_dispatch,
     },
+    material::AuroraMaterial3d,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
@@ -62,9 +63,9 @@ pub struct ProceduralMesh {
     pub params: Vec<u8>,
 }
 
-/// A ray-traced instance of a [`ProceduralMesh`] (the procedural `Mesh3d`).
+/// A ray-traced instance of a [`ProceduralMesh`] (the procedural `AuroraMesh3d`).
 #[derive(Component, Clone, Debug, Deref)]
-#[require(Transform, Visibility)]
+#[require(AuroraMaterial3d, Transform, Visibility)]
 pub struct ProceduralMesh3d(pub Handle<ProceduralMesh>);
 
 /// The engine's own procedural kernels (procedural.slang).

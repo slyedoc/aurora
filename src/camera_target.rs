@@ -110,9 +110,10 @@ pub fn prepare_camera_targets(
         .by_camera
         .values()
         .filter(|(asset, size)| {
-            targets.map.get(asset).is_none_or(|(_, extent)| {
-                extent.width != size.x || extent.height != size.y
-            })
+            targets
+                .map
+                .get(asset)
+                .is_none_or(|(_, extent)| extent.width != size.x || extent.height != size.y)
         })
         .copied()
         .collect();

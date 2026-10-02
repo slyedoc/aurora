@@ -659,10 +659,7 @@ impl XrState {
             let image = device.create_render_target(&info);
             let view = unsafe {
                 device
-                    .create_image_view(
-                        &vk_init::image_view_info(image, DISPLAY_FORMAT),
-                        None,
-                    )
+                    .create_image_view(&vk_init::image_view_info(image, DISPLAY_FORMAT), None)
                     .unwrap()
             };
             EyeTarget { image, view }

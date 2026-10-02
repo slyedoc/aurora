@@ -1,5 +1,6 @@
-//! GPU skinning: bevy's animated Fox.glb (three clips) path-traced through per-instance
-//! deformed BLASes (src/skinning.rs).
+//! GPU skinning: bevy's animated fox, baked with its clips by aurora_files' `prop_import
+//! --hierarchy --scale 0.01` (authored in centimetres, baked in metres), path-traced through
+//! per-instance deformed BLASes (src/skinning.rs).
 //!
 //!   cargo run --release --example skinning
 //!
@@ -11,22 +12,21 @@ use bevy::{
         graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
     },
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    gltf::GltfAssetLabel,
     prelude::*,
-    world_serialization::WorldAssetRoot,
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
+    animclip::AnimationTargetsByName,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
-    util::screenshot::ScreenshotExt,
+    mesh::{AuroraMesh, AuroraMesh3d},
+    util::{ScreenshotExt, TimeoutAppExt},
 };
 
+const CLIPS: [&str; 3] = ["fox/survey.animclip", "fox/walk.animclip", "fox/run.animclip"];
+
 #[derive(Resource)]
-struct FoxClips {
-    graph: Handle<AnimationGraph>,
-    clips: Vec<AnimationNodeIndex>,
-}
+struct FoxClips(Vec<AnimationNodeIndex>);
 
 fn main() {
     App::new()
@@ -36,8 +36,9 @@ fn main() {
             FreeCameraPlugin::default(),
         ))
         .add_screenshot(KeyCode::F12)
+        .add_timeout_exit(None, 12.0)
         .add_systems(Startup, setup)
-        .add_systems(Update, (start_clips, switch_clips))
+        .add_systems(Update, switch_clips)
         .run();
 }
 
@@ -46,32 +47,30 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     let mut graph = AnimationGraph::new();
-    let clips: Vec<AnimationNodeIndex> = (0..3)
-        .map(|i| {
-            graph.add_clip(
-                asset_server.load(GltfAssetLabel::Animation(i).from_asset("models/Fox.glb")),
-                1.0,
-                graph.root,
-            )
-        })
+    let clips: Vec<AnimationNodeIndex> = CLIPS
+        .iter()
+        .map(|path| graph.add_clip(asset_server.load(*path), 1.0, graph.root))
         .collect();
-    commands.insert_resource(FoxClips {
-        graph: graphs.add(graph),
-        clips,
-    });
+    let mut player = AnimationPlayer::default();
+    player.play(clips[2]).repeat();
+    commands.insert_resource(FoxClips(clips));
 
-    // The fox is authored in centimetres.
+    // The player on the scene root; `AnimationTargetsByName` binds the bones once they spawn.
     commands.spawn((
         Name::new("fox"),
-        WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/Fox.glb"))),
-        Transform::from_scale(Vec3::splat(0.01)),
+        ScenePatchInstance(asset_server.load("fox/fox.bsn")),
+        Transform::default(),
+        Visibility::Visible,
+        AnimationTargetsByName,
+        player,
+        AnimationGraphHandle(graphs.add(graph)),
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(40.0, 40.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(40.0, 40.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.35, 0.33, 0.3),
             perceptual_roughness: 0.9,
@@ -90,21 +89,6 @@ fn setup(
     ));
 }
 
-/// The glTF loader puts an `AnimationPlayer` on the fox's armature root: hook the graph up and
-/// start the run clip once it appears.
-fn start_clips(
-    mut commands: Commands,
-    clips: Res<FoxClips>,
-    mut players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
-) {
-    for (entity, mut player) in &mut players {
-        player.play(clips.clips[2]).repeat();
-        commands
-            .entity(entity)
-            .insert(AnimationGraphHandle(clips.graph.clone()));
-    }
-}
-
 fn switch_clips(
     input: Res<ButtonInput<KeyCode>>,
     clips: Res<FoxClips>,
@@ -116,6 +100,6 @@ fn switch_clips(
     let Some(i) = wanted else { return };
     for mut player in &mut players {
         player.stop_all();
-        player.play(clips.clips[i]).repeat();
+        player.play(clips.0[i]).repeat();
     }
 }

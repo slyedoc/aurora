@@ -118,7 +118,6 @@ impl Swapchain {
                     panic!("surface does not offer {DISPLAY_FORMAT:?}; it has {formats:?}")
                 });
 
-
             let surface_caps = self
                 .device
                 .ext_surface
@@ -182,7 +181,6 @@ impl Swapchain {
                 .cloned()
                 .find(|&mode| mode == wanted)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
-
 
             let old_swapchain = self.swapchain;
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()

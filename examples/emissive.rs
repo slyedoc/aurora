@@ -5,10 +5,11 @@
 
 use bevy::prelude::*;
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -34,7 +35,7 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     // HDR environment sky (equirectangular), texel x scale = nits.
     commands.insert_resource(Sky::Hdr {
@@ -48,7 +49,7 @@ fn setup(
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(50.0, 50.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(50.0, 50.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.3, 0.3, 0.3),
             perceptual_roughness: 1.0,
@@ -67,7 +68,7 @@ fn setup(
     ));
     commands.spawn((
         Transform::from_xyz(1.5, 1.0, 0.0),
-        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(1.0, 1.0, 1.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             emissive: LinearRgba::rgb(0.2, 0.8, 1.0) * EMISSIVE_NITS,
             ..default()

@@ -14,6 +14,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -29,7 +30,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
@@ -61,7 +62,7 @@ fn setup(
     });
     commands.spawn((
         Name::new("ground"),
-        Mesh3d(meshes.add(Cuboid::new(16.0, 0.2, 10.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(16.0, 0.2, 10.0)))),
         AuroraMaterial3d(ground),
         Transform::from_xyz(0.0, -0.1, 0.0),
     ));

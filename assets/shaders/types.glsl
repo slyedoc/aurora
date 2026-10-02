@@ -290,6 +290,8 @@ struct Material {
   vec3 absorption;
   // Alpha-mask cutout threshold (0 = opaque, no any-hit test).
   float alpha_cutoff;
+  // Row in the surface class's parameter array; 0 when the class published none.
+  uint surface_param_index;
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialData {

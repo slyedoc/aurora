@@ -54,11 +54,11 @@ it: `cargo run --release -p bsn --features xr -- bistro/bistro.bsn`.
   `build-server/openxr_wivrn-dev.json`. NVENC + VAAPI + x264 encoders on.
 - Headset-free dev loop: `tail -f /dev/null | XRT_COMPOSITOR_NULL=1 monado-service` (the
   stdin pipe matters — it epolls stdin), then
-  `XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json cargo run --features xr --example bistro_exterior`.
+  `XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json cargo run --release -p bsn --features xr -- bistro/bistro.bsn` (in aurora_files).
 - Verified against Monado sim HMD: device created through the runtime, session reaches
   FOCUSED, frames composite, zero validation errors.
 - **Verified on the Quest 2 over WiVRn** (client from the Meta store, paired with
-  `wivrnctl pair`): bistro_exterior streams to the headset. Mirror mode — no head
+  `wivrnctl pair`): the bistro streams to the headset. Mirror mode — no head
   tracking yet, both eyes see the window image.
 - Gotcha found: the runtime submits on the shared VkQueue inside
   `xrBeginFrame`/`xrEndFrame`/`xrReleaseSwapchainImage` — those calls hold

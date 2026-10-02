@@ -1,0 +1,15 @@
+# The material as data: the asset, the component that binds it and their reflection, with no
+# Vulkan. An editor, an importer or a headless test names materials through this crate;
+# `bevy_aurora::material` re-exports it and adds the GPU side.
+[package]
+name = "aurora_material"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [
+    "std",
+    "bevy_asset",
+    "bevy_image",
+] }

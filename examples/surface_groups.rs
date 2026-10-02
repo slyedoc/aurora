@@ -14,6 +14,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     sky::Sky,
@@ -101,7 +102,7 @@ fn register_layered(
 
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     layered: Res<LayeredClass>,
 ) {
@@ -129,7 +130,7 @@ fn setup(
     });
     commands.spawn((
         Name::new("ground"),
-        Mesh3d(meshes.add(Cuboid::new(16.0, 0.2, 10.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(16.0, 0.2, 10.0)))),
         AuroraMaterial3d(ground),
         Transform::from_xyz(0.0, -0.1, 0.0),
     ));
@@ -144,16 +145,16 @@ fn setup(
     // MESH spheres, not aurora's `Sphere` component: that one is a PROCEDURAL hit group
     // with its own record at offset 0, so it always routes to `sphere_hit.rchit` and never
     // sees a surface class. Class routing is a property of triangle records.
-    let ball = meshes.add(bevy::math::primitives::Sphere::new(1.0).mesh().uv(48, 32));
+    let ball = meshes.add(AuroraMesh::from_shape(bevy::math::primitives::Sphere::new(1.0).mesh().uv(48, 32)));
     commands.spawn((
         Name::new("opaque class"),
-        Mesh3d(ball.clone()),
+        AuroraMesh3d(ball.clone()),
         AuroraMaterial3d(stone.clone()),
         Transform::from_xyz(-1.6, 1.0, 0.0),
     ));
     commands.spawn((
         Name::new("layered class"),
-        Mesh3d(ball),
+        AuroraMesh3d(ball),
         AuroraMaterial3d(stone),
         layered.0,
         Transform::from_xyz(1.6, 1.0, 0.0),

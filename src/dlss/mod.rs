@@ -56,7 +56,6 @@ pub fn set_jitter_scale(scale: f32) {
     JITTER_SCALE.store(scale.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
 
-
 /// Which Ray Reconstruction model the feature is created with (RR guide 3.13). Changing it
 /// at runtime (the dev panel has a row for it) rebuilds the feature.
 #[derive(Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -220,14 +219,21 @@ pub(crate) fn suggested_jitter(frame: u32, render_width: u32, output_width: u32)
     // the sign wrong by twice that. One run keeps one window and one camera across captures.
     if let Ok(schedule) = std::env::var("AURORA_JITTER_TEST") {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32();
+        let elapsed = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f32();
         let mut pinned = None;
         for entry in schedule.split(';') {
             let (xy, from) = entry.split_once('@').unwrap_or((entry, "0"));
-            let Some((x, y)) = xy.split_once(',') else { continue };
-            let (Ok(x), Ok(y), Ok(from)) =
-                (x.trim().parse::<f32>(), y.trim().parse::<f32>(), from.trim().parse::<f32>())
-            else {
+            let Some((x, y)) = xy.split_once(',') else {
+                continue;
+            };
+            let (Ok(x), Ok(y), Ok(from)) = (
+                x.trim().parse::<f32>(),
+                y.trim().parse::<f32>(),
+                from.trim().parse::<f32>(),
+            ) else {
                 continue;
             };
             if elapsed >= from {

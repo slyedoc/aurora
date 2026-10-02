@@ -601,7 +601,11 @@ impl DlssRenderer {
                 reset || first,
                 [-(view.render.width as f32), -(view.render.height as f32)],
                 // A paused/first frame reports 0; hand NGX a sane 60 Hz delta instead.
-                if frame_time_ms > 0.0 { frame_time_ms } else { 16.6 },
+                if frame_time_ms > 0.0 {
+                    frame_time_ms
+                } else {
+                    16.6
+                },
             )
         };
         if let Err(e) = result {

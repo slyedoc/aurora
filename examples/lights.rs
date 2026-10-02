@@ -10,9 +10,10 @@ use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::light::{PointLight, RectLight, SpotLight};
 use bevy::prelude::*;
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -32,7 +33,7 @@ fn setup(
     mut commands: Commands,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     let mut window = windows.single_mut().unwrap();
     window.title = "aurora — analytic lights".into();
@@ -55,7 +56,7 @@ fn setup(
 
     commands.spawn((
         Name::new("floor"),
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(40.0, 40.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(40.0, 40.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.5, 0.5, 0.5),
             perceptual_roughness: 0.8,
@@ -68,7 +69,7 @@ fn setup(
         let x = (i as f32 - 2.0) * 2.5;
         commands.spawn((
             Name::new(format!("pillar {i}")),
-            Mesh3d(meshes.add(Cuboid::new(0.8, 2.0, 0.8))),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.8, 2.0, 0.8)))),
             Transform::from_xyz(x, 1.0, 0.0),
             AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: Color::srgb(0.8, 0.75, 0.7),

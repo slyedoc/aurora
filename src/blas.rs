@@ -11,12 +11,11 @@ use half::f16;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
-    cluster_mesh::OmmSlices,
+    mesh::OmmSlices,
     omm::{Micromap, MicromapBuild},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
-    render_texture::RenderTexture,
     vk_utils,
 };
 
@@ -106,6 +105,10 @@ pub struct RTXMaterial {
     pub absorption: [f32; 3],
     /// Alpha-mask cutout threshold; 0 = opaque (the any-hit shader never tests it).
     pub alpha_cutoff: f32,
+    /// Row this material owns in its [`SurfaceClass`](crate::surface_group::SurfaceClass)'s
+    /// parameter array. The material arena's offset is allocated here and recycled, so a
+    /// surface group cannot be indexed by it from outside; this is the stable key instead.
+    pub surface_param_index: u32,
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:
@@ -136,11 +139,13 @@ impl Default for RTXMaterial {
             metallic_factor: 0.0,
             refract_index: 1.0,
             absorption: [0.0; 3],
+            surface_param_index: 0,
             alpha_cutoff: 0.0,
         }
     }
 }
 
+#[derive(Default)]
 pub struct BLAS {
     pub acceleration_structure: AccelerationStructure,
     pub vertex_buffer: Buffer<Vertex>,
@@ -152,8 +157,6 @@ pub struct BLAS {
     pub skin_buffer: Option<Buffer<SkinVertex>>,
     /// The opacity micromap the structure references (alpha-cutout meshes with a bake).
     pub micromap: Option<Micromap>,
-    pub gltf_materials: Option<Vec<RTXMaterial>>,
-    pub gltf_textures: Option<Vec<RenderTexture>>,
 }
 
 impl BLAS {
@@ -347,6 +350,35 @@ struct BlasStaging {
 pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput>) -> Vec<BLAS> {
     if inputs.is_empty() {
         return Vec::new();
+    }
+    // A mesh with no triangles gets the default BLAS, whose null address the TLAS reads as
+    // "nothing to trace". Feeding one to the builder means a zero-primitive build over null
+    // buffers, and the whole batch -- every other mesh in it -- dies with it.
+    let drawable: Vec<bool> = inputs
+        .iter()
+        .map(|input| input.vertex_count > 0 && input.index_count >= 3)
+        .collect();
+    if drawable.iter().any(|keep| !keep) {
+        log::warn!(
+            "{} mesh(es) have no triangles; not traced",
+            drawable.iter().filter(|keep| !**keep).count()
+        );
+        let kept: Vec<BlasBuildInput> = inputs
+            .into_iter()
+            .zip(&drawable)
+            .filter_map(|(input, keep)| keep.then_some(input))
+            .collect();
+        let mut built = build_blas_batch(render_device, kept).into_iter();
+        return drawable
+            .into_iter()
+            .map(|keep| {
+                if keep {
+                    built.next().unwrap_or_default()
+                } else {
+                    BLAS::default()
+                }
+            })
+            .collect();
     }
     log::debug!("Building {} BLASes", inputs.len());
 
@@ -883,8 +915,6 @@ fn build_chunk(
             geometry_to_triangle: s.geom_to_triangle,
             skin_buffer: s.skin,
             micromap: s.omm.map(|build| build.finish(render_device)),
-            gltf_materials: None,
-            gltf_textures: None,
         })
         .collect()
 }

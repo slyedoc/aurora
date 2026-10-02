@@ -18,23 +18,22 @@ pub mod assets;
 pub mod atmosphere;
 pub mod auto_exposure;
 pub mod blas;
+pub mod bluenoise_plugin;
 pub mod bsn;
 pub mod camera_target;
 pub mod collision;
 pub mod compute;
-pub use aurora_cluster_mesh as cluster_mesh;
-pub mod bluenoise_plugin;
 pub mod debug_view;
-pub mod render_shaders;
 pub mod dev_ui;
 pub mod dlss;
 pub mod env_light;
 pub mod gizmo_render;
-pub mod gltf_mesh;
 pub mod gpu_transform;
 pub mod lights;
 pub mod material;
+pub mod mesh;
 pub mod omm;
+pub mod portal;
 pub mod post_process_filter;
 pub mod procedural_mesh;
 pub mod ray_render_plugin;
@@ -42,17 +41,17 @@ pub mod raytracing_pipeline;
 pub mod render_buffer;
 pub mod render_device;
 pub mod render_env;
+pub mod render_shaders;
 pub mod render_texture;
 pub mod restir;
 pub mod sbt;
 pub mod shader;
 pub mod sharc;
 pub mod skinning;
-pub mod surface_group;
 pub mod sky;
 pub mod sphere;
+pub mod surface_group;
 pub mod swapchain;
-pub mod portal;
 pub mod terrain;
 pub mod tlas_builder;
 pub mod transform;
@@ -62,7 +61,6 @@ pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;
-pub mod vulkan_mesh;
 pub mod xr;
 
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -74,22 +72,24 @@ use bevy::{app::PluginGroupBuilder, prelude::*};
 /// mirrors, the per-system plugins [`AuroraDefaultPlugins`] already adds) stays behind its
 /// module path.
 ///
-/// Four names are held back because they would shadow `bevy::prelude`:
-/// `material::AlphaMode`, `sphere::Sphere`, `transform::TransformPlugin` and
-/// `gltf_mesh::GltfPlugin`. Import those by path and alias them.
+/// Three names are held back because they would shadow `bevy::prelude`:
+/// `material::AlphaMode`, `sphere::Sphere` and `transform::TransformPlugin`. Import those by
+/// path and alias them.
 pub mod prelude {
     pub use crate::{
+        AuroraDefaultPlugins, AuroraMinimalPlugins,
+        animclip::AnimationTargetsByName,
         assets::aurora_asset,
         atmosphere::{Atmosphere, CloudLayer},
-        auto_exposure::{ev100_from_ev, ev_from_ev100, AuroraExposure, FixedExposure},
+        auto_exposure::{AuroraExposure, FixedExposure, ev_from_ev100, ev100_from_ev},
         collision::{CollisionMesh, CollisionShape},
         compute::{ComputeModule, ComputeModules},
         debug_view::AuroraDebugView,
         dev_ui::{DevUIPanel, DevUIPlugin, DevUIState},
         dlss::{AuroraDlss, RrPreset},
         env_light::EnvLight,
-        gltf_mesh::{GltfModel, GltfModelHandle},
         material::{AuroraMaterial, AuroraMaterial3d},
+        mesh::{AuroraMesh, AuroraMesh3d},
         portal::AuroraPortal,
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         skinning::{SkinJointsByName, Wind, WindSway},
@@ -97,7 +97,6 @@ pub mod prelude {
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
-        AuroraDefaultPlugins,
     };
 }
 
@@ -128,11 +127,10 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(bevy::asset::AssetPlugin::default());
         group = group.add(bevy::scene::ScenePlugin);
         // Skeletal animation drives joint `Transform`s; the tracer skins on the GPU
-        // (skinning.rs). bevy's glTF loader yields skinned meshes + clips (render-free in the
-        // fork); aurora's own `GltfModel` loader keeps the `.glb` extension for typed loads.
+        // (skinning.rs). Clips arrive as baked `.animclip` (animclip.rs). No glTF loader: a
+        // `.glb` is an importer input, never a runtime asset.
         group = group.add(bevy::animation::AnimationPlugin);
         group = group.add(bevy::world_serialization::WorldSerializationPlugin);
-        group = group.add(bevy::gltf::GltfPlugin::default());
         group = group.add(crate::portal::PortalPlugin);
         group = group.add(bevy::winit::WinitPlugin::default());
         group = group.add(bevy::audio::AudioPlugin::default());
@@ -149,8 +147,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::shader::ShaderPlugin);
         group = group.add(crate::compute::ComputePlugin);
         group = group.add(crate::material::MaterialPlugin);
-        group = group.add(crate::vulkan_mesh::VulkanMeshPlugin);
-        group = group.add(crate::gltf_mesh::GltfPlugin);
+        group = group.add(crate::mesh::AuroraMeshPlugin);
         group = group.add(crate::procedural_mesh::ProceduralMeshPlugin);
         group = group.add(crate::collision::CollisionPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
@@ -182,5 +179,54 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::animclip::AnimClipPlugin);
 
         group
+    }
+}
+
+/// Aurora with no Vulkan device: the assets, types and resources a scene can name, and
+/// nothing that draws.
+///
+/// A headless host -- the editor's tests, an importer, a server build -- gets
+/// `Assets<AuroraMaterial>`, the surface-class registry and the loaders, so a `.bsn` loads
+/// and round-trips exactly as it does under [`AuroraDefaultPlugins`]. The `VulkanAssets<A>`
+/// tables exist and stay empty. No window, no audio: add `WinitPlugin` yourself if the host
+/// wants one without a tracer.
+pub struct AuroraMinimalPlugins;
+
+impl PluginGroup for AuroraMinimalPlugins {
+    fn build(self) -> PluginGroupBuilder {
+        PluginGroupBuilder::start::<Self>()
+            // Before AssetPlugin: registers the `aurora://` source for the engine's own assets.
+            .add(crate::assets::AuroraAssetSourcePlugin)
+            .add(bevy::log::LogPlugin::default())
+            .add(bevy::app::TaskPoolPlugin::default())
+            .add(bevy::diagnostic::FrameCountPlugin)
+            .add(bevy::time::TimePlugin)
+            .add(crate::transform::TransformPlugin::default())
+            .add(bevy::diagnostic::DiagnosticsPlugin)
+            .add(bevy::input::InputPlugin)
+            .add(bevy::window::WindowPlugin {
+                close_when_requested: false,
+                ..default()
+            })
+            .add(bevy::a11y::AccessibilityPlugin)
+            .add(bevy::asset::AssetPlugin::default())
+            .add(bevy::scene::ScenePlugin)
+            .add(bevy::animation::AnimationPlugin)
+            .add(bevy::world_serialization::WorldSerializationPlugin)
+            // Aurora's own registrations. Each of these is asset, loader and reflection
+            // only; the plugins that hold a queue, a pipeline or a descriptor set are the
+            // ones this group leaves out.
+            .add(crate::shader::ShaderPlugin)
+            .add(crate::material::MaterialPlugin)
+            .add(crate::render_texture::RenderTexturePlugin)
+            .add(crate::mesh::AuroraMeshPlugin)
+            .add(crate::collision::CollisionPlugin)
+            .add(crate::sphere::SpherePlugin)
+            .add(crate::surface_group::SurfaceGroupPlugin)
+            .add(crate::bsn::BsnPlugin)
+            .add(crate::animclip::AnimClipPlugin)
+            .add(crate::skinning::SkinTypesPlugin)
+            .add(crate::sky::SkyPlugin)
+            .add(crate::ui_render::UiTreePlugin)
     }
 }

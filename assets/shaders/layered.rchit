@@ -12,38 +12,87 @@
 #define PACKED 1
 #include "surface_common.glsl"
 
-// A LAYERED surface: two PBR sets blended by the surface's slope, which is the shape
-// jackdaw's `LayeredSurface` wants -- rock on the steep faces, grass on the flat ones,
-// without a splat texture. The blend is the surface class's own parameters, read from the
-// record's `surfaceData` rather than from the shared material array: every class has a
-// different parameter shape, so they cannot share one.
+// A LAYERED surface: a second PBR set over the base on the faces that point up, and a detail
+// set multiplied over the result. Both extra sets are sampled TRIPLANAR in world space, so
+// they hold their scale across a mesh whose own UVs were laid out for the base.
 //
-// This is the reference for what a surface group looks like. It fetches the triangle and
-// writes the payload with the same two calls the opaque class uses; only the middle differs.
-
-layout(buffer_reference, scalar, buffer_reference_align = 4) buffer LayeredParams {
-  // Indexed exactly like `pc.materials`: instance custom index + geometry index.
-  vec4 layer_color[];
-};
+// The blend law is `jackdaw_surface::LayerBlend::weight`, expression for expression; that
+// function is the definition and carries the tests.
 
 struct Layered {
   vec4 layer_color;
   vec4 detail_color;
-  float layer_roughness;
-  float detail_roughness;
+  float layer_uv_scale;
+  float layer_normal_strength;
   float layer_metallic;
-  float detail_metallic;
-  // Surface normal Y above which the layer wins outright; below `blend_start` the detail
-  // wins outright. Between them it ramps, sharpened by `blend_contrast`.
-  float blend_start;
-  float blend_end;
+  float layer_perceptual_roughness;
+  float detail_uv_scale;
+  float detail_normal_strength;
+  float blend_amount;
+  float blend_power;
+  float blend_threshold;
+  float blend_position;
   float blend_contrast;
-  float pad;
+  // Set when the mask is painted into a vertex colour channel, which this back end has no
+  // vertex stream for: the shader falls back to the slope so the surface still reads.
+  uint use_vertex_color;
+  uint vertex_color_channel;
+  // `LAYER_NORMAL_MAP` / `DETAIL_NORMAL_MAP`: an unbound colour or ORM map falls back to
+  // white, which is what a set without one should contribute, but white read as a normal
+  // is a slant.
+  uint flags;
+  uint layer_base_color_texture;
+  uint layer_normal_map_texture;
+  uint layer_orm_texture;
+  uint detail_base_color_texture;
+  uint detail_normal_map_texture;
+  uint detail_orm_texture;
 };
 
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer LayeredData {
   Layered entries[];
 };
+
+const uint LAYER_NORMAL_MAP = 1u;
+const uint DETAIL_NORMAL_MAP = 2u;
+const float MIN_THRESHOLD_EXPONENT = 0.001;
+
+// Weights for the three projections, normalized so the set contributes once.
+vec3 triplanarWeights(const vec3 n) {
+  vec3 w = abs(n);
+  w = max(w - 0.2, vec3(0.0));
+  const float sum = w.x + w.y + w.z;
+  return sum > 1.0e-5 ? w / sum : vec3(0.0, 1.0, 0.0);
+}
+
+vec4 triplanar(const uint tex, const vec3 p, const vec3 w, const float lod) {
+  return w.x * sampleLod(tex, p.yz, lod)
+       + w.y * sampleLod(tex, p.xz, lod)
+       + w.z * sampleLod(tex, p.xy, lod);
+}
+
+// Whiteout blend: each projection's tangent normal is lifted into world space by swizzling
+// to that plane's axes, then summed. Cheaper than three TBNs and stable at the seams.
+vec3 triplanarNormal(const uint tex, const vec3 p, const vec3 w, const vec3 n,
+                     const float lod, const float strength) {
+  const vec3 sx = sampleLod(tex, p.yz, lod).xyz * 2.0 - 1.0;
+  const vec3 sy = sampleLod(tex, p.xz, lod).xyz * 2.0 - 1.0;
+  const vec3 sz = sampleLod(tex, p.xy, lod).xyz * 2.0 - 1.0;
+  const vec3 axis = sign(n);
+  const vec3 nx = vec3(sx.z * axis.x, sx.y, sx.x);
+  const vec3 ny = vec3(sy.x, sy.z * axis.y, sy.y);
+  const vec3 nz = vec3(sz.x, sz.y * axis.z, sz.z);
+  const vec3 blended = normalize(nx * w.x + ny * w.y + nz * w.z);
+  return normalize(mix(n, blended, clamp(strength, 0.0, 1.0)));
+}
+
+// `LayerBlend::weight`. `up` is the world normal's Y.
+float layerWeight(const Layered p, const float up) {
+  const float lifted = clamp(up + p.blend_power, 0.0, 1.0);
+  const float exponent =
+      MIN_THRESHOLD_EXPONENT + p.blend_threshold * (1.0 - MIN_THRESHOLD_EXPONENT);
+  return p.blend_amount * pow(abs(lifted), exponent);
+}
 
 void main() {
   const SurfaceHit hit = surfaceHit();
@@ -52,37 +101,52 @@ void main() {
   payload.refract_index = material.refract_index;
   payload.absorption = material.absorption;
 
-  // The base colour texture still comes from the shared material, so a layered surface
-  // keeps whatever albedo map it was given; the class only decides how the two sets mix.
-  const vec4 albedo = material.base_color_factor
+  vec4 albedo = material.base_color_factor
       * toLinear(sampleLod(material.base_color_texture, hit.uv, hit.lod_base));
-
-  vec4 tint = vec4(1.0);
   float roughness = material.roughness_factor;
   float metallic = material.metallic_factor;
+  vec3 normal = surfaceShadingNormal(hit);
 
   // A class that published no parameter buffer shades as plain PBR rather than reading
   // address 0. `surfaceData` is zero exactly then (`SurfaceGroupData::get`).
   const uint64_t data_address = packUint2x32(surfaceData);
   if (data_address != 0) {
     LayeredData data = LayeredData(data_address);
-    const Layered p = data.entries[gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT];
+    const Layered p = data.entries[material.surface_param_index];
 
     // Slope from the GEOMETRIC normal, not the shading normal: a normal map should change
     // how the surface catches light, not which layer it is made of.
-    const float slope = clamp(hit.surface_normal.y, -1.0, 1.0);
-    const float span = max(p.blend_end - p.blend_start, 1.0e-4);
-    float t = clamp((slope - p.blend_start) / span, 0.0, 1.0);
-    // Contrast sharpens the transition around its midpoint; 1.0 leaves it linear.
-    t = pow(t, max(p.blend_contrast, 1.0e-3));
-    t = t * t * (3.0 - 2.0 * t);
+    const float weight = layerWeight(p, clamp(hit.surface_normal.y, -1.0, 1.0));
+    const vec3 world_p = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
+    const vec3 w = triplanarWeights(hit.surface_normal);
 
-    tint = mix(p.detail_color, p.layer_color, t);
-    roughness *= mix(p.detail_roughness, p.layer_roughness, t);
-    metallic = mix(p.detail_metallic, p.layer_metallic, t);
+    if (weight > 0.0) {
+      const vec3 lp = world_p * p.layer_uv_scale;
+      vec4 layer = p.layer_color
+          * toLinear(triplanar(p.layer_base_color_texture, lp, w, hit.lod_base));
+      // Occlusion red, roughness green, metallic blue -- the channel order glTF writes.
+      const vec3 orm = triplanar(p.layer_orm_texture, lp, w, hit.lod_base).rgb;
+      albedo = mix(albedo, layer, weight);
+      roughness = mix(roughness, p.layer_perceptual_roughness * orm.g, weight);
+      metallic = mix(metallic, p.layer_metallic * orm.b, weight);
+      if ((p.flags & LAYER_NORMAL_MAP) != 0u) {
+        const vec3 ln = triplanarNormal(p.layer_normal_map_texture, lp, w, hit.surface_normal,
+                                        hit.lod_base, p.layer_normal_strength);
+        normal = normalize(mix(normal, ln, weight));
+      }
+    }
+
+    // The detail set multiplies over base and layer alike, so it is not part of the blend.
+    const vec3 dp = world_p * p.detail_uv_scale;
+    albedo *= p.detail_color
+        * toLinear(triplanar(p.detail_base_color_texture, dp, w, hit.lod_base));
+    if ((p.flags & DETAIL_NORMAL_MAP) != 0u) {
+      normal = triplanarNormal(p.detail_normal_map_texture, dp, w, normal, hit.lod_base,
+                               p.detail_normal_strength);
+    }
   }
 
-  payload.color = albedo * tint;
+  payload.color = albedo;
   payload.emission = material.base_emissive_factor.rgb;
   payload.emission *= toLinear(sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base)).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
@@ -90,7 +154,7 @@ void main() {
   float transmission = material.specular_transmission_factor;
   transmission *= sampleLod(material.specular_transmission_texture, hit.uv, hit.lod_base).r;
 
-  surfaceWritePayload(hit, surfaceShadingNormal(hit));
+  surfaceWritePayload(hit, normal);
   hitPayloadSetTransmission(payload, transmission);
   hitPayloadSetRoughness(payload, clamp(roughness, 0.0, 1.0));
   hitPayloadSetMetallic(payload, clamp(metallic, 0.0, 1.0));

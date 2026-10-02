@@ -25,13 +25,14 @@ use bevy::{
 
 use crate::{
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     ui_render::{UiSurfacePanel, ui_target_placeholder},
 };
 
 /// A world-space UI panel: `size` meters on the entity's local XY plane, facing +Z, rendered
 /// from a `px` texture. `scale` is the UI scale factor (2.0 doubles every widget — VR wants
 /// big hit targets); `nits` the panel's emission. Once built, the entity also carries
-/// [`UiPanel3dRoot`], [`UiSurfacePanel`], a `Mesh3d` and an [`AuroraMaterial3d`].
+/// [`UiPanel3dRoot`], [`UiSurfacePanel`], an `AuroraMesh3d` and an [`AuroraMaterial3d`].
 ///
 /// The pointer bridge reads the panel's `GlobalTransform`, so a panel parented to something
 /// (a wrist panel under a controller grip) needs `TransformPlugin { propagate_on_cpu: true }`;
@@ -142,7 +143,7 @@ fn build_panels(
     mut commands: Commands,
     panels: Query<(Entity, &UiPanel3d), Without<UiPanel3dRoot>>,
     mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
     for (entity, panel) in &panels {
@@ -187,7 +188,7 @@ fn build_panels(
             }
         }
         commands.entity(entity).insert((
-            Mesh3d(meshes.add(mesh)),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_mesh(&mesh).expect("cuboid has positions"))),
             AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: Color::BLACK,
                 emissive: LinearRgba::WHITE * panel.nits,

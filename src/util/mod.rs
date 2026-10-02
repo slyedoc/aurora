@@ -3,5 +3,5 @@
 pub mod screenshot;
 pub mod timeout;
 
-pub use screenshot::{ScreenshotExt, ScreenshotRequests};
+pub use screenshot::{Capture, ScreenshotExt, ScreenshotRequests};
 pub use timeout::TimeoutAppExt;

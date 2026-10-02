@@ -13,10 +13,11 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     skinning::{Wind, WindSway},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -29,11 +30,7 @@ const HEIGHT: f32 = 0.6;
 
 fn main() {
     App::new()
-        .add_plugins((
-            AuroraDefaultPlugins,
-            DevUIPlugin,
-            FreeCameraPlugin,
-        ))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .insert_resource(Wind {
             speed: 6.0,
             ..default()
@@ -86,7 +83,8 @@ fn field_mesh(seed: u32) -> Mesh {
     let mut weights: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let hash = |a: u32, b: u32| -> f32 {
-        let mut n = a.wrapping_mul(73856093) ^ b.wrapping_mul(19349663) ^ seed.wrapping_mul(83492791);
+        let mut n =
+            a.wrapping_mul(73856093) ^ b.wrapping_mul(19349663) ^ seed.wrapping_mul(83492791);
         n ^= n >> 13;
         n = n.wrapping_mul(0x5bd1e995);
         n ^= n >> 15;
@@ -144,7 +142,7 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     commands.insert_resource(Sky::Hdr {
@@ -157,7 +155,7 @@ fn setup(
         Transform::from_xyz(0.0, 2.2, 9.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
     ));
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(80.0, 80.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(80.0, 80.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::linear_rgb(0.10, 0.14, 0.05),
             perceptual_roughness: 1.0,
@@ -181,7 +179,7 @@ fn setup(
     .enumerate()
     {
         let mut entity = commands.spawn((
-            Mesh3d(meshes.add(field_mesh(i as u32))),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_shape(field_mesh(i as u32)))),
             AuroraMaterial3d(grass.clone()),
             Transform::from_xyz(x, 0.0, z),
         ));

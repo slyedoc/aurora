@@ -9,18 +9,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ash::vk;
 use bevy::prelude::*;
 
-/// Pending captures, drained one per frame by the render loop.
+/// Pending captures, drained one per frame by the render loop, and the ones already on
+/// disk. A capture lands several frames after it is asked for, so a caller that has to
+/// answer for it -- the editor's remote screenshot method -- polls [`take_written`].
 #[derive(Resource, Default)]
-pub struct ScreenshotRequests(Vec<PathBuf>);
+pub struct ScreenshotRequests {
+    pending: Vec<PathBuf>,
+    written: Vec<Capture>,
+}
+
+/// A capture that reached disk, with the size it was written at.
+pub struct Capture {
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+}
 
 impl ScreenshotRequests {
     /// Captures the next presented frame to `path` (PNG).
     pub fn request(&mut self, path: impl Into<PathBuf>) {
-        self.0.push(path.into());
+        self.pending.push(path.into());
+    }
+
+    /// Every capture written since the last call.
+    pub fn take_written(&mut self) -> Vec<Capture> {
+        std::mem::take(&mut self.written)
     }
 
     pub(crate) fn take_next(&mut self) -> Option<PathBuf> {
-        (!self.0.is_empty()).then(|| self.0.remove(0))
+        (!self.pending.is_empty()).then(|| self.pending.remove(0))
+    }
+
+    pub(crate) fn record_written(&mut self, path: PathBuf, extent: vk::Extent2D) {
+        self.written.push(Capture {
+            path,
+            width: extent.width,
+            height: extent.height,
+        });
     }
 }
 
@@ -96,7 +121,7 @@ pub(crate) fn save_png(
     format: vk::Format,
     extent: vk::Extent2D,
     path: &std::path::Path,
-) {
+) -> bool {
     let bgra = matches!(
         format,
         vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_SNORM
@@ -116,7 +141,7 @@ pub(crate) fn save_png(
         Ok(f) => f,
         Err(e) => {
             log::error!("screenshot: cannot create {}: {e}", path.display());
-            return;
+            return false;
         }
     };
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), extent.width, extent.height);
@@ -126,7 +151,13 @@ pub(crate) fn save_png(
         .write_header()
         .and_then(|mut w| w.write_image_data(pixels))
     {
-        Ok(()) => log::info!("screenshot written to {}", path.display()),
-        Err(e) => log::error!("screenshot: png encode failed: {e}"),
+        Ok(()) => {
+            log::info!("screenshot written to {}", path.display());
+            true
+        }
+        Err(e) => {
+            log::error!("screenshot: png encode failed: {e}");
+            false
+        }
     }
 }

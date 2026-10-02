@@ -137,48 +137,40 @@ This rendering backend integrates seamlessly with Bevy, as a result, the code ne
 ```rust
 use bevy::prelude::*;
 use bevy_aurora::{
-    debug_camera::{DebugCamera, DebugCameraPlugin},
-    dev_shaders::DevShaderPlugin,
-    dev_ui::DevUIPlugin,
-    gltf_mesh::{GltfModel, GltfModelHandle},
-    ray_default_plugins::RayDefaultPlugins,
-    ray_render_plugin::RenderConfig,
+    AuroraDefaultPlugins,
+    material::{AuroraMaterial, AuroraMaterial3d},
     sphere::Sphere,
 };
 
 fn main() {
-    let mut app = App::new();
-    app.add_plugins(RayDefaultPlugins);
-    app.add_plugins(DevShaderPlugin);
-    app.add_plugins(DevUIPlugin);
-    app.add_plugins(DebugCameraPlugin);
-    app.add_systems(Startup, setup);
-    app.run();
+    App::new()
+        .add_plugins(AuroraDefaultPlugins)
+        .add_systems(Startup, setup)
+        .run();
 }
 
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
-    // camera
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(4.0, 1.8, 0.0).looking_at(Vec3::new(4.0, 1.8, 0.0), Vec3::Y),
-        DebugCamera::default(),
+        Transform::from_xyz(4.0, 1.8, 0.0).looking_at(Vec3::new(0.0, 1.8, 0.0), Vec3::Y),
     ));
 
+    // A baked scene: `.bsn` + `.aurora_mesh`, written by the aurora_files importers.
     commands.spawn((
-        GltfModelHandle(asset_server.load::<GltfModel>("models/sponza.glb")),
-        Transform::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2 * 0.0))
-            .with_scale(Vec3::splat(0.012)),
+        Transform::IDENTITY,
+        Visibility::Visible,
+        ScenePatchInstance(asset_server.load("bistro/bistro.bsn")),
     ));
 
-    // glowing sphere
+    // A glowing sphere.
     commands.spawn((
         Transform::from_translation(Vec3::new(0.0, 1.5, 0.0)),
         Sphere,
-        MeshMaterial3d(materials.add(StandardMaterial {
+        AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(1.0, 0.0, 0.0),
             emissive: LinearRgba::new(10.0, 7.0, 5.0, 1.0),
             ..default()

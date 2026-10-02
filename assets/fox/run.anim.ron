@@ -1,0 +1,7 @@
+(
+    source: AnimClip(
+        path: "fox/run.animclip",
+    ),
+    skeleton: "fox/fox.skn.ron",
+    event_tracks: {},
+)

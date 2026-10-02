@@ -1,6 +1,6 @@
 //! `ProceduralMesh` smoke test: a wavy heightfield whose vertices are written by a compute
 //! kernel (assets/shaders/procedural_demo.slang) and traced like any mesh, beside a plain
-//! `Mesh3d` cube for reference. `AUTO_SCREENSHOT_MS=7000` captures it; exits at 12 s.
+//! `AuroraMesh3d` cube for reference. `AUTO_SCREENSHOT_MS=7000` captures it; exits at 12 s.
 
 use std::sync::Arc;
 
@@ -9,12 +9,13 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     assets::aurora_asset,
     compute::{ComputeModule, ComputeModules},
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
-    AuroraDefaultPlugins,
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -41,11 +42,7 @@ struct Spawned(bool);
 
 fn main() {
     App::new()
-        .add_plugins((
-            AuroraDefaultPlugins,
-            DevUIPlugin,
-            FreeCameraPlugin,
-        ))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .init_resource::<Spawned>()
         .add_systems(Startup, setup)
         .add_systems(Update, spawn_when_ready)
@@ -57,7 +54,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
     commands.insert_resource(Sky::Procedural);
@@ -67,7 +64,7 @@ fn setup(
 
     // Reference geometry through the ordinary mesh path.
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(3.0, 3.0, 3.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(3.0, 3.0, 3.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.85, 0.3, 0.2),
             perceptual_roughness: 0.5,

@@ -26,7 +26,7 @@ use bevy::{
 };
 
 use crate::{
-    auto_exposure::{AuroraExposure, ev100_from_ev, ev_from_ev100},
+    auto_exposure::{AuroraExposure, ev_from_ev100, ev100_from_ev},
     dlss::{AuroraDlss, RrPreset, set_jitter_scale},
     sky::ProceduralSky,
     ui_render::UiRenderPlugin,

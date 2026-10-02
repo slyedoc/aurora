@@ -1,6 +1,6 @@
 //! TLAS instances, GPU-resident.
 //!
-//! Every ray-traced entity (`Mesh3d`, `GltfModelHandle`, `Sphere`) owns a [`GpuInstance`] slot
+//! Every ray-traced entity (`AuroraMesh3d`, `ProceduralMesh3d`, `Sphere`) owns a [`GpuInstance`] slot
 //! in a device-local `VkAccelerationStructureInstanceKHR` array — the buffer the TLAS is built
 //! from directly. The CPU touches a slot only when its *static* half changes (BLAS arrived,
 //! material resolved, visibility flipped, spawned, despawned): it scatters one
@@ -27,9 +27,9 @@ use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
-    gltf_mesh::{GltfModel, GltfModelHandle},
     gpu_transform::{GpuNode, GpuTransforms, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralMesh, ProceduralMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
@@ -100,12 +100,7 @@ fn assign_gpu_instances(
     unslotted: Query<
         Entity,
         (
-            Or<(
-                With<Mesh3d>,
-                With<GltfModelHandle>,
-                With<ProceduralMesh3d>,
-                With<Sphere>,
-            )>,
+            Or<(With<AuroraMesh3d>, With<ProceduralMesh3d>, With<Sphere>)>,
             With<Transform>,
             Without<GpuInstance>,
         ),
@@ -141,8 +136,7 @@ fn clear_freed(mut slots: ResMut<GpuInstanceSlots>) {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Geometry {
-    Mesh(AssetId<Mesh>),
-    Gltf(AssetId<GltfModel>),
+    Mesh(AssetId<AuroraMesh>),
     Procedural(AssetId<ProceduralMesh>),
     Sphere,
 }
@@ -150,7 +144,7 @@ enum Geometry {
 #[derive(Clone, Debug, PartialEq)]
 struct InstanceSource {
     geometry: Geometry,
-    material: Option<AssetId<AuroraMaterial>>,
+    material: AssetId<AuroraMaterial>,
     node: u32,
     mask: u8,
     /// Which hit group shades this instance; see [`crate::surface_group`]. Part of the
@@ -322,6 +316,17 @@ pub struct TLAS {
 }
 
 impl TLAS {
+    /// Slots allocated, slots whose BLAS resolved, and slots still waiting on an asset.
+    pub fn instance_summary(&self) -> (u32, usize, usize) {
+        let drawn = self
+            .mirror
+            .iter()
+            .take(self.count as usize)
+            .filter(|record| record.blas != 0)
+            .count();
+        (self.count, drawn, self.pending.len())
+    }
+
     fn new(module: Handle<ComputeModule>) -> Self {
         Self {
             module,
@@ -725,8 +730,7 @@ impl TLAS {
 type ChangedInstances = Or<(
     Added<GpuInstance>,
     Changed<GpuNode>,
-    Changed<Mesh3d>,
-    Changed<GltfModelHandle>,
+    Changed<AuroraMesh3d>,
     Changed<ProceduralMesh3d>,
     Changed<AuroraMaterial3d>,
     Changed<InheritedVisibility>,
@@ -760,11 +764,10 @@ fn extract_instances(
         (
             &GpuInstance,
             &GpuNode,
-            Option<&Mesh3d>,
-            Option<&GltfModelHandle>,
+            Option<&AuroraMesh3d>,
             Option<&ProceduralMesh3d>,
             Has<Sphere>,
-            Option<&AuroraMaterial3d>,
+            &AuroraMaterial3d,
             Option<&InheritedVisibility>,
             Option<&bevy::camera::visibility::RenderLayers>,
             Option<&crate::surface_group::SurfaceClass>,
@@ -776,13 +779,11 @@ fn extract_instances(
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
     }
-    for (instance, node, mesh, gltf, procedural, sphere, material, visibility, layers, class) in
+    for (instance, node, mesh, procedural, sphere, material, visibility, layers, class) in
         changed.iter()
     {
         let geometry = if let Some(mesh) = mesh {
-            Geometry::Mesh(mesh.id())
-        } else if let Some(gltf) = gltf {
-            Geometry::Gltf(gltf.0.id())
+            Geometry::Mesh(mesh.0.id())
         } else if let Some(procedural) = procedural {
             Geometry::Procedural(procedural.0.id())
         } else if sphere {
@@ -794,7 +795,7 @@ fn extract_instances(
             instance.0,
             Some(InstanceSource {
                 geometry,
-                material: material.map(|m| m.0.id()),
+                material: material.0.id(),
                 node: node.0,
                 mask: if visibility.is_none_or(|v| v.get()) {
                     layers_mask(layers)
@@ -812,8 +813,7 @@ fn extract_instances(
 pub fn prepare_instances(
     render_device: Res<RenderDevice>,
     mut tlas: ResMut<TLAS>,
-    meshes: Res<VulkanAssets<Mesh>>,
-    gltf_meshes: Res<VulkanAssets<GltfModel>>,
+    meshes: Res<VulkanAssets<AuroraMesh>>,
     procedural_meshes: Res<VulkanAssets<ProceduralMesh>>,
     materials: Res<VulkanAssets<AuroraMaterial>>,
     textures: Res<VulkanAssets<Image>>,
@@ -821,6 +821,7 @@ pub fn prepare_instances(
     mut replaced: ResMut<ReplacedAssets>,
     mut dropped: ResMut<DroppedAssets>,
     dev_ui: Option<Res<crate::dev_ui::DevUIState>>,
+    surface_data: Res<crate::surface_group::SurfaceGroupData>,
     mut omm_enabled: Local<Option<bool>>,
 ) {
     let tlas = &mut *tlas;
@@ -838,7 +839,7 @@ pub fn prepare_instances(
             tlas.release_hit_offset(key);
         }
     }
-    // A re-prepared mesh / gltf / material: every slot built on it re-resolves NOW, so the
+    // A re-prepared mesh / material: every slot built on it re-resolves NOW, so the
     // rows scattered this frame carry the replacement's addresses before the old BLAS is
     // destroyed (the destroyer only outlives the in-flight frame). Rows left pointing at a
     // freed BLAS are how the TLAS build / traversal ends up dereferencing garbage.
@@ -847,10 +848,10 @@ pub fn prepare_instances(
             let Some(source) = source else { continue };
             let hit = match source.geometry {
                 Geometry::Mesh(m) => m.untyped() == id,
-                Geometry::Gltf(g) => g.untyped() == id,
                 Geometry::Procedural(m) => m.untyped() == id,
                 Geometry::Sphere => false,
-            } || source.material.is_some_and(|m| {
+            } || {
+                let m = source.material;
                 // The material itself, or one of its textures (a re-uploaded image gets a
                 // new bindless index; the record's old one is freed for reuse).
                 m.untyped() == id
@@ -864,7 +865,7 @@ pub fn prepare_instances(
                         .iter()
                         .any(|t| t.is_some_and(|t| t.untyped() == id))
                     })
-            });
+            };
             if hit {
                 tlas.dirty.push(slot as u32);
             }
@@ -904,42 +905,28 @@ pub fn prepare_instances(
         };
 
         let mut complete = true;
-        let (mut blas, mut hit_offset, gltf_materials) = match source.geometry {
+        let (mut blas, mut hit_offset) = match source.geometry {
             Geometry::Mesh(id) => {
                 let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
                 match meshes.get_by_id(id) {
-                    Some(b) => (b.acceleration_structure.address, offset, None),
+                    Some(b) => (b.acceleration_structure.address, offset),
                     None => {
                         complete = false;
-                        (0, offset, None)
-                    }
-                }
-            }
-            Geometry::Gltf(id) => {
-                let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
-                match gltf_meshes.get_by_id(id) {
-                    Some(b) => (
-                        b.acceleration_structure.address,
-                        offset,
-                        b.gltf_materials.clone(),
-                    ),
-                    None => {
-                        complete = false;
-                        (0, offset, None)
+                        (0, offset)
                     }
                 }
             }
             Geometry::Procedural(id) => {
                 let offset = tlas.hit_offset(HitKey::Asset(id.untyped(), source.class));
                 match procedural_meshes.get_by_id(id) {
-                    Some(b) => (b.acceleration_structure.address, offset, None),
+                    Some(b) => (b.acceleration_structure.address, offset),
                     None => {
                         complete = false;
-                        (0, offset, None)
+                        (0, offset)
                     }
                 }
             }
-            Geometry::Sphere => (sphere_blas.acceleration_structure.address, 0, None),
+            Geometry::Sphere => (sphere_blas.acceleration_structure.address, 0),
         };
         if blas != 0
             && let Some(over) = tlas.overrides.get(&slot)
@@ -950,20 +937,20 @@ pub fn prepare_instances(
             }
         }
 
-        let material_slice: Vec<RTXMaterial> = match (source.material, gltf_materials) {
-            (Some(id), _) => match materials.get_by_id(id) {
-                Some(m) => {
-                    let (resolved, all_textures) = m.resolve_checked(&render_device, &textures);
-                    complete &= all_textures;
-                    vec![resolved]
-                }
-                None => {
-                    complete = false;
-                    vec![RTXMaterial::default()]
-                }
-            },
-            (None, Some(bundle)) => bundle,
-            (None, None) => vec![RTXMaterial::default()],
+        // An instance whose material has not reached the GPU yet stays inactive (null BLAS)
+        // until it does, rather than tracing in a stand-in.
+        let material_slice: Vec<RTXMaterial> = match materials.get_by_id(source.material) {
+            Some(m) => {
+                let (mut resolved, all_textures) = m.resolve_checked(&render_device, &textures);
+                resolved.surface_param_index = surface_data.row(source.material);
+                complete &= all_textures;
+                vec![resolved]
+            }
+            None => {
+                complete = false;
+                blas = 0;
+                vec![RTXMaterial::default()]
+            }
         };
         let custom_index = tlas.materials.set(slot, &material_slice);
         let flags = INSTANCE_FLAGS
@@ -1031,8 +1018,7 @@ impl Plugin for TLASBuilderPlugin {
                 extract_instances.in_set(RenderSet::Extract),
                 prepare_instances
                     .in_set(RenderSet::Prepare)
-                    .after(poll_for_asset::<Mesh>)
-                    .after(poll_for_asset::<GltfModel>)
+                    .after(poll_for_asset::<AuroraMesh>)
                     .after(poll_for_asset::<ProceduralMesh>)
                     .after(poll_for_asset::<AuroraMaterial>)
                     .after(poll_for_asset::<Image>),

@@ -24,9 +24,10 @@
 
 use bevy::{
     animation::{
-        animated_field, animation_curves::AnimatableCurve, AnimationTargetId, VariableCurve,
+        AnimatedBy, AnimationTargetId, VariableCurve, animated_field,
+        animation_curves::AnimatableCurve,
     },
-    asset::{io::Reader, AssetLoader, LoadContext},
+    asset::{AssetLoader, LoadContext, io::Reader},
     math::curve::{ConstantCurve, Interval, UnevenSampleAutoCurve},
     prelude::*,
     reflect::TypePath,
@@ -37,7 +38,44 @@ pub struct AnimClipPlugin;
 impl Plugin for AnimClipPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<AnimationClip>()
-            .register_asset_loader(AnimationClipLoader);
+            .register_asset_loader(AnimationClipLoader)
+            .add_systems(PreUpdate, bind_animation_targets);
+    }
+}
+
+/// Put on a scene's root, beside its `AnimationPlayer`: once the scene has spawned, every named
+/// node under it gets the [`AnimationTargetId`] of its name path from the root and
+/// `AnimatedBy(root)` -- the binding a `.animclip` baked for that scene expects -- and this
+/// component goes. The root's own name is not part of the path.
+#[derive(Component, Default, Clone, Copy, Reflect)]
+#[reflect(Component, Default)]
+pub struct AnimationTargetsByName;
+
+fn bind_animation_targets(
+    mut commands: Commands,
+    roots: Query<Entity, With<AnimationTargetsByName>>,
+    children: Query<&Children>,
+    names: Query<&Name>,
+) {
+    for root in &roots {
+        let Ok(top) = children.get(root) else {
+            continue; // the scene has not spawned yet
+        };
+        let mut stack: Vec<(Entity, Vec<&str>)> = top.iter().map(|e| (e, Vec::new())).collect();
+        while let Some((entity, mut path)) = stack.pop() {
+            let Ok(name) = names.get(entity) else {
+                continue;
+            };
+            path.push(name.as_str());
+            commands.entity(entity).insert((
+                AnimationTargetId::from_iter(path.iter().copied()),
+                AnimatedBy(root),
+            ));
+            if let Ok(kids) = children.get(entity) {
+                stack.extend(kids.iter().map(|k| (k, path.clone())));
+            }
+        }
+        commands.entity(root).remove::<AnimationTargetsByName>();
     }
 }
 

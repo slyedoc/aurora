@@ -146,7 +146,10 @@ impl BufferProvider for RenderDevice {
         };
 
         {
-            let mut state = self.allocator_state.lock().unwrap();
+            let mut state = self
+                .allocator_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let allocation = state
                 .allocate(&AllocationCreateDesc {
                     name: "Buffer Allocation",
@@ -198,12 +201,34 @@ impl BufferProvider for RenderDevice {
     }
 
     fn map_buffer<T>(&self, buffer: &mut Buffer<T>) -> BufferView<T> {
-        let state = self.allocator_state.lock().unwrap();
-        let ptr = state
-            .get_buffer_allocation(buffer.handle)
-            .unwrap()
-            .mapped_ptr()
-            .unwrap()
+        // `create_buffer` answers a zero-element request with a null handle, so mapping one
+        // is ordinary -- an empty mesh, an unpainted splat -- and must not panic.
+        if buffer.nr_elements == 0 {
+            return BufferView {
+                nr_elements: 0,
+                ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
+                marker: std::marker::PhantomData,
+            };
+        }
+        // The lock is released before anything can panic. Unwrapping while holding it
+        // poisons the mutex, and then every later map -- and the destroy thread's frees --
+        // panic on the poison instead of on the one buffer that was actually missing.
+        let ptr = {
+            let state = self
+                .allocator_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .get_buffer_allocation(buffer.handle)
+                .and_then(gpu_allocator::vulkan::Allocation::mapped_ptr)
+        };
+        let ptr = ptr
+            .unwrap_or_else(|| {
+                panic!(
+                    "map_buffer: {:?} has no live mapped allocation (destroyed, or not host visible)",
+                    buffer.handle
+                )
+            })
             .as_ptr()
             .cast::<T>();
 

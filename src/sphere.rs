@@ -3,13 +3,14 @@ use bevy::prelude::*;
 
 use crate::{
     blas::{AccelerationStructure, allocate_acceleration_structure},
+    material::AuroraMaterial3d,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
 };
 
 #[derive(Component, Default, Clone, Reflect)]
 #[reflect(Component, Default)]
-#[require(Transform, Visibility)]
+#[require(AuroraMaterial3d, Transform, Visibility)]
 pub struct Sphere;
 
 pub struct SpherePlugin;

@@ -21,7 +21,7 @@
 //! (f32 LE x 3) and the triangles (u32 LE x 3). Written by `aurora_files`' importers.
 
 use bevy::{
-    asset::{io::Reader, AssetLoader, LoadContext},
+    asset::{AssetLoader, LoadContext, io::Reader},
     prelude::*,
 };
 

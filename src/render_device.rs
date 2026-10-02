@@ -414,7 +414,10 @@ unsafe fn create_instance(
     display_handle: &DisplayHandle,
     entry: &ash::Entry,
     xr: Option<&XrContext>,
-) -> (ash::Instance, Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>) {
+) -> (
+    ash::Instance,
+    Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+) {
     unsafe {
         let app_name = CStr::from_bytes_with_nul_unchecked(b"VK RAYS\0");
         let mut layer_names: Vec<&CStr> = Vec::new();
@@ -1098,12 +1101,16 @@ fn spawn_destroy_thread(
                                 device.destroy_image_view(view, None);
                             },
                             VkDestroyCmd::Image(image) => unsafe {
-                                let mut state = state.lock().unwrap();
+                                let mut state = state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 state.free_image_allocation(image);
                                 device.destroy_image(image, None);
                             },
                             VkDestroyCmd::Buffer(buffer) => unsafe {
-                                let mut state = state.lock().unwrap();
+                                let mut state = state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 state.free_buffer_allocation(buffer);
                                 device.destroy_buffer(buffer, None);
                             },

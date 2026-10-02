@@ -31,9 +31,10 @@ use bevy::{
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     dev_ui::{DevUIPlugin, DevUIState},
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere as RtSphere,
     ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},
@@ -49,11 +50,7 @@ const PANEL_NITS: f32 = 4000.0;
 
 fn main() {
     App::new()
-        .add_plugins((
-            AuroraDefaultPlugins,
-            DevUIPlugin,
-            FreeCameraPlugin,
-        ))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_systems(Update, (populate_panel, tick_counter))
         // The widgets are headless: they EMIT events, the app applies the state. These three
@@ -89,7 +86,7 @@ struct DemoPanel;
 
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
     // Dim overcast void: bright enough to see the scene, dim enough that the panel's glow
@@ -100,7 +97,7 @@ fn setup(
 
     // ---- the scene --------------------------------------------------------------------
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(30.0, 30.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(30.0, 30.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.45, 0.45, 0.48),
             perceptual_roughness: 0.9,

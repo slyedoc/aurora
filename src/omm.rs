@@ -2,7 +2,7 @@
 //! geometry, resolved by the ray-tracing hardware instead of the any-hit shader.
 //!
 //! The bake is offline (the `aurora_files` importers, against the material's base-colour
-//! alpha) and ships inside the `.cluster_mesh` v3 slices; [`crate::cluster_mesh::OmmSlices`]
+//! alpha) and ships inside the `.aurora_mesh` slices; [`crate::mesh::OmmSlices`]
 //! re-indexes them to the emitted mesh's triangle order. This module turns those slices into a
 //! `VkMicromapEXT` and the `VkAccelerationStructureTrianglesOpacityMicromapEXT` the mesh's BLAS
 //! build attaches to its triangle geometry (`blas.rs`). Known opaque / transparent
@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use ash::vk;
 
 use crate::{
-    cluster_mesh::{OmmDesc, OmmSlices, OmmUsage},
+    mesh::{OmmDesc, OmmSlices, OmmUsage},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     vk_utils,
@@ -271,7 +271,11 @@ impl MicromapBuild {
     /// Releases the array build inputs once the BLAS build that read them has completed; the
     /// per-triangle index stays with the micromap.
     pub fn finish(self: Box<Self>, rd: &RenderDevice) -> Micromap {
-        for b in [self.array_data.handle, self.descs.handle, self.scratch.handle] {
+        for b in [
+            self.array_data.handle,
+            self.descs.handle,
+            self.scratch.handle,
+        ] {
             rd.destroyer.destroy_buffer(b);
         }
         self.micromap

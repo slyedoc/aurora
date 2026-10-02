@@ -9,10 +9,11 @@ use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::light::PointLight;
 use bevy::prelude::*;
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
@@ -25,11 +26,7 @@ const CORE_NITS: f32 = 200_000.0;
 
 fn main() {
     App::new()
-        .add_plugins((
-            AuroraDefaultPlugins,
-            DevUIPlugin,
-            FreeCameraPlugin,
-        ))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)
@@ -41,7 +38,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     let mut window = windows.single_mut().unwrap();
     window.title = "aurora — point lights".into();
@@ -69,12 +66,12 @@ fn setup(
     });
     commands.spawn((
         Name::new("floor"),
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(40.0, 40.0))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(40.0, 40.0)))),
         AuroraMaterial3d(grey.clone()),
     ));
     commands.spawn((
         Name::new("back wall"),
-        Mesh3d(meshes.add(Cuboid::new(40.0, 6.0, 0.2))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(40.0, 6.0, 0.2)))),
         AuroraMaterial3d(grey.clone()),
         Transform::from_xyz(0.0, 3.0, -4.0),
     ));
@@ -89,7 +86,7 @@ fn setup(
         let x = i as f32 * 4.0 - 8.0;
         commands.spawn((
             Name::new(format!("pillar {i}")),
-            Mesh3d(meshes.add(Cuboid::new(0.3, 3.0, 0.3))),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.3, 3.0, 0.3)))),
             AuroraMaterial3d(grey.clone()),
             Transform::from_xyz(x, 1.5, -2.0),
         ));
@@ -120,7 +117,7 @@ fn setup(
     ));
     commands.spawn((
         Name::new("bsn pillar"),
-        Mesh3d(meshes.add(Cuboid::new(0.3, 3.0, 0.3))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.3, 3.0, 0.3)))),
         AuroraMaterial3d(grey),
         Transform::from_xyz(6.0, 1.5, -2.0),
     ));

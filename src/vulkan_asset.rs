@@ -302,12 +302,16 @@ pub trait VulkanAssetExt {
 
 impl VulkanAssetExt for App {
     fn init_vulkan_asset<A: VulkanAsset>(&mut self) {
-        let render_device = self.world().resource::<RenderDevice>().clone();
-        self.insert_resource(VulkanAssetComms::<A>::new(render_device));
         self.init_resource::<VulkanAssets<A>>();
         self.init_resource::<VulkanAssetDropped<A>>();
         self.init_resource::<ReplacedAssets>();
         self.init_resource::<DroppedAssets>();
+        // No device, no uploads: the read side stays and answers empty, which is what a
+        // headless app wants. Registering the worker would need a device to hand it.
+        let Some(render_device) = self.world().get_resource::<RenderDevice>().cloned() else {
+            return;
+        };
+        self.insert_resource(VulkanAssetComms::<A>::new(render_device));
         self.add_systems(
             Last,
             (

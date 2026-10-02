@@ -13,9 +13,10 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
+    AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
-    AuroraDefaultPlugins,
+    mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -26,11 +27,7 @@ const LIGHT_NITS: f32 = 60_000.0;
 
 fn main() {
     App::new()
-        .add_plugins((
-            AuroraDefaultPlugins,
-            DevUIPlugin,
-            FreeCameraPlugin,
-        ))
+        .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)
@@ -46,7 +43,7 @@ fn p(x: f32, y: f32, z: f32) -> Vec3 {
 
 /// One quad, `a b c d` in order round the edge, its normal facing `toward`. The walls face
 /// the middle of the room, the blocks face away from their own centres.
-fn quad(meshes: &mut Assets<Mesh>, corners: [Vec3; 4], toward: Vec3) -> Handle<Mesh> {
+fn quad(meshes: &mut Assets<AuroraMesh>, corners: [Vec3; 4], toward: Vec3) -> Handle<AuroraMesh> {
     let [a, b, c, d] = corners;
     let mut normal = (b - a).cross(c - a).normalize();
     let centre = (a + b + c + d) * 0.25;
@@ -69,13 +66,13 @@ fn quad(meshes: &mut Assets<Mesh>, corners: [Vec3; 4], toward: Vec3) -> Handle<M
         vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
     )
     .with_inserted_indices(Indices::U32(indices));
-    meshes.add(mesh)
+    meshes.add(AuroraMesh::from_shape(mesh))
 }
 
 /// A block from its top face (published order) down to the floor.
 fn block(
     commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
+    meshes: &mut Assets<AuroraMesh>,
     material: &Handle<AuroraMaterial>,
     top: [Vec3; 4],
 ) {
@@ -91,7 +88,7 @@ fn block(
     for face in faces {
         let face_centre = (face[0] + face[1] + face[2] + face[3]) * 0.25;
         commands.spawn((
-            Mesh3d(quad(meshes, face, away(face_centre))),
+            AuroraMesh3d(quad(meshes, face, away(face_centre))),
             AuroraMaterial3d(material.clone()),
         ));
     }
@@ -100,7 +97,7 @@ fn block(
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<AuroraMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     commands.insert_resource(Sky::Color {
         radiance: Vec3::ZERO,
@@ -191,14 +188,14 @@ fn setup(
     ];
     for (corners, material) in walls {
         commands.spawn((
-            Mesh3d(quad(&mut meshes, corners, room)),
+            AuroraMesh3d(quad(&mut meshes, corners, room)),
             AuroraMaterial3d(material.clone()),
         ));
     }
 
     // The light panel, a hair below the ceiling so the two never coincide.
     commands.spawn((
-        Mesh3d(quad(
+        AuroraMesh3d(quad(
             &mut meshes,
             [
                 p(343.0, 548.0, 227.0),
