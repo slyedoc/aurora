@@ -178,7 +178,8 @@ impl From<Color> for AuroraMaterial {
 /// [`AuroraMaterialTypesPlugin`] fills with [`AuroraMaterial::default`], so a mesh spawned
 /// without a material traces as that.
 #[derive(Component, FromTemplate, Clone, Debug, Default, Reflect, PartialEq, Eq)]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
+#[template(reflect)]
 #[type_path = "bevy_aurora::material"]
 pub struct AuroraMaterial3d(pub Handle<AuroraMaterial>);
 
@@ -194,6 +195,7 @@ impl Plugin for AuroraMaterialTypesPlugin {
             .register_type::<Face>()
             .register_type::<ParallaxMappingMethod>()
             .register_type::<AuroraMaterial3d>()
+            .register_type::<AuroraMaterial3dTemplate>()
             .register_asset_reflect::<AuroraMaterial>();
         app.world_mut()
             .resource_mut::<Assets<AuroraMaterial>>()

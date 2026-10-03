@@ -647,6 +647,28 @@ dependencies = [
 name = "bevy_bsn"
 version = "0.20.0-dev"
 dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "bevy_bsn_asset"
+version = "0.20.0-dev"
+dependencies = [
+ "bevy_app",
+ "bevy_asset",
+ "bevy_bsn",
+ "bevy_ecs",
+ "bevy_platform",
+ "bevy_reflect",
+ "bevy_scene",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "bevy_bsn_document"
+version = "0.20.0-dev"
+dependencies = [
  "bevy_app",
  "bevy_asset",
  "bevy_ecs",
@@ -1028,6 +1050,8 @@ dependencies = [
  "bevy_asset",
  "bevy_audio",
  "bevy_bsn",
+ "bevy_bsn_asset",
+ "bevy_bsn_document",
  "bevy_camera",
  "bevy_camera_controller",
  "bevy_clipboard",
@@ -1354,7 +1378,6 @@ version = "0.20.0-dev"
 dependencies = [
  "bevy_app",
  "bevy_asset",
- "bevy_bsn",
  "bevy_derive",
  "bevy_ecs",
  "bevy_platform",

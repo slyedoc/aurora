@@ -2,122 +2,329 @@
 #fox
 bevy_ecs::hierarchy::Children [
     bevy_ecs::name::Name("root")
-    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_transform::components::transform::Transform {
+        translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+    }
     bevy_ecs::hierarchy::Children [
         bevy_ecs::name::Name("_rootJoint")
-        bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+        bevy_transform::components::transform::Transform {
+            translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+        }
         bevy_ecs::hierarchy::Children [
             bevy_ecs::name::Name("b_Root_00")
-            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: -0.7071081, y: 0.0, z: 0.0, w: 0.7071055 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+            bevy_transform::components::transform::Transform {
+                translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                rotation: glam::Quat { x: -0.7071081, y: 0.0, z: 0.0, w: 0.70710546 },
+                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+            }
             bevy_ecs::hierarchy::Children [
                 bevy_ecs::name::Name("b_Hip_01")
-                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0, y: 0.267484, z: 0.4293817 }, rotation: glam::Quat { x: 0.1276909, y: -0.695482, z: -0.1276902, w: 0.6954818 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                bevy_transform::components::transform::Transform {
+                    translation: glam::Vec3 { x: 0.0, y: 0.26748404, z: 0.4293817 },
+                    rotation: glam::Quat {
+                        x: 0.12769094,
+                        y: -0.695482,
+                        z: -0.12769023,
+                        w: 0.69548184,
+                    },
+                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                }
                 bevy_ecs::hierarchy::Children [
                     bevy_ecs::name::Name("b_Spine01_02")
-                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.128506, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.5904158, w: 0.8070993 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                    bevy_transform::components::transform::Transform {
+                        translation: glam::Vec3 { x: 0.128506, y: 0.0, z: 0.0 },
+                        rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.5904158, w: 0.8070993 },
+                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                    }
                     bevy_ecs::hierarchy::Children [
                         bevy_ecs::name::Name("b_Spine02_03")
-                        bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.2165575, y: -0.0000012, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.017412, w: 0.9998484 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                        bevy_transform::components::transform::Transform {
+                            translation: glam::Vec3 { x: 0.21655753, y: -1.1825562e-6, z: 0.0 },
+                            rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.017411953, w: 0.9998484 },
+                            scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                        }
                         bevy_ecs::hierarchy::Children [
                             bevy_ecs::name::Name("b_Neck_04")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.2564914, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.3033791, w: 0.95287 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 { x: 0.25649142, y: 0.0, z: 0.0 },
+                                rotation: glam::Quat {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    z: 0.30337915,
+                                    w: 0.95286995,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                             bevy_ecs::hierarchy::Children [
                                 bevy_ecs::name::Name("b_Head_05")
-                                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1337696, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.4002854, w: 0.9163905 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                                ,
+                                bevy_transform::components::transform::Transform {
+                                    translation: glam::Vec3 { x: 0.1337696, y: 0.0, z: 0.0 },
+                                    rotation: glam::Quat {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: -0.40028542,
+                                        w: 0.91639054,
+                                    },
+                                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                }
                             ]
-                            ,
+                            --
                             bevy_ecs::name::Name("b_RightUpperArm_06")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1867791, y: -0.0429734, z: 0.0696758 }, rotation: glam::Quat { x: 0.0004673, y: -0.0004461, z: -0.7121793, w: 0.7019973 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 {
+                                    x: 0.18677913,
+                                    y: -0.042973403,
+                                    z: 0.06967575,
+                                },
+                                rotation: glam::Quat {
+                                    x: 0.00046732734,
+                                    y: -0.00044614848,
+                                    z: -0.7121793,
+                                    w: 0.70199734,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                             bevy_ecs::hierarchy::Children [
                                 bevy_ecs::name::Name("b_RightForeArm_07")
-                                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.2304513, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0371259, w: 0.9993106 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                                bevy_transform::components::transform::Transform {
+                                    translation: glam::Vec3 { x: 0.23045126, y: 0.0, z: 0.0 },
+                                    rotation: glam::Quat {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.0371259,
+                                        w: 0.9993106,
+                                    },
+                                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                }
                                 bevy_ecs::hierarchy::Children [
                                     bevy_ecs::name::Name("b_RightHand_08")
-                                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1935005, y: -0.0014599, z: 0.0 }, rotation: glam::Quat { x: -0.0120374, y: -0.0078222, z: 0.4605623, w: 0.8875113 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                                    ,
+                                    bevy_transform::components::transform::Transform {
+                                        translation: glam::Vec3 {
+                                            x: 0.19350055,
+                                            y: -0.0014598655,
+                                            z: 0.0,
+                                        },
+                                        rotation: glam::Quat {
+                                            x: -0.012037407,
+                                            y: -0.00782221,
+                                            z: 0.46056232,
+                                            w: 0.88751125,
+                                        },
+                                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                    }
                                 ]
-                                ,
                             ]
-                            ,
+                            --
                             bevy_ecs::name::Name("b_LeftUpperArm_09")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1867792, y: -0.0429734, z: -0.0696799 }, rotation: glam::Quat { x: 0.0004973, y: -0.0008822, z: -0.7120875, w: 0.70209 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 {
+                                    x: 0.18677917,
+                                    y: -0.04297344,
+                                    z: -0.06967987,
+                                },
+                                rotation: glam::Quat {
+                                    x: 0.00049726194,
+                                    y: -0.00088219234,
+                                    z: -0.7120875,
+                                    w: 0.70209,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                             bevy_ecs::hierarchy::Children [
                                 bevy_ecs::name::Name("b_LeftForeArm_010")
-                                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.2304512, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0371259, w: 0.9993106 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                                bevy_transform::components::transform::Transform {
+                                    translation: glam::Vec3 { x: 0.23045124, y: 0.0, z: 0.0 },
+                                    rotation: glam::Quat {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.0371259,
+                                        w: 0.9993106,
+                                    },
+                                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                }
                                 bevy_ecs::hierarchy::Children [
                                     bevy_ecs::name::Name("b_LeftHand_011")
-                                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1935005, y: -0.0014599, z: 0.0 }, rotation: glam::Quat { x: 0.0165179, y: 0.0140137, z: 0.4600756, w: 0.8876155 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                                    ,
+                                    bevy_transform::components::transform::Transform {
+                                        translation: glam::Vec3 {
+                                            x: 0.19350052,
+                                            y: -0.0014599037,
+                                            z: 0.0,
+                                        },
+                                        rotation: glam::Quat {
+                                            x: 0.016517915,
+                                            y: 0.01401374,
+                                            z: 0.4600756,
+                                            w: 0.8876155,
+                                        },
+                                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                    }
                                 ]
-                                ,
                             ]
-                            ,
                         ]
-                        ,
                     ]
-                    ,
+                    --
                     bevy_ecs::name::Name("b_Tail01_012")
-                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0426038, y: 0.1595877, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.9818929, w: 0.1894369 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                    bevy_transform::components::transform::Transform {
+                        translation: glam::Vec3 { x: 0.042603757, y: 0.15958771, z: 0.0 },
+                        rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.9818929, w: 0.18943691 },
+                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                    }
                     bevy_ecs::hierarchy::Children [
                         bevy_ecs::name::Name("b_Tail02_013")
-                        bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1241192, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.0696172, w: 0.9975738 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                        bevy_transform::components::transform::Transform {
+                            translation: glam::Vec3 { x: 0.124119185, y: 0.0, z: 0.0 },
+                            rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.06961717, w: 0.9975738 },
+                            scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                        }
                         bevy_ecs::hierarchy::Children [
                             bevy_ecs::name::Name("b_Tail03_014")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.2424032, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.0538327, w: 0.9985499 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                            ,
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 { x: 0.24240321, y: 0.0, z: 0.0 },
+                                rotation: glam::Quat {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    z: -0.053832743,
+                                    w: 0.99854994,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                         ]
-                        ,
                     ]
-                    ,
+                    --
                     bevy_ecs::name::Name("b_LeftLeg01_015")
-                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0481377, y: 0.0515402, z: -0.0696801 }, rotation: glam::Quat { x: 0.0, y: -0.0001718, z: 0.9700159, w: -0.2430415 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                    bevy_transform::components::transform::Transform {
+                        translation: glam::Vec3 { x: 0.048137702, y: 0.05154018, z: -0.06968006 },
+                        rotation: glam::Quat {
+                            x: 0.0,
+                            y: -0.00017175225,
+                            z: 0.9700159,
+                            w: -0.24304147,
+                        },
+                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                    }
                     bevy_ecs::hierarchy::Children [
                         bevy_ecs::name::Name("b_LeftLeg02_016")
-                        bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1894418, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.3680438, w: 0.9298084 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                        bevy_transform::components::transform::Transform {
+                            translation: glam::Vec3 { x: 0.18944176, y: 0.0, z: 0.0 },
+                            rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.36804378, w: 0.92980844 },
+                            scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                        }
                         bevy_ecs::hierarchy::Children [
                             bevy_ecs::name::Name("b_LeftFoot01_017")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1794281, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0002484, y: 0.0, z: 0.4584841, w: 0.8887026 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 { x: 0.17942812, y: 0.0, z: 0.0 },
+                                rotation: glam::Quat {
+                                    x: 0.0002484106,
+                                    y: 0.0,
+                                    z: 0.4584841,
+                                    w: 0.8887026,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                             bevy_ecs::hierarchy::Children [
                                 bevy_ecs::name::Name("b_LeftFoot02_018")
-                                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1577994, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.5472883, w: 0.8369442 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                                ,
+                                bevy_transform::components::transform::Transform {
+                                    translation: glam::Vec3 { x: 0.15779938, y: 0.0, z: 0.0 },
+                                    rotation: glam::Quat {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.5472883,
+                                        w: 0.83694416,
+                                    },
+                                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                }
                             ]
-                            ,
                         ]
-                        ,
                     ]
-                    ,
+                    --
                     bevy_ecs::name::Name("b_RightLeg01_019")
-                    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0481378, y: 0.0515403, z: 0.0696756 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.9699586, w: -0.2432701 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                    bevy_transform::components::transform::Transform {
+                        translation: glam::Vec3 { x: 0.048137777, y: 0.05154026, z: 0.06967563 },
+                        rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.9699586, w: -0.24327007 },
+                        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                    }
                     bevy_ecs::hierarchy::Children [
                         bevy_ecs::name::Name("b_RightLeg02_020")
-                        bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1894418, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.3680438, w: 0.9298084 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                        bevy_transform::components::transform::Transform {
+                            translation: glam::Vec3 { x: 0.18944183, y: 0.0, z: 0.0 },
+                            rotation: glam::Quat { x: 0.0, y: 0.0, z: -0.3680438, w: 0.92980844 },
+                            scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                        }
                         bevy_ecs::hierarchy::Children [
                             bevy_ecs::name::Name("b_RightFoot01_021")
-                            bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1794281, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: -0.0001535, y: 0.0, z: 0.4579094, w: 0.8889989 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+                            bevy_transform::components::transform::Transform {
+                                translation: glam::Vec3 { x: 0.1794281, y: 0.0, z: 0.0 },
+                                rotation: glam::Quat {
+                                    x: -0.00015345456,
+                                    y: 0.0,
+                                    z: 0.45790938,
+                                    w: 0.88899887,
+                                },
+                                scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                            }
                             bevy_ecs::hierarchy::Children [
                                 bevy_ecs::name::Name("b_RightFoot02_022")
-                                bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.1577993, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.5472883, w: 0.8369442 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
-                                ,
+                                bevy_transform::components::transform::Transform {
+                                    translation: glam::Vec3 { x: 0.15779935, y: 0.0, z: 0.0 },
+                                    rotation: glam::Quat {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.5472883,
+                                        w: 0.83694416,
+                                    },
+                                    scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+                                }
                             ]
-                            ,
                         ]
-                        ,
                     ]
-                    ,
                 ]
-                ,
             ]
-            ,
         ]
-        ,
     ]
-    ,
+    --
     bevy_ecs::name::Name("fox")
-    bevy_transform::components::transform::Transform { translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 }, rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+    bevy_transform::components::transform::Transform {
+        translation: glam::Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        rotation: glam::Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+        scale: glam::Vec3 { x: 1.0, y: 1.0, z: 1.0 },
+    }
     bevy_aurora::mesh::AuroraMesh3d("fox/meshes/mesh0_0.aurora_mesh")
-    bevy_aurora::material::AuroraMaterial3d(bevy_aurora::material::AuroraMaterial { perceptual_roughness: 0.58, base_color_texture: "fox/textures/image_0.png",})
-    bevy_aurora::skinning::SkinJointsByName(["_rootJoint", "b_Root_00", "b_Hip_01", "b_Spine01_02", "b_Spine02_03", "b_Neck_04", "b_Head_05", "b_RightUpperArm_06", "b_RightForeArm_07", "b_RightHand_08", "b_LeftUpperArm_09", "b_LeftForeArm_010", "b_LeftHand_011", "b_Tail01_012", "b_Tail02_013", "b_Tail03_014", "b_LeftLeg01_015", "b_LeftLeg02_016", "b_LeftFoot01_017", "b_LeftFoot02_018", "b_RightLeg01_019", "b_RightLeg02_020", "b_RightFoot01_021", "b_RightFoot02_022"])
-    ,
+    bevy_aurora::material::AuroraMaterial3d(
+        bevy_aurora::material::AuroraMaterial {
+            perceptual_roughness: 0.58,
+            base_color_texture: "fox/textures/image_0.png",
+        },
+    )
+    bevy_aurora::skinning::SkinJointsByName(
+        [
+            "_rootJoint",
+            "b_Root_00",
+            "b_Hip_01",
+            "b_Spine01_02",
+            "b_Spine02_03",
+            "b_Neck_04",
+            "b_Head_05",
+            "b_RightUpperArm_06",
+            "b_RightForeArm_07",
+            "b_RightHand_08",
+            "b_LeftUpperArm_09",
+            "b_LeftForeArm_010",
+            "b_LeftHand_011",
+            "b_Tail01_012",
+            "b_Tail02_013",
+            "b_Tail03_014",
+            "b_LeftLeg01_015",
+            "b_LeftLeg02_016",
+            "b_LeftFoot01_017",
+            "b_LeftFoot02_018",
+            "b_RightLeg01_019",
+            "b_RightLeg02_020",
+            "b_RightFoot01_021",
+            "b_RightFoot02_022",
+        ],
+    )
 ]

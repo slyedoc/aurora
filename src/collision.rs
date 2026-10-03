@@ -51,8 +51,9 @@ impl CollisionShape {
 
 /// This entity's collision geometry. Shared: every placement of a model names the same file,
 /// and the asset server hands them all one [`CollisionShape`].
-#[derive(Component, Reflect, Default, Clone)]
-#[reflect(Component, Default, Clone)]
+#[derive(Component, FromTemplate, Reflect, Default, Clone)]
+#[reflect(Component, Default, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct CollisionMesh(pub Handle<CollisionShape>);
 
 #[derive(TypePath)]
@@ -111,6 +112,7 @@ impl Plugin for CollisionPlugin {
         app.init_asset::<CollisionShape>()
             .register_asset_reflect::<CollisionShape>()
             .register_asset_loader(CollisionShapeLoader)
-            .register_type::<CollisionMesh>();
+            .register_type::<CollisionMesh>()
+            .register_type::<CollisionMeshTemplate>();
     }
 }

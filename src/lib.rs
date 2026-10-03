@@ -126,6 +126,7 @@ impl PluginGroup for AuroraDefaultPlugins {
 
         group = group.add(bevy::asset::AssetPlugin::default());
         group = group.add(bevy::scene::ScenePlugin);
+        group = group.add(bevy::bsn_asset::BsnAssetPlugin);
         // Skeletal animation drives joint `Transform`s; the tracer skins on the GPU
         // (skinning.rs). Clips arrive as baked `.animclip` (animclip.rs). No glTF loader: a
         // `.glb` is an importer input, never a runtime asset.
@@ -211,6 +212,7 @@ impl PluginGroup for AuroraMinimalPlugins {
             .add(bevy::a11y::AccessibilityPlugin)
             .add(bevy::asset::AssetPlugin::default())
             .add(bevy::scene::ScenePlugin)
+            .add(bevy::bsn_asset::BsnAssetPlugin)
             .add(bevy::animation::AnimationPlugin)
             .add(bevy::world_serialization::WorldSerializationPlugin)
             // Aurora's own registrations. Each of these is asset, loader and reflection

@@ -144,7 +144,8 @@ pub struct AuroraMesh {
 /// The mesh of a ray-traced entity. A material is required alongside; an entity spawned
 /// without one gets `AuroraMaterial3d::default()`, whose handle holds `AuroraMaterial::default()`.
 #[derive(Component, FromTemplate, Clone, Debug, Default, Reflect, PartialEq, Eq)]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
+#[template(reflect)]
 #[require(AuroraMaterial3d, Transform, Visibility)]
 #[type_path = "bevy_aurora::mesh"]
 pub struct AuroraMesh3d(pub Handle<AuroraMesh>);
@@ -895,6 +896,7 @@ impl Plugin for AuroraMeshTypesPlugin {
         app.init_asset::<AuroraMesh>()
             .register_asset_loader(AuroraMeshLoader)
             .register_type::<AuroraMesh3d>()
+            .register_type::<AuroraMesh3dTemplate>()
             .register_asset_reflect::<AuroraMesh>();
     }
 }
