@@ -372,26 +372,27 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                caption("aurora  (F2: panel, F1: world inspector)"),
-                (caption("fps: -") DevUIStats),
-                (caption("centre: -") DevUIProbe),
-                (
-                    Node {
-                        flex_direction: FlexDirection::Column,
-                        align_self: AlignSelf::Stretch,
-                    }
-                    DevUIInspectorHost
-                ),
+                @caption("aurora  (F2: panel, F1: world inspector)")
+                --
+                @caption("fps: -") DevUIStats
+                --
+                @caption("centre: -") DevUIProbe
+                --
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_self: AlignSelf::Stretch,
+                }
+                DevUIInspectorHost
                 // The procedural-sky section is parked while the examples run HDR skies;
                 // uncomment (with the inspector block below) to get it back.
-                // caption("sky (procedural)"),
-                // (
-                //     Node {
-                //         flex_direction: FlexDirection::Column,
-                //         align_self: AlignSelf::Stretch,
-                //     }
-                //     DevUISkyHost
-                // ),
+                // --
+                // @caption("sky (procedural)")
+                // --
+                // Node {
+                //     flex_direction: FlexDirection::Column,
+                //     align_self: AlignSelf::Stretch,
+                // }
+                // DevUISkyHost
             ]
         })
         .expect("dev panel spawns")

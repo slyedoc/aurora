@@ -9,3 +9,4 @@
 /assets/textures/sky.hdr
 
 crash-dumps/
+.cargo/local.toml

@@ -40,6 +40,8 @@ ash-window = "0.13.0"
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = [
     # app / platform
     "std",
+    # .animclip samples its keys through bevy::curve
+    "bevy_curve",
     "async_executor",
     "multi_threaded",
     "bevy_log",

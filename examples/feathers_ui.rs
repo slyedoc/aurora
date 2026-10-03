@@ -165,39 +165,36 @@ fn panel() -> impl Scene {
         }
         ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
-            caption("feathers on raw Vulkan"),
-            (
-                @FeathersButton
-                on(|_: On<Activate>, mut counter: ResMut<Counter>| {
-                    counter.0 += 1;
-                })
-                Children [ caption("Click me") ]
-            ),
-            (caption("clicks: 0") CounterText),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { caption("Checkbox") }
-                }
-                Checked
-                on(|change: On<ValueChange<bool>>| {
-                    info!("checkbox -> {}", change.value);
-                })
-            ),
-            (
-                @FeathersToggleSwitch
-                on(|change: On<ValueChange<bool>>| {
-                    info!("toggle -> {}", change.value);
-                })
-            ),
-            (
-                @FeathersSlider {
-                    @max: 100.0,
-                }
-                SliderValue(35.0)
-                on(|change: On<ValueChange<f32>>| {
-                    info!("slider -> {}", change.value);
-                })
-            ),
+            @caption("feathers on raw Vulkan")
+            --
+            @FeathersButton
+            on(|_: On<Activate>, mut counter: ResMut<Counter>| {
+                counter.0 += 1;
+            })
+            Children [ @caption("Click me") ]
+            --
+            @caption("clicks: 0") CounterText
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { @caption("Checkbox") }
+            }
+            Checked
+            on(|change: On<ValueChange<bool>>| {
+                info!("checkbox -> {}", change.value);
+            })
+            --
+            @FeathersToggleSwitch
+            on(|change: On<ValueChange<bool>>| {
+                info!("toggle -> {}", change.value);
+            })
+            --
+            @FeathersSlider {
+                @max: 100.0,
+            }
+            SliderValue(35.0)
+            on(|change: On<ValueChange<f32>>| {
+                info!("slider -> {}", change.value);
+            })
         ]
     }
 }

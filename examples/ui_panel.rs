@@ -198,61 +198,51 @@ fn populate_panel(
             BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.96))
             BorderColor::all(Color::srgb(0.35, 0.62, 0.95))
             Children [
-                (
-                    Text("[ Aurora ]")
-                    TextFont { font_size: FontSize::Px(72.0) }
-                    TextColor(Color::srgb(0.65, 0.85, 1.0))
-                ),
-                (
-                    Text("UI surface lane armed.")
-                    TextFont { font_size: FontSize::Px(40.0) }
-                    TextColor(Color::WHITE)
-                ),
-                (
-                    Text("uptime 0.0 s")
-                    TextFont { font_size: FontSize::Px(40.0) }
-                    TextColor(Color::srgb(0.55, 0.95, 0.65))
-                    UptimeText
-                ),
+                Text("[ Aurora ]")
+                TextFont { font_size: FontSize::Px(72.0) }
+                TextColor(Color::srgb(0.65, 0.85, 1.0))
+                --
+                Text("UI surface lane armed.")
+                TextFont { font_size: FontSize::Px(40.0) }
+                TextColor(Color::WHITE)
+                --
+                Text("uptime 0.0 s")
+                TextFont { font_size: FontSize::Px(40.0) }
+                TextColor(Color::srgb(0.55, 0.95, 0.65))
+                UptimeText
+                --
                 // A row of REAL feathers widgets on the same surface: same theme, same
                 // extraction as the window lane, and the mouse operates them through the
                 // panel's pointer bridge.
-                (
-                    Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: px(18),
-                        margin: UiRect::top(px(12)),
-                    }
-                    Children [
-                        (
-                            @FeathersButton {
-                                @caption: bsn! { caption("Engage") },
-                                @variant: ButtonVariant::Primary,
-                                @corners: RoundedCorners::All,
-                            }
-                        ),
-                        (
-                            @FeathersCheckbox {
-                                @caption: bsn! { caption("shields") },
-                            }
-                        ),
-                        (@FeathersToggleSwitch),
-                        (
-                            Node {
-                                width: px(260),
-                            }
-                            Children [
-                                (
-                                    @FeathersSlider {
-                                        @min: 0.0,
-                                        @max: 100.0,
-                                    }
-                                ),
-                            ]
-                        ),
-                    ]
-                ),
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(18),
+                    margin: UiRect::top(px(12)),
+                }
+                Children [
+                        @FeathersButton {
+                            @caption: bsn! { @caption("Engage") },
+                            @variant: ButtonVariant::Primary,
+                            @corners: RoundedCorners::All,
+                        }
+                    --
+                        @FeathersCheckbox {
+                            @caption: bsn! { @caption("shields") },
+                        }
+                    --
+                    @FeathersToggleSwitch
+                    --
+                        Node {
+                            width: px(260),
+                        }
+                        Children [
+                                @FeathersSlider {
+                                    @min: 0.0,
+                                    @max: 100.0,
+                                }
+                        ]
+                ]
             ]
         })
         .insert(ChildOf(built.root));

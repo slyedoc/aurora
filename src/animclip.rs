@@ -28,7 +28,7 @@ use bevy::{
         animation_curves::AnimatableCurve,
     },
     asset::{AssetLoader, LoadContext, io::Reader},
-    math::curve::{ConstantCurve, Interval, UnevenSampleAutoCurve},
+    curve::{ConstantCurve, Interval, UnevenSampleAutoCurve},
     prelude::*,
     reflect::TypePath,
 };
