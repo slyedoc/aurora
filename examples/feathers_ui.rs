@@ -57,6 +57,15 @@ fn setup(
     window.resolution.set_scale_factor_override(Some(1.0));
     window.resolution.set(1600.0, 900.0);
 
+    // The sun (the sky draws its disc; it lights the scene).
+    commands.spawn((
+        Name::new("Sun"),
+        DirectionalLight {
+            illuminance: 20_000.0,
+            ..default()
+        },
+        Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {

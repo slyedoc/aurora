@@ -63,6 +63,15 @@ fn setup(
     commands.insert_resource(FoxClips(clips));
 
     // The player on the scene root; `AnimationTargetsByName` binds the bones once they spawn.
+    // The sun (the sky draws its disc; it lights the scene).
+    commands.spawn((
+        Name::new("Sun"),
+        DirectionalLight {
+            illuminance: 20_000.0,
+            ..default()
+        },
+        Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
     commands.spawn((
         Name::new("fox"),
         ScenePatchInstance(asset_server.load("fox/fox.bsn")),

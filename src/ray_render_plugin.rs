@@ -11,7 +11,7 @@ use ash::vk;
 
 use crate::post_process_filter::POST_TARGETS;
 
-use crate::sky::{ProceduralSky, Sky};
+use crate::sky::{Sky, WorldEnvGpu, WorldSkies};
 use crate::{
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
     bluenoise_plugin::BlueNoiseBuffer,
@@ -62,14 +62,6 @@ pub struct UniformData {
     max_bounces: u32,
     /// Post-process vignette strength (0 = off).
     vignette: f32,
-    /// Sky source: 0 flat colour, 1 equirect HDR (`sky_color` = scale), 2 procedural.
-    sky_mode: u32,
-    sun_cos_radius: f32,
-    sun_direction: [f32; 3],
-    sun_radiance: [f32; 3],
-    sky_zenith: [f32; 3],
-    sky_horizon: [f32; 3],
-    sky_ground: [f32; 3],
     /// Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     light_entries: u32,
     /// ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
@@ -101,10 +93,9 @@ pub struct UniformData {
     /// The camera's render-layer cull mask (tlas_builder::layers_mask); rays start with
     /// it and portals swap it to the exit instance's mask.
     camera_mask: u32,
-    /// Per-layer skies (LayerSkies): mode / bindless texture / colour-or-scale per layer.
-    sky_layer_mode: [u32; 8],
-    sky_layer_tex: [u32; 8],
-    sky_layer_color: [[f32; 4]; 8],
+    /// Every world's sky and suns (sky.rs `WorldEnvGpu`, 8 entries by world bit): a ray
+    /// reads the entry of the world its mask says it is in.
+    worlds: u64,
     /// Terrain brush ring (terrain.rs `TerrainCursor`): world x/z, radius, emission; drawn
     /// by the closest-hit shader on terrain records when `brush_active != 0`.
     brush_center: [f32; 2],
@@ -357,6 +348,8 @@ pub struct Frame {
     /// its own matrices.
     pub uniform_buffers: [Buffer<UniformData>; crate::MAX_VIEWS],
     pub focus_data: Buffer<FocusData>,
+    /// The per-world sky / sun table, rewritten each frame.
+    pub world_envs: Buffer<WorldEnvGpu>,
 }
 
 fn render_frame(
@@ -366,11 +359,9 @@ fn render_frame(
     dev_ui_stuff: (
         Option<Res<crate::dev_ui::DevUIState>>,
         crate::ui_render::UiDrawParams,
-        Res<Sky>,
-        Res<ProceduralSky>,
+        Res<WorldSkies>,
         Res<crate::env_light::EnvLight>,
         crate::gizmo_render::GizmoDrawParams,
-        Res<crate::sky::LayerSkies>,
         Res<crate::terrain::TerrainCursor>,
         Res<Atmosphere>,
         Res<CloudLayer>,
@@ -452,18 +443,8 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
-    let (
-        dev_ui_state,
-        mut ui,
-        sky,
-        procedural,
-        env_light,
-        mut gizmos,
-        layer_skies,
-        terrain_cursor,
-        atmosphere,
-        clouds,
-    ) = dev_ui_stuff;
+    let (dev_ui_state, mut ui, skies, env_light, mut gizmos, terrain_cursor, atmosphere, clouds) =
+        dev_ui_stuff;
     let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     // Every active Camera3d becomes a view, lowest `Camera::order` first -- so a camera
@@ -684,53 +665,46 @@ fn render_frame(
             .destroy_buffer(staging_buffer.handle);
     }
 
-    // Per-layer sky table: every layer defaults to the global sky; LayerSkies overrides.
-    let sky_entry = |s: &Sky| -> (u32, u32, Vec4) {
-        match s {
-            Sky::Color { radiance } => (0, WHITE_TEXTURE_IDX, radiance.extend(0.0)),
-            Sky::Hdr { image, scale } => (
-                1,
-                textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
-                    render_device.register_bindless_texture(t)
-                }),
-                Vec4::splat(*scale),
-            ),
-            Sky::Procedural => (2, WHITE_TEXTURE_IDX, Vec4::ONE),
+    // Every world's sky and suns, by world bit.
+    if frame.world_envs.handle == vk::Buffer::null() {
+        frame.world_envs =
+            render_device.create_host_buffer(8, vk::BufferUsageFlags::STORAGE_BUFFER);
+    }
+    let texture_index = |image: &Handle<Image>| {
+        textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
+            render_device.register_bindless_texture(t)
+        })
+    };
+    let envs: Vec<WorldEnvGpu> = skies
+        .worlds
+        .iter()
+        .map(|world| match &world.sky {
+            Sky::Hdr { image, .. } => WorldEnvGpu::new(world, texture_index(image), Vec4::ZERO),
             // The space image behind the air (colour = its scale; 0 = none).
-            Sky::Atmosphere => match atmosphere
-                .space
-                .as_ref()
-                .and_then(|image| textures.get(image))
-            {
-                Some(t) => (
-                    3,
-                    render_device.register_bindless_texture(t),
+            Sky::Atmosphere => match &atmosphere.space {
+                Some(image) => WorldEnvGpu::new(
+                    world,
+                    texture_index(image),
                     Vec4::splat(atmosphere.space_scale),
                 ),
-                None => (3, WHITE_TEXTURE_IDX, Vec4::ZERO),
+                None => WorldEnvGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
             },
-        }
-    };
-    let global_entry = sky_entry(&sky);
-    let mut sky_layer_mode = [global_entry.0; 8];
-    let mut sky_layer_tex = [global_entry.1; 8];
-    let mut sky_layer_color = [global_entry.2.to_array(); 8];
-    for (layer, layer_sky) in &layer_skies.0 {
-        if *layer < 8 {
-            let (mode, tex, color) = sky_entry(layer_sky);
-            sky_layer_mode[*layer] = mode;
-            sky_layer_tex[*layer] = tex;
-            sky_layer_color[*layer] = color.to_array();
-        }
-    }
+            _ => WorldEnvGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
+        })
+        .collect();
+    render_device
+        .map_buffer(&mut frame.world_envs)
+        .copy_from_slice(&envs);
+    // The camera world's HDR sky: importance-sampled (env_light.rs) through `skycolor` (its
+    // scale) and the `skydome` texture.
+    let camera_sky = &skies.camera().sky;
 
     // Update each view's uniform buffer
     for view in &views {
         let data = UniformData {
-            sky_color: match &*sky {
-                Sky::Color { radiance } => radiance.extend(0.0),
+            sky_color: match camera_sky {
                 Sky::Hdr { scale, .. } => Vec4::splat(*scale),
-                Sky::Procedural | Sky::Atmosphere => Vec4::ONE,
+                _ => Vec4::ONE,
             },
             inverse_view: view.inverse_view,
             inverse_projection: view.projection.inverse(),
@@ -755,18 +729,6 @@ fn render_frame(
             samples: dev_ui_state.samples.max(1),
             max_bounces: dev_ui_state.max_bounces.max(1),
             vignette: dev_ui_state.vignette,
-            sky_mode: match &*sky {
-                Sky::Color { .. } => 0,
-                Sky::Hdr { .. } => 1,
-                Sky::Procedural => 2,
-                Sky::Atmosphere => 3,
-            },
-            sun_cos_radius: procedural.sun_cos_radius(),
-            sun_direction: procedural.sun_direction().to_array(),
-            sun_radiance: Vec3::splat(procedural.sun_radiance).to_array(),
-            sky_zenith: procedural.zenith_radiance().to_array(),
-            sky_horizon: procedural.horizon_radiance().to_array(),
-            sky_ground: procedural.ground_radiance().to_array(),
             light_entries: if dev_ui_state.light_nee {
                 lights.active_entries
             } else {
@@ -805,9 +767,7 @@ fn render_frame(
             portals: portal_table.address(),
             portal_count: portal_table.count(),
             camera_mask: view.camera_mask,
-            sky_layer_mode,
-            sky_layer_tex,
-            sky_layer_color,
+            worlds: frame.world_envs.address,
             brush_center: terrain_cursor.center.to_array(),
             brush_radius: terrain_cursor.radius,
             brush_active: terrain_cursor.active as u32,
@@ -938,10 +898,9 @@ fn render_frame(
             &render_device,
             cmd_buffer,
             &modules,
-            &sky,
+            &skies,
             &atmosphere,
             &clouds,
-            &procedural,
             camera.map_or(Vec3::ZERO, |c| c.2.translation()),
             time.delta_secs(),
         );
@@ -952,10 +911,8 @@ fn render_frame(
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
                 && sbt.data.address != 0
             {
-                let sky_texture = match &*sky {
-                    Sky::Hdr { image, .. } => textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
-                        render_device.register_bindless_texture(&t)
-                    }),
+                let sky_texture = match camera_sky {
+                    Sky::Hdr { image, .. } => texture_index(image),
                     _ => WHITE_TEXTURE_IDX,
                 };
                 render_device.cmd_bind_pipeline(
@@ -1647,6 +1604,9 @@ pub fn on_shutdown(world: &mut World) {
     render_device
         .destroyer
         .destroy_buffer(frame.focus_data.handle);
+    render_device
+        .destroyer
+        .destroy_buffer(frame.world_envs.handle);
     let sphere_blas = world
         .remove_resource::<crate::sphere::SphereBLAS>()
         .unwrap();

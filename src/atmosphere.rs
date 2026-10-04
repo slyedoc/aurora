@@ -1,4 +1,4 @@
-//! Planetary atmosphere and cloud shell for [`Sky::Atmosphere`].
+//! Planetary atmosphere and cloud shell for [`Sky::Atmosphere`](crate::sky::Sky::Atmosphere).
 //!
 //! The planet is a sphere ([`Atmosphere::planet_center`] / `planet_radius`); the air above
 //! it is Hillaire 2020's model ("A Scalable and Production Ready Sky and Atmosphere
@@ -16,7 +16,8 @@
 //! noise. The noise tables it samples are built once by the `cloud_noise` kernel.
 //!
 //! Both resources are reflected: edit them live in the F1 world inspector. The sun
-//! (direction, disc size, top-of-atmosphere radiance) is the shared [`ProceduralSky`].
+//! (direction, disc size, top-of-atmosphere radiance) is the first `DirectionalLight` of the
+//! world whose sky is the atmosphere (sky.rs).
 
 use ash::vk;
 use bevy::prelude::*;
@@ -28,7 +29,7 @@ use crate::{
     ray_render_plugin::{TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sky::{ProceduralSky, Sky},
+    sky::{Sun, WorldSkies},
 };
 
 // LUT and table sizes; must match atmosphere.glsl.
@@ -303,23 +304,33 @@ impl AtmosphereState {
     }
 
     /// Uploads this frame's parameters and records the LUT kernels (and the noise tables
-    /// on first use). Call before the trace; a no-op unless the sky is [`Sky::Atmosphere`].
+    /// on first use). Call before the trace; a no-op unless a world's sky is the atmosphere.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
-        sky: &Sky,
+        skies: &WorldSkies,
         atmosphere: &Atmosphere,
         clouds: &CloudLayer,
-        sun: &ProceduralSky,
         camera_pos: Vec3,
         dt: f32,
     ) {
-        if !matches!(sky, Sky::Atmosphere) {
+        let Some(world) = skies.atmosphere else {
             return;
-        }
+        };
+        // No sun: the air still scatters the sky, just unlit by one.
+        let sun = skies.worlds[world as usize]
+            .suns
+            .first()
+            .copied()
+            .unwrap_or(Sun {
+                direction: Vec3::Y,
+                cos_radius: 1.0,
+                radiance: Vec3::ZERO,
+                disc: 0.0,
+            });
         self.ensure_buffers(rd, cmd);
         self.wind_offset += clouds.wind * dt.clamp(0.0, 0.25);
 
@@ -344,9 +355,9 @@ impl AtmosphereState {
             ozone_absorb: (atmosphere.ozone_absorb * km).to_array(),
             mie_g: atmosphere.mie_g.clamp(-0.99, 0.99),
             ground_albedo: atmosphere.ground_albedo.to_linear().to_vec3().to_array(),
-            sun_direction: sun.sun_direction().to_array(),
-            sun_radiance: Vec3::splat(sun.sun_radiance).to_array(),
-            sun_cos_radius: sun.sun_cos_radius(),
+            sun_direction: sun.direction.to_array(),
+            sun_radiance: sun.radiance.to_array(),
+            sun_cos_radius: sun.cos_radius,
             camera_pos: camera_pos.to_array(),
             clouds: clouds.enabled as u32,
             cloud_shadows: clouds.shadows as u32,

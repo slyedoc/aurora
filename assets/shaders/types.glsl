@@ -40,6 +40,37 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Po
   uvec4 pairs[];
 };
 
+// One sun of a world (src/sky.rs WorldSunGpu): xyz towards it + cos(angular radius); the
+// disc's radiance (nits) + the directly-seen disc's scale.
+struct WorldSun {
+  vec4 direction;
+  vec4 radiance;
+};
+
+// One world's sky and suns (src/sky.rs WorldEnvGpu). mode 0 = flat colour (color),
+// 1 = HDR (tex, color = scale), 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex =
+// the space image, color = its scale, 0 = none).
+struct WorldEnv {
+  uint mode;
+  uint tex;
+  uint sun_count;
+  uint pad;
+  vec4 color;
+  vec4 zenith;
+  vec4 horizon;
+  vec4 ground;
+  WorldSun suns[4];
+};
+
+layout (buffer_reference, scalar, buffer_reference_align = 16) readonly restrict buffer WorldEnvs {
+  WorldEnv w[];
+};
+
+// The world a ray mask is in: its lowest set bit (the main world for an empty mask).
+uint worldOf(const uint mask) {
+  return mask == 0u ? 0u : uint(findLSB(mask));
+}
+
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict buffer UniformData {
   vec4 skycolor;
   mat4 inverse_view;
@@ -65,14 +96,6 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint max_bounces;
   // Post-process vignette strength (0 = off).
   float vignette;
-  // Sky source: 0 flat colour (skycolor), 1 equirect HDR (skycolor = scale), 2 procedural.
-  uint sky_mode;
-  float sun_cos_radius;
-  vec3 sun_direction;
-  vec3 sun_radiance;
-  vec3 sky_zenith;
-  vec3 sky_horizon;
-  vec3 sky_ground;
   // Entries in the emissive-triangle light table (0 = no light NEE / MIS).
   uint light_entries;
   // ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
@@ -104,12 +127,9 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   float emissive_boost;
   // The camera's render-layer cull mask; every ray starts with it (portals swap it).
   uint camera_mask;
-  // Per-render-layer skies (src/sky.rs LayerSkies): a ray's miss evaluates the sky of
-  // the world its mask says it is in. mode 0 = colour, 1 = HDR (tex, colour = scale),
-  // 2 = procedural (shares the global procedural params).
-  uint sky_layer_mode[8];
-  uint sky_layer_tex[8];
-  vec4 sky_layer_color[8];
+  // Every world's sky and suns, by world bit: a ray reads the entry of the world its mask
+  // says it is in (portals swap the mask mid-path).
+  WorldEnvs worlds;
   // Terrain brush ring (terrain.rs TerrainCursor): world x/z, radius, emission (nits);
   // the closest-hit draws it on terrain records while brush_active != 0.
   vec2 brush_center;
@@ -424,7 +444,7 @@ struct PushConstants {
   // Auto-exposure: per-pixel luminance out, smoothed exposure in (auto_exposure.slang).
   LumData lum;
   AeData ae;
-  // Atmosphere + cloud parameters and LUTs (valid whenever uniforms.sky_mode == 3).
+  // Atmosphere + cloud parameters and LUTs (valid whenever a world's mode is 3).
   AtmosphereParams atmo;
 };
 

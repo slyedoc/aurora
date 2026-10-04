@@ -17,7 +17,6 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sky::Sky,
     surface_group::{SurfaceClass, SurfaceGroup, SurfaceGroupData, SurfaceGroupRegistry},
     util::{ScreenshotExt, TimeoutAppExt},
 };
@@ -106,8 +105,6 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     layered: Res<LayeredClass>,
 ) {
-    commands.insert_resource(Sky::Procedural);
-
     commands.spawn((
         Name::new("camera"),
         Camera3d::default(),

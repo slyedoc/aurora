@@ -15,7 +15,6 @@ use bevy_aurora::{
     assets::aurora_asset,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
-    sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
 
@@ -34,8 +33,6 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    commands.insert_resource(Sky::Procedural);
-
     commands.spawn((
         Name::new("camera"),
         Camera3d::default(),

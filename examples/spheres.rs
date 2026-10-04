@@ -13,6 +13,7 @@ use bevy_aurora::{
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -44,12 +45,13 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
     // HDR environment sky (equirectangular), texel x scale = nits.
-    commands.insert_resource(Sky::Hdr {
+    commands.entity(main_world.0).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: SKY_SCALE_NITS,
     });

@@ -17,6 +17,7 @@ use bevy_aurora::{
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 
 /// Lumens per lantern (a bright oil lamp is ~1000; WoW glow cards come out around 5000).
@@ -35,6 +36,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     asset_server: Res<AssetServer>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
@@ -46,7 +48,7 @@ fn setup(
     window.resolution.set(1600.0, 900.0);
 
     // Night: the lanterns carry the scene.
-    commands.insert_resource(Sky::Color {
+    commands.entity(main_world.0).insert(Sky::Color {
         radiance: Vec3::new(2.0, 3.0, 6.0),
     });
     commands.spawn((

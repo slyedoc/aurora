@@ -4,11 +4,10 @@
 //!
 //! A third gate, between and behind the first two, opens into a second WORLD (an
 //! avian `PhysicsWorld`, so its own render bit) occupying the same space: a red desert under
-//! a night sky with its own stones. Neither world sees the other's geometry except through
+//! a night sky with its own low orange sun and its own stones. Neither world sees the other's geometry except through
 //! that gate. The camera is a `PortalTraveler`: fly through any gate and you come out of its
 //! partner, in its world.
 
-use avian3d::world::PhysicsWorld;
 use std::f32::consts::PI;
 
 use bevy::{
@@ -22,45 +21,17 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     portal::{AuroraPortal, PortalTraveler},
-    sky::{LayerSkies, Sky},
+    sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::RenderWorlds,
+    world::{MainPhysicsWorldEntity, PhysicsWorld},
 };
 
 const SKY_SCALE_NITS: f32 = 8000.0;
-
-/// The second world's root; everything under it renders (and would collide) only there.
-#[derive(Resource)]
-struct Desert(Entity);
-
-/// The desert's night sky, once its render bit is known (`LayerSkies` is keyed by bit).
-fn desert_sky(
-    desert: Res<Desert>,
-    worlds: Res<RenderWorlds>,
-    asset_server: Res<AssetServer>,
-    mut skies: ResMut<LayerSkies>,
-) {
-    let Some(bit) = worlds.bit(desert.0) else {
-        return;
-    };
-    if skies.0.iter().any(|(layer, _)| *layer == bit as usize) {
-        return;
-    }
-    info!("desert world renders on bit {bit}");
-    skies.0.push((
-        bit as usize,
-        Sky::Hdr {
-            image: asset_server.load(aurora_asset("sky/night_sky.hdr")),
-            scale: SKY_SCALE_NITS,
-        },
-    ));
-}
 
 fn main() {
     App::new()
         .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
-        .add_systems(Update, desert_sky)
         .add_screenshot(KeyCode::F12)
         .add_timeout_exit(None, 12.0)
         .run();
@@ -68,14 +39,24 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
-    commands.insert_resource(Sky::Hdr {
+    commands.entity(main_world.0).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: SKY_SCALE_NITS,
     });
+    // The plain's sun: high and white.
+    commands.spawn((
+        Name::new("Sun"),
+        DirectionalLight {
+            illuminance: 20_000.0,
+            ..default()
+        },
+        Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     commands.spawn((
         Camera3d::default(),
@@ -151,9 +132,27 @@ fn setup(
     // Gate C (main world, z = -8, front +Z) opens into the desert world at the same spot:
     // gate D there faces -Z, so looking into C carries straight on into the other world.
     let desert = commands
-        .spawn((Name::new("Desert World"), PhysicsWorld))
+        .spawn((
+            Name::new("Desert World"),
+            PhysicsWorld,
+            Sky::Hdr {
+                image: asset_server.load(aurora_asset("sky/night_sky.hdr")),
+                scale: SKY_SCALE_NITS,
+            },
+        ))
         .id();
-    commands.insert_resource(Desert(desert));
+    // The desert's own sun, low and orange: it lights only the desert, and the plain's only
+    // the plain.
+    commands.spawn((
+        Name::new("Desert Sun"),
+        ChildOf(desert),
+        DirectionalLight {
+            illuminance: 12_000.0,
+            color: Color::srgb(1.0, 0.55, 0.25),
+            ..default()
+        },
+        Transform::from_xyz(-6.0, 1.5, -20.0).looking_at(Vec3::new(0.0, 0.0, -12.0), Vec3::Y),
+    ));
     let c = spawn_gate(
         &mut commands,
         None,

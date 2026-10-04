@@ -388,6 +388,11 @@ vec3 envBRDFApprox2(vec3 f0, float alpha, float NoV) {
 // ---- HDR environment importance sampling (env_light.rs) ------------------------------------
 
 // Solid-angle pdf of the environment sampler picking direction `d`.
+// The environment sampler serves the camera world's HDR sky only (env_light.rs).
+bool envSampled(const uint ray_mask) {
+  return pc.uniforms.env_w > 0u && worldOf(ray_mask) == worldOf(pc.uniforms.camera_mask);
+}
+
 float envPdf(const vec3 d) {
   const vec2 uv = env_dir_to_uv(d);
   const uint x = min(uint(uv.x * float(pc.uniforms.env_w)), pc.uniforms.env_w - 1u);
@@ -761,7 +766,7 @@ void main() {
         }
         // MIS against the environment sampler: a BRDF-sampled ray that escapes to the HDR
         // sky shares credit with the previous vertex's environment estimate.
-        if (payload.t == 0.0 && prev_pdf > 0.0 && pc.uniforms.sky_mode == 1u && pc.uniforms.env_w > 0u) {
+        if (payload.t == 0.0 && prev_pdf > 0.0 && envSampled(ray_mask)) {
           contribution *= prev_pdf / (prev_pdf + envPdf(direction));
         }
         // Firefly suppression: an indirect path that reaches an emitter far brighter than the
@@ -1066,7 +1071,7 @@ void main() {
       // Next-event estimation for an HDR environment: one importance-sampled direction
       // (luminance x sin theta CDF, env_light.rs), MIS-weighted against BRDF sampling; the
       // BRDF-sampled rays that reach the sky take the complementary weight on miss.
-      if (pc.uniforms.sky_mode == 1u && pc.uniforms.env_w > 0u) {
+      if (envSampled(ray_mask)) {
         vec3 l;
         float pdf_env;
         const vec3 L = envSample(randf(), randf(), randf(), l, pdf_env);
@@ -1086,19 +1091,23 @@ void main() {
         }
       }
 
-      // Next-event estimation for the procedural sun: one shadow ray towards a uniformly
-      // sampled point on the disc. Direct sunlight is the dominant, low-variance term, so it
-      // is not firefly-clamped; BRDF-sampled rays that reach the disc afterwards return the
-      // sky only (`want_sun` = 0), so nothing is counted twice.
-      if ((pc.uniforms.sky_mode == 2u || pc.uniforms.sky_mode == 3u) && pc.uniforms.sun_radiance.r > 0.0) {
-        const vec3 l = sampleCone(pc.uniforms.sun_direction, pc.uniforms.sun_cos_radius, randf(), randf());
-        const float NoL = dot(world_normal, l);
-        if (NoL > 0.0 && dot(l, surface_normal) > 0.0) {
+      // Next-event estimation for the world's suns (its DirectionalLights, src/sky.rs): one
+      // shadow ray per sun towards a uniformly sampled point on its disc. Direct sunlight is
+      // the dominant, low-variance term, so it is not firefly-clamped; BRDF-sampled rays that
+      // reach a disc afterwards return the sky only (`want_sun` = 0), so nothing is counted
+      // twice.
+      {
+        const WorldEnv env = pc.uniforms.worlds.w[worldOf(ray_mask)];
+        for (uint si = 0u; si < env.sun_count; si++) {
+          const WorldSun sun = env.suns[si];
+          const vec3 l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
+          const float NoL = dot(world_normal, l);
+          if (NoL <= 0.0 || dot(l, surface_normal) <= 0.0) { continue; }
           const vec3 f = evalDisneyBRDF(-direction, world_normal, l, disney_mat);
-          // Under an atmosphere the disc's radiance is top-of-atmosphere: attenuate by the
-          // air above the hit, and (primary hits only) by the cloud shell.
-          vec3 sun_radiance = pc.uniforms.sun_radiance;
-          if (pc.uniforms.sky_mode == 3u) {
+          // Under an atmosphere the first sun's radiance is top-of-atmosphere: attenuate by
+          // the air above the hit, and (primary hits only) by the cloud shell.
+          vec3 sun_radiance = sun.radiance.rgb;
+          if (env.mode == 3u && si == 0u) {
             sun_radiance *= atmoSunTransmittanceAt(origin);
             if (bounce_idx == 0u) { sun_radiance *= cloudShadow(origin); }
           }
@@ -1111,7 +1120,7 @@ void main() {
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                         ray_mask, 0, 0, 0, origin, tmin, l, tmax, 0);
             if (payload.t == 0.0) {
-              const float solid_angle = 2.0 * PI * (1.0 - pc.uniforms.sun_cos_radius);
+              const float solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
               acc += mask * f * NoL * sun_radiance * solid_angle;
             }
           }
@@ -1174,7 +1183,7 @@ void main() {
   vec3 mean = acc / SAMPLES;
   // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
   // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
-  if (pc.uniforms.sky_mode == 3u) {
+  if (pc.uniforms.worlds.w[worldOf(pc.uniforms.camera_mask)].mode == 3u) {
     mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
   }
   // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

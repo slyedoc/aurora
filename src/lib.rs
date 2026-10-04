@@ -96,7 +96,7 @@ pub mod prelude {
         portal::AuroraPortal,
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         skinning::{SkinJointsByName, Wind, WindSway},
-        sky::{LayerSkies, ProceduralSky, Sky},
+        sky::{GradientSky, Sky, WorldSkies},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
         world::{InWorld, RenderWorlds},

@@ -16,7 +16,6 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
-    sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
 };
 use bytemuck::{Pod, Zeroable};
@@ -57,12 +56,20 @@ fn setup(
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
-    commands.insert_resource(Sky::Procedural);
     let shader = asset_server.load(aurora_asset("shaders/procedural_demo.slang"));
     let module = asset_server.add(ComputeModule::new(shader, &["demo_fill"]));
     commands.insert_resource(DemoKernel(module));
 
     // Reference geometry through the ordinary mesh path.
+    // The sun (the sky draws its disc; it lights the scene).
+    commands.spawn((
+        Name::new("Sun"),
+        DirectionalLight {
+            illuminance: 20_000.0,
+            ..default()
+        },
+        Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
     commands.spawn((
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(3.0, 3.0, 3.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {

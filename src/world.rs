@@ -6,7 +6,7 @@
 //! [`MainPhysicsWorld`] and everything outside any world is bit 0, other worlds take the lowest
 //! free bit. An explicit `RenderLayers` on an entity overrides its world's bit.
 
-use avian3d::world::{MainPhysicsWorld, PhysicsWorld};
+pub use avian3d::world::{MainPhysicsWorld, MainPhysicsWorldEntity, PhysicsWorld};
 use bevy::{camera::visibility::RenderLayers, platform::collections::HashSet, prelude::*};
 
 /// Which world owns each of the 8 instance-mask bits.
@@ -144,6 +144,16 @@ impl Plugin for RenderWorldPlugin {
             .add_observer(assign_bit)
             .add_observer(free_bit)
             .add_systems(PostUpdate, propagate_worlds);
+    }
+
+    /// Without avian's physics plugins nothing spawns the main world, yet it is where the
+    /// main world's sky lives: spawn it here (after every plugin has built, so avian's own
+    /// is seen first).
+    fn finish(&self, app: &mut App) {
+        if !app.world().contains_resource::<MainPhysicsWorldEntity>() {
+            let main = app.world_mut().spawn(MainPhysicsWorld).id();
+            app.insert_resource(MainPhysicsWorldEntity(main));
+        }
     }
 }
 

@@ -28,7 +28,6 @@ use bevy::{
 use crate::{
     auto_exposure::{AuroraExposure, ev_from_ev100, ev100_from_ev},
     dlss::{AuroraDlss, RrPreset, set_jitter_scale},
-    sky::ProceduralSky,
     ui_render::UiRenderPlugin,
 };
 
@@ -210,12 +209,6 @@ struct DevUIProbe;
 #[derive(Component, Default, Clone)]
 struct DevUIInspectorHost;
 
-/// The node the [`ProceduralSky`] inspector is built under (parked with the panel's sky
-/// section; see `spawn_panel`).
-#[allow(dead_code)]
-#[derive(Component, Default, Clone)]
-struct DevUISkyHost;
-
 pub struct DevUIPlugin;
 
 impl Plugin for DevUIPlugin {
@@ -383,29 +376,20 @@ fn spawn_panel(world: &mut World) {
                     align_self: AlignSelf::Stretch,
                 }
                 DevUIInspectorHost
-                // The procedural-sky section is parked while the examples run HDR skies;
-                // uncomment (with the inspector block below) to get it back.
-                // --
-                // @caption("sky (procedural)")
-                // --
-                // Node {
-                //     flex_direction: FlexDirection::Column,
-                //     align_self: AlignSelf::Stretch,
-                // }
-                // DevUISkyHost
             ]
         })
         .expect("dev panel spawns")
         .id();
     world.flush();
 
-    // Both cards start collapsed (expanding is one click; the panel stays compact).
-    {
-        let mut collapsed = world.resource_mut::<InspectorCollapsed>();
-        for type_id in [TypeId::of::<DevUIState>(), TypeId::of::<ProceduralSky>()] {
-            collapsed.set(&InspectorRoot::Resource { type_id }, "", true);
-        }
-    }
+    // The card starts collapsed (expanding is one click; the panel stays compact).
+    world.resource_mut::<InspectorCollapsed>().set(
+        &InspectorRoot::Resource {
+            type_id: TypeId::of::<DevUIState>(),
+        },
+        "",
+        true,
+    );
 
     let host = world
         .query_filtered::<Entity, With<DevUIInspectorHost>>()
@@ -413,14 +397,6 @@ fn spawn_panel(world: &mut World) {
         .find(|_| true)
         .unwrap_or(panel);
     build_resource_inspector(world, TypeId::of::<DevUIState>(), host);
-    // Parked with the panel section above.
-    // let sky_host = world
-    //     .query_filtered::<Entity, With<DevUISkyHost>>()
-    //     .iter(world)
-    //     .find(|_| true)
-    //     .unwrap_or(panel);
-    // build_resource_inspector(world, TypeId::of::<ProceduralSky>(), sky_host);
-    let _ = TypeId::of::<ProceduralSky>();
 }
 
 fn toggle_panel(

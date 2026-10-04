@@ -1,4 +1,4 @@
-//! Environment importance sampling for [`Sky::Hdr`].
+//! Environment importance sampling for the camera world's [`Sky::Hdr`].
 //!
 //! An equirectangular sky lights the scene through the miss shader, but a BRDF-sampled bounce
 //! rarely lands on the small, bright parts of the map (the sun), so an HDR sky alone gives
@@ -19,7 +19,7 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sky::Sky,
+    sky::{Sky, WorldSkies},
 };
 
 pub const ENV_W: u32 = 512;
@@ -132,11 +132,12 @@ fn build_distribution(lum: &[f32]) -> Vec<f32> {
 
 fn prepare_env_light(
     render_device: Res<RenderDevice>,
-    sky: Res<Sky>,
+    skies: Res<WorldSkies>,
     images: Res<Assets<Image>>,
     mut env: ResMut<EnvLight>,
 ) {
-    let Sky::Hdr { image, .. } = &*sky else {
+    // The table serves the camera's world; other worlds' HDR skies are clamped instead.
+    let Sky::Hdr { image, .. } = &skies.camera().sky else {
         if env.image.is_some() {
             env.release(&render_device);
         }

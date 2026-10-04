@@ -44,25 +44,33 @@ vec3 hdr_sky(const vec3 d, const uint tex, const vec3 scale, const bool cam_worl
   return scale * texel;
 }
 
-// Analytic clear sky: zenith / horizon gradient above, horizon / ground below, a soft sun
-// disc with a small aureole. All inputs in nits. The disc itself is only added when the
-// path may see it directly (`want_sun`); other paths gather the sun by next-event
-// estimation in the raygen.
-vec3 procedural_sky(const vec3 d, const bool want_sun) {
+// Zenith / horizon gradient above, horizon / ground below (all nits), with a small aureole
+// around each of the world's suns.
+vec3 gradient_sky(const vec3 d, const WorldEnv env) {
   const float up = d.y;
   vec3 col;
   if (up >= 0.0) {
-    col = mix(pc.uniforms.sky_horizon, pc.uniforms.sky_zenith, pow(up, 0.6));
+    col = mix(env.horizon.rgb, env.zenith.rgb, pow(up, 0.6));
   } else {
-    col = mix(pc.uniforms.sky_horizon, pc.uniforms.sky_ground, clamp(-up * 6.0, 0.0, 1.0));
+    col = mix(env.horizon.rgb, env.ground.rgb, clamp(-up * 6.0, 0.0, 1.0));
   }
-  const float c = dot(d, pc.uniforms.sun_direction);
-  const float cos_r = pc.uniforms.sun_cos_radius;
-  // Disc: full inside the radius, fading over the outer fifth of it.
-  const float disc = smoothstep(cos_r - (1.0 - cos_r) * 0.2, cos_r, c);
-  const float aureole = pow(max(c, 0.0), 48.0) * 0.35;
-  if (want_sun) { col += pc.uniforms.sun_radiance * disc * step(0.0, up); }
-  col += pc.uniforms.sky_horizon * aureole;
+  for (uint i = 0u; i < env.sun_count; i++) {
+    col += env.horizon.rgb * pow(max(dot(d, env.suns[i].direction.xyz), 0.0), 48.0) * 0.35;
+  }
+  return col;
+}
+
+// The world's sun discs, on the paths that may see them directly; every other path gathers
+// the suns by next-event estimation in the raygen. Full inside the radius, fading over its
+// outer fifth.
+vec3 sun_discs(const vec3 d, const WorldEnv env) {
+  vec3 col = vec3(0.0);
+  for (uint i = 0u; i < env.sun_count; i++) {
+    const WorldSun sun = env.suns[i];
+    const float cos_r = sun.direction.w;
+    const float disc = smoothstep(cos_r - (1.0 - cos_r) * 0.2, cos_r, dot(d, sun.direction.xyz));
+    col += sun.radiance.rgb * sun.radiance.a * disc;
+  }
   return col;
 }
 
@@ -72,21 +80,18 @@ void main() {
   // The raygen packs the ray's cull mask above the want-sun bit: this miss evaluates the
   // sky of the world the ray is IN (portals swap the mask mid-path).
   const bool want_sun = (payload.want_sun & 1u) != 0u;
-  const uint mask = payload.want_sun >> 1;
-  const uint lay = mask == 0u ? 0u : uint(findLSB(mask));
-  const uint cam_lay = pc.uniforms.camera_mask == 0u ? 0u : uint(findLSB(pc.uniforms.camera_mask));
+  const uint world = worldOf(payload.want_sun >> 1);
+  const WorldEnv env = pc.uniforms.worlds.w[world];
   vec3 sky;
-  switch (pc.uniforms.sky_layer_mode[lay]) {
-    case 1u:
-      sky = hdr_sky(d, pc.uniforms.sky_layer_tex[lay], pc.uniforms.sky_layer_color[lay].rgb,
-                    lay == cam_lay);
-      break;
-    case 2u: sky = procedural_sky(d, want_sun); break;
-    case 3u:
-      sky = atmosphere_sky(d, want_sun, pc.uniforms.sky_layer_tex[lay],
-                           pc.uniforms.sky_layer_color[lay].rgb);
-      break;
-    default: sky = pc.uniforms.sky_layer_color[lay].rgb; break;
+  switch (env.mode) {
+    case 1u: sky = hdr_sky(d, env.tex, env.color.rgb, world == worldOf(pc.uniforms.camera_mask)); break;
+    case 2u: sky = gradient_sky(d, env); break;
+    // The atmosphere draws its own (first) sun through the air.
+    case 3u: sky = atmosphere_sky(d, want_sun, env.tex, env.color.rgb); break;
+    default: sky = env.color.rgb; break;
+  }
+  if (want_sun && env.mode != 3u) {
+    sky += sun_discs(d, env);
   }
   payload.emission = sky * pc.uniforms.sky_brightness;
 }

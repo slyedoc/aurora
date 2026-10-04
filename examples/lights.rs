@@ -16,6 +16,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 
 fn main() {
@@ -31,6 +32,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
@@ -39,7 +41,7 @@ fn setup(
     window.title = "aurora — analytic lights".into();
 
     // A near-black night sky (nits), so the analytic lights carry the scene.
-    commands.insert_resource(Sky::Color {
+    commands.entity(main_world.0).insert(Sky::Color {
         radiance: Vec3::splat(20.0),
     });
 

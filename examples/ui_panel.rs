@@ -39,6 +39,7 @@ use bevy_aurora::{
     sphere::Sphere as RtSphere,
     ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 
 /// The offscreen UI target's resolution: 16:9, matching the quad's 2.4 x 1.35 world aspect
@@ -86,12 +87,13 @@ struct DemoPanel;
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
     // Dim overcast void: bright enough to see the scene, dim enough that the panel's glow
     // reads on the ground.
-    commands.insert_resource(Sky::Color {
+    commands.entity(main_world.0).insert(Sky::Color {
         radiance: Vec3::splat(250.0),
     });
 

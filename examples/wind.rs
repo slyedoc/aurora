@@ -21,6 +21,7 @@ use bevy_aurora::{
     skinning::{Wind, WindSway},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
@@ -140,12 +141,13 @@ fn field_mesh(seed: u32) -> Mesh {
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    commands.insert_resource(Sky::Hdr {
+    commands.entity(main_world.0).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: 8000.0,
     });

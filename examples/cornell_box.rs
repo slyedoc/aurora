@@ -19,6 +19,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
+    world::MainPhysicsWorldEntity,
 };
 
 /// Panel brightness in nits (cd/m^2): a bright ceiling light panel. The camera's auto
@@ -96,10 +97,11 @@ fn block(
 
 fn setup(
     mut commands: Commands,
+    main_world: Res<MainPhysicsWorldEntity>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
-    commands.insert_resource(Sky::Color {
+    commands.entity(main_world.0).insert(Sky::Color {
         radiance: Vec3::ZERO,
     });
 
