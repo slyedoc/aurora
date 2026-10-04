@@ -62,6 +62,7 @@ pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;
+pub mod world;
 pub mod xr;
 
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -78,7 +79,7 @@ use bevy::{app::PluginGroupBuilder, prelude::*};
 /// path and alias them.
 pub mod prelude {
     pub use crate::{
-        AuroraDefaultPlugins, AuroraMinimalPlugins,
+        AuroraDefaultPlugins,
         animclip::AnimationTargetsByName,
         assets::aurora_asset,
         atmosphere::{Atmosphere, CloudLayer},
@@ -98,6 +99,7 @@ pub mod prelude {
         sky::{LayerSkies, ProceduralSky, Sky},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
+        world::{InWorld, RenderWorlds},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }
@@ -154,6 +156,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::procedural_mesh::ProceduralMeshPlugin);
         group = group.add(crate::collision::CollisionPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
+        group = group.add(crate::world::RenderWorldPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::picking::PickingPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
@@ -183,55 +186,5 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::animclip::AnimClipPlugin);
 
         group
-    }
-}
-
-/// Aurora with no Vulkan device: the assets, types and resources a scene can name, and
-/// nothing that draws.
-///
-/// A headless host -- the editor's tests, an importer, a server build -- gets
-/// `Assets<AuroraMaterial>`, the surface-class registry and the loaders, so a `.bsn` loads
-/// and round-trips exactly as it does under [`AuroraDefaultPlugins`]. The `VulkanAssets<A>`
-/// tables exist and stay empty. No window, no audio: add `WinitPlugin` yourself if the host
-/// wants one without a tracer.
-pub struct AuroraMinimalPlugins;
-
-impl PluginGroup for AuroraMinimalPlugins {
-    fn build(self) -> PluginGroupBuilder {
-        PluginGroupBuilder::start::<Self>()
-            // Before AssetPlugin: registers the `aurora://` source for the engine's own assets.
-            .add(crate::assets::AuroraAssetSourcePlugin)
-            .add(bevy::log::LogPlugin::default())
-            .add(bevy::app::TaskPoolPlugin::default())
-            .add(bevy::diagnostic::FrameCountPlugin)
-            .add(bevy::time::TimePlugin)
-            .add(crate::transform::TransformPlugin::default())
-            .add(bevy::diagnostic::DiagnosticsPlugin)
-            .add(bevy::input::InputPlugin)
-            .add(bevy::window::WindowPlugin {
-                close_when_requested: false,
-                ..default()
-            })
-            .add(bevy::a11y::AccessibilityPlugin)
-            .add(bevy::asset::AssetPlugin::default())
-            .add(bevy::scene::ScenePlugin)
-            .add(bevy::bsn_asset::BsnAssetPlugin)
-            .add(bevy::animation::AnimationPlugin)
-            .add(bevy::world_serialization::WorldSerializationPlugin)
-            // Aurora's own registrations. Each of these is asset, loader and reflection
-            // only; the plugins that hold a queue, a pipeline or a descriptor set are the
-            // ones this group leaves out.
-            .add(crate::shader::ShaderPlugin)
-            .add(crate::material::MaterialPlugin)
-            .add(crate::render_texture::RenderTexturePlugin)
-            .add(crate::mesh::AuroraMeshPlugin)
-            .add(crate::collision::CollisionPlugin)
-            .add(crate::sphere::SpherePlugin)
-            .add(crate::surface_group::SurfaceGroupPlugin)
-            .add(crate::bsn::BsnPlugin)
-            .add(crate::animclip::AnimClipPlugin)
-            .add(crate::skinning::SkinTypesPlugin)
-            .add(crate::sky::SkyPlugin)
-            .add(crate::ui_render::UiTreePlugin)
     }
 }

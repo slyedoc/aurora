@@ -2194,8 +2194,8 @@ pub enum UiPointerSystems {
 /// its -Z (the OpenXR aim-pose convention, and a camera's). The owner writes `active` and
 /// `buttons`; [`drive_ui_pointers`] writes `hit`. A root entity's `Transform` is read
 /// directly (this runs in `PreUpdate`, before propagation, so a pose written this frame
-/// counts); a child's `GlobalTransform` is used instead -- which only updates under
-/// `TransformPlugin { propagate_on_cpu: true }` (aurora's default syncs roots only).
+/// counts); a child's `GlobalTransform` is used instead -- the GPU read-back pose, one frame
+/// old.
 #[derive(Component, Clone, Debug)]
 #[require(PointerLocation, UiPointerTrack)]
 pub struct UiPointerSource {

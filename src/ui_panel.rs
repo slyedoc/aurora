@@ -34,9 +34,8 @@ use crate::{
 /// big hit targets); `nits` the panel's emission. Once built, the entity also carries
 /// [`UiPanel3dRoot`], [`UiSurfacePanel`], an `AuroraMesh3d` and an [`AuroraMaterial3d`].
 ///
-/// The pointer bridge reads the panel's `GlobalTransform`, so a panel parented to something
-/// (a wrist panel under a controller grip) needs `TransformPlugin { propagate_on_cpu: true }`;
-/// aurora's default syncs roots only and a child panel would never move.
+/// The pointer bridge reads the panel's `GlobalTransform`; for a panel parented to something
+/// (a wrist panel under a controller grip) that is the GPU read-back pose, one frame old.
 #[derive(Component, Clone, Debug)]
 #[require(Transform, Visibility)]
 pub struct UiPanel3d {

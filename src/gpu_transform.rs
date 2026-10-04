@@ -14,9 +14,10 @@
 //! (`tlas_builder.rs`) copies them straight into the instance buffer. Static scenes cost
 //! nothing past the (empty) delta check. Kernels: `assets/shaders/transform.slang`.
 //!
-//! The CPU does not propagate the hierarchy at all by default (`transform.rs`): roots get
-//! `GlobalTransform = Transform` for cameras and gameplay, and the render side reads only the
-//! GPU table for instances.
+//! The GPU table is the source of world transforms. Every node `propagate` rewrote is copied
+//! back (`readback`) in a small submit of its own, ahead of the rest of the frame, and the next
+//! frame's `First` writes those rows into `GlobalTransform` -- so `Update` sees last frame's
+//! world poses, as in stock bevy, without the CPU walking the hierarchy (`transform.rs`).
 
 use std::mem::offset_of;
 
@@ -27,10 +28,12 @@ use bevy::{
         lifecycle::{Remove, RemovedComponents},
         observer::On,
     },
+    math::{Affine3A, Mat3A, Vec3A},
     prelude::*,
     transform::TransformSystems,
 };
 use bytemuck::{Pod, Zeroable};
+use gpu_allocator::MemoryLocation;
 
 use crate::{
     assets::aurora_asset,
@@ -143,6 +146,42 @@ struct FrontierExpandParams {
     node_count: u32,
 }
 
+/// One node's world rows copied back for `GlobalTransform` (must match transform.slang).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct ReadbackRecord {
+    pub slot: u32,
+    pub pad: [u32; 3],
+    pub world: NodeWorld,
+}
+
+impl NodeWorld {
+    pub fn affine(&self) -> Affine3A {
+        let [r0, r1, r2] = self.rows;
+        Affine3A {
+            matrix3: Mat3A::from_cols(
+                Vec3A::new(r0[0], r1[0], r2[0]),
+                Vec3A::new(r0[1], r1[1], r2[1]),
+                Vec3A::new(r0[2], r1[2], r2[2]),
+            ),
+            translation: Vec3A::new(r0[3], r1[3], r2[3]),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ReadbackParams {
+    world: u64,
+    frontier: u64,
+    records: u64,
+    total: u64,
+    count: u32,
+    base: u32,
+    full_rebuild: u32,
+    node_count: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PropagateParams {
@@ -167,15 +206,27 @@ pub struct GpuNode(pub u32);
 pub struct GpuNodeSlots {
     free: Vec<u32>,
     next: u32,
+    /// The entity holding each slot, for writing read-back rows into `GlobalTransform`.
+    entities: Vec<Option<Entity>>,
 }
 
 impl GpuNodeSlots {
-    fn alloc(&mut self) -> u32 {
-        self.free.pop().unwrap_or_else(|| {
+    fn alloc(&mut self, entity: Entity) -> u32 {
+        let slot = self.free.pop().unwrap_or_else(|| {
             let s = self.next;
             self.next += 1;
             s
-        })
+        });
+        if self.entities.len() <= slot as usize {
+            self.entities.resize(slot as usize + 1, None);
+        }
+        self.entities[slot as usize] = Some(entity);
+        slot
+    }
+
+    /// The entity holding `slot`.
+    pub fn entity(&self, slot: u32) -> Option<Entity> {
+        self.entities.get(slot as usize).copied().flatten()
     }
 
     /// High-water mark: every live slot is below this.
@@ -190,7 +241,7 @@ fn assign_gpu_nodes(
     mut slots: ResMut<GpuNodeSlots>,
 ) {
     for entity in &unslotted {
-        commands.entity(entity).insert(GpuNode(slots.alloc()));
+        commands.entity(entity).insert(GpuNode(slots.alloc(entity)));
     }
 }
 
@@ -201,6 +252,9 @@ fn free_gpu_node(
 ) {
     if let Ok(node) = nodes.get(remove.entity) {
         slots.free.push(node.0);
+        if let Some(entity) = slots.entities.get_mut(node.0 as usize) {
+            *entity = None;
+        }
     }
 }
 
@@ -236,6 +290,15 @@ pub struct GpuTransforms {
     frame_id: u32,
     needs_full_rebuild: bool,
     warned_module: bool,
+    // Readback: the rows `propagate` wrote, for `GlobalTransform` next frame.
+    readback: Buffer<ReadbackRecord>,
+    readback_total: Buffer<u32>,
+    readback_cmd: vk::CommandBuffer,
+    readback_fence: vk::Fence,
+    /// A submitted readback the next `First` has to collect.
+    readback_pending: bool,
+    /// The build `record` just made was a full rebuild (read back every node).
+    rebuilt_full: bool,
 }
 
 impl GpuTransforms {
@@ -265,6 +328,12 @@ impl GpuTransforms {
             frame_id: 0,
             needs_full_rebuild: true,
             warned_module: false,
+            readback: Buffer::default(),
+            readback_total: Buffer::default(),
+            readback_cmd: vk::CommandBuffer::null(),
+            readback_fence: vk::Fence::null(),
+            readback_pending: false,
+            rebuilt_full: false,
         }
     }
 
@@ -359,6 +428,7 @@ impl GpuTransforms {
             self.indirect_buf.handle,
             self.locals_buf.handle,
             self.world_buf.handle,
+            self.readback.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
         }
@@ -379,6 +449,11 @@ impl GpuTransforms {
         self.indirect_buf = rd.create_device_buffer(
             INDIRECT_WORDS,
             storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
+        );
+        self.readback = rd.create_buffer(
+            capacity as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::GpuToCpu,
         );
         unsafe {
             rd.device
@@ -454,6 +529,7 @@ impl GpuTransforms {
             );
             compute_to_compute_barrier(rd, cmd);
             log::debug!("GPU transforms: full rebuild of {} nodes", self.node_count);
+            self.rebuilt_full = true;
             return true;
         }
 
@@ -461,6 +537,7 @@ impl GpuTransforms {
             return false;
         }
         self.frame_id += 1;
+        self.rebuilt_full = false;
 
         // Staging.
         let u32_records: Vec<U32Record> = self
@@ -616,6 +693,118 @@ impl GpuTransforms {
         true
     }
 
+    /// Records and submits this frame's transform work in a command buffer of its own, with
+    /// the readback at its end, under the readback fence. Call after the in-flight fence wait,
+    /// before anything that reads the `World` table is recorded; those command buffers are
+    /// submitted later on the same queue and need [`world_barrier`] first. Returns whether the
+    /// `World` table changed.
+    pub fn submit(&mut self, rd: &RenderDevice, modules: &ComputeModules) -> bool {
+        if self.readback_cmd == vk::CommandBuffer::null() {
+            unsafe {
+                self.readback_cmd = rd
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(rd.command_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                    .unwrap()[0];
+                self.readback_total = rd.create_buffer(
+                    1,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    MemoryLocation::GpuToCpu,
+                );
+                self.readback_fence = rd
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .unwrap();
+            }
+        }
+        // Normally collected by `apply_readback` already; this only covers a skipped `First`.
+        self.wait_readback(rd);
+        let cmd = self.readback_cmd;
+        unsafe {
+            rd.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            rd.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+        }
+        let changed = self.record(rd, cmd, modules);
+        if changed && let Some(module) = modules.get(&self.module) {
+            let params = ReadbackParams {
+                world: self.world_buf.address,
+                frontier: self.frontier_buf.address,
+                records: self.readback.address,
+                total: self.readback_total.address,
+                count: self.node_count,
+                base: 0,
+                full_rebuild: self.rebuilt_full as u32,
+                node_count: self.node_count,
+            };
+            if self.rebuilt_full {
+                record_dispatch(
+                    rd,
+                    cmd,
+                    module,
+                    "readback",
+                    &params,
+                    self.node_count,
+                    Some(offset_of!(ReadbackParams, base)),
+                );
+            } else {
+                record_dispatch_indirect(
+                    rd,
+                    cmd,
+                    module,
+                    "readback",
+                    &params,
+                    self.indirect_buf.handle,
+                    CONSUMER_ARGS_OFFSET,
+                );
+            }
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::HOST,
+                vk::AccessFlags2::HOST_READ,
+            );
+        }
+        unsafe {
+            rd.end_command_buffer(cmd).unwrap();
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            let queue = rd.queue.lock().unwrap();
+            rd.queue_submit(*queue, std::slice::from_ref(&submit), self.readback_fence)
+                .unwrap_or_else(|e| {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("transform submit failed: {e:?}");
+                });
+        }
+        self.readback_pending = true;
+        changed
+    }
+
+    fn wait_readback(&mut self, rd: &RenderDevice) {
+        if !self.readback_pending {
+            return;
+        }
+        unsafe {
+            rd.wait_for_fences(std::slice::from_ref(&self.readback_fence), true, u64::MAX)
+                .unwrap_or_else(|e| {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("transform readback fence wait failed: {e:?}");
+                });
+            rd.reset_fences(std::slice::from_ref(&self.readback_fence))
+                .unwrap();
+        }
+        self.readback_pending = false;
+    }
+
     fn upload_full(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
         let n = self.node_count as usize;
         self.ensure_node(self.node_count.saturating_sub(1));
@@ -651,6 +840,48 @@ pub(crate) fn ensure_staging<T>(rd: &RenderDevice, buffer: &mut Buffer<T>, len: 
     rd.destroyer.destroy_buffer(buffer.handle);
     let capacity = (len as u64).max(256).next_power_of_two();
     *buffer = rd.create_host_buffer(capacity, vk::BufferUsageFlags::STORAGE_BUFFER);
+}
+
+/// Makes the transform submit's `World` writes visible to a command buffer submitted after it
+/// on the same queue (a barrier's first scope covers everything earlier in submission order).
+pub fn world_barrier(rd: &RenderDevice, cmd: vk::CommandBuffer) {
+    memory_barrier(
+        rd,
+        cmd,
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+        vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::COMPUTE_SHADER
+            | vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+        vk::AccessFlags2::SHADER_READ,
+    );
+}
+
+/// `First`: last frame's read-back world rows into `GlobalTransform`.
+fn apply_readback(
+    rd: Option<Res<RenderDevice>>,
+    mut table: ResMut<GpuTransforms>,
+    slots: Res<GpuNodeSlots>,
+    mut globals: Query<&mut GlobalTransform>,
+) {
+    let Some(rd) = rd else {
+        return;
+    };
+    if !table.readback_pending {
+        return;
+    }
+    table.wait_readback(&rd);
+    let table = &mut *table;
+    let total = rd.map_buffer(&mut table.readback_total).as_slice_mut()[0] as usize;
+    let mut view = rd.map_buffer(&mut table.readback);
+    let records = view.as_slice_mut();
+    for record in &records[..total.min(records.len())] {
+        let Some(entity) = slots.entity(record.slot) else {
+            continue;
+        };
+        if let Ok(mut global) = globals.get_mut(entity) {
+            global.set_if_neq(GlobalTransform::from(record.world.affine()));
+        }
+    }
 }
 
 // ---- extraction -----------------------------------------------------------------------------
@@ -738,6 +969,11 @@ fn cleanup(world: &mut World) {
         table.destroy_device(rd);
         rd.destroyer.destroy_buffer(table.staging_locals.handle);
         rd.destroyer.destroy_buffer(table.staging_u32.handle);
+        rd.destroyer.destroy_buffer(table.readback_total.handle);
+        table.wait_readback(rd);
+        if table.readback_fence != vk::Fence::null() {
+            unsafe { rd.destroy_fence(table.readback_fence, None) };
+        }
     });
 }
 
@@ -763,11 +999,13 @@ impl Plugin for GpuTransformPlugin {
                 "frontier_finalize",
                 "frontier_expand",
                 "propagate",
+                "readback",
             ],
         ));
 
         app.insert_resource(GpuTransforms::new(module));
         app.add_systems(Last, extract_transforms.in_set(RenderSet::Extract));
+        app.add_systems(First, apply_readback);
         app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }
 }

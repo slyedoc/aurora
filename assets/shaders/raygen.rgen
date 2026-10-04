@@ -521,6 +521,10 @@ void main() {
   const float radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
   // The camera ray's first hit distance (0 = sky), for the atmosphere composite below.
   float primary_t = 0.0;
+  // Auto-exposure meters incident light: radiance over sample 0's guide-vertex albedo. Sky
+  // and emitters seen directly are left out of the meter.
+  float meter_albedo = 1.0;
+  bool meter_skip = false;
 
   for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
     const float offsetR = sqrt(randf());
@@ -624,6 +628,7 @@ void main() {
         if (!guides_written && !pass_through && !guide_defer) {
           guides_written = true;
           if (payload.t == 0.0) {
+            meter_skip = true;
             imageStore(guide_normal_roughness, px, vec4(0.0, 0.0, 0.0, 1.0));
             imageStore(guide_diffuse, px, vec4(0.0));
             imageStore(guide_specular, px, vec4(0.5, 0.5, 0.5, 1.0)); // sky: RR guide 3.4.2
@@ -664,7 +669,10 @@ void main() {
             imageStore(guide_diffuse, px, vec4(albedo * (1.0 - g_metallic), 1.0));
             const vec3 g_f0 = mix(vec3(0.04), albedo, g_metallic);
             const float g_NoV = dot(world_normal, -direction);
-            imageStore(guide_specular, px, vec4(envBRDFApprox2(g_f0, linear_roughness, g_NoV), 1.0));
+            const vec3 g_spec = envBRDFApprox2(g_f0, linear_roughness, g_NoV);
+            imageStore(guide_specular, px, vec4(g_spec, 1.0));
+            meter_albedo = dot(vec3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
+            meter_skip = payload.emission != vec3(0.0);
             imageStore(guide_depth, px, vec4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0));
             // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
             const vec4 cur_clip = pc.uniforms.view_proj * vec4(virtual_pos, 1.0);
@@ -1169,8 +1177,12 @@ void main() {
   if (pc.uniforms.sky_mode == 3u) {
     mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
   }
-  // Raw-radiance luminance for next frame's auto-exposure metering (auto_exposure.slang).
-  pc.lum.data[px.y * gl_LaunchSizeEXT.x + px.x] = dot(vec3(0.2125, 0.7154, 0.0721), mean);
+  // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =
+  // skipped) and the raw nits for the panel readout.
+  const float lum_nits = dot(vec3(0.2125, 0.7154, 0.0721), mean);
+  const uint lum_at = 2u * (px.y * gl_LaunchSizeEXT.x + px.x);
+  pc.lum.data[lum_at] = meter_skip ? -1.0 : lum_nits / max(meter_albedo, 0.04);
+  pc.lum.data[lum_at + 1u] = lum_nits;
   // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
   // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
   // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the

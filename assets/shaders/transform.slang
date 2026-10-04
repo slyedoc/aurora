@@ -289,3 +289,58 @@ void propagate(uint3 gid: SV_DispatchThreadID) {
     w.r2 = float4(m.r2, m.t.z);
     p.world[node] = w;
 }
+
+// ---- readback -----------------------------------------------------------------------------
+
+// One world row set copied out for the CPU's `GlobalTransform` (gpu_transform.rs). 64 bytes.
+struct ReadbackRecord {
+    uint slot;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    World world;
+};
+
+struct ReadbackParams {
+    World* world;
+    uint* frontier;
+    ReadbackRecord* records;
+    // records[0 .. total) are valid; written by thread 0.
+    uint* total;
+    // Threads on the full-rebuild path (node = base + thread), as in `propagate`.
+    uint count;
+    uint base;
+    uint full_rebuild;
+    uint node_count;
+};
+[[vk::push_constant]] ReadbackParams readback_params;
+
+// Copies every node `propagate` just wrote: the frontier, or all nodes after a full rebuild.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void readback(uint3 gid: SV_DispatchThreadID) {
+    let p = readback_params;
+    let k = p.base + gid.x;
+    uint total;
+    uint node;
+    if (p.full_rebuild != 0) {
+        total = p.count;
+        node = k;
+    } else {
+        total = p.frontier[1];
+        node = k < total ? p.frontier[HEADER + k] : 0;
+    }
+    if (k == 0) {
+        p.total[0] = total;
+    }
+    if (k >= total || node >= p.node_count) {
+        return;
+    }
+    ReadbackRecord r;
+    r.slot = node;
+    r.pad0 = 0;
+    r.pad1 = 0;
+    r.pad2 = 0;
+    r.world = p.world[node];
+    p.records[k] = r;
+}

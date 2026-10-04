@@ -752,6 +752,7 @@ type ChangedInstances = Or<(
     Changed<AuroraMaterial3d>,
     Changed<InheritedVisibility>,
     Changed<bevy::camera::visibility::RenderLayers>,
+    Changed<crate::world::InWorld>,
 )>;
 
 /// [`RenderLayers`](bevy::camera::visibility::RenderLayers) folded into the 8-bit TLAS
@@ -787,6 +788,7 @@ fn extract_instances(
             &AuroraMaterial3d,
             Option<&InheritedVisibility>,
             Option<&bevy::camera::visibility::RenderLayers>,
+            Option<&crate::world::InWorld>,
             Option<&crate::surface_group::SurfaceClass>,
         ),
         ChangedInstances,
@@ -796,7 +798,7 @@ fn extract_instances(
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
     }
-    for (instance, node, mesh, procedural, sphere, material, visibility, layers, class) in
+    for (instance, node, mesh, procedural, sphere, material, visibility, layers, world, class) in
         changed.iter()
     {
         let geometry = if let Some(mesh) = mesh {
@@ -815,7 +817,7 @@ fn extract_instances(
                 material: material.0.id(),
                 node: node.0,
                 mask: if visibility.is_none_or(|v| v.get()) {
-                    layers_mask(layers)
+                    crate::world::world_mask(layers, world)
                 } else {
                     0x00
                 },

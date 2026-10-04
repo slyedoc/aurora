@@ -142,6 +142,11 @@ struct ViewFrame {
     view_proj: Mat4,
     last_view_proj: Mat4,
     plan: Option<crate::dlss::DlssPlan>,
+    /// The camera this view traces for; its exposure meters under this entity.
+    camera: Entity,
+    exposure: crate::auto_exposure::AuroraExposure,
+    /// This camera's (luminance, exposure state) addresses, set when its metering records.
+    ae: (u64, u64),
 }
 
 /// Where a view's composited image lands.
@@ -407,6 +412,7 @@ fn render_frame(
             // whole window, which is what a plain app wants. `order` sorts the views and
             // `is_active` skips them.
             Option<&Camera>,
+            Option<&crate::world::InWorld>,
         ),
         With<Camera3d>,
     >,
@@ -465,6 +471,8 @@ fn render_frame(
     // everywhere else in bevy. Entity breaks ties because query iteration order is not
     // stable and a flickering slot assignment would throw away temporal history.
     // MAX_VIEWS caps it; the rest are dropped with a warning rather than silently.
+    // Inactive cameras keep their metering; only a despawned (or no longer 3D) one drops it.
+    let camera_entities: Vec<Entity> = camera.iter().map(|c| c.0).collect();
     let mut cameras: Vec<_> = camera
         .iter()
         .filter(|c| c.7.is_none_or(|cam| cam.is_active))
@@ -500,6 +508,8 @@ fn render_frame(
         dlss_mode: crate::dlss::AuroraDlss,
         camera_mask: u32,
         debug_view: u32,
+        camera: Entity,
+        exposure: crate::auto_exposure::AuroraExposure,
     }
 
     let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {
@@ -527,8 +537,10 @@ fn render_frame(
                             rect: vk::Rect2D::default().extent(swapchain.swapchain_extent),
                         },
                         dlss_mode: camera.3.copied().unwrap_or_default(),
-                        camera_mask: crate::tlas_builder::layers_mask(camera.6) as u32,
+                        camera_mask: crate::world::world_mask(camera.6, camera.8) as u32,
                         debug_view: camera.5.copied().unwrap_or_default().shader_index(),
+                        camera: camera.0,
+                        exposure: camera.4.cloned().unwrap_or_default(),
                     }
                 })
                 .collect()
@@ -574,8 +586,10 @@ fn render_frame(
                     output_extent: extent,
                     target,
                     dlss_mode: c.3.copied().unwrap_or_default(),
-                    camera_mask: crate::tlas_builder::layers_mask(c.6) as u32,
+                    camera_mask: crate::world::world_mask(c.6, c.8) as u32,
                     debug_view: c.5.copied().unwrap_or_default().shader_index(),
+                    camera: c.0,
+                    exposure: c.4.cloned().unwrap_or_default(),
                 })
             })
             .collect(),
@@ -584,7 +598,7 @@ fn render_frame(
     // DLSS: settle each view's trace resolution and jitter before recording (feature
     // creation, when the mode or output size changed, submits and waits on its own).
     let reset_requested = std::mem::take(&mut dlss.reset_requested);
-    let views: Vec<ViewFrame> = planned
+    let mut views: Vec<ViewFrame> = planned
         .into_iter()
         .map(|p| {
             let PlannedView {
@@ -596,6 +610,8 @@ fn render_frame(
                 dlss_mode,
                 camera_mask,
                 debug_view,
+                camera,
+                exposure,
             } = p;
             let plan = dlss
                 .renderer
@@ -618,17 +634,15 @@ fn render_frame(
                 view_proj,
                 last_view_proj,
                 plan,
+                camera,
+                exposure,
+                ae: (0, 0),
             }
         })
         .collect();
     let plan = views.first().and_then(|v| v.plan);
     let dlss_reset = plan.is_some() && (!*dlss_was_active || reset_requested);
     *dlss_was_active = plan.is_some();
-    // The primary view drives the frame-wide passes (auto-exposure, the atmosphere LUTs).
-    // Per-view work reads the view's own extents.
-    let primary_trace_extent = views
-        .first()
-        .map_or(swapchain.swapchain_extent, |v| v.trace_extent);
     // Set once an evaluate has been recorded this frame: only then does a blit read a DLSS
     // output (before the RT pipeline is compiled nothing has written them).
     let mut dlss_ran = false;
@@ -846,9 +860,14 @@ fn render_frame(
 
         // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
-        // them, and rebuild the single TLAS in place. With rays to pick, that part goes into
-        // its own command buffer, submitted ahead of the rest with the pick at its end, so the
-        // hits are ready long before the frame is (picking.rs).
+        // them, and rebuild the single TLAS in place. With rays to pick, the instance table and
+        // TLAS go into their own command buffer, submitted ahead of the rest with the pick at
+        // its end, so the hits are ready long before the frame is (picking.rs).
+        drop(section);
+        // Transforms go first, in a submit of their own: their rows are read back into
+        // `GlobalTransform` at the next `First` (gpu_transform.rs).
+        let section = info_span!("submit_transforms").entered();
+        let world_changed = transforms.submit(&render_device, &modules);
         drop(section);
         let pick = picker.active(&modules, &tlas);
         let scene_cmd = if pick {
@@ -856,9 +875,7 @@ fn render_frame(
         } else {
             cmd_buffer
         };
-        let section = info_span!("record_transforms").entered();
-        let world_changed = transforms.record(&render_device, scene_cmd, &modules);
-        drop(section);
+        crate::gpu_transform::world_barrier(&render_device, scene_cmd);
         let section = info_span!("record_skins").entered();
         let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
         drop(section);
@@ -892,19 +909,29 @@ fn render_frame(
             *frame_counter,
             dev_ui_state.sharc,
         );
-        // Exposure: meter last frame's luminance into this frame's exposure (the raygen
-        // reads it), or write the camera's fixed EV.
+        // Exposure: each camera meters its own last frame into this frame's exposure (the
+        // raygen reads it). A headset's two eyes are one camera and share one meter.
         drop(section);
         let section = info_span!("record_exposure_atmo").entered();
-        let exposure = camera.and_then(|c| c.4.cloned()).unwrap_or_default();
-        ae.record(
-            &render_device,
-            cmd_buffer,
-            &modules,
-            primary_trace_extent,
-            &exposure,
-            time.delta_secs(),
-        );
+        let mut metered: Vec<(Entity, (u64, u64))> = Vec::new();
+        for view in &mut views {
+            if let Some((_, addresses)) = metered.iter().find(|(c, _)| *c == view.camera) {
+                view.ae = *addresses;
+                continue;
+            }
+            view.ae = ae.record(
+                &render_device,
+                cmd_buffer,
+                &modules,
+                view.camera,
+                view.trace_extent,
+                &view.exposure,
+                time.delta_secs(),
+            );
+            metered.push((view.camera, view.ae));
+        }
+        ae.set_primary(views.first().map(|v| v.camera));
+        ae.retain(&render_device, |e| camera_entities.contains(&e));
         // The atmosphere's LUTs for this frame's camera altitude and sun (the raygen and
         // the miss shader read them); nothing unless the sky is the atmosphere.
         atmo.record(
@@ -1021,8 +1048,8 @@ fn render_frame(
                         reservoirs_prev,
                         reservoirs_cur,
                         sharc: sharc.address(),
-                        lum_buffer: ae.addresses().0,
-                        auto_exposure: ae.addresses().1,
+                        lum_buffer: view.ae.0,
+                        auto_exposure: view.ae.1,
                         atmo: atmo.address(),
                     };
 
@@ -1058,7 +1085,7 @@ fn render_frame(
                         );
                         dlss_ran = true;
                         // The raygen just filled the luminance buffer at this size.
-                        ae.primed = true;
+                        ae.mark_traced(view.camera);
                     }
                 }
             }
@@ -1156,8 +1183,8 @@ fn render_frame(
                         dlss.renderer.as_ref().and_then(|r| r.guide_views(eye)),
                         &crate::post_process_filter::PostProcessPushConstants {
                             uniforms: frame.uniform_buffers[eye].address,
-                            auto_exposure: ae.addresses().1,
-                            display_exposure: exposure.display_exposure(),
+                            auto_exposure: views[eye].ae.1,
+                            display_exposure: views[eye].exposure.display_exposure(),
                             debug_view,
                         },
                     );
@@ -1236,8 +1263,8 @@ fn render_frame(
                             .and_then(|r| r.guide_views(view.slot)),
                         &crate::post_process_filter::PostProcessPushConstants {
                             uniforms: frame.uniform_buffers[view.slot].address,
-                            auto_exposure: ae.addresses().1,
-                            display_exposure: exposure.display_exposure(),
+                            auto_exposure: view.ae.1,
+                            display_exposure: view.exposure.display_exposure(),
                             debug_view: view.debug_view,
                         },
                     );
@@ -1383,8 +1410,8 @@ fn render_frame(
                         .and_then(|r| r.guide_views(view.slot)),
                     &crate::post_process_filter::PostProcessPushConstants {
                         uniforms: frame.uniform_buffers[view.slot].address,
-                        auto_exposure: ae.addresses().1,
-                        display_exposure: exposure.display_exposure(),
+                        auto_exposure: view.ae.1,
+                        display_exposure: view.exposure.display_exposure(),
                         debug_view: view.debug_view,
                     },
                 );

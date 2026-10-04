@@ -328,8 +328,8 @@ struct HitPayload {
   vec2 cone;
 };
 
-// Per-pixel raw-radiance luminance, render resolution: the raygen writes it, the
-// auto-exposure metering (auto_exposure.slang) histograms it next frame.
+// Per-pixel (incident meter, raw nits) pairs, render resolution: the raygen writes them, the
+// auto-exposure metering (auto_exposure.slang) histograms the meters next frame.
 layout (buffer_reference, scalar, buffer_reference_align = 4) buffer LumData {
   float data[];
 };

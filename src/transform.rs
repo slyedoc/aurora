@@ -1,63 +1,60 @@
 //! Transforms without CPU hierarchy propagation.
 //!
-//! World transforms of ray-traced entities come from the GPU node table
-//! (`gpu_transform.rs`), which propagates the hierarchy itself from local `Transform` deltas.
-//! Walking the tree on the CPU as well (`propagate_parent_transforms` over every node, every
-//! frame something moved) is the single largest CPU cost in a large scene and produces a
-//! `GlobalTransform` nothing here reads. So by default only `sync_simple_transforms` runs:
-//! root entities without children (cameras, lights, gameplay actors) get
-//! `GlobalTransform = Transform`; anything inside a hierarchy keeps whatever `GlobalTransform`
-//! it was spawned with.
+//! World transforms come from the GPU node table (`gpu_transform.rs`), which propagates the
+//! hierarchy from local `Transform` deltas and reads the rows it rewrote back into
+//! `GlobalTransform` at the next `First`. The CPU only fills in what has to be exact in the
+//! frame being drawn:
+//! - root entities without children: `GlobalTransform = Transform` (a copy, no walk);
+//! - cameras inside a hierarchy (one that crossed a portal into a world): composed from
+//!   their ancestors' `Transform`s, since the view is built before this frame's GPU rows
+//!   could come back.
 //!
-//! Gameplay that needs CPU world transforms of *children* can turn the propagation back on
-//! (`TransformPlugin { propagate_on_cpu: true }`); the GPU path is unaffected either way.
+//! A host with no GPU (headless tests) has no readback: it uses bevy's own `TransformPlugin`
+//! and propagates on the CPU instead.
 
 use bevy::{
     app::ValidateParentHasComponentPlugin,
-    ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     prelude::*,
     transform::{
         TransformSystems,
-        systems::{
-            StaticTransformOptimizations, mark_dirty_trees, propagate_parent_transforms,
-            sync_simple_transforms,
-        },
+        systems::{StaticTransformOptimizations, sync_simple_transforms},
     },
 };
 
-fn full_propagation() -> ScheduleConfigs<ScheduleSystem> {
-    (
-        mark_dirty_trees,
-        propagate_parent_transforms,
-        sync_simple_transforms,
-    )
-        .chain()
-        .in_set(TransformSystems::Propagate)
+/// Cameras inside a hierarchy: this frame's pose from their ancestors' `Transform`s.
+#[allow(clippy::type_complexity)]
+fn sync_child_cameras(
+    mut cameras: Query<(&Transform, &ChildOf, &mut GlobalTransform), With<Camera>>,
+    frames: Query<(&Transform, Option<&ChildOf>), Without<Camera>>,
+) {
+    for (local, child_of, mut global) in &mut cameras {
+        let mut pose = local.compute_affine();
+        let mut parent = Some(child_of.parent());
+        while let Some(entity) = parent {
+            let Ok((transform, up)) = frames.get(entity) else {
+                break;
+            };
+            pose = transform.compute_affine() * pose;
+            parent = up.map(ChildOf::parent);
+        }
+        global.set_if_neq(GlobalTransform::from(pose));
+    }
 }
 
 #[derive(Default)]
-pub struct TransformPlugin {
-    /// Also run bevy's full hierarchy propagation on the CPU (`GlobalTransform` for every
-    /// descendant). Off by default: the renderer never reads it.
-    pub propagate_on_cpu: bool,
-}
+pub struct TransformPlugin;
 
 impl Plugin for TransformPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())
-            .init_resource::<StaticTransformOptimizations>();
-        if self.propagate_on_cpu {
-            app.add_systems(PostStartup, full_propagation())
-                .add_systems(PostUpdate, full_propagation());
-        } else {
-            app.add_systems(
+            .init_resource::<StaticTransformOptimizations>()
+            .add_systems(
                 PostStartup,
                 sync_simple_transforms.in_set(TransformSystems::Propagate),
             )
             .add_systems(
                 PostUpdate,
-                sync_simple_transforms.in_set(TransformSystems::Propagate),
+                (sync_simple_transforms, sync_child_cameras).in_set(TransformSystems::Propagate),
             );
-        }
     }
 }

@@ -182,9 +182,9 @@ impl Default for DevUIState {
             omm: true,
             dlss: AuroraDlss::from_env(),
             rr_preset: RrPreset::current(),
-            ev100_lock: false,
-            // Filament's indoor preset; matches AuroraExposure::INDOOR.
-            ev100: 7.0,
+            // Matches AuroraExposure::default().
+            ev100_lock: true,
+            ev100: 13.0,
             jitter_scale: 1.0,
         }
     }
@@ -302,7 +302,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::default()
+                AuroraExposure::Auto(default())
             };
         }
         *agreed = Some(want);
@@ -315,7 +315,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::default()
+                AuroraExposure::Auto(default())
             };
         }
         *agreed = Some(want);

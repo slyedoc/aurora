@@ -14,16 +14,26 @@
 //! portals, portals in reflections, portals through glass, bounded by `max_bounces`.
 //! Light is NOT transported -- portals carry the view, not next-event estimation, so each
 //! side is lit by its own surroundings (and a portal surface still occludes shadow rays).
+//!
+//! [`PortalTraveler`] carries an entity (a camera, a player) through a portal it crosses: the
+//! same map the rays use moves it, and it joins the exit's world (a physics body by avian's
+//! `TransferToWorld`, anything else by re-parenting under the exit's world).
 
 use ash::vk;
-use bevy::prelude::*;
+use avian3d::{
+    prelude::RigidBody,
+    world::{MainPhysicsWorldEntity, TransferToWorld},
+};
+use bevy::{math::Affine3A, prelude::*, transform::TransformSystems};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
+    mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::RenderSet,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     tlas_builder::GpuInstance,
+    world::{InWorld, RenderWorlds},
 };
 
 /// Marks a ray-traced surface as a portal showing the view out of `target`'s front face
@@ -125,13 +135,253 @@ fn upload_portals(
     table.last = entries;
 }
 
+/// Moves its entity through any [`AuroraPortal`] it crosses (front to back, within the
+/// portal mesh's bounds) and into the exit's world.
+#[derive(Component, Reflect, Default, Clone, Copy)]
+#[reflect(Component, Default)]
+pub struct PortalTraveler {
+    /// Last frame's world position: crossings are found on the segment from here to now.
+    #[reflect(ignore)]
+    last: Option<Vec3>,
+}
+
+/// The ray map: into `portal`'s frame, a half-turn about its local Y, out of `target`'s
+/// (both world-space).
+pub fn portal_map(portal: Affine3A, target: Affine3A) -> Affine3A {
+    target * Affine3A::from_rotation_y(std::f32::consts::PI) * portal.inverse()
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn travel(
+    mut commands: Commands,
+    mut travelers: Query<(
+        Entity,
+        &mut PortalTraveler,
+        &mut Transform,
+        Option<&ChildOf>,
+        Has<RigidBody>,
+    )>,
+    portals: Query<(&AuroraPortal, &GlobalTransform, Option<&AuroraMesh3d>)>,
+    frames: Query<&GlobalTransform, Without<PortalTraveler>>,
+    meshes: Res<Assets<AuroraMesh>>,
+    in_world: Query<&InWorld>,
+    worlds: Res<RenderWorlds>,
+    main_world: Option<Res<MainPhysicsWorldEntity>>,
+) {
+    for (entity, mut traveler, mut transform, child_of, body) in &mut travelers {
+        // This frame's pose, ahead of propagation: the teleport lands in the same frame.
+        let parent_affine = child_of
+            .and_then(|c| frames.get(c.parent()).ok())
+            .map_or(Affine3A::IDENTITY, GlobalTransform::affine);
+        let global = parent_affine * transform.compute_affine();
+        let now: Vec3 = global.translation.into();
+        let Some(last) = traveler.last.replace(now) else {
+            continue;
+        };
+        for (portal, portal_global, mesh) in &portals {
+            let portal_pose = portal_global.affine();
+            let to_local = portal_pose.inverse();
+            let (a, b) = (
+                to_local.transform_point3(last),
+                to_local.transform_point3(now),
+            );
+            if !(a.z > 0.0 && b.z <= 0.0) {
+                continue;
+            }
+            let hit = a.lerp(b, a.z / (a.z - b.z));
+            let half = mesh
+                .and_then(|m| meshes.get(&m.0))
+                .map_or(Vec2::splat(0.5), |m| {
+                    Vec2::new(m.aabb.half_extent[0], m.aabb.half_extent[1])
+                });
+            if hit.x.abs() > half.x || hit.y.abs() > half.y {
+                continue;
+            }
+            let Ok(target) = frames.get(portal.target) else {
+                continue;
+            };
+            let moved = portal_map(portal_pose, target.affine()) * global;
+            // The exit's world: its render bit's owner, else the main world.
+            let world = in_world
+                .get(portal.target)
+                .ok()
+                .and_then(|w| worlds.world(w.0))
+                .or(main_world.as_ref().map(|m| m.0));
+            let parent = world.and_then(|w| frames.get(w).ok());
+            let local = parent.map_or(moved, |p| p.affine().inverse() * moved);
+            let (scale, rotation, translation) = local.to_scale_rotation_translation();
+            *transform = Transform {
+                translation,
+                rotation,
+                scale,
+            };
+            traveler.last = Some(moved.translation.into());
+            match world {
+                Some(world) if body => commands.trigger(TransferToWorld { entity, world }),
+                Some(world) => {
+                    commands.entity(entity).insert(ChildOf(world));
+                }
+                None => {
+                    commands.entity(entity).remove::<ChildOf>();
+                }
+            }
+            break;
+        }
+    }
+}
+
 pub struct PortalPlugin;
 
 impl Plugin for PortalPlugin {
     fn build(&self, app: &mut App) {
-        app.register_type::<AuroraPortal>();
+        app.register_type::<AuroraPortal>()
+            .register_type::<PortalTraveler>()
+            .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
         app.init_resource::<PortalTable>();
         // The Prepare set already gates on the render device existing.
         app.add_systems(Last, upload_portals.in_set(RenderSet::Prepare));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use avian3d::world::PhysicsWorld;
+
+    use std::f32::consts::PI;
+
+    use super::*;
+    use crate::world::RenderWorldPlugin;
+
+    #[test]
+    fn crossing_a_portal_moves_the_traveler_into_the_exits_world() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            // No GPU here: CPU propagation stands in for the read-back GlobalTransform.
+            TransformPlugin,
+            RenderWorldPlugin,
+        ))
+        .init_resource::<Assets<AuroraMesh>>()
+        .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
+        let desert = app.world_mut().spawn(PhysicsWorld).id();
+        // C faces +Z in the main world; D stands at the same spot in the desert, turned
+        // around, so walking into C carries straight on.
+        let d = app
+            .world_mut()
+            .spawn((
+                ChildOf(desert),
+                Transform::from_rotation(Quat::from_rotation_y(PI)),
+            ))
+            .id();
+        let c = app
+            .world_mut()
+            .spawn((Transform::IDENTITY, AuroraPortal { target: d }))
+            .id();
+        app.world_mut()
+            .entity_mut(d)
+            .insert(AuroraPortal { target: c });
+        let walker = app
+            .world_mut()
+            .spawn((
+                PortalTraveler::default(),
+                Transform::from_xyz(0.1, 0.0, 1.0),
+            ))
+            .id();
+        app.update();
+        app.world_mut()
+            .get_mut::<Transform>(walker)
+            .unwrap()
+            .translation
+            .z = -1.0;
+        app.update();
+        app.update();
+
+        let world = app.world();
+        assert_eq!(
+            world.get::<ChildOf>(walker).map(ChildOf::parent),
+            Some(desert)
+        );
+        assert_eq!(world.get::<InWorld>(walker), Some(&InWorld(1)));
+        let at = world.get::<Transform>(walker).unwrap().translation;
+        assert!(at.abs_diff_eq(Vec3::new(0.1, 0.0, -1.0), 1e-4), "{at}");
+    }
+
+    #[test]
+    fn the_examples_gate_c_carries_a_walker_into_the_desert() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            // No GPU here: CPU propagation stands in for the read-back GlobalTransform.
+            TransformPlugin,
+            RenderWorldPlugin,
+        ))
+        .init_resource::<Assets<AuroraMesh>>()
+        .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
+        let quad = app
+            .world_mut()
+            .resource_mut::<Assets<AuroraMesh>>()
+            .add(AuroraMesh::from_shape(Rectangle::new(2.0, 3.0)));
+        let desert = app.world_mut().spawn(PhysicsWorld).id();
+        let gate = |app: &mut App, world: Option<Entity>, at: Transform| {
+            let mut root = app.world_mut().spawn((at, Visibility::default()));
+            if let Some(world) = world {
+                root.insert(ChildOf(world));
+            }
+            let root = root.id();
+            app.world_mut()
+                .spawn((
+                    ChildOf(root),
+                    AuroraMesh3d(quad.clone()),
+                    Transform::from_xyz(0.0, 1.6, 0.0),
+                ))
+                .id()
+        };
+        let c = gate(&mut app, None, Transform::from_xyz(0.0, 0.0, -8.0));
+        let d = gate(
+            &mut app,
+            Some(desert),
+            Transform::from_xyz(0.0, 0.0, -8.0).with_rotation(Quat::from_rotation_y(PI)),
+        );
+        app.world_mut()
+            .entity_mut(c)
+            .insert(AuroraPortal { target: d });
+        app.world_mut()
+            .entity_mut(d)
+            .insert(AuroraPortal { target: c });
+        let walker = app
+            .world_mut()
+            .spawn((
+                PortalTraveler::default(),
+                Transform::from_xyz(0.3, 1.7, -6.0),
+            ))
+            .id();
+        for _ in 0..60 {
+            app.world_mut()
+                .get_mut::<Transform>(walker)
+                .unwrap()
+                .translation
+                .z -= 0.05;
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<ChildOf>(walker).map(ChildOf::parent),
+            Some(desert)
+        );
+        // Under the world its pose still reaches GlobalTransform (what the camera renders from).
+        app.world_mut()
+            .get_mut::<Transform>(walker)
+            .unwrap()
+            .translation
+            .z = -12.0;
+        app.update();
+        let global = app
+            .world()
+            .get::<GlobalTransform>(walker)
+            .unwrap()
+            .translation();
+        assert!(
+            global.abs_diff_eq(Vec3::new(0.3, 1.7, -12.0), 1e-4),
+            "{global}"
+        );
     }
 }

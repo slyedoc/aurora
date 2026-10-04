@@ -1,7 +1,9 @@
 // Auto-exposure metering (a port of bevy_post_process::auto_exposure; src/auto_exposure.rs).
 //
-// The raygen writes every pixel's raw-radiance luminance (nits) into `lum`. `ae_histogram`
-// bins last frame's buffer into 64 log2-luminance bins (groupshared, then merged), and
+// The raygen writes every pixel's (meter, nits) pair into `lum`: the meter is the incident
+// luminance (radiance over the first surface's albedo), < 0 for sky and emitter pixels the
+// meter skips. `ae_histogram` bins last frame's meters into 64 log2 bins (groupshared, then
+// merged), and
 // `ae_resolve` trims the percentile tails, averages what is left, adapts the exposure over
 // time, and writes the linear exposure the NEXT frame's raygen applies.
 
@@ -55,7 +57,10 @@ void ae_histogram(uint3 gid: SV_DispatchThreadID, uint li: SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
 
     for (uint i = gid.x; i < p.pixel_count; i += AE_HISTOGRAM_THREADS) {
-        let lum = p.lum[i];
+        let lum = p.lum[2 * i];
+        if (lum < 0.0) {
+            continue;
+        }
         uint bin = 0;
         if (lum >= exp2(p.min_log_lum)) {
             let t = saturate((log2(lum) - p.min_log_lum) * p.inv_log_lum_range);
@@ -98,9 +103,9 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
     var state = p.state[0];
     if (count > 0) {
         let avg_log_lum = weighted / (float(count) * 63.0) * p.log_lum_range + p.min_log_lum;
-        // The exposure that puts the trimmed average at photographic mid-gray (0.18), plus
-        // compensation.
-        let metered = clamp(p.compensation + log2(0.18) - avg_log_lum, p.min_ev, p.max_ev);
+        // The meter reads incident light (radiance over albedo), so the exposure that shows
+        // an 18% card as 0.18 is its reciprocal; plus compensation.
+        let metered = clamp(p.compensation - avg_log_lum, p.min_ev, p.max_ev);
 
         // The LOOK goes only part of the way from the reference exposure to the metering,
         // so a night scene still reads darker than a sunlit one (a full-auto look renders

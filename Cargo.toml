@@ -84,6 +84,11 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "experimental_bevy_feathers_inspector",
 ] }
 aurora_mesh = { path = "crates/aurora_mesh" }
+# A render world is an avian physics world (world.rs): each PhysicsWorld gets a layer bit.
+avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", default-features = false, features = [
+    "3d",
+    "parry-f32",
+] }
 aurora_material = { path = "crates/aurora_material" }
 # Pure type definitions (`TextureFormat` for `Image::convert`); the version bevy_image resolves to.
 wgpu-types = { version = "30", default-features = false }
@@ -108,5 +113,8 @@ thiserror = "1.0.57"
 
 # Redirect every bevy_* crate to the fork branch `aurora`: upstream main + render-free feathers
 # (`bevy_feathers_core`), the .bsn asset loader and free_camera tweaks.
+[patch."https://github.com/avianphysics/avian"]
+avian3d = { git = "https://github.com/slyedoc/avian", branch = "aurora" }
+
 [patch."https://github.com/bevyengine/bevy"]
 bevy = { git = "https://github.com/slyedoc/bevy", branch = "aurora" }
