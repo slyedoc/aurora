@@ -493,6 +493,13 @@ fn render_frame(
         exposure: crate::auto_exposure::AuroraExposure,
     }
 
+    // `AuroraExposure::World`: the fixed exposure of the world the camera is in.
+    let world_ev100 = |layers, world| {
+        let bit = crate::world::world_mask(layers, world)
+            .trailing_zeros()
+            .min(7);
+        skies.worlds[bit as usize].ev100
+    };
     let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {
         // A headset with no camera has nothing to anchor to.
         (Some(_), _) if camera.is_none() => Vec::new(),
@@ -521,7 +528,11 @@ fn render_frame(
                         camera_mask: crate::world::world_mask(camera.6, camera.8) as u32,
                         debug_view: camera.5.copied().unwrap_or_default().shader_index(),
                         camera: camera.0,
-                        exposure: camera.4.cloned().unwrap_or_default(),
+                        exposure: camera
+                            .4
+                            .cloned()
+                            .unwrap_or_default()
+                            .resolve(world_ev100(camera.6, camera.8)),
                     }
                 })
                 .collect()
@@ -570,7 +581,11 @@ fn render_frame(
                     camera_mask: crate::world::world_mask(c.6, c.8) as u32,
                     debug_view: c.5.copied().unwrap_or_default().shader_index(),
                     camera: c.0,
-                    exposure: c.4.cloned().unwrap_or_default(),
+                    exposure: c
+                        .4
+                        .cloned()
+                        .unwrap_or_default()
+                        .resolve(world_ev100(c.6, c.8)),
                 })
             })
             .collect(),

@@ -85,9 +85,12 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
 ] }
 aurora_mesh = { path = "crates/aurora_mesh" }
 # A render world is an avian physics world (world.rs): each PhysicsWorld gets a layer bit.
+# Baked collision becomes avian colliders (collision.rs).
 avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", default-features = false, features = [
     "3d",
     "parry-f32",
+    # `Collider`: baked `.collider` files become trimesh colliders (collision.rs).
+    "default-collider",
 ] }
 aurora_material = { path = "crates/aurora_material" }
 # Pure type definitions (`TextureFormat` for `Image::convert`); the version bevy_image resolves to.

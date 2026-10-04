@@ -318,13 +318,22 @@ float sphereEmitterPdf(const uint e, const vec3 from) {
 // Unshadowed contribution of the point (su, sv) on light-table entry `e`, in AREA measure:
 // f * NoL * Le * cos_l / d^2, evaluated at shading point `sp` (normal n, geometric normal
 // ns, view v). Outputs the area pdf (p_pick / live area), the matching solid-angle pdf and
-// the shadow-ray direction / distance; returns 0 on any rejection.
+// the shadow-ray direction / distance; returns 0 on any rejection -- including a light in
+// another world than `ray_mask`'s (the shadow ray could not see its geometry, so it would
+// otherwise light through).
 vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
                      const float su, const float sv,
                      const vec3 sp, const vec3 n, const vec3 ns, const vec3 v,
-                     const DisneyMaterial mat,
+                     const DisneyMaterial mat, const uint ray_mask,
                      out float p_area, out float pdf_solid, out vec3 dir, out float dist) {
   if (e < pc.lights.analytic_count) {
+    if (((pc.lights.analytics.data[e].flags >> 8) & ray_mask & 0xFFu) == 0u) {
+      p_area = 0.0;
+      pdf_solid = 0.0;
+      dir = vec3(0.0);
+      dist = 0.0;
+      return vec3(0.0);
+    }
     return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat,
                               p_area, pdf_solid, dir, dist)
         * pc.uniforms.emissive_boost;
@@ -334,6 +343,10 @@ vec3 lightSampleEval(const uint e, const uint li_idx, const float p_pick,
   dir = vec3(0.0);
   dist = 0.0;
   LightInstance li = pc.lights.linsts.data[li_idx];
+  // The emitter's world: its instance row's mask (packed above the custom index).
+  if (((floatBitsToUint(pc.cur_instances.data[li.slot * 4u + 3u].x) >> 24) & ray_mask & 0xFFu) == 0u) {
+    return vec3(0.0);
+  }
   uint g;
   vec3 w0, w1, w2;
   lightTriangleWorld(li, e - li.entry_base, g, w0, w1, w2);
@@ -928,7 +941,7 @@ void main() {
             vec3 cdir;
             const vec3 val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
                                              origin, world_normal, surface_normal,
-                                             -direction, disney_mat,
+                                             -direction, disney_mat, ray_mask,
                                              p_area, pdf_solid, cdir, cdist);
             r_M += 1.0;
             const float phat = luma(val);
@@ -971,7 +984,8 @@ void main() {
                 const vec3 val = lightSampleEval(prev.y, lightsFindInstance(prev.y), 1.0,
                                                  suv.x, suv.y, origin, world_normal,
                                                  surface_normal, -direction, disney_mat,
-                                                 p_area_ign, pdf_solid_ign, cdir, cdist);
+                                                 ray_mask, p_area_ign, pdf_solid_ign, cdir,
+                                                 cdist);
                 const float phat = luma(val);
                 const float Mprev = min(prev.M, pc.uniforms.restir_m_clamp);
                 if (phat > 0.0) {
@@ -1038,7 +1052,8 @@ void main() {
             vec3 cdir;
             const vec3 val = lightSampleEval(e, lightsFindInstance(e), p_pick, randf(), randf(),
                                              origin, world_normal, surface_normal, -direction,
-                                             disney_mat, p_area, pdf_solid, cdir, cdist);
+                                             disney_mat, ray_mask, p_area, pdf_solid, cdir,
+                                             cdist);
             if (luma(val) <= 0.0 || p_area <= 0.0) { continue; }
             const float w = pdf_solid / (pdf_solid + pdfDisneyBRDF(-direction, world_normal, cdir, disney_mat));
             const vec3 g = val * w;

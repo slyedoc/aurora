@@ -45,7 +45,8 @@ const MIN_LOG_LUM: f32 = -5.0;
 const LOG_LUM_RANGE: f32 = 32.0;
 
 /// Camera exposure -- on every `Camera3d`, applied in the raygen (before Ray
-/// Reconstruction, which needs pre-exposed colour). `Fixed` locks a look; `Auto` meters
+/// Reconstruction, which needs pre-exposed colour). `World` (the default) takes the fixed
+/// exposure of the world the camera is in; `Fixed` locks a look of its own; `Auto` meters
 /// and adapts.
 #[derive(Component, Reflect, Clone, PartialEq, Debug)]
 #[reflect(Component, Default, Clone, PartialEq)]
@@ -56,13 +57,17 @@ pub enum AuroraExposure {
     /// Reconstruction's input stays metered underneath -- changing the EV is instant and
     /// costs no denoiser history).
     Fixed(FixedExposure),
+    /// The fixed exposure of the camera's world (sky.rs `WorldSky::ev100`: its
+    /// `WorldExposure`, else its brightest sun's), so crossing a portal changes it.
+    World,
 }
 
-/// Fixed: a consistent look that never changes with what the camera points at. `Auto` is
-/// opt-in, for scenes that move between very different light levels.
+/// The world's fixed exposure: a consistent look that never changes with what the camera
+/// points at, set by how brightly the world is lit. `Auto` is opt-in, for scenes that move
+/// between very different light levels.
 impl Default for AuroraExposure {
     fn default() -> Self {
-        Self::Fixed(FixedExposure::default())
+        Self::World
     }
 }
 
@@ -96,11 +101,21 @@ impl AuroraExposure {
         Self::Fixed(FixedExposure { ev })
     }
 
-    /// The blit's look: 0 = follow the metering, else the fixed linear exposure.
+    /// `World` as the fixed exposure of a world at `world_ev100`; anything else unchanged.
+    pub fn resolve(&self, world_ev100: f32) -> Self {
+        match self {
+            Self::World => Self::fixed(ev_from_ev100(world_ev100)),
+            other => other.clone(),
+        }
+    }
+
+    /// The blit's look: 0 = follow the metering, else the fixed linear exposure. `World`
+    /// must be [resolved](Self::resolve) first.
     pub fn display_exposure(&self) -> f32 {
         match self {
             Self::Auto(_) => 0.0,
             Self::Fixed(fixed) => fixed.ev.exp2(),
+            Self::World => ev_from_ev100(crate::sky::DEFAULT_EV100).exp2(),
         }
     }
 }
@@ -386,7 +401,7 @@ impl ViewExposure {
         let settings = match exposure {
             AuroraExposure::Auto(settings) => settings,
             // A fixed look still meters the RR input; default metering does that job.
-            AuroraExposure::Fixed(_) => {
+            AuroraExposure::Fixed(_) | AuroraExposure::World => {
                 fixed_settings = AutoExposureSettings::default();
                 &fixed_settings
             }

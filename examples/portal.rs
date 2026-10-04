@@ -188,6 +188,18 @@ fn setup(
             ..default()
         })),
     ));
+    // A blue lamp among the stones: the desert's alone (the plain under the same spot
+    // stays dark).
+    commands.spawn((
+        Name::new("Desert Lamp"),
+        ChildOf(desert),
+        PointLight {
+            intensity: 2_000_000.0,
+            color: Color::srgb(0.3, 0.5, 1.0),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 1.5, -12.0),
+    ));
     let stone = meshes.add(AuroraMesh::from_shape(Sphere::new(0.8)));
     let stone_mat = materials.add(AuroraMaterial {
         base_color: Color::srgb(0.85, 0.82, 0.75),

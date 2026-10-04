@@ -28,6 +28,31 @@ use crate::world::{InWorld, RenderWorlds, world_mask};
 /// Suns per world the GPU table holds; more are ignored.
 pub const MAX_SUNS: usize = 4;
 
+/// The exposure (EV100) of a world with no [`WorldExposure`] and no sun.
+pub const DEFAULT_EV100: f32 = 13.0;
+
+/// The exposure a world's cameras take by default (`AuroraExposure::World`), in EV100. On a
+/// world entity; without one it follows the world's brightest sun.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct WorldExposure {
+    #[reflect(@0.0..=20.0_f32)]
+    pub ev100: f32,
+}
+
+impl Default for WorldExposure {
+    fn default() -> Self {
+        Self {
+            ev100: DEFAULT_EV100,
+        }
+    }
+}
+
+/// The exposure a sun of `lux` calls for: incident-meter EV100 = log2(lux * 100 / 250).
+pub fn ev100_for_lux(lux: f32) -> f32 {
+    (lux.max(1.0e-3) * 100.0 / 250.0).log2()
+}
+
 /// What a ray that escapes this world returns. On a world entity.
 #[derive(Component, Reflect, Clone, Debug, Default)]
 #[reflect(Component, Default)]
@@ -125,12 +150,25 @@ impl Sun {
     }
 }
 
-/// One world's sky and suns, gathered each frame.
-#[derive(Clone, Debug, Default)]
+/// One world's sky, suns and exposure, gathered each frame.
+#[derive(Clone, Debug)]
 pub struct WorldSky {
     pub sky: Sky,
     pub gradient: GradientSky,
     pub suns: Vec<Sun>,
+    /// The fixed exposure its cameras take by default (EV100).
+    pub ev100: f32,
+}
+
+impl Default for WorldSky {
+    fn default() -> Self {
+        Self {
+            sky: Sky::default(),
+            gradient: GradientSky::default(),
+            suns: Vec::new(),
+            ev100: DEFAULT_EV100,
+        }
+    }
 }
 
 /// Every world's sky and suns, indexed by world bit; rebuilt each frame before rendering.
@@ -152,7 +190,7 @@ impl WorldSkies {
 #[allow(clippy::type_complexity)]
 fn gather_skies(
     worlds: Option<Res<RenderWorlds>>,
-    skies: Query<(Option<&Sky>, Option<&GradientSky>)>,
+    skies: Query<(Option<&Sky>, Option<&GradientSky>, Option<&WorldExposure>)>,
     suns: Query<(
         &DirectionalLight,
         Option<&SunDisk>,
@@ -168,11 +206,13 @@ fn gather_skies(
         return;
     };
     let mut atmosphere = None;
+    let mut exposures = [None; 8];
     for bit in 0..8u8 {
-        let (sky, gradient) = worlds
+        let (sky, gradient, exposure) = worlds
             .world(bit)
             .and_then(|world| skies.get(world).ok())
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
+        exposures[bit as usize] = exposure.map(|e| e.ev100);
         let mut sky = sky.cloned().unwrap_or_default();
         if matches!(sky, Sky::Atmosphere) {
             if atmosphere.is_some() {
@@ -191,6 +231,7 @@ fn gather_skies(
     }
     out.atmosphere = atmosphere;
 
+    let mut brightest = [0.0f32; 8];
     for (light, disk, transform, layers, world, visibility) in &suns {
         if visibility.is_some_and(|v| !v.get()) || light.illuminance <= 0.0 {
             continue;
@@ -201,8 +242,16 @@ fn gather_skies(
             let suns = &mut out.worlds[bit].suns;
             if mask & (1 << bit) != 0 && suns.len() < MAX_SUNS {
                 suns.push(sun);
+                brightest[bit] = brightest[bit].max(light.illuminance);
             }
         }
+    }
+    for bit in 0..8 {
+        out.worlds[bit].ev100 = exposures[bit].unwrap_or(if brightest[bit] > 0.0 {
+            ev100_for_lux(brightest[bit])
+        } else {
+            DEFAULT_EV100
+        });
     }
 
     out.camera_world = cameras
@@ -288,6 +337,9 @@ impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<Sky>()
             .register_type::<GradientSky>()
+            .register_type::<WorldExposure>()
+            .register_type::<DirectionalLight>()
+            .register_type::<SunDisk>()
             .init_resource::<WorldSkies>()
             .add_systems(
                 Last,

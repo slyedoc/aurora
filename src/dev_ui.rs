@@ -106,9 +106,9 @@ pub struct DevUIState {
     pub dlss: AuroraDlss,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
     pub rr_preset: RrPreset,
-    /// Lock exposure to `ev100` instead of metering. The metering keeps running
-    /// underneath either way -- it is what normalises Ray Reconstruction's input -- so
-    /// this changes the LOOK only, instantly and at no cost to denoiser history.
+    /// Lock exposure to `ev100` instead of the camera's world's exposure. The metering keeps
+    /// running underneath either way -- it is what normalises Ray Reconstruction's input --
+    /// so this changes the LOOK only, instantly and at no cost to denoiser history.
     pub ev100_lock: bool,
     /// The locked exposure, EV100: the photographic stop, the same number
     /// aurora_files/lighting_units.md uses. ~14-16 daylight exterior, ~5-9 interior.
@@ -181,8 +181,8 @@ impl Default for DevUIState {
             omm: true,
             dlss: AuroraDlss::from_env(),
             rr_preset: RrPreset::current(),
-            // Matches AuroraExposure::default().
-            ev100_lock: true,
+            // Unlocked: cameras follow their world (AuroraExposure::default()).
+            ev100_lock: false,
             ev100: 13.0,
             jitter_scale: 1.0,
         }
@@ -295,7 +295,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::Auto(default())
+                AuroraExposure::World
             };
         }
         *agreed = Some(want);
@@ -308,7 +308,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::Auto(default())
+                AuroraExposure::World
             };
         }
         *agreed = Some(want);
@@ -319,7 +319,7 @@ fn sync_exposure(
     if let Some(exposure) = cameras.iter().next() {
         let now = match exposure {
             AuroraExposure::Fixed(fixed) => (true, ev100_from_ev(fixed.ev)),
-            AuroraExposure::Auto(_) => (false, state.ev100),
+            AuroraExposure::Auto(_) | AuroraExposure::World => (false, state.ev100),
         };
         if now.0 != state.ev100_lock || (now.0 && (now.1 - state.ev100).abs() > 1.0e-3) {
             state.ev100_lock = now.0;
@@ -418,6 +418,7 @@ fn update_stats(
     time: Res<Time>,
     ae: Option<Res<crate::auto_exposure::AutoExposureState>>,
     cameras: Query<&AuroraExposure, With<Camera3d>>,
+    skies: Option<Res<crate::sky::WorldSkies>>,
     mut stats: Query<&mut Text, (With<DevUIStats>, Without<DevUIProbe>)>,
     mut probe: Query<&mut Text, (With<DevUIProbe>, Without<DevUIStats>)>,
     mut fps_avg: Local<f32>,
@@ -431,8 +432,9 @@ fn update_stats(
     // bright stop being the same symptom.
     let nits = ae.as_ref().map_or(0.0, |ae| ae.probe_nits());
     let ev100 = cameras.iter().next().map(|exposure| match exposure {
-        AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), true),
-        AuroraExposure::Auto(_) => (f32::NAN, false),
+        AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), 'L'),
+        AuroraExposure::World => (skies.as_ref().map_or(f32::NAN, |s| s.camera().ev100), 'W'),
+        AuroraExposure::Auto(_) => (f32::NAN, 'A'),
     });
     for mut text in &mut stats {
         text.0 = format!("fps: {:>6.1}", *fps_avg);
@@ -441,8 +443,8 @@ fn update_stats(
     // 340 px: a line that grows as the numbers change digits relayouts the panel every
     // frame, which reads as a flicker.
     let exposure = match ev100 {
-        Some((ev, true)) => format!("EV100 {ev:.1}L", ev = ev),
-        Some((_, false)) => "EV100 auto".to_string(),
+        Some((_, 'A')) => "EV100 auto".to_string(),
+        Some((ev, tag)) => format!("EV100 {ev:.1}{tag}"),
         None => String::new(),
     };
     for mut text in &mut probe {

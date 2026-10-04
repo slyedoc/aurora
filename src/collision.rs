@@ -9,19 +9,20 @@
 //! bevy_aurora::collision::CollisionMesh("wow/meshes/elwynn_tree01.collider")
 //! ```
 //!
-//! **This crate deliberately stops at the triangles.** It has no physics engine and does not
-//! want one — a game turns [`CollisionShape`] into whatever its solver uses (zero inserts an
-//! avian `Collider` and a static `RigidBody`). Keeping the component here is what lets a
-//! `.bsn` carrying collision load in a viewer that has no physics at all: the type resolves,
-//! the shape loads, and nothing happens with it. Emitting the game's own physics components
-//! into the scene instead makes every consumer of that scene depend on that game
-//! (`unknown type: avian3d::dynamics::rigid_body::RigidBody`, and the whole scene is refused).
+//! Every [`CollisionMesh`] whose shape has loaded gets an avian trimesh `Collider` and a
+//! static `RigidBody`: baked collision is world geometry, so the body is always static.
+//! Anything dynamic is spawned by gameplay with its own collider and never comes through
+//! here. avian's `Collider` does not reflect, and its scene-friendly `ColliderConstructor`
+//! either inlines the geometry per entity or reads the RENDER mesh, which is why the scene
+//! names the file instead.
 //!
 //! `.collider`: `ACOL`, version, vertex count, triangle count (u32 LE), then the positions
 //! (f32 LE x 3) and the triangles (u32 LE x 3). Written by `aurora_files`' importers.
 
+use avian3d::prelude::{Collider, RigidBody};
 use bevy::{
     asset::{AssetLoader, LoadContext, io::Reader},
+    platform::collections::HashMap,
     prelude::*,
 };
 
@@ -105,6 +106,50 @@ impl AssetLoader for CollisionShapeLoader {
     }
 }
 
+/// Built colliders by shape, so a model placed a thousand times builds ONE trimesh BVH and
+/// every placement clones it. A failed build is cached as `None` so it is not retried every
+/// frame for the rest of the run.
+#[derive(Resource, Default)]
+struct BuiltColliders(HashMap<AssetId<CollisionShape>, Option<Collider>>);
+
+/// Gives every [`CollisionMesh`] whose shape has loaded its avian [`Collider`]. The trimesh
+/// build (and its BVH) happens here rather than in the loader, cached per shape, so it is
+/// once per unique model rather than once per placement.
+fn attach_colliders(
+    mut commands: Commands,
+    shapes: Res<Assets<CollisionShape>>,
+    mut built: ResMut<BuiltColliders>,
+    waiting: Query<(Entity, &CollisionMesh), Without<Collider>>,
+) {
+    let mut attached = 0;
+    for (entity, mesh) in &waiting {
+        let Some(shape) = shapes.get(&mesh.0) else {
+            continue;
+        };
+        let collider = built.0.entry(mesh.0.id()).or_insert_with(|| {
+            if shape.is_empty() {
+                return None;
+            }
+            match Collider::try_trimesh(shape.positions.clone(), shape.triangles.clone()) {
+                Ok(collider) => Some(collider),
+                Err(err) => {
+                    warn!("collider build failed ({} tris): {err}", shape.len());
+                    None
+                }
+            }
+        });
+        if let Some(collider) = collider.clone() {
+            commands
+                .entity(entity)
+                .insert((collider, RigidBody::Static));
+            attached += 1;
+        }
+    }
+    if attached > 0 {
+        debug!("attached {attached} baked colliders");
+    }
+}
+
 pub struct CollisionPlugin;
 
 impl Plugin for CollisionPlugin {
@@ -113,6 +158,8 @@ impl Plugin for CollisionPlugin {
             .register_asset_reflect::<CollisionShape>()
             .register_asset_loader(CollisionShapeLoader)
             .register_type::<CollisionMesh>()
-            .register_type::<CollisionMeshTemplate>();
+            .register_type::<CollisionMeshTemplate>()
+            .init_resource::<BuiltColliders>()
+            .add_systems(Update, attach_colliders);
     }
 }

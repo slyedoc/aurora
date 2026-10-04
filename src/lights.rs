@@ -662,8 +662,17 @@ fn track_analytic_lights(
     spheres: Query<(Entity, &GpuInstance, &AuroraMaterial3d), With<Sphere>>,
     materials: Res<Assets<AuroraMaterial>>,
     nodes: Query<(&Transform, Option<&ChildOf>)>,
+    worlds: Query<(
+        Option<&bevy::camera::visibility::RenderLayers>,
+        Option<&crate::world::InWorld>,
+    )>,
 ) {
     use std::f32::consts::PI;
+    // The worlds a light lights, in `flags` bits 8..15: the raygen skips it for rays elsewhere.
+    let world_flags = |entity: Entity| -> u32 {
+        let (layers, world) = worlds.get(entity).unwrap_or((None, None));
+        (crate::world::world_mask(layers, world) as u32) << 8
+    };
     // CPU hierarchy propagation is off (mesh transforms propagate on the GPU), so a child
     // light's GlobalTransform never updates: walk the parent chain here instead. Lights
     // are few and hierarchies shallow.
@@ -708,7 +717,7 @@ fn track_analytic_lights(
                 half_extents: [0.0; 2],
                 // Lambertian sphere: flux / pi = 4 pi r^2 L.
                 power: 4.0 * PI * radius * radius * luma(emission),
-                flags: 0,
+                flags: world_flags(entity),
             },
         ));
     }
@@ -730,7 +739,7 @@ fn track_analytic_lights(
                 cos_outer: -1.0,
                 half_extents: [0.0; 2],
                 power: 4.0 * luma(emission),
-                flags: 0,
+                flags: world_flags(entity),
             },
         ));
     }
@@ -758,7 +767,7 @@ fn track_analytic_lights(
                 cos_outer,
                 half_extents: [0.0; 2],
                 power: luma(emission) * solid_angle / PI,
-                flags: 0,
+                flags: world_flags(entity),
             },
         ));
     }
@@ -788,7 +797,7 @@ fn track_analytic_lights(
                 cos_outer: -1.0,
                 half_extents: [half_x.length(), half_y.length()],
                 power: luma(emission) * area,
-                flags: 0,
+                flags: world_flags(entity),
             },
         ));
     }

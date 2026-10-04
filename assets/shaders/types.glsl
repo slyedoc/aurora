@@ -272,7 +272,7 @@ struct AnalyticLight {
   float cos_outer;    // spot: falloff limit
   vec2 half_extents;  // rect half sizes along tangent / bitangent
   float power;        // CPU-computed CDF weight (same units as tri entries: flux / pi)
-  uint flags;         // bit 0: two-sided (rect)
+  uint flags;         // bit 0: two-sided (rect); bits 8..15: the world mask it lights
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer AnalyticLights {
