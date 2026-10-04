@@ -34,6 +34,7 @@ pub mod material;
 pub mod mesh;
 pub mod omm;
 pub mod picking;
+pub mod pointer_picking;
 pub mod portal;
 pub mod post_process_filter;
 pub mod procedural_mesh;
@@ -159,6 +160,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::world::RenderWorldPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::picking::PickingPlugin);
+        group = group.add(crate::pointer_picking::PointerPickingPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
         group = group.add(crate::terrain::TerrainPlugin);
         group = group.add(crate::lights::LightsPlugin);
