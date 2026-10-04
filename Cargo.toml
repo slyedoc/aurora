@@ -92,6 +92,9 @@ avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", defa
     # `Collider`: baked `.collider` files become trimesh colliders (collision.rs).
     "default-collider",
 ] }
+# Graph-driven skeletal animation on baked `.animclip`s (slyedoc fork, `aurora` branch:
+# render-free bevy, no glTF); its plugin is part of `AuroraDefaultPlugins`.
+bevy_animation_graph = { git = "https://github.com/slyedoc/bevy_animation_graph", branch = "aurora" }
 aurora_material = { path = "crates/aurora_material" }
 # Pure type definitions (`TextureFormat` for `Image::convert`); the version bevy_image resolves to.
 wgpu-types = { version = "30", default-features = false }

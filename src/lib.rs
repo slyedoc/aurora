@@ -157,6 +157,10 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::procedural_mesh::ProceduralMeshPlugin);
         group = group.add(crate::collision::CollisionPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
+        // Physics and skeletal animation are part of the stack: every world is an avian
+        // physics world (world.rs), and characters play bevy_animation_graph graphs.
+        group = group.add_group(avian3d::prelude::PhysicsPlugins::default());
+        group = group.add(bevy_animation_graph::AnimationGraphPlugin::default());
         group = group.add(crate::world::RenderWorldPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::picking::PickingPlugin);
