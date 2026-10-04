@@ -406,7 +406,8 @@ impl SkinnedGpu {
 const BLAS_FLAGS: vk::BuildAccelerationStructureFlagsKHR =
     vk::BuildAccelerationStructureFlagsKHR::from_raw(
         vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD.as_raw()
-            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE.as_raw(),
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE.as_raw()
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS.as_raw(),
     );
 
 struct SkinnedInstance {

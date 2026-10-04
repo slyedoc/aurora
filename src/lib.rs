@@ -33,6 +33,7 @@ pub mod lights;
 pub mod material;
 pub mod mesh;
 pub mod omm;
+pub mod picking;
 pub mod portal;
 pub mod post_process_filter;
 pub mod procedural_mesh;
@@ -90,6 +91,7 @@ pub mod prelude {
         env_light::EnvLight,
         material::{AuroraMaterial, AuroraMaterial3d},
         mesh::{AuroraMesh, AuroraMesh3d},
+        picking::{RayCaster, RayHit, RayHits},
         portal::AuroraPortal,
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         skinning::{SkinJointsByName, Wind, WindSway},
@@ -153,6 +155,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::collision::CollisionPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
+        group = group.add(crate::picking::PickingPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
         group = group.add(crate::terrain::TerrainPlugin);
         group = group.add(crate::lights::LightsPlugin);

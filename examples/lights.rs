@@ -56,7 +56,9 @@ fn setup(
 
     commands.spawn((
         Name::new("floor"),
-        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(40.0, 40.0)))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
+            Plane3d::default().mesh().size(40.0, 40.0),
+        ))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.5, 0.5, 0.5),
             perceptual_roughness: 0.8,

@@ -93,6 +93,15 @@ pub struct GpuInstanceSlots {
     next: u32,
     /// Slots freed since the last extraction; the render side clears them.
     freed: Vec<u32>,
+    /// The entity holding each slot, for resolving traced hits (picking.rs).
+    entities: Vec<Option<Entity>>,
+}
+
+impl GpuInstanceSlots {
+    /// The entity whose instance occupies `slot`.
+    pub fn entity(&self, slot: u32) -> Option<Entity> {
+        self.entities.get(slot as usize).copied().flatten()
+    }
 }
 
 fn assign_gpu_instances(
@@ -113,6 +122,11 @@ fn assign_gpu_instances(
             slots.next += 1;
             s
         });
+        let index = slot as usize;
+        if slots.entities.len() <= index {
+            slots.entities.resize(index + 1, None);
+        }
+        slots.entities[index] = Some(entity);
         commands.entity(entity).insert(GpuInstance(slot));
     }
 }
@@ -125,10 +139,13 @@ fn free_gpu_instance(
     if let Ok(instance) = instances.get(remove.entity) {
         slots.free.push(instance.0);
         slots.freed.push(instance.0);
+        if let Some(held) = slots.entities.get_mut(instance.0 as usize) {
+            *held = None;
+        }
     }
 }
 
-fn clear_freed(mut slots: ResMut<GpuInstanceSlots>) {
+pub(crate) fn clear_freed(mut slots: ResMut<GpuInstanceSlots>) {
     slots.freed.clear();
 }
 

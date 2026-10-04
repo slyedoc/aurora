@@ -296,7 +296,9 @@ pub fn build_blas_batch_device(
     let as_properties = vk_utils::get_acceleration_structure_properties(render_device);
     let scratch_alignment =
         as_properties.min_acceleration_structure_scratch_offset_alignment as u64;
-    let mut build_flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    // ALLOW_DATA_ACCESS: picking reads the hit triangle's vertices from the BLAS.
+    let mut build_flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS;
     if compact {
         build_flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
     }
@@ -571,7 +573,8 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
     let scratch_alignment =
         as_properties.min_acceleration_structure_scratch_offset_alignment as u64;
     let build_flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
+        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION
+        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS;
 
     let mut out: Vec<BLAS> = Vec::with_capacity(staging.len());
     let mut chunk: Vec<BlasStaging> = Vec::new();

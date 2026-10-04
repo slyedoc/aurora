@@ -23,7 +23,11 @@ use bevy_aurora::{
     util::{ScreenshotExt, TimeoutAppExt},
 };
 
-const CLIPS: [&str; 3] = ["fox/survey.animclip", "fox/walk.animclip", "fox/run.animclip"];
+const CLIPS: [&str; 3] = [
+    "fox/survey.animclip",
+    "fox/walk.animclip",
+    "fox/run.animclip",
+];
 
 #[derive(Resource)]
 struct FoxClips(Vec<AnimationNodeIndex>);
@@ -70,7 +74,9 @@ fn setup(
     ));
 
     commands.spawn((
-        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(40.0, 40.0)))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
+            Plane3d::default().mesh().size(40.0, 40.0),
+        ))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.35, 0.33, 0.3),
             perceptual_roughness: 0.9,

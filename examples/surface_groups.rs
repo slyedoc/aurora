@@ -145,7 +145,9 @@ fn setup(
     // MESH spheres, not aurora's `Sphere` component: that one is a PROCEDURAL hit group
     // with its own record at offset 0, so it always routes to `sphere_hit.rchit` and never
     // sees a surface class. Class routing is a property of triangle records.
-    let ball = meshes.add(AuroraMesh::from_shape(bevy::shape::Sphere::new(1.0).mesh().uv(48, 32)));
+    let ball = meshes.add(AuroraMesh::from_shape(
+        bevy::shape::Sphere::new(1.0).mesh().uv(48, 32),
+    ));
     commands.spawn((
         Name::new("opaque class"),
         AuroraMesh3d(ball.clone()),

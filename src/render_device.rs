@@ -9,8 +9,9 @@ use ash::vk;
 use ash::{
     ext::{descriptor_indexing, opacity_micromap},
     khr::{
-        acceleration_structure, deferred_host_operations, maintenance4, ray_tracing_pipeline,
-        spirv_1_4, surface, swapchain, synchronization2,
+        acceleration_structure, deferred_host_operations, maintenance4, ray_query,
+        ray_tracing_pipeline, ray_tracing_position_fetch, spirv_1_4, surface, swapchain,
+        synchronization2,
     },
 };
 use bevy::prelude::*;
@@ -685,6 +686,10 @@ unsafe fn create_logical_device(
             maintenance4::NAME.as_ptr(),
             acceleration_structure::NAME.as_ptr(),
             ray_tracing_pipeline::NAME.as_ptr(),
+            // Picking (picking.rs): inline ray queries from compute, reading the hit triangle's
+            // vertices out of the BLAS.
+            ray_query::NAME.as_ptr(),
+            ray_tracing_position_fetch::NAME.as_ptr(),
             deferred_host_operations::NAME.as_ptr(),
             spirv_1_4::NAME.as_ptr(),
             descriptor_indexing::NAME.as_ptr(),
@@ -774,6 +779,13 @@ unsafe fn create_logical_device(
         let mut features_raytracing_pipeline =
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
+        let mut features_ray_query =
+            vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+
+        let mut features_position_fetch =
+            vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
+                .ray_tracing_position_fetch(true);
+
         let mut features_scalar_block =
             vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
 
@@ -815,6 +827,8 @@ unsafe fn create_logical_device(
             .push_next(&mut features_indexing)
             .push_next(&mut features_acceleration_structure)
             .push_next(&mut features_raytracing_pipeline)
+            .push_next(&mut features_ray_query)
+            .push_next(&mut features_position_fetch)
             .push_next(&mut features_scalar_block)
             .push_next(&mut features_float16);
         let device_info = if micromaps {

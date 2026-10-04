@@ -317,15 +317,21 @@ impl Swapchain {
         &mut self,
         window: &RenderWindow,
         cmd_buffer: vk::CommandBuffer,
+        // A semaphore of work submitted ahead of this frame that it depends on (picking.rs).
+        scene_ready: Option<vk::Semaphore>,
     ) {
         unsafe {
+            let mut wait_semaphores = vec![self.image_available_semaphore];
+            let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            if let Some(semaphore) = scene_ready {
+                wait_semaphores.push(semaphore);
+                wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+            }
             // submit the command buffer to the queue
             let submit_info = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&cmd_buffer))
-                .wait_semaphores(std::slice::from_ref(&self.image_available_semaphore))
-                .wait_dst_stage_mask(std::slice::from_ref(
-                    &vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                ))
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
                 .signal_semaphores(std::slice::from_ref(
                     &self.render_finished_semaphores[self.current_image_idx as usize],
                 ));

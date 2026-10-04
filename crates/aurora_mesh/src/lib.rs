@@ -11,8 +11,8 @@
 //! [`AuroraMesh::clustered`]; the renderer today traces the finest LOD as one ordinary BLAS.
 //!
 //! Bevy's [`Mesh`] is an import format here, not something the tracer sees: an importer bakes it
-//! with [`AuroraMesh::clustered`], a mesh built at runtime converts with
-//! [`AuroraMesh::from_mesh`].
+//! with [`AuroraMesh::clustered`]. A mesh built at runtime is made from its streams with
+//! [`AuroraMesh::from_triangles`], or converted with [`AuroraMesh::from_mesh`].
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -595,7 +595,19 @@ fn flat_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
 // From bevy's Mesh
 // ---------------------------------------------------------------------------------------------
 
-/// A bevy mesh's streams, read once for either conversion.
+/// Triangle-list streams for [`AuroraMesh::from_triangles`]. A vertex stream left empty (or not
+/// one entry per position) takes its default: flat normals, zero uvs, +X tangents. `indices`
+/// names every triangle; empty draws nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Triangles {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    pub uvs: Vec<Vec2>,
+    pub tangents: Vec<Vec4>,
+    pub indices: Vec<u32>,
+}
+
+/// A mesh's streams, read once for either conversion.
 struct SourceStreams {
     positions: Vec<Vec3>,
     normals: Vec<Vec3>,
@@ -606,6 +618,32 @@ struct SourceStreams {
 }
 
 impl SourceStreams {
+    fn from_triangles(t: Triangles) -> Self {
+        let n = t.positions.len();
+        let indices = t.indices;
+        let normals = if t.normals.len() == n {
+            t.normals
+        } else {
+            flat_normals(&t.positions, &indices)
+        };
+        Self {
+            uvs: if t.uvs.len() == n {
+                t.uvs
+            } else {
+                vec![Vec2::ZERO; n]
+            },
+            tangents: if t.tangents.len() == n {
+                t.tangents
+            } else {
+                vec![Vec4::new(1.0, 0.0, 0.0, 1.0); n]
+            },
+            normals,
+            positions: t.positions,
+            skin: None,
+            indices,
+        }
+    }
+
     fn read(mesh: &Mesh) -> Result<Self, AuroraMeshError> {
         let positions: Vec<Vec3> = mesh
             .attribute(Mesh::ATTRIBUTE_POSITION)
@@ -716,7 +754,15 @@ impl AuroraMesh {
     /// heights in place). It is not valid NV cluster input past 256 vertices; bake files with
     /// [`Self::clustered`].
     pub fn from_mesh(mesh: &Mesh) -> Result<Self, AuroraMeshError> {
-        let s = SourceStreams::read(mesh)?;
+        Ok(Self::from_streams(SourceStreams::read(mesh)?))
+    }
+
+    /// [`Self::from_mesh`] for streams built in code, without a bevy [`Mesh`] in between.
+    pub fn from_triangles(triangles: Triangles) -> Self {
+        Self::from_streams(SourceStreams::from_triangles(triangles))
+    }
+
+    fn from_streams(s: SourceStreams) -> Self {
         let aabb = aabb_of(&s.positions);
         let cluster = Cluster {
             vertex_offset: 0,
@@ -729,7 +775,7 @@ impl AuroraMesh {
             _pad: [0; 2],
         };
         let (joints, weights) = s.skin.unzip();
-        Ok(Self {
+        Self {
             vertex_normals: s.normals.iter().map(|&n| pack_normal(n)).collect(),
             vertex_positions: s.positions.into(),
             vertex_tangents: s.tangents.into(),
@@ -744,7 +790,25 @@ impl AuroraMesh {
             root_node_id: u32::MAX,
             lod_levels: 1,
             ..Default::default()
-        })
+        }
+    }
+
+    /// Replaces the triangles of a single-cluster mesh ([`Self::from_mesh`],
+    /// [`Self::from_triangles`]) over the same vertices: a surface that re-picks which of its
+    /// vertices to draw (a terrain level moving its hole).
+    ///
+    /// # Panics
+    /// On a clustered mesh, whose indices are cluster-local.
+    pub fn set_indices(&mut self, indices: Vec<u32>) {
+        assert_eq!(
+            self.clusters.len(),
+            1,
+            "set_indices needs a single-cluster mesh"
+        );
+        let mut clusters = self.clusters.to_vec();
+        clusters[0].triangle_count = (indices.len() / 3) as u32;
+        self.clusters = clusters.into();
+        self.indices = indices.into();
     }
 
     /// [`Self::from_mesh`] for anything that builds a bevy [`Mesh`]: a primitive
@@ -983,5 +1047,36 @@ mod tests {
     fn type_paths() {
         assert_eq!(AuroraMesh::type_path(), "bevy_aurora::mesh::AuroraMesh");
         assert_eq!(AuroraMesh3d::type_path(), "bevy_aurora::mesh::AuroraMesh3d");
+    }
+
+    #[test]
+    fn triangles_keep_their_order_and_default_the_rest() {
+        let mesh = AuroraMesh::from_triangles(Triangles {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(1.0, 0.0, 1.0)],
+            indices: vec![0, 2, 1, 1, 2, 3],
+            ..default()
+        });
+        assert_eq!(&*mesh.indices, &[0, 2, 1, 1, 2, 3]);
+        let none = AuroraMesh::from_triangles(Triangles {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Z],
+            ..default()
+        });
+        assert!(none.indices.is_empty(), "no indices is no triangles");
+        assert_eq!(mesh.vertex_uvs.len(), 4);
+        assert!(unpack_normal(mesh.vertex_normals[0]).abs_diff_eq(Vec3::Y, 1e-3));
+        assert_eq!(mesh.clusters.len(), 1);
+    }
+
+    #[test]
+    fn set_indices_redraws_the_same_vertices() {
+        let mut mesh = AuroraMesh::from_triangles(Triangles {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(1.0, 0.0, 1.0)],
+            indices: vec![0, 2, 1, 1, 2, 3],
+            ..default()
+        });
+        mesh.set_indices(vec![1, 2, 3]);
+        assert_eq!(&*mesh.indices, &[1, 2, 3]);
+        assert_eq!(mesh.clusters[0].triangle_count, 1);
+        assert_eq!(mesh.vertex_positions.len(), 4);
     }
 }

@@ -155,7 +155,9 @@ fn setup(
         Transform::from_xyz(0.0, 2.2, 9.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
     ));
     commands.spawn((
-        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(80.0, 80.0)))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
+            Plane3d::default().mesh().size(80.0, 80.0),
+        ))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::linear_rgb(0.10, 0.14, 0.05),
             perceptual_roughness: 1.0,

@@ -391,6 +391,7 @@ fn render_frame(
         Res<crate::portal::PortalTable>,
         ResMut<crate::terrain::Terrains>,
         ResMut<AtmosphereState>,
+        ResMut<crate::picking::Picker>,
     ),
     camera: Query<
         (
@@ -441,6 +442,7 @@ fn render_frame(
         portal_table,
         mut terrains,
         mut atmo,
+        mut picker,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
@@ -844,25 +846,37 @@ fn render_frame(
 
         // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
-        // them, and rebuild the single TLAS in place -- all inside this command buffer.
+        // them, and rebuild the single TLAS in place. With rays to pick, that part goes into
+        // its own command buffer, submitted ahead of the rest with the pick at its end, so the
+        // hits are ready long before the frame is (picking.rs).
         drop(section);
+        let pick = picker.active(&modules, &tlas);
+        let scene_cmd = if pick {
+            picker.begin(&render_device, swapchain.frame_count)
+        } else {
+            cmd_buffer
+        };
         let section = info_span!("record_transforms").entered();
-        let world_changed = transforms.record(&render_device, cmd_buffer, &modules);
+        let world_changed = transforms.record(&render_device, scene_cmd, &modules);
         drop(section);
         let section = info_span!("record_skins").entered();
-        let skinned = skins.record(&render_device, cmd_buffer, &modules, &transforms);
+        let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
         drop(section);
         let section = info_span!("record_terrains").entered();
-        let terrain_changed = terrains.record(&render_device, cmd_buffer, &modules, &textures);
+        let terrain_changed = terrains.record(&render_device, scene_cmd, &modules, &textures);
         drop(section);
         let section = info_span!("record_tlas").entered();
         tlas.record(
             &render_device,
-            cmd_buffer,
+            scene_cmd,
             &modules,
             &transforms,
             world_changed || skinned || terrain_changed,
         );
+        if pick {
+            let _submit = info_span!("submit_pick").entered();
+            picker.submit(&render_device, scene_cmd, &modules, &tlas);
+        }
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).
         drop(section);
@@ -1483,7 +1497,7 @@ fn render_frame(
         render_device.end_command_buffer(cmd_buffer).unwrap();
         drop(section);
         drop(record);
-        swapchain.submit_presentation(&window, cmd_buffer);
+        swapchain.submit_presentation(&window, cmd_buffer, pick.then_some(picker.semaphore));
         // The XR side of the submit: release the image and hand the compositor its layer.
         if let (Some(xr_state), Some(xr_frame)) = (xr.as_deref_mut(), xr_frame) {
             xr_state.end_frame(&render_device, xr_frame);

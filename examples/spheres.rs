@@ -67,7 +67,9 @@ fn setup(
 
     // plane
     commands.spawn((
-        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Plane3d::default().mesh().size(100.0, 100.0)))),
+        AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
+            Plane3d::default().mesh().size(100.0, 100.0),
+        ))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.1, 0.2, 0.1),
             perceptual_roughness: 1.0,
