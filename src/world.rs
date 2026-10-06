@@ -45,6 +45,12 @@ pub fn world_mask(layers: Option<&RenderLayers>, world: Option<&InWorld>) -> u8 
     }
 }
 
+/// The world a view of `mask` belongs to: its highest bit, so a view of {main, world} is that
+/// world's (its sky, suns and exposure).
+pub fn view_world(mask: u8) -> u8 {
+    (7 - mask.leading_zeros().min(7)) as u8
+}
+
 fn assign_bit(
     add: On<Add<PhysicsWorld>>,
     main: Query<(), With<MainPhysicsWorld>>,

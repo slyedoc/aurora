@@ -495,9 +495,7 @@ fn render_frame(
 
     // `AuroraExposure::World`: the fixed exposure of the world the camera is in.
     let world_ev100 = |layers, world| {
-        let bit = crate::world::world_mask(layers, world)
-            .trailing_zeros()
-            .min(7);
+        let bit = crate::world::view_world(crate::world::world_mask(layers, world));
         skies.worlds[bit as usize].ev100
     };
     let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {

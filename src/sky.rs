@@ -259,7 +259,7 @@ fn gather_skies(
         .filter(|(camera, ..)| camera.is_active)
         .min_by_key(|(camera, ..)| camera.order)
         .map_or(0, |(_, layers, world)| {
-            world_mask(layers, world).trailing_zeros().min(7) as u8
+            crate::world::view_world(world_mask(layers, world))
         });
 }
 
