@@ -28,7 +28,6 @@ layout(location = 14) flat in uint in_color_space;
 layout(location = 0) out vec4 out_color;
 
 const uint TEXTURED = 1u;
-const uint TEXTURE_SRGB = 2u;
 // must align with `ui_render::shader_flags`
 const uint RADIAL = 16u;
 const uint FILL_START = 32u;
@@ -272,13 +271,8 @@ void main() {
 
   // Linear light out: the sRGB attachment encodes on store and blends in linear space.
   if (enabled(in_flags, TEXTURED)) {
-    vec4 texel = texture(textures[nonuniformEXT(in_tex)], in_uv);
-    // Image bytes are sRGB encoded (uploaded as UNORM); alpha-mask glyph atlases are
-    // linear coverage.
-    if (enabled(in_flags, TEXTURE_SRGB)) {
-      texel.rgb = srgb_to_linear_rgb(texel.rgb);
-    }
-    color *= texel;
+    // sRGB textures decode on sampling: the texel is linear.
+    color *= texture(textures[nonuniformEXT(in_tex)], in_uv);
   }
 
   if (enabled(in_flags, BORDER_ANY)) {

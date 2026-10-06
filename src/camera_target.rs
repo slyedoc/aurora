@@ -23,6 +23,7 @@ use bevy::{
 use ash::vk;
 
 use crate::{
+    color_target::TargetKind,
     render_device::RenderDevice,
     render_texture::{RenderTexture, create_blank_texture},
     vulkan_asset::{VulkanAsset, VulkanAssetLoadingState, VulkanAssets},
@@ -31,21 +32,21 @@ use crate::{
 /// The image-targeted `Camera3d`s this frame, and the Vulkan images backing them.
 #[derive(Resource, Default)]
 pub struct CameraTargets {
-    /// Camera entity -> (target asset, size in pixels). Rebuilt every frame.
-    pub by_camera: HashMap<Entity, (AssetId<Image>, UVec2)>,
+    /// Camera entity -> (target asset, size in pixels, what it holds). Rebuilt every frame.
+    pub by_camera: HashMap<Entity, (AssetId<Image>, UVec2, TargetKind)>,
     /// The created images, keyed by asset. App-lifetime: a despawned camera's texture stays
     /// registered so re-entering a state reuses the same asset id and bindless slot.
-    pub map: HashMap<AssetId<Image>, (RenderTexture, vk::Extent2D)>,
+    pub map: HashMap<AssetId<Image>, (RenderTexture, vk::Extent2D, TargetKind)>,
 }
 
 /// A size-carrying placeholder [`Image`] for a camera render target: `data` is `None`, so
 /// the texture upload path skips it and [`prepare_camera_targets`] builds the real target in
-/// its place.
+/// its place. A display target; give the image `Rgba16Float` for scene radiance.
 pub fn camera_target_placeholder(size: UVec2) -> Image {
     let mut image = Image::new_target_texture(
         size.x.max(1),
         size.y.max(1),
-        wgpu_types::TextureFormat::Bgra8Unorm,
+        wgpu_types::TextureFormat::Bgra8UnormSrgb,
         None,
     );
     image.data = None;
@@ -88,14 +89,13 @@ pub fn sync_camera_targets(
         if stale {
             camera.computed.target_info = Some(info);
         }
-        targets.by_camera.insert(entity, (asset, size));
+        let kind = TargetKind::of(image.texture_descriptor.format);
+        targets.by_camera.insert(entity, (asset, size, kind));
     }
 }
 
-/// `RenderSet::Prepare`: create the image for every new target.
-///
-/// `STORAGE` is the difference from a UI surface: the composite writes here as a colour
-/// attachment, but the image is also sampled, and a future direct-write path needs storage.
+/// `RenderSet::Prepare`: create the image for every new target, in the format its kind
+/// holds; sampling it reads linear values back.
 pub fn prepare_camera_targets(
     render_device: Res<RenderDevice>,
     mut targets: ResMut<CameraTargets>,
@@ -106,24 +106,21 @@ pub fn prepare_camera_targets(
     // `update_viewport_render_target_size` resizes the Image asset to match. Without this
     // the asset says one size and the Vulkan image stays at the size it was first built
     // at, so the view traces at a resolution nothing samples back.
-    let pending: Vec<(AssetId<Image>, UVec2)> = targets
+    let pending: Vec<(AssetId<Image>, UVec2, TargetKind)> = targets
         .by_camera
         .values()
-        .filter(|(asset, size)| {
-            targets
-                .map
-                .get(asset)
-                .is_none_or(|(_, extent)| extent.width != size.x || extent.height != size.y)
+        .filter(|(asset, size, kind)| {
+            targets.map.get(asset).is_none_or(|(_, extent, built)| {
+                extent.width != size.x || extent.height != size.y || built != kind
+            })
         })
         .copied()
         .collect();
-    for (asset, size) in pending {
+    for (asset, size, kind) in pending {
         let texture = create_blank_texture(
             &render_device,
-            vk::Format::B8G8R8A8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::STORAGE,
+            kind.format(),
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             size.x,
             size.y,
@@ -148,9 +145,10 @@ pub fn prepare_camera_targets(
                     width: size.x,
                     height: size.y,
                 },
+                kind,
             ),
         );
-        log::info!("camera: render target {:?} ({}x{})", asset, size.x, size.y);
+        log::info!("camera: render target {:?} ({}x{}, {kind:?})", asset, size.x, size.y);
     }
 }
 

@@ -60,6 +60,9 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "bevy_image",
     "hdr",
     "png",
+    # Baked textures: block-compressed KTX2 with zstd supercompression.
+    "ktx2",
+    "zstd_rust",
     "bevy_mesh",
     "bevy_mikktspace",
     # Skeletal animation (skinning.rs drives the joints' world transforms into the tracer).

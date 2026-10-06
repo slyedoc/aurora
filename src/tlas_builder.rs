@@ -333,17 +333,6 @@ pub struct TLAS {
 }
 
 impl TLAS {
-    /// Slots allocated, slots whose BLAS resolved, and slots still waiting on an asset.
-    pub fn instance_summary(&self) -> (u32, usize, usize) {
-        let drawn = self
-            .mirror
-            .iter()
-            .take(self.count as usize)
-            .filter(|record| record.blas != 0)
-            .count();
-        (self.count, drawn, self.pending.len())
-    }
-
     fn new(module: Handle<ComputeModule>) -> Self {
         Self {
             module,

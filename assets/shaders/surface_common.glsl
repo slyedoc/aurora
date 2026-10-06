@@ -82,13 +82,10 @@ vec3 calcTangent(const Vertex v0, const Vertex v1, const Vertex v2) {
   return normalize(tangent);
 }
 
-// sRGB-encoded texels (colour textures are uploaded as UNORM) to linear; alpha untouched.
-vec4 toLinear(const vec4 sRGB) {
-  const bvec4 cutoff = lessThan(sRGB, vec4(0.04045));
-  const vec4 higher = pow((sRGB + vec4(0.055)) / vec4(1.055), vec4(2.4));
-  const vec4 lower = sRGB / vec4(12.92);
-
-  return vec4(mix(higher, lower, cutoff).rgb, sRGB.a);
+// A tangent-space normal from a normal map's XY; Z is rebuilt, so two-channel (BC5) maps work.
+vec3 normalTexel(const vec4 texel) {
+  const vec2 xy = texel.xy * 2.0 - 1.0;
+  return vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
 }
 
 // One texture read at the ray-cone level: `lod_base` plus half the log2 of the texel count.
@@ -157,7 +154,7 @@ vec3 surfaceWorldNormal(const SurfaceHit hit, const vec3 texture_normal) {
 // The material's own normal map, or the geometric normal when it has none.
 vec3 surfaceShadingNormal(const SurfaceHit hit) {
   const vec3 texture_normal =
-      sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base).xyz * 2.0 - 1.0;
+      normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base));
   return surfaceWorldNormal(hit, texture_normal);
 }
 

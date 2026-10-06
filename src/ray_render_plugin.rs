@@ -9,6 +9,7 @@ use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
 
+use crate::color_target::TargetKind;
 use crate::post_process_filter::POST_TARGETS;
 
 use crate::sky::{Sky, WorldEnvGpu, WorldSkies};
@@ -553,7 +554,7 @@ fn render_frame(
                 // whole point of the latter: a docked viewport costs its own pixels, not
                 // the window's, and never pays for a copy into a UI texture.
                 let (target, extent) = match camera_targets.by_camera.get(&c.0) {
-                    Some((asset, size)) => (
+                    Some((asset, size, _)) => (
                         ViewTarget::Image { asset: *asset },
                         vk::Extent2D {
                             width: size.x,
@@ -1062,42 +1063,6 @@ fn render_frame(
         }
 
         drop(section);
-        // A view that renders nothing has several indistinguishable causes; name them.
-        {
-            let (slots, drawn, waiting) = tlas.instance_summary();
-            let summary = format!(
-                "views={} tlas={} sbt={} traced={} instances={}/{} waiting={} gizmo_verts={} | {}",
-                views.len(),
-                tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null(),
-                sbt.data.address != 0,
-                dlss_ran,
-                drawn,
-                slots,
-                waiting,
-                gizmos.frame.vertices.len(),
-                views
-                    .iter()
-                    .map(|v| format!(
-                        "slot{} {} {}x{} plan={}",
-                        v.slot,
-                        match v.target {
-                            ViewTarget::Window { .. } => "window",
-                            ViewTarget::Image { .. } => "image",
-                        },
-                        v.output_extent.width,
-                        v.output_extent.height,
-                        v.plan.is_some()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-            let mut last = LAST.lock().unwrap();
-            if *last != summary {
-                log::info!("frame: {summary}");
-                *last = summary;
-            }
-        }
         let section = info_span!("record_present_pass").entered();
         let parity = swapchain.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
@@ -1148,6 +1113,7 @@ fn render_frame(
                         &render_device,
                         cmd_buffer,
                         pipeline,
+                        TargetKind::Display,
                         pipeline.descriptor_sets[parity * POST_TARGETS + eye],
                         source_view,
                         dlss.renderer.as_ref().and_then(|r| r.guide_views(eye)),
@@ -1156,6 +1122,8 @@ fn render_frame(
                             auto_exposure: views[eye].ae.1,
                             display_exposure: views[eye].exposure.display_exposure(),
                             debug_view,
+                            scene_radiance: 0,
+                            _pad: 0,
                         },
                     );
                 }
@@ -1176,7 +1144,7 @@ fn render_frame(
                 let ViewTarget::Image { asset } = view.target else {
                     continue;
                 };
-                let Some((texture, extent)) = camera_targets.map.get(&asset) else {
+                let Some((texture, extent, kind)) = camera_targets.map.get(&asset) else {
                     continue;
                 };
                 // `dlss_ran` is frame-wide; the view's own plan says whether its slot holds
@@ -1226,6 +1194,7 @@ fn render_frame(
                         &render_device,
                         cmd_buffer,
                         pipeline,
+                        *kind,
                         pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
                         source_view,
                         dlss.renderer
@@ -1236,27 +1205,32 @@ fn render_frame(
                             auto_exposure: view.ae.1,
                             display_exposure: view.exposure.display_exposure(),
                             debug_view: view.debug_view,
+                            scene_radiance: 0,
+                            _pad: 0,
                         },
                     );
                 }
                 // Gizmos belong to the surface their camera rendered into; drawn
                 // full-window the UI pass covers them. No depth guide means nothing traced,
                 // and then nothing can occlude them either.
-                crate::gizmo_render::draw_gizmos(
-                    &render_device,
-                    cmd_buffer,
-                    view.view_proj,
-                    *extent,
-                    dlss.renderer
-                        .as_ref()
-                        .filter(|_| composite.is_some())
-                        .and_then(|r| r.guide_views(view.slot))
-                        .map(|g| g.depth),
-                    swapchain.frame_count % 2,
-                    view.slot,
-                    view.camera_mask,
-                    &mut gizmos,
-                );
+                // A radiance target is lit scenery, not a screen: no overlays.
+                if *kind == TargetKind::Display {
+                    crate::gizmo_render::draw_gizmos(
+                        &render_device,
+                        cmd_buffer,
+                        view.view_proj,
+                        *extent,
+                        dlss.renderer
+                            .as_ref()
+                            .filter(|_| composite.is_some())
+                            .and_then(|r| r.guide_views(view.slot))
+                            .map(|g| g.depth),
+                        swapchain.frame_count % 2,
+                        view.slot,
+                        view.camera_mask,
+                        &mut gizmos,
+                    );
+                }
                 render_device.cmd_end_rendering(cmd_buffer);
                 vk_utils::transition_image_layout(
                     &render_device,
@@ -1374,6 +1348,7 @@ fn render_frame(
                     &render_device,
                     cmd_buffer,
                     pipeline,
+                    TargetKind::Display,
                     pipeline.descriptor_sets[parity * POST_TARGETS + target],
                     source_view,
                     dlss.renderer
@@ -1384,6 +1359,8 @@ fn render_frame(
                         auto_exposure: view.ae.1,
                         display_exposure: view.exposure.display_exposure(),
                         debug_view: view.debug_view,
+                        scene_radiance: 0,
+                        _pad: 0,
                     },
                 );
             }
@@ -1538,23 +1515,31 @@ unsafe fn record_post_draw(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
     pipeline: &crate::post_process_filter::CompiledPostProcessFilter,
+    kind: TargetKind,
     set: vk::DescriptorSet,
     source_view: vk::ImageView,
     guides: Option<crate::dlss::GuideViews>,
     push_constants: &crate::post_process_filter::PostProcessPushConstants,
 ) {
+    let Some(format_pipeline) = pipeline.pipelines.get(kind.format()) else {
+        return;
+    };
+    let push_constants = crate::post_process_filter::PostProcessPushConstants {
+        scene_radiance: (kind == TargetKind::SceneRadiance) as u32,
+        ..*push_constants
+    };
     unsafe {
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline,
+            format_pipeline,
         );
         render_device.cmd_push_constants(
             cmd_buffer,
             pipeline.pipeline_layout,
             vk::ShaderStageFlags::ALL,
             0,
-            bytemuck::bytes_of(push_constants),
+            bytemuck::bytes_of(&push_constants),
         );
 
         let output_info = vk::DescriptorImageInfo::default()

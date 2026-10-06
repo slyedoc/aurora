@@ -18,7 +18,7 @@ pub struct RenderTexturePlugin;
 impl Plugin for RenderTexturePlugin {
     fn build(&self, app: &mut bevy::app::App) {
         app.init_asset::<bevy::prelude::Image>();
-        app.register_asset_loader(ImageLoader::new(CompressedImageFormats::NONE));
+        app.register_asset_loader(ImageLoader::new(CompressedImageFormats::BC));
         app.init_asset_loader::<HdrTextureLoader>();
         app.init_vulkan_asset::<bevy::prelude::Image>();
     }
@@ -203,7 +203,12 @@ impl VulkanAsset for bevy::prelude::Image {
         if vk_format_for(self.texture_descriptor.format).is_some() {
             return Some(self.clone());
         }
-        match self.convert(wgpu_types::TextureFormat::Rgba8UnormSrgb) {
+        let rgba8 = if self.texture_descriptor.format.is_srgb() {
+            wgpu_types::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu_types::TextureFormat::Rgba8Unorm
+        };
+        match self.convert(rgba8) {
             Some(converted) => Some(converted),
             None => {
                 log::warn!(
@@ -226,7 +231,7 @@ impl VulkanAsset for bevy::prelude::Image {
             )
         });
 
-        let res = load_texture_from_bytes(
+        let res = load_texture_levels(
             render_device,
             format,
             vk::ImageUsageFlags::SAMPLED,
@@ -234,6 +239,7 @@ impl VulkanAsset for bevy::prelude::Image {
             asset.data.as_ref().unwrap(),
             asset.texture_descriptor.size.width,
             asset.texture_descriptor.size.height,
+            asset.texture_descriptor.mip_level_count,
         );
 
         render_device.register_bindless_texture(&res);
@@ -252,26 +258,69 @@ impl VulkanAsset for bevy::prelude::Image {
 
 /// The Vulkan format for a wgpu texture format the upload path can take as-is.
 ///
-/// `None` means it has to be converted to RGBA8 first. Keyed on the FORMAT, not on
-/// bytes-per-pixel: `Rgba16Unorm` and `Rgba16Float` are both 8 bytes and need
-/// different Vulkan formats, and size alone cannot tell them apart.
+/// `None` means it has to be converted to RGBA8 first. The colour space travels in the
+/// format: an sRGB texture is created sRGB and the sampler decodes it before filtering, so
+/// shaders only ever see linear values. Block-compressed formats arrive baked (KTX2) with
+/// their own mips.
 ///
 /// 16-bit is worth carrying rather than flattening. An 8-bit normal map quantises
 /// the surface normal to roughly 0.4-degree steps, which terraces visibly on large
-/// smooth surfaces at grazing incidence -- a concrete wall in raking sun is the
-/// worst case for it. Poly Haven and other libraries ship 16-bit maps routinely.
+/// smooth surfaces at grazing incidence.
 pub fn vk_format_for(format: wgpu_types::TextureFormat) -> Option<vk::Format> {
     use wgpu_types::TextureFormat as F;
     Some(match format {
-        // NB: UNORM, not SRGB -- the shading path expects these linear.
-        F::Rgba8Unorm | F::Rgba8UnormSrgb => vk::Format::R8G8B8A8_UNORM,
+        F::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        F::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
         F::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         F::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         F::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+        F::Bc1RgbaUnorm => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        F::Bc1RgbaUnormSrgb => vk::Format::BC1_RGBA_SRGB_BLOCK,
+        F::Bc3RgbaUnorm => vk::Format::BC3_UNORM_BLOCK,
+        F::Bc3RgbaUnormSrgb => vk::Format::BC3_SRGB_BLOCK,
+        F::Bc4RUnorm => vk::Format::BC4_UNORM_BLOCK,
+        F::Bc5RgUnorm => vk::Format::BC5_UNORM_BLOCK,
+        F::Bc6hRgbUfloat => vk::Format::BC6H_UFLOAT_BLOCK,
+        F::Bc7RgbaUnorm => vk::Format::BC7_UNORM_BLOCK,
+        F::Bc7RgbaUnormSrgb => vk::Format::BC7_SRGB_BLOCK,
         _ => return None,
     })
 }
 
+/// Texel block edge and bytes per block of an uploadable format.
+fn block_layout(format: vk::Format) -> (u32, usize) {
+    match format {
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => (1, 4),
+        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => (1, 8),
+        vk::Format::R32G32B32A32_SFLOAT => (1, 16),
+        vk::Format::BC1_RGBA_UNORM_BLOCK
+        | vk::Format::BC1_RGBA_SRGB_BLOCK
+        | vk::Format::BC4_UNORM_BLOCK => (4, 8),
+        vk::Format::BC3_UNORM_BLOCK
+        | vk::Format::BC3_SRGB_BLOCK
+        | vk::Format::BC5_UNORM_BLOCK
+        | vk::Format::BC6H_UFLOAT_BLOCK
+        | vk::Format::BC7_UNORM_BLOCK
+        | vk::Format::BC7_SRGB_BLOCK => (4, 16),
+        _ => panic!("unsupported format: {format:?}"),
+    }
+}
+
+/// Bytes of mip `level` of a `width` x `height` image.
+pub fn level_bytes(format: vk::Format, width: u32, height: u32, level: u32) -> usize {
+    let (block, block_bytes) = block_layout(format);
+    let blocks = |v: u32| (v >> level).max(1).div_ceil(block) as usize;
+    blocks(width) * blocks(height) * block_bytes
+}
+
+/// Whether a missing mip chain is generated on upload: 8-bit colour, filtered in linear
+/// light for the sRGB format. Baked formats carry their chain; the float path is the sky,
+/// read by direction at its own resolution.
+fn generates_mips(format: vk::Format) -> bool {
+    matches!(format, vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB)
+}
+
+/// A single-level image, mipped on upload when [`generates_mips`].
 pub fn load_texture_from_bytes(
     device: &RenderDevice,
     format: vk::Format,
@@ -281,30 +330,41 @@ pub fn load_texture_from_bytes(
     width: u32,
     height: u32,
 ) -> RenderTexture {
-    let target_bytes_per_pixel = match format {
-        vk::Format::R8G8B8A8_UNORM => 4,
-        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => 8,
-        vk::Format::R32G32B32A32_SFLOAT => 16,
-        _ => panic!("unsupported format: {format:?}"),
-    };
+    load_texture_levels(device, format, usage_flags, desired_layout, bytes, width, height, 1)
+}
 
+/// An image from `levels` tightly packed mips (level 0 first). With one level, a chain is
+/// generated when [`generates_mips`]: a ray-tracing stage has no derivatives, so without
+/// one a minified texture lands on a different texel every jittered frame.
+#[allow(clippy::too_many_arguments)]
+pub fn load_texture_levels(
+    device: &RenderDevice,
+    format: vk::Format,
+    usage_flags: vk::ImageUsageFlags,
+    desired_layout: vk::ImageLayout,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    levels: u32,
+) -> RenderTexture {
+    let levels = levels.max(1);
+    let level_sizes: Vec<usize> = (0..levels)
+        .map(|level| level_bytes(format, width, height, level))
+        .collect();
+    let expected: usize = level_sizes.iter().sum();
     assert!(
-        bytes.len() == (width * height) as usize * target_bytes_per_pixel,
-        "expected {} bytes, got {}",
-        (width * height) as usize * target_bytes_per_pixel,
+        bytes.len() == expected,
+        "expected {expected} bytes for {levels} levels of {format:?}, got {}",
         bytes.len()
     );
-    // A ray-tracing stage has no derivatives: without a chain every texture is read at full
-    // resolution however far away it is, and under sub-pixel jitter a minified one lands on a
-    // different texel every frame. 8-bit textures get the whole chain (the float path is the
-    // sky, read by direction at its own resolution).
-    let mip_levels = if format == vk::Format::R8G8B8A8_UNORM {
+    let generate = levels == 1 && generates_mips(format);
+    let mip_levels = if generate {
         32 - width.max(height).max(1).leading_zeros()
     } else {
-        1
+        levels
     };
     let mut staging_buffer = device.create_host_buffer::<u8>(
-        (width * height * target_bytes_per_pixel as u32) as u64,
+        bytes.len() as u64,
         vk::BufferUsageFlags::TRANSFER_SRC,
     );
     {
@@ -371,12 +431,20 @@ pub fn load_texture_from_bytes(
 
     // One submission: the barriers carry explicit transfer stages so the copy is ordered between
     // the two layout transitions inside the command buffer.
+    // Every level the file supplies is written by the copy; a generated chain's levels are
+    // transitioned by `record_mip_chain`.
+    let all_levels = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(mip_levels)
+        .layer_count(1);
+    let copied_levels = if generate { 1 } else { mip_levels };
     device.run_transfer_commands(|cmd_buffer| unsafe {
         let to_transfer = vk_init::layout_transition2(
             image_handle,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )
+        .subresource_range(all_levels.level_count(copied_levels))
         .src_stage_mask(vk::PipelineStageFlags2::NONE)
         .src_access_mask(vk::AccessFlags2::NONE)
         .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
@@ -386,25 +454,65 @@ pub fn load_texture_from_bytes(
             &vk::DependencyInfo::default()
                 .image_memory_barriers(std::slice::from_ref(&to_transfer)),
         );
-        let copy_region = vk_init::buffer_image_copy(width, height);
+        let mut offset = 0u64;
+        let regions: Vec<vk::BufferImageCopy> = level_sizes
+            .iter()
+            .enumerate()
+            .map(|(level, size)| {
+                let level = level as u32;
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(level)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: (width >> level).max(1),
+                        height: (height >> level).max(1),
+                        depth: 1,
+                    });
+                offset += *size as u64;
+                region
+            })
+            .collect();
         device.device.cmd_copy_buffer_to_image(
             cmd_buffer,
             staging_buffer.handle,
             image_handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            std::slice::from_ref(&copy_region),
+            &regions,
         );
-        record_mip_chain(
-            device,
-            cmd_buffer,
-            image_handle,
-            width,
-            height,
-            mip_levels,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::UNDEFINED,
-            desired_layout,
-        );
+        if generate {
+            record_mip_chain(
+                device,
+                cmd_buffer,
+                image_handle,
+                width,
+                height,
+                mip_levels,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::UNDEFINED,
+                desired_layout,
+            );
+        } else {
+            let to_shader = vk_init::layout_transition2(
+                image_handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                desired_layout,
+            )
+            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+            .subresource_range(all_levels);
+            device.ext_sync2.cmd_pipeline_barrier2(
+                cmd_buffer,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&to_shader)),
+            );
+        }
     });
 
     device.destroyer.destroy_buffer(staging_buffer.handle);
@@ -517,5 +625,18 @@ pub fn create_blank_texture(
         mip_levels: 1,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_levels_round_up_to_whole_blocks() {
+        assert_eq!(level_bytes(vk::Format::BC7_SRGB_BLOCK, 1024, 1024, 0), 256 * 256 * 16);
+        assert_eq!(level_bytes(vk::Format::BC7_SRGB_BLOCK, 1024, 1024, 9), 16);
+        assert_eq!(level_bytes(vk::Format::BC4_UNORM_BLOCK, 1024, 1024, 10), 8);
+        assert_eq!(level_bytes(vk::Format::R8G8B8A8_SRGB, 4, 2, 1), 2 * 1 * 4);
     }
 }

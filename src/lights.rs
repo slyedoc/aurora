@@ -163,7 +163,6 @@ pub struct LightManager {
     linst_count: u32,
     needs_power_pass: bool,
     warned_module: bool,
-    logged: (u32, u32),
     /// Mean linear emission of each emissive texture (rgb x alpha, sRGB decoded): the
     /// factor next-event estimation samples with is the material's emissive x this, so a
     /// textured emitter (a glow card, a window) lights the scene with its average rather than
@@ -195,7 +194,6 @@ impl LightManager {
             linst_count: 0,
             needs_power_pass: false,
             warned_module: false,
-            logged: (0, 0),
             texture_means: HashMap::new(),
             active_entries: 0,
             epoch: 1,
@@ -307,16 +305,6 @@ impl LightManager {
             vk::AccessFlags2::SHADER_READ,
         );
         self.needs_power_pass = false;
-        // The table rebuilds every frame while the scene streams in; log the milestones.
-        if self.logged != (self.linst_count, self.entry_count) {
-            self.logged = (self.linst_count, self.entry_count);
-            log::info!(
-                "light table: {} instances, {} entries ({} analytic)",
-                self.linst_count,
-                self.entry_count,
-                self.analytic_cache.len()
-            );
-        }
     }
 }
 

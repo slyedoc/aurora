@@ -1,7 +1,7 @@
 use ash::vk;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
-use crate::swapchain::DISPLAY_FORMAT;
+use crate::color_target::{DISPLAY_FORMAT, FormatPipelines, SCENE_RADIANCE_FORMAT};
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
 /// Must match `Registers` in quad.frag.
@@ -14,6 +14,9 @@ pub struct PostProcessPushConstants {
     pub display_exposure: f32,
     /// [`AuroraDebugView`](crate::debug_view::AuroraDebugView) as its shader index.
     pub debug_view: u32,
+    /// 1: write physical radiance (no exposure or tonemap) for a scene-radiance target.
+    pub scene_radiance: u32,
+    pub _pad: u32,
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
@@ -25,7 +28,7 @@ pub struct PostProcessFilter {
 }
 
 pub struct CompiledPostProcessFilter {
-    pub pipeline: vk::Pipeline,
+    pub pipelines: FormatPipelines,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     /// One set per frame parity and target: `[frame_parity * POST_TARGETS + target]`,
@@ -144,29 +147,30 @@ impl VulkanAsset for PostProcessFilter {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let mut pipeline_rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stages)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .push_next(&mut pipeline_rendering_info);
-
-        let pipeline = unsafe {
-            render_device.create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[pipeline_info],
-                None,
-            )
-        }
-        .unwrap()[0];
+        let pipelines = FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT], |format| {
+            let formats = [format];
+            let mut pipeline_rendering_info =
+                vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&shader_stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend_state)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .push_next(&mut pipeline_rendering_info);
+            unsafe {
+                render_device.create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_info],
+                    None,
+                )
+            }
+            .unwrap()[0]
+        });
 
         unsafe {
             render_device.destroy_shader_module(shader_stages[0].module, None);
@@ -174,7 +178,7 @@ impl VulkanAsset for PostProcessFilter {
         }
 
         CompiledPostProcessFilter {
-            pipeline,
+            pipelines,
             pipeline_layout,
             descriptor_set_layout,
             descriptor_sets,
@@ -190,9 +194,7 @@ impl VulkanAsset for PostProcessFilter {
         render_device
             .destroyer
             .destroy_pipeline_layout(prepared_asset.pipeline_layout);
-        render_device
-            .destroyer
-            .destroy_pipeline(prepared_asset.pipeline);
+        prepared_asset.pipelines.destroy(render_device);
     }
 }
 

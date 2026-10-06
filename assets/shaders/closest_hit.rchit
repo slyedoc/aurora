@@ -102,9 +102,9 @@ void main() {
     TerrainShade shade = TerrainShade(terrain_address);
     const vec3 object_p = gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT;
     const vec2 tile_uv = object_p.xz / shade.size + 0.5;
-    payload.color *= toLinear(terrainSplat(shade, tile_uv, hit.lod_base));
+    payload.color *= terrainSplat(shade, tile_uv, hit.lod_base);
   } else {
-    payload.color *= toLinear(sampleLod(material.base_color_texture, hit.uv, hit.lod_base));
+    payload.color *= sampleLod(material.base_color_texture, hit.uv, hit.lod_base);
   }
   if (material.alpha_cutoff > 0.0) {
     // A cutout's coverage comes from level 0, like the any-hit test: a blurred alpha would
@@ -113,7 +113,7 @@ void main() {
         * texture(textures[material.base_color_texture], hit.uv).a;
   }
   payload.emission = material.base_emissive_factor.rgb;
-  payload.emission *= toLinear(sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base)).rgb;
+  payload.emission *= sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
 
   // Terrain records (recordFlags.x bit 1): the editor's brush ring, emissive so it reads in

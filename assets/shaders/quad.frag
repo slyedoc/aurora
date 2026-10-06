@@ -18,6 +18,9 @@ layout(push_constant, std430) uniform Registers {
   float display_exposure;
   // AuroraDebugView (src/debug_view.rs): 0 = the output, else a guide visualisation.
   uint debug_view;
+  // 1: a scene-radiance target (half float) -- physical radiance, no exposure or tonemap.
+  uint scene_radiance;
+  uint pad;
 };
 
 // Scene luminance in NITS, false-coloured against the authoring reference bands in
@@ -106,6 +109,11 @@ void main() {
   // Re-expose to the look here -- the smooth metered value (Auto) or a fixed one -- where
   // it cannot disturb RR's history. Tonemap to display-linear; the sRGB attachment applies
   // the transfer function on store.
+  if (scene_radiance != 0u) {
+    const vec3 radiance = texture(test[debug_view], in_UV).rgb / max(ae.input_exposure, 1.0e-12);
+    out_Color = vec4(radiance, 1.0);
+    return;
+  }
   const float look = display_exposure > 0.0 ? display_exposure : ae.exposure;
   vec3 color = texture(test[debug_view], in_UV).rgb * (look / max(ae.input_exposure, 1.0e-12));
   color = clamp(acesFilm(color), vec3(0.0), vec3(1.0));

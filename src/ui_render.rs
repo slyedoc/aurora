@@ -66,9 +66,6 @@ use crate::{
 pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     pub const TEXTURED: u32 = 1;
-    /// The texture holds sRGB-encoded colour (an `ImageNode` image, a colour glyph atlas)
-    /// rather than linear data (an alpha-mask glyph atlas): decode before use.
-    pub const TEXTURE_SRGB: u32 = 2;
     pub const RADIAL: u32 = 16;
     pub const FILL_START: u32 = 32;
     pub const FILL_END: u32 = 64;
@@ -499,7 +496,6 @@ pub enum UiItem {
         translation: Vec2,
         size: Vec2,
         uvs: [Vec2; 4],
-        /// `TEXTURED`, plus `TEXTURE_SRGB` for a colour (emoji) atlas.
         flags: u32,
     },
     /// A whole gradient; drawn as one segment quad per pair of adjacent stops.
@@ -724,9 +720,8 @@ fn extract_ui(
                     ),
                     border_radius: uinode.border_radius().into(),
                     border: [0.0; 4],
-                    // The composite wrote display-encoded colour into a UNORM image, so it
-                    // decodes like any other sRGB texture on the way back to linear.
-                    flags: shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
+                    // An sRGB target: sampling returns linear.
+                    flags: shader_flags::TEXTURED,
                 },
             });
         }
@@ -827,14 +822,12 @@ fn extract_ui(
                 else {
                     continue;
                 };
-                let (glyph_color, glyph_flags) = if atlas_info.is_alpha_mask {
-                    (color, shader_flags::TEXTURED)
+                let glyph_color = if atlas_info.is_alpha_mask {
+                    color
                 } else {
-                    (
-                        LinearRgba::WHITE,
-                        shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
-                    )
+                    LinearRgba::WHITE
                 };
+                let glyph_flags = shader_flags::TEXTURED;
                 quads.push(UiQuad {
                     z: z(z_offsets::TEXT),
                     image: Some(atlas_info.texture),
@@ -1453,7 +1446,7 @@ fn extract_image(
             uvs: rect_uvs(rect, atlas_extent, image.flip_x, image.flip_y),
             border_radius: clamped_radius.into(),
             border: [0.0; 4],
-            flags: shader_flags::TEXTURED | shader_flags::TEXTURE_SRGB,
+            flags: shader_flags::TEXTURED,
         },
     })
 }
@@ -1896,12 +1889,12 @@ fn build_vertices(
 // own render-to-texture idiom. UI roots pointed at it with `UiTargetCamera` lay out at the
 // TEXTURE's resolution (sync_ui_surfaces publishes the size onto `Camera::computed` for
 // taffy), the extractor routes their quads into per-surface buckets, and draw_ui_surfaces
-// rasterizes each bucket into a bindless-registered B8G8R8A8_UNORM texture BEFORE the trace,
+// rasterizes each bucket into a bindless-registered DISPLAY_FORMAT texture BEFORE the trace,
 // so the frame's rays sample this frame's UI. A material referencing the image handle (e.g.
 // as its emissive texture) needs no special casing: `prepare_ui_surfaces` parks the target in
 // `VulkanAssets<Image>` under the placeholder's asset id, and material resolution finds it
-// like any uploaded texture. The panel stores sRGB-encoded straight alpha, which the hit
-// shader's `toLinear` decode matches; an emissive panel glows onto the scene.
+// like any uploaded texture. The sRGB target decodes on sampling, so the hit shaders read linear
+// colour; an emissive panel glows onto the scene.
 
 /// The live offscreen UI surfaces, rebuilt every frame by [`sync_ui_surfaces`]:
 /// camera entity → (target image asset, physical size).
@@ -1932,7 +1925,7 @@ pub fn ui_target_placeholder(size: UVec2) -> Image {
     let mut image = Image::new_target_texture(
         size.x.max(1),
         size.y.max(1),
-        wgpu_types::TextureFormat::Bgra8Unorm,
+        wgpu_types::TextureFormat::Bgra8UnormSrgb,
         None,
     );
     image.data = None;
@@ -1995,11 +1988,10 @@ pub fn prepare_ui_surfaces(
         if targets.map.contains_key(asset) {
             continue;
         }
-        // Same format as the UI pipeline's color attachment; stores sRGB-encoded straight
-        // alpha, which the hit shaders' `toLinear` texture decode expects.
+        // The UI pipeline's attachment format: encodes on store, decodes when sampled.
         let texture = create_blank_texture(
             &render_device,
-            vk::Format::B8G8R8A8_UNORM,
+            DISPLAY_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             size.x,

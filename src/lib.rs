@@ -21,6 +21,7 @@ pub mod blas;
 pub mod bluenoise_plugin;
 pub mod bsn;
 pub mod camera_target;
+pub mod color_target;
 pub mod collision;
 pub mod compute;
 pub mod debug_view;

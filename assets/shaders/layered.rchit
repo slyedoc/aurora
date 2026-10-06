@@ -75,9 +75,9 @@ vec4 triplanar(const uint tex, const vec3 p, const vec3 w, const float lod) {
 // to that plane's axes, then summed. Cheaper than three TBNs and stable at the seams.
 vec3 triplanarNormal(const uint tex, const vec3 p, const vec3 w, const vec3 n,
                      const float lod, const float strength) {
-  const vec3 sx = sampleLod(tex, p.yz, lod).xyz * 2.0 - 1.0;
-  const vec3 sy = sampleLod(tex, p.xz, lod).xyz * 2.0 - 1.0;
-  const vec3 sz = sampleLod(tex, p.xy, lod).xyz * 2.0 - 1.0;
+  const vec3 sx = normalTexel(sampleLod(tex, p.yz, lod));
+  const vec3 sy = normalTexel(sampleLod(tex, p.xz, lod));
+  const vec3 sz = normalTexel(sampleLod(tex, p.xy, lod));
   const vec3 axis = sign(n);
   const vec3 nx = vec3(sx.z * axis.x, sx.y, sx.x);
   const vec3 ny = vec3(sy.x, sy.z * axis.y, sy.y);
@@ -102,7 +102,7 @@ void main() {
   payload.absorption = material.absorption;
 
   vec4 albedo = material.base_color_factor
-      * toLinear(sampleLod(material.base_color_texture, hit.uv, hit.lod_base));
+      * sampleLod(material.base_color_texture, hit.uv, hit.lod_base);
   float roughness = material.roughness_factor;
   float metallic = material.metallic_factor;
   vec3 normal = surfaceShadingNormal(hit);
@@ -123,7 +123,7 @@ void main() {
     if (weight > 0.0) {
       const vec3 lp = world_p * p.layer_uv_scale;
       vec4 layer = p.layer_color
-          * toLinear(triplanar(p.layer_base_color_texture, lp, w, hit.lod_base));
+          * triplanar(p.layer_base_color_texture, lp, w, hit.lod_base);
       // Occlusion red, roughness green, metallic blue -- the channel order glTF writes.
       const vec3 orm = triplanar(p.layer_orm_texture, lp, w, hit.lod_base).rgb;
       albedo = mix(albedo, layer, weight);
@@ -139,7 +139,7 @@ void main() {
     // The detail set multiplies over base and layer alike, so it is not part of the blend.
     const vec3 dp = world_p * p.detail_uv_scale;
     albedo *= p.detail_color
-        * toLinear(triplanar(p.detail_base_color_texture, dp, w, hit.lod_base));
+        * triplanar(p.detail_base_color_texture, dp, w, hit.lod_base);
     if ((p.flags & DETAIL_NORMAL_MAP) != 0u) {
       normal = triplanarNormal(p.detail_normal_map_texture, dp, w, normal, hit.lod_base,
                                p.detail_normal_strength);
@@ -148,7 +148,7 @@ void main() {
 
   payload.color = albedo;
   payload.emission = material.base_emissive_factor.rgb;
-  payload.emission *= toLinear(sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base)).rgb;
+  payload.emission *= sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base).rgb;
   payload.emission *= pc.uniforms.emissive_boost;
 
   float transmission = material.specular_transmission_factor;

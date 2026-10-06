@@ -738,7 +738,7 @@ fn palette_images(mut palette: ResMut<TerrainPalette>, mut images: ResMut<Assets
                 },
                 wgpu_types::TextureDimension::D2,
                 entry.rgba.clone(),
-                wgpu_types::TextureFormat::Rgba8Unorm,
+                wgpu_types::TextureFormat::Rgba8UnormSrgb,
                 RenderAssetUsages::default(),
             ))
         })
