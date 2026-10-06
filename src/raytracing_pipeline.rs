@@ -360,7 +360,7 @@ impl VulkanAsset for RaytracingPipeline {
             // Class from the registry's own order, not from the group index: the groups
             // array has raygen, miss, opaque and the sphere group ahead of these, so
             // deriving it from the index is an off-by-one waiting to happen.
-            log::info!("surface group {label:?} -> class {}", index + 1);
+            log::debug!("surface group {label:?} -> class {}", index + 1);
         }
 
         // Pipelines that trace structures referencing opacity micromaps must say so.
@@ -432,7 +432,7 @@ impl VulkanAsset for RaytracingPipeline {
             .chain(handles[OPAQUE_GROUP + 2..].iter().copied())
             .collect();
 
-        log::info!("Raytracing pipeline compiled in {:?}", start.elapsed());
+        log::debug!("Raytracing pipeline compiled in {:?}", start.elapsed());
 
         CompiledRaytracingPipeline {
             pipeline,

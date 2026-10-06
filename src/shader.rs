@@ -93,7 +93,7 @@ impl AssetLoader for ShaderLoader {
                         .to_string(),
                 };
                 let spirv = compile_slang(&source_path)?;
-                log::info!("Loaded shader: {path} (slang)");
+                log::debug!("Loaded shader: {path} (slang)");
                 return Ok(Shader {
                     path: load_context.path().path().to_str().unwrap().to_string(),
                     spirv: Some(spirv.into()),
@@ -170,7 +170,7 @@ impl AssetLoader for ShaderLoader {
                 dependencies,
             };
 
-            log::info!("Loaded shader: {:?}", shader.path);
+            log::debug!("Loaded shader: {:?}", shader.path);
             Ok(shader)
         })
     }

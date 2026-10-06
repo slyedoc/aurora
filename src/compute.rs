@@ -128,7 +128,7 @@ impl VulkanAsset for ComputeModule {
                     panic!("compute pipelines for {} failed: {e:?}", shader.path)
                 })
         };
-        log::info!(
+        log::debug!(
             "Compiled compute module {} ({} kernels)",
             shader.path,
             handles.len()
