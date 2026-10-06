@@ -853,7 +853,7 @@ fn render_frame(
         let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
         drop(section);
         let section = info_span!("record_terrains").entered();
-        let terrain_changed = terrains.record(&render_device, scene_cmd, &modules, &textures);
+        let terrain_changed = terrains.record(&render_device, scene_cmd, &modules);
         drop(section);
         let section = info_span!("record_tlas").entered();
         tlas.record(

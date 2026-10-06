@@ -4,8 +4,9 @@
 //! grid — the same center-vertex pattern core used, no folded quads for RT) plus a
 //! [`TerrainTile`] component carrying the editable state: the height grid, the WoW-style
 //! alphamap atlas (16×16 subchunk cells, up to 4 texture layers per chunk — layer 0 base,
-//! layers 1..3 weighted by the cell's R/G/B), the per-chunk layer table, and the diffuse
-//! texture the splat blend composes into.
+//! layers 1..3 weighted by the cell's R/G/B) and the per-chunk layer table. The closest-hit
+//! shader blends the palette textures per hit with those weights (WoW's sequential lerp), at
+//! full texture resolution and the ray cone's mip.
 //!
 //! Rendering rides the skinning pattern: the tile gets its own deformed vertex/triangle
 //! streams and a per-instance BLAS (`ALLOW_UPDATE`), the TLAS slot is overridden to it and
@@ -13,13 +14,13 @@
 //! that only compute kernels (terrain.slang) write:
 //!
 //!   brush op  →  terrain_brush / terrain_paint  →  terrain_vertices → terrain_pack → refit
-//!                                              ↘  terrain_compose → copy → diffuse texture
+//!                                              ↘  alpha atlas, read by the closest-hit
 //!
 //! Ops are queued from gameplay in [`TerrainEdits`] (tile-local coordinates). After edits the
 //! host buffers are mirrored back into the component two frames later (the in-flight fence
 //! guarantees the GPU is done) and [`TerrainHeightsSynced`] ticks — colliders and saves hang
-//! off that. The splat palette (tileset textures as raw RGBA buffers — compute has no
-//! descriptor sets) is global in [`TerrainPalette`].
+//! off that. The splat palette is global in [`TerrainPalette`]: its textures become ordinary
+//! mipmapped images, sampled bindless by the hit shader.
 
 use std::collections::HashMap;
 use std::mem::offset_of;
@@ -44,7 +45,6 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    render_texture::{RenderTexture, record_mip_chain},
     tlas_builder::{GpuInstance, InstanceOverride, TLAS, prepare_instances},
     vk_utils,
     vulkan_asset::{VulkanAssets, poll_for_asset},
@@ -58,7 +58,7 @@ const REBUILD_INTERVAL: u32 = 16;
 // ---- authoring-side components / resources ---------------------------------------------------
 
 /// One terrain tile's editable state. Spawn together with `AuroraMesh3d(terrain_mesh(..))` and an
-/// `AuroraMaterial3d` whose `base_color_texture` is `diffuse`.
+/// `AuroraMaterial3d` (its roughness and factors apply; the colour is the splat).
 #[derive(Component)]
 pub struct TerrainTile {
     /// Height grid edge (vertices), e.g. 129.
@@ -76,10 +76,6 @@ pub struct TerrainTile {
     pub alpha: Vec<u8>,
     pub alpha_atlas: u32,
     pub alpha_cell: u32,
-    /// The diffuse the splat blend composes into (the material's `base_color_texture`).
-    /// RGBA8, `diffuse_px`²; its CPU contents are never read.
-    pub diffuse: Handle<Image>,
-    pub diffuse_px: u32,
 }
 
 /// Ticks after edited heights/alphas have been mirrored back into [`TerrainTile`] —
@@ -96,10 +92,13 @@ pub struct TerrainPaletteEntry {
     pub repeats: f32,
 }
 
-/// The global splat palette. Fill before spawning tiles; uploaded once (static thereafter).
+/// The global splat palette. Fill `entries` before spawning tiles; each becomes an image in
+/// `images` (static thereafter).
 #[derive(Resource, Default)]
 pub struct TerrainPalette {
     pub entries: Vec<TerrainPaletteEntry>,
+    /// The entries as images, made by aurora; the hit shader samples them.
+    pub images: Vec<Handle<Image>>,
 }
 
 /// What a brush stroke does this frame.
@@ -188,32 +187,19 @@ struct PaintParams {
     _pad: u32,
 }
 
+
+/// What the terrain closest-hit reads for a tile (`TerrainShade` in closest_hit.rchit, scalar).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ComposeParams {
+struct TerrainShadeGpu {
     alpha: u64,
     chunk_layers: u64,
+    /// `[bindless texture index, repeats bits]` per palette entry.
     palette: u64,
-    dst: u64,
-    out_px: u32,
     atlas: u32,
     cell: u32,
-    x0: u32,
-    y0: u32,
-    x1: u32,
-    y1: u32,
-    base: u32,
-}
-
-/// Matches terrain.slang's `PaletteEntry` (scalar layout, 24 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct PaletteEntryGpu {
-    rgba: u64,
-    w: u32,
-    h: u32,
-    repeats: f32,
-    _pad: u32,
+    size: f32,
+    palette_len: u32,
 }
 
 // ---- device state -----------------------------------------------------------------------------
@@ -221,12 +207,10 @@ struct PaletteEntryGpu {
 #[derive(Clone, PartialEq)]
 struct TerrainSource {
     mesh: AssetId<AuroraMesh>,
-    image: AssetId<Image>,
     resolution: u32,
     size: f32,
     alpha_atlas: u32,
     alpha_cell: u32,
-    diffuse_px: u32,
 }
 
 struct TerrainGpu {
@@ -244,8 +228,8 @@ struct TerrainGpu {
     index_buffer: Buffer<u32>,
     geometry_to_index: u64,
     geometry_to_triangle: u64,
-    /// Composed diffuse (device); copied region-wise into the material's texture.
-    compose: Buffer<u32>,
+    /// What the hit shader reads for this tile (host-visible, rewritten each prepare).
+    shade: Buffer<TerrainShadeGpu>,
     blas: AccelerationStructure,
     scratch: Buffer<u8>,
     scratch_alignment: u64,
@@ -263,7 +247,7 @@ impl TerrainGpu {
             self.vertices.handle,
             self.triangles.handle,
             self.index_buffer.handle,
-            self.compose.handle,
+            self.shade.handle,
             self.scratch.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
@@ -304,8 +288,6 @@ struct TerrainInstance {
     /// Pending kernel work.
     ops: Vec<TerrainBrushOp>,
     geo_dirty: bool,
-    /// Dirty diffuse rect in out pixels (x0, y0, x1, y1), merged per frame.
-    compose_dirty: Option<[u32; 4]>,
     /// CPU chunk-layer table changed: re-map the host buffer.
     layers_dirty: bool,
     /// Mirror heights/alpha back into the component at this frame (edit frame + 2:
@@ -321,6 +303,8 @@ pub struct TerrainHitRecord {
     pub index_buffer: u64,
     pub geometry_to_index: u64,
     pub geometry_to_triangle: u64,
+    /// The tile's [`TerrainShadeGpu`]; 0 until the palette's images are uploaded.
+    pub surface_data: u64,
 }
 
 #[derive(Resource)]
@@ -328,8 +312,8 @@ pub struct Terrains {
     module: Handle<ComputeModule>,
     instances: HashMap<u32, TerrainInstance>,
     removed: Vec<u32>,
-    /// Palette device buffers: the entry table + one RGBA buffer per texture.
-    palette: Option<(Buffer<PaletteEntryGpu>, Vec<Buffer<u32>>)>,
+    /// `[texture index, repeats bits]` per palette entry, once its images are uploaded.
+    palette: Option<Buffer<[u32; 2]>>,
     frame: u32,
     warned_module: bool,
 }
@@ -357,19 +341,22 @@ impl Terrains {
                 index_buffer: gpu.index_buffer.address,
                 geometry_to_index: gpu.geometry_to_index,
                 geometry_to_triangle: gpu.geometry_to_triangle,
+                surface_data: if self.palette.is_some() {
+                    gpu.shade.address
+                } else {
+                    0
+                },
             })
         })
     }
 
-    /// Records this frame's brush kernels, stream rebuilds, BLAS refits and diffuse
-    /// composes. Call after `Skins::record`, before `TLAS::record`. Returns whether any
+    /// Records this frame's brush kernels, stream rebuilds and BLAS refits. Call after `Skins::record`, before `TLAS::record`. Returns whether any
     /// BLAS changed (the TLAS must rebuild).
     pub fn record(
         &mut self,
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
-        textures: &VulkanAssets<Image>,
     ) -> bool {
         if self.instances.values().all(|i| i.gpu.is_none()) {
             return false;
@@ -381,8 +368,6 @@ impl Terrains {
             }
             return false;
         };
-        let palette = self.palette.as_ref().map(|(table, _)| table.address);
-
         // Brush / paint kernels, conservatively barriered between ops (few per frame).
         let mut any_ops = false;
         for inst in self.instances.values_mut() {
@@ -460,21 +445,6 @@ impl Terrains {
                             texels,
                             Some(offset_of!(PaintParams, base)),
                         );
-                        // Dirty diffuse rect from the brush circle (in out pixels).
-                        let px = inst.source.diffuse_px as f32;
-                        let size = inst.source.size;
-                        let to_px = |v: f32| ((v / size + 0.5) * px).floor();
-                        let x0 = (to_px(op.center.x - op.radius).max(0.0)) as u32;
-                        let y0 = (to_px(op.center.y - op.radius).max(0.0)) as u32;
-                        let x1 = (to_px(op.center.x + op.radius) + 2.0).min(px) as u32;
-                        let y1 = (to_px(op.center.y + op.radius) + 2.0).min(px) as u32;
-                        if x1 > x0 && y1 > y0 {
-                            let r = inst.compose_dirty.get_or_insert([x0, y0, x1, y1]);
-                            r[0] = r[0].min(x0);
-                            r[1] = r[1].min(y0);
-                            r[2] = r[2].max(x1);
-                            r[3] = r[3].max(y1);
-                        }
                     }
                 }
                 inst.sync_at = Some(self.frame.wrapping_add(2));
@@ -482,6 +452,15 @@ impl Terrains {
         }
         if any_ops {
             compute_to_compute_barrier(rd, cmd);
+            // Painted alphas are read by the hit shader this frame.
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::SHADER_READ,
+            );
         }
 
         // Stream rebuild + BLAS build/refit for geometry-dirty tiles.
@@ -602,56 +581,6 @@ impl Terrains {
             any_blas = true;
         }
 
-        // Diffuse compose + copy into the material's texture, tile by tile.
-        for inst in self.instances.values_mut() {
-            let Some(gpu) = inst.gpu.as_ref() else {
-                continue;
-            };
-            let Some(rect) = inst.compose_dirty else {
-                continue;
-            };
-            let Some(palette) = palette else { continue };
-            // The texture must be uploaded before we can copy into it; keep the rect dirty
-            // until it is.
-            let Some(texture) = textures.get_by_id(inst.source.image) else {
-                continue;
-            };
-            let [x0, y0, x1, y1] = rect;
-            let params = ComposeParams {
-                alpha: gpu.alpha.address,
-                chunk_layers: gpu.chunk_layers.address,
-                palette,
-                dst: gpu.compose.address,
-                out_px: inst.source.diffuse_px,
-                atlas: inst.source.alpha_atlas,
-                cell: inst.source.alpha_cell,
-                x0,
-                y0,
-                x1,
-                y1,
-                base: 0,
-            };
-            record_dispatch(
-                rd,
-                cmd,
-                module,
-                "terrain_compose",
-                &params,
-                (x1 - x0) * (y1 - y0),
-                Some(offset_of!(ComposeParams, base)),
-            );
-            memory_barrier(
-                rd,
-                cmd,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_WRITE,
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
-            );
-            copy_compose_to_texture(rd, cmd, gpu, texture, inst.source.diffuse_px, rect);
-            inst.compose_dirty = None;
-        }
-
         any_blas
     }
 
@@ -662,94 +591,12 @@ impl Terrains {
             }
         }
         self.instances.clear();
-        if let Some((table, textures)) = self.palette.take() {
-            rd.destroyer.destroy_buffer(table.handle);
-            for t in textures {
-                rd.destroyer.destroy_buffer(t.handle);
-            }
+        if let Some(palette) = self.palette.take() {
+            rd.destroyer.destroy_buffer(palette.handle);
         }
     }
 }
 
-/// Transition the diffuse image, copy the composed rect out of the buffer, transition back.
-fn copy_compose_to_texture(
-    rd: &RenderDevice,
-    cmd: vk::CommandBuffer,
-    gpu: &TerrainGpu,
-    texture: &RenderTexture,
-    out_px: u32,
-    [x0, y0, x1, y1]: [u32; 4],
-) {
-    let subresource_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(1)
-        .layer_count(1);
-    let transition = |old, new, src_stage, src_access, dst_stage, dst_access| {
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .image(texture.image)
-            .old_layout(old)
-            .new_layout(new)
-            .src_stage_mask(src_stage)
-            .src_access_mask(src_access)
-            .dst_stage_mask(dst_stage)
-            .dst_access_mask(dst_access)
-            .subresource_range(subresource_range);
-        unsafe {
-            rd.ext_sync2.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default()
-                    .image_memory_barriers(std::slice::from_ref(&barrier)),
-            );
-        }
-    };
-    transition(
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-        vk::AccessFlags2::SHADER_READ,
-        vk::PipelineStageFlags2::TRANSFER,
-        vk::AccessFlags2::TRANSFER_WRITE,
-    );
-    let region = vk::BufferImageCopy::default()
-        .buffer_offset((y0 as u64 * out_px as u64 + x0 as u64) * 4)
-        .buffer_row_length(out_px)
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .layer_count(1),
-        )
-        .image_offset(vk::Offset3D {
-            x: x0 as i32,
-            y: y0 as i32,
-            z: 0,
-        })
-        .image_extent(vk::Extent3D {
-            width: x1 - x0,
-            height: y1 - y0,
-            depth: 1,
-        });
-    unsafe {
-        rd.device.cmd_copy_buffer_to_image(
-            cmd,
-            gpu.compose.handle,
-            texture.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            std::slice::from_ref(&region),
-        );
-    }
-    // Level 0 changed: refresh the chain under it (the tracer reads the diffuse by ray cone).
-    record_mip_chain(
-        rd,
-        cmd,
-        texture.image,
-        texture.width,
-        texture.height,
-        texture.mip_levels,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    );
-}
 
 // ---- extraction / preparation ------------------------------------------------------------------
 
@@ -775,12 +622,10 @@ fn extract_terrains(
     for (entity, instance, mesh, tile) in changed.iter() {
         let source = TerrainSource {
             mesh: mesh.0.id(),
-            image: tile.diffuse.id(),
             resolution: tile.resolution,
             size: tile.size,
             alpha_atlas: tile.alpha_atlas,
             alpha_cell: tile.alpha_cell,
-            diffuse_px: tile.diffuse_px,
         };
         match terrains.instances.get_mut(&instance.0) {
             Some(existing) if existing.source == source => {
@@ -801,7 +646,6 @@ fn extract_terrains(
                         gpu: None,
                         ops: Vec::new(),
                         geo_dirty: false,
-                        compose_dirty: None,
                         layers_dirty: false,
                         sync_at: None,
                     },
@@ -876,56 +720,74 @@ fn sync_terrain_cpu(
     }
 }
 
+/// The palette's entries as images (UNORM: the hit shader linearises, as for every colour
+/// texture), once.
+fn palette_images(mut palette: ResMut<TerrainPalette>, mut images: ResMut<Assets<Image>>) {
+    if palette.entries.is_empty() || !palette.images.is_empty() {
+        return;
+    }
+    let made: Vec<Handle<Image>> = palette
+        .entries
+        .iter()
+        .map(|entry| {
+            images.add(Image::new(
+                wgpu_types::Extent3d {
+                    width: entry.width,
+                    height: entry.height,
+                    depth_or_array_layers: 1,
+                },
+                wgpu_types::TextureDimension::D2,
+                entry.rgba.clone(),
+                wgpu_types::TextureFormat::Rgba8Unorm,
+                RenderAssetUsages::default(),
+            ))
+        })
+        .collect();
+    palette.images = made;
+}
+
 pub fn prepare_terrains(
     render_device: Res<RenderDevice>,
     mut terrains: ResMut<Terrains>,
     mut tlas: ResMut<TLAS>,
     meshes: Res<VulkanAssets<AuroraMesh>>,
     palette: Option<Res<TerrainPalette>>,
+    images: Res<VulkanAssets<Image>>,
     tiles: Query<&TerrainTile>,
 ) {
     let terrains = &mut *terrains;
     terrains.frame = terrains.frame.wrapping_add(1);
 
-    // The palette uploads once, before any tile composes.
+    // The palette's table, once every image is uploaded (indices are bindless slots).
     if terrains.palette.is_none()
         && let Some(palette) = palette.as_ref()
-        && !palette.entries.is_empty()
+        && !palette.images.is_empty()
+        && palette.images.len() == palette.entries.len()
     {
-        let mut texture_bufs = Vec::with_capacity(palette.entries.len());
-        let mut table = Vec::with_capacity(palette.entries.len());
-        for entry in &palette.entries {
-            let words: &[u32] = bytemuck::cast_slice(&entry.rgba);
-            let mut host: Buffer<u32> = render_device.create_host_buffer(
-                words.len().max(1) as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-            );
-            render_device.map_buffer(&mut host).copy_from_slice(words);
-            let device: Buffer<u32> = render_device.create_device_buffer(
-                words.len().max(1) as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            );
-            render_device.run_transfer_commands(|cmd| {
-                render_device.upload_buffer(cmd, &host, &device);
-            });
-            render_device.destroyer.destroy_buffer(host.handle);
-            table.push(PaletteEntryGpu {
-                rgba: device.address,
-                w: entry.width,
-                h: entry.height,
-                repeats: entry.repeats,
-                _pad: 0,
-            });
-            texture_bufs.push(device);
+        let table: Option<Vec<[u32; 2]>> = palette
+            .images
+            .iter()
+            .zip(&palette.entries)
+            .map(|(image, entry)| {
+                let texture = images.get(image)?;
+                Some([
+                    render_device.register_bindless_texture(texture),
+                    entry.repeats.to_bits(),
+                ])
+            })
+            .collect();
+        if let Some(table) = table {
+            let mut buffer: Buffer<[u32; 2]> = render_device
+                .create_host_buffer(table.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
+            render_device.map_buffer(&mut buffer).copy_from_slice(&table);
+            terrains.palette = Some(buffer);
+            log::info!("terrain: palette ready ({} textures)", table.len());
         }
-        let mut table_buf: Buffer<PaletteEntryGpu> = render_device
-            .create_host_buffer(table.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
-        render_device
-            .map_buffer(&mut table_buf)
-            .copy_from_slice(&table);
-        terrains.palette = Some((table_buf, texture_bufs));
-        log::info!("terrain: palette uploaded ({} textures)", table.len());
     }
+    let palette_table = terrains
+        .palette
+        .as_ref()
+        .map_or((0, 0), |b| (b.address, b.nr_elements as u32));
 
     for slot in terrains.removed.drain(..) {
         tlas.set_override(slot, None);
@@ -1024,10 +886,8 @@ pub fn prepare_terrains(
                 triangle_count as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
-            let compose = render_device.create_device_buffer::<u32>(
-                (tile.diffuse_px as u64) * (tile.diffuse_px as u64),
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-            );
+            let shade = render_device
+                .create_host_buffer::<TerrainShadeGpu>(1, vk::BufferUsageFlags::STORAGE_BUFFER);
 
             let mut gpu = TerrainGpu {
                 mesh_vertex_buffer: blas.vertex_buffer.handle,
@@ -1041,7 +901,7 @@ pub fn prepare_terrains(
                 index_buffer,
                 geometry_to_index: blas.geometry_to_index.address,
                 geometry_to_triangle: blas.geometry_to_triangle.address,
-                compose,
+                shade,
                 blas: AccelerationStructure::default(),
                 scratch: Buffer::default(),
                 scratch_alignment: vk_utils::get_acceleration_structure_properties(&render_device)
@@ -1076,10 +936,9 @@ pub fn prepare_terrains(
             );
             inst.gpu = Some(gpu);
             inst.geo_dirty = true;
-            inst.compose_dirty = Some([0, 0, tile.diffuse_px, tile.diffuse_px]);
             inst.layers_dirty = false;
         } else if inst.layers_dirty {
-            // Chunk-table edit from the CPU (adding a layer while painting): re-map + recompose.
+            // Chunk-table edit from the CPU (adding a layer while painting): re-map.
             if let Ok(tile) = tiles.get(inst.entity)
                 && let Some(gpu) = inst.gpu.as_mut()
                 && tile.chunk_layers.len() == 256
@@ -1087,11 +946,22 @@ pub fn prepare_terrains(
                 render_device
                     .map_buffer(&mut gpu.chunk_layers)
                     .copy_from_slice(&tile.chunk_layers);
-                inst.compose_dirty = Some([0, 0, inst.source.diffuse_px, inst.source.diffuse_px]);
             }
             inst.layers_dirty = false;
         }
 
+        if let Some(gpu) = inst.gpu.as_mut() {
+            let shade = TerrainShadeGpu {
+                alpha: gpu.alpha.address,
+                chunk_layers: gpu.chunk_layers.address,
+                palette: palette_table.0,
+                atlas: inst.source.alpha_atlas,
+                cell: inst.source.alpha_cell,
+                size: inst.source.size,
+                palette_len: palette_table.1,
+            };
+            render_device.map_buffer(&mut gpu.shade).copy_from_slice(&[shade]);
+        }
         if let Some(gpu) = &inst.gpu
             && gpu.builds > 0
         {
@@ -1242,10 +1112,10 @@ impl Plugin for TerrainPlugin {
                 "terrain_vertices",
                 "terrain_pack",
                 "terrain_paint",
-                "terrain_compose",
             ],
         ));
         app.insert_resource(Terrains::new(module));
+        app.add_systems(PostUpdate, palette_images);
         app.add_systems(
             Last,
             (

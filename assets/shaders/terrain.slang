@@ -15,13 +15,10 @@
 //   terrain_paint     one thread per alpha-atlas texel: paint one splat channel (WoW
 //                     alphamaps: 16x16 chunk cells of 64x64, layers 1..3 in R/G/B, layer 0
 //                     is the base).
-//   terrain_compose   one thread per diffuse texel in the dirty rect: blend the palette's
-//                     tileset textures with the alpha weights (sequential lerp, WoW's
-//                     blending) into the tile's diffuse buffer; the host copies the rect
-//                     into the material's texture image.
+//   The closest-hit shader reads the alpha atlas and layer table directly and blends the
+//   palette textures per hit (closest_hit.rchit's terrainSplat).
 //
-// Every buffer arrives as a raw pointer in push constants (no descriptor sets), which is
-// also why the palette textures are plain RGBA byte buffers, not sampled images.
+// Every buffer arrives as a raw pointer in push constants (no descriptor sets).
 
 // Deformed vertex stream: `Vertex` in blas.rs (32 bytes, scalar layout).
 struct Vertex {
@@ -338,122 +335,4 @@ void terrain_paint(uint3 gid: SV_DispatchThreadID) {
     }
     p.alpha[i] =
         (uint(a.w) << 24) | (uint(a.z) << 16) | (uint(a.y) << 8) | uint(a.x);
-}
-
-// ---- terrain_compose -------------------------------------------------------------------------
-
-static const uint NO_LAYER = 0xffffffff;
-
-// One palette (tileset) texture as a raw RGBA byte buffer. Matches `PaletteEntryGpu`.
-struct PaletteEntry {
-    uint* rgba;
-    uint w;
-    uint h;
-    float repeats;  // texture repeats per chunk cell edge
-    uint pad;
-};
-
-float3 palette_fetch(PaletteEntry t, uint x, uint y) {
-    let p = t.rgba[y * t.w + x];
-    return float3(float(p & 0xff), float((p >> 8) & 0xff), float((p >> 16) & 0xff));
-}
-
-// Bilinear, wrapping sample of a palette texture at chunk-cell uv (repeats applied).
-float3 palette_sample(PaletteEntry t, float2 cell_uv) {
-    let u = cell_uv.x * t.repeats;
-    let v = cell_uv.y * t.repeats;
-    let fw = float(t.w);
-    let fh = float(t.h);
-    let x = (u - floor(u)) * fw - 0.5;
-    let y = (v - floor(v)) * fh - 0.5;
-    let x0f = floor(x);
-    let y0f = floor(y);
-    let tx = x - x0f;
-    let ty = y - y0f;
-    let x0 = uint(int(x0f) + int(fw)) % t.w;
-    let y0 = uint(int(y0f) + int(fh)) % t.h;
-    let x1 = (x0 + 1) % t.w;
-    let y1 = (y0 + 1) % t.h;
-    let c00 = palette_fetch(t, x0, y0);
-    let c10 = palette_fetch(t, x1, y0);
-    let c01 = palette_fetch(t, x0, y1);
-    let c11 = palette_fetch(t, x1, y1);
-    return lerp(lerp(c00, c10, tx), lerp(c01, c11, tx), ty);
-}
-
-// Bilinear alpha-weight sample inside one chunk's 64x64 atlas cell (edge-clamped to the cell).
-float alpha_sample(uint* alpha, uint atlas, uint cell, uint2 chunk, float2 cell_uv, uint ch) {
-    let fcell = float(cell);
-    let x = clamp(cell_uv.x * fcell - 0.5, 0.0, fcell - 1.0);
-    let y = clamp(cell_uv.y * fcell - 0.5, 0.0, fcell - 1.0);
-    let x0 = uint(floor(x));
-    let y0 = uint(floor(y));
-    let x1 = min(x0 + 1, cell - 1);
-    let y1 = min(y0 + 1, cell - 1);
-    let tx = x - float(x0);
-    let ty = y - float(y0);
-    let bx = chunk.x * cell;
-    let by = chunk.y * cell;
-    let w00 = float((alpha[(by + y0) * atlas + bx + x0] >> (ch * 8)) & 0xff);
-    let w10 = float((alpha[(by + y0) * atlas + bx + x1] >> (ch * 8)) & 0xff);
-    let w01 = float((alpha[(by + y1) * atlas + bx + x0] >> (ch * 8)) & 0xff);
-    let w11 = float((alpha[(by + y1) * atlas + bx + x1] >> (ch * 8)) & 0xff);
-    return lerp(lerp(w00, w10, tx), lerp(w01, w11, tx), ty) / 255.0;
-}
-
-struct ComposeParams {
-    uint* alpha;          // the tile's alpha atlas
-    uint4* chunk_layers;  // 256 palette indices per chunk, NO_LAYER = unused
-    PaletteEntry* palette;
-    uint* dst;            // diffuse RGBA buffer, out_px x out_px
-    uint out_px;
-    uint atlas;
-    uint cell;
-    // Dirty rect in dst pixels (x1/y1 exclusive); threads cover the rect.
-    uint x0;
-    uint y0;
-    uint x1;
-    uint y1;
-    uint base;
-};
-[[vk::push_constant]] ComposeParams compose_params;
-
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void terrain_compose(uint3 gid: SV_DispatchThreadID) {
-    let p = compose_params;
-    let rw = p.x1 - p.x0;
-    let i = p.base + gid.x;
-    if (i >= rw * (p.y1 - p.y0)) {
-        return;
-    }
-    let rx = p.x0 + i % rw;
-    let ry = p.y0 + i / rw;
-    let out_cell = p.out_px / 16;
-    let chunk = uint2(rx / out_cell, ry / out_cell);
-    let ci = chunk.y * 16 + chunk.x;
-    let cell_uv = float2(
-        (float(rx % out_cell) + 0.5) / float(out_cell),
-        (float(ry % out_cell) + 0.5) / float(out_cell));
-
-    let layers = p.chunk_layers[ci];
-    // Sequential lerp in layer order — WoW's alphamap blending. Layer 0 is the base.
-    float3 color = float3(70.0, 90.0, 50.0);
-    if (layers.x != NO_LAYER) {
-        color = palette_sample(p.palette[layers.x], cell_uv);
-    }
-    if (layers.y != NO_LAYER) {
-        let w = alpha_sample(p.alpha, p.atlas, p.cell, chunk, cell_uv, 0);
-        color = lerp(color, palette_sample(p.palette[layers.y], cell_uv), w);
-    }
-    if (layers.z != NO_LAYER) {
-        let w = alpha_sample(p.alpha, p.atlas, p.cell, chunk, cell_uv, 1);
-        color = lerp(color, palette_sample(p.palette[layers.z], cell_uv), w);
-    }
-    if (layers.w != NO_LAYER) {
-        let w = alpha_sample(p.alpha, p.atlas, p.cell, chunk, cell_uv, 2);
-        color = lerp(color, palette_sample(p.palette[layers.w], cell_uv), w);
-    }
-    p.dst[ry * p.out_px + rx] =
-        0xff000000u | (uint(color.z) << 16) | (uint(color.y) << 8) | uint(color.x);
 }

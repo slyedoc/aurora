@@ -241,7 +241,8 @@ fn update_sbt(
                         geometry_to_triangle: record.geometry_to_triangle,
                         prev_vertex_buffer: 0,
                         flags: 2,
-                        surface_data: 0,
+                        // The tile's splat inputs (`TerrainShadeGpu`), read by the hit shader.
+                        surface_data: record.surface_data,
                     });
             }
         }
