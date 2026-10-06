@@ -18,6 +18,7 @@
 //! The GPU side -- the record the hit shaders read, bindless texture resolution -- is
 //! `bevy_aurora::material`, which re-exports this crate.
 
+use bevy::bsn_asset::BsnAssetAppExt;
 use bevy::{asset::AssetApp, ecs::template::FromTemplate, prelude::*};
 
 /// Which side of a surface is culled.
@@ -25,11 +26,12 @@ use bevy::{asset::AssetApp, ecs::template::FromTemplate, prelude::*};
 /// Aurora's own rather than bevy's: bevy's `Face` lives in `bevy_render::render_resource`,
 /// a wgpu type this crate cannot reach. Same variants, so an editor's material inspector
 /// matches on it unchanged.
-#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[reflect(Clone, PartialEq)]
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[reflect(Clone, Default, PartialEq)]
 #[type_path = "bevy_aurora::material"]
 pub enum Face {
     Front,
+    #[default]
     Back,
 }
 
@@ -196,7 +198,9 @@ impl Plugin for AuroraMaterialTypesPlugin {
             .register_type::<ParallaxMappingMethod>()
             .register_type::<AuroraMaterial3d>()
             .register_type::<AuroraMaterial3dTemplate>()
-            .register_asset_reflect::<AuroraMaterial>();
+            .register_asset_reflect::<AuroraMaterial>()
+            // `materials/slate.bsn`: a `#name` and the material, as the editor writes it.
+            .register_bsn_asset::<AuroraMaterial>();
         app.world_mut()
             .resource_mut::<Assets<AuroraMaterial>>()
             .insert(
