@@ -29,7 +29,7 @@ use crate::{
     ray_render_plugin::{TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sky::{Sun, WorldSkies},
+    sky::{EnvironmentSkies, Sun},
 };
 
 // LUT and table sizes; must match atmosphere.glsl.
@@ -311,7 +311,7 @@ impl AtmosphereState {
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
-        skies: &WorldSkies,
+        skies: &EnvironmentSkies,
         atmosphere: &Atmosphere,
         clouds: &CloudLayer,
         camera_pos: Vec3,

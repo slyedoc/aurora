@@ -33,7 +33,7 @@ struct SkinVertex {
     float4 weights;
 };
 
-// A node's world affine: three rows of a row-major 3x4 (`NodeWorld` in gpu_transform.rs).
+// A node's world affine: three rows of a row-major 3x4 (`NodeEnvironment` in gpu_transform.rs).
 struct World {
     float4 r0;
     float4 r1;

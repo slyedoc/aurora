@@ -12,12 +12,12 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 
 /// Lumens per lantern (a bright oil lamp is ~1000; WoW glow cards come out around 5000).
@@ -36,7 +36,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,

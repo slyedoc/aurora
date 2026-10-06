@@ -17,23 +17,23 @@
 //!
 //! [`PortalTraveler`] carries an entity (a camera, a player) through a portal it crosses: the
 //! same map the rays use moves it, and it joins the exit's world (a physics body by avian's
-//! `TransferToWorld`, anything else by re-parenting under the exit's world).
+//! `TransferToEnvironment`, anything else by re-parenting under the exit's world).
 
 use ash::vk;
 use avian3d::{
+    environment::{MainPhysicsEnvironmentEntity, TransferToEnvironment},
     prelude::RigidBody,
-    world::{MainPhysicsWorldEntity, TransferToWorld},
 };
 use bevy::{math::Affine3A, prelude::*, transform::TransformSystems};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
+    environment::{InEnvironment, RenderEnvironments},
     mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::RenderSet,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     tlas_builder::GpuInstance,
-    world::{InWorld, RenderWorlds},
 };
 
 /// Marks a ray-traced surface as a portal showing the view out of `target`'s front face
@@ -164,9 +164,9 @@ fn travel(
     portals: Query<(&AuroraPortal, &GlobalTransform, Option<&AuroraMesh3d>)>,
     frames: Query<&GlobalTransform, Without<PortalTraveler>>,
     meshes: Res<Assets<AuroraMesh>>,
-    in_world: Query<&InWorld>,
-    worlds: Res<RenderWorlds>,
-    main_world: Option<Res<MainPhysicsWorldEntity>>,
+    in_world: Query<&InEnvironment>,
+    worlds: Res<RenderEnvironments>,
+    main_world: Option<Res<MainPhysicsEnvironmentEntity>>,
 ) {
     for (entity, mut traveler, mut transform, child_of, body) in &mut travelers {
         // This frame's pose, ahead of propagation: the teleport lands in the same frame.
@@ -205,7 +205,7 @@ fn travel(
             let world = in_world
                 .get(portal.target)
                 .ok()
-                .and_then(|w| worlds.world(w.0))
+                .and_then(|w| worlds.environment(w.0))
                 .or(main_world.as_ref().map(|m| m.0));
             let parent = world.and_then(|w| frames.get(w).ok());
             let local = parent.map_or(moved, |p| p.affine().inverse() * moved);
@@ -217,7 +217,7 @@ fn travel(
             };
             traveler.last = Some(moved.translation.into());
             match world {
-                Some(world) if body => commands.trigger(TransferToWorld { entity, world }),
+                Some(world) if body => commands.trigger(TransferToEnvironment { entity, world }),
                 Some(world) => {
                     commands.entity(entity).insert(ChildOf(world));
                 }
@@ -245,12 +245,12 @@ impl Plugin for PortalPlugin {
 
 #[cfg(test)]
 mod tests {
-    use avian3d::world::PhysicsWorld;
+    use crate::environment::Environment;
 
     use std::f32::consts::PI;
 
     use super::*;
-    use crate::world::RenderWorldPlugin;
+    use crate::environment::RenderEnvironmentPlugin;
 
     #[test]
     fn crossing_a_portal_moves_the_traveler_into_the_exits_world() {
@@ -259,11 +259,11 @@ mod tests {
             MinimalPlugins,
             // No GPU here: CPU propagation stands in for the read-back GlobalTransform.
             TransformPlugin,
-            RenderWorldPlugin,
+            RenderEnvironmentPlugin,
         ))
         .init_resource::<Assets<AuroraMesh>>()
         .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
-        let desert = app.world_mut().spawn(PhysicsWorld).id();
+        let desert = app.world_mut().spawn(Environment).id();
         // C faces +Z in the main world; D stands at the same spot in the desert, turned
         // around, so walking into C carries straight on.
         let d = app
@@ -301,7 +301,7 @@ mod tests {
             world.get::<ChildOf>(walker).map(ChildOf::parent),
             Some(desert)
         );
-        assert_eq!(world.get::<InWorld>(walker), Some(&InWorld(1)));
+        assert_eq!(world.get::<InEnvironment>(walker), Some(&InEnvironment(1)));
         let at = world.get::<Transform>(walker).unwrap().translation;
         assert!(at.abs_diff_eq(Vec3::new(0.1, 0.0, -1.0), 1e-4), "{at}");
     }
@@ -313,7 +313,7 @@ mod tests {
             MinimalPlugins,
             // No GPU here: CPU propagation stands in for the read-back GlobalTransform.
             TransformPlugin,
-            RenderWorldPlugin,
+            RenderEnvironmentPlugin,
         ))
         .init_resource::<Assets<AuroraMesh>>()
         .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
@@ -321,7 +321,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<AuroraMesh>>()
             .add(AuroraMesh::from_shape(Rectangle::new(2.0, 3.0)));
-        let desert = app.world_mut().spawn(PhysicsWorld).id();
+        let desert = app.world_mut().spawn(Environment).id();
         let gate = |app: &mut App, world: Option<Entity>, at: Transform| {
             let mut root = app.world_mut().spawn((at, Visibility::default()));
             if let Some(world) = world {

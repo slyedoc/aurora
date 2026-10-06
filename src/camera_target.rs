@@ -148,7 +148,12 @@ pub fn prepare_camera_targets(
                 kind,
             ),
         );
-        log::info!("camera: render target {:?} ({}x{}, {kind:?})", asset, size.x, size.y);
+        log::info!(
+            "camera: render target {:?} ({}x{}, {kind:?})",
+            asset,
+            size.x,
+            size.y
+        );
     }
 }
 

@@ -295,7 +295,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::World
+                AuroraExposure::Environment
             };
         }
         *agreed = Some(want);
@@ -308,7 +308,7 @@ fn sync_exposure(
             *exposure = if want.0 {
                 AuroraExposure::fixed(ev_from_ev100(want.1))
             } else {
-                AuroraExposure::World
+                AuroraExposure::Environment
             };
         }
         *agreed = Some(want);
@@ -319,7 +319,7 @@ fn sync_exposure(
     if let Some(exposure) = cameras.iter().next() {
         let now = match exposure {
             AuroraExposure::Fixed(fixed) => (true, ev100_from_ev(fixed.ev)),
-            AuroraExposure::Auto(_) | AuroraExposure::World => (false, state.ev100),
+            AuroraExposure::Auto(_) | AuroraExposure::Environment => (false, state.ev100),
         };
         if now.0 != state.ev100_lock || (now.0 && (now.1 - state.ev100).abs() > 1.0e-3) {
             state.ev100_lock = now.0;
@@ -418,7 +418,7 @@ fn update_stats(
     time: Res<Time>,
     ae: Option<Res<crate::auto_exposure::AutoExposureState>>,
     cameras: Query<&AuroraExposure, With<Camera3d>>,
-    skies: Option<Res<crate::sky::WorldSkies>>,
+    skies: Option<Res<crate::sky::EnvironmentSkies>>,
     mut stats: Query<&mut Text, (With<DevUIStats>, Without<DevUIProbe>)>,
     mut probe: Query<&mut Text, (With<DevUIProbe>, Without<DevUIStats>)>,
     mut fps_avg: Local<f32>,
@@ -433,7 +433,7 @@ fn update_stats(
     let nits = ae.as_ref().map_or(0.0, |ae| ae.probe_nits());
     let ev100 = cameras.iter().next().map(|exposure| match exposure {
         AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), 'L'),
-        AuroraExposure::World => (skies.as_ref().map_or(f32::NAN, |s| s.camera().ev100), 'W'),
+        AuroraExposure::Environment => (skies.as_ref().map_or(f32::NAN, |s| s.camera().ev100), 'W'),
         AuroraExposure::Auto(_) => (f32::NAN, 'A'),
     });
     for mut text in &mut stats {

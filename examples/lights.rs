@@ -12,11 +12,11 @@ use bevy::prelude::*;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 
 fn main() {
@@ -32,7 +32,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,

@@ -8,12 +8,12 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -45,7 +45,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,

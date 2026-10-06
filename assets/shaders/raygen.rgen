@@ -403,7 +403,7 @@ vec3 envBRDFApprox2(vec3 f0, float alpha, float NoV) {
 // Solid-angle pdf of the environment sampler picking direction `d`.
 // The environment sampler serves the camera world's HDR sky only (env_light.rs).
 bool envSampled(const uint ray_mask) {
-  return pc.uniforms.env_w > 0u && worldOf(ray_mask) == worldOf(pc.uniforms.camera_mask);
+  return pc.uniforms.env_w > 0u && environmentOf(ray_mask) == environmentOf(pc.uniforms.camera_mask);
 }
 
 float envPdf(const vec3 d) {
@@ -1112,9 +1112,9 @@ void main() {
       // reach a disc afterwards return the sky only (`want_sun` = 0), so nothing is counted
       // twice.
       {
-        const WorldEnv env = pc.uniforms.worlds.w[worldOf(ray_mask)];
+        const EnvironmentGpu env = pc.uniforms.worlds.w[environmentOf(ray_mask)];
         for (uint si = 0u; si < env.sun_count; si++) {
-          const WorldSun sun = env.suns[si];
+          const EnvironmentSun sun = env.suns[si];
           const vec3 l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
           const float NoL = dot(world_normal, l);
           if (NoL <= 0.0 || dot(l, surface_normal) <= 0.0) { continue; }
@@ -1198,7 +1198,7 @@ void main() {
   vec3 mean = acc / SAMPLES;
   // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
   // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
-  if (pc.uniforms.worlds.w[worldOf(pc.uniforms.camera_mask)].mode == 3u) {
+  if (pc.uniforms.worlds.w[environmentOf(pc.uniforms.camera_mask)].mode == 3u) {
     mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
   }
   // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

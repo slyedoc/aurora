@@ -652,14 +652,14 @@ fn track_analytic_lights(
     nodes: Query<(&Transform, Option<&ChildOf>)>,
     worlds: Query<(
         Option<&bevy::camera::visibility::RenderLayers>,
-        Option<&crate::world::InWorld>,
+        Option<&crate::environment::InEnvironment>,
     )>,
 ) {
     use std::f32::consts::PI;
     // The worlds a light lights, in `flags` bits 8..15: the raygen skips it for rays elsewhere.
     let world_flags = |entity: Entity| -> u32 {
         let (layers, world) = worlds.get(entity).unwrap_or((None, None));
-        (crate::world::world_mask(layers, world) as u32) << 8
+        (crate::environment::environment_mask(layers, world) as u32) << 8
     };
     // CPU hierarchy propagation is off (mesh transforms propagate on the GPU), so a child
     // light's GlobalTransform never updates: walk the parent chain here instead. Lights

@@ -147,30 +147,31 @@ impl VulkanAsset for PostProcessFilter {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let pipelines = FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT], |format| {
-            let formats = [format];
-            let mut pipeline_rendering_info =
-                vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
-            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&shader_stages)
-                .vertex_input_state(&vertex_input_state)
-                .input_assembly_state(&input_assembly_state)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&rasterization_state)
-                .multisample_state(&multisample_state)
-                .color_blend_state(&color_blend_state)
-                .dynamic_state(&dynamic_state)
-                .layout(pipeline_layout)
-                .push_next(&mut pipeline_rendering_info);
-            unsafe {
-                render_device.create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[pipeline_info],
-                    None,
-                )
-            }
-            .unwrap()[0]
-        });
+        let pipelines =
+            FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT], |format| {
+                let formats = [format];
+                let mut pipeline_rendering_info =
+                    vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+                let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&shader_stages)
+                    .vertex_input_state(&vertex_input_state)
+                    .input_assembly_state(&input_assembly_state)
+                    .viewport_state(&viewport_state)
+                    .rasterization_state(&rasterization_state)
+                    .multisample_state(&multisample_state)
+                    .color_blend_state(&color_blend_state)
+                    .dynamic_state(&dynamic_state)
+                    .layout(pipeline_layout)
+                    .push_next(&mut pipeline_rendering_info);
+                unsafe {
+                    render_device.create_graphics_pipelines(
+                        vk::PipelineCache::null(),
+                        &[pipeline_info],
+                        None,
+                    )
+                }
+                .unwrap()[0]
+            });
 
         unsafe {
             render_device.destroy_shader_module(shader_stages[0].module, None);

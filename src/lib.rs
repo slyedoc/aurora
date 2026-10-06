@@ -21,13 +21,14 @@ pub mod blas;
 pub mod bluenoise_plugin;
 pub mod bsn;
 pub mod camera_target;
-pub mod color_target;
 pub mod collision;
+pub mod color_target;
 pub mod compute;
 pub mod debug_view;
 pub mod dev_ui;
 pub mod dlss;
 pub mod env_light;
+pub mod environment;
 pub mod gizmo_render;
 pub mod gpu_transform;
 pub mod lights;
@@ -64,7 +65,6 @@ pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;
-pub mod world;
 pub mod xr;
 
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -92,16 +92,16 @@ pub mod prelude {
         dev_ui::{DevUIPanel, DevUIPlugin, DevUIState},
         dlss::{AuroraDlss, RrPreset},
         env_light::EnvLight,
+        environment::{InEnvironment, RenderEnvironments},
         material::{AuroraMaterial, AuroraMaterial3d},
         mesh::{AuroraMesh, AuroraMesh3d},
         picking::{RayCaster, RayHit, RayHits},
         portal::AuroraPortal,
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         skinning::{SkinJointsByName, Wind, WindSway},
-        sky::{GradientSky, Sky, WorldSkies},
+        sky::{EnvironmentSkies, GradientSky, Sky},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
-        world::{InWorld, RenderWorlds},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }
@@ -162,7 +162,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         // physics world (world.rs), and characters play bevy_animation_graph graphs.
         group = group.add_group(avian3d::prelude::PhysicsPlugins::default());
         group = group.add(bevy_animation_graph::AnimationGraphPlugin::default());
-        group = group.add(crate::world::RenderWorldPlugin);
+        group = group.add(crate::environment::RenderEnvironmentPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::picking::PickingPlugin);
         group = group.add(crate::pointer_picking::PointerPickingPlugin);

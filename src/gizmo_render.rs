@@ -35,13 +35,13 @@ use bevy::{
 
 use crate::{
     assets::aurora_asset,
+    environment::{InEnvironment, environment_mask},
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     swapchain::DISPLAY_FORMAT,
     tlas_builder::layers_mask,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
-    world::{InWorld, world_mask},
 };
 
 /// Hard cap on drawable line vertices per frame (2 per segment). Overflow drops the excess and
@@ -342,7 +342,7 @@ fn extract_gizmo_lines(
     retained: Query<(Entity, &Gizmo, &GlobalTransform)>,
     owners: Query<(
         Option<&RenderLayers>,
-        Option<&InWorld>,
+        Option<&InEnvironment>,
         Option<&InheritedVisibility>,
     )>,
 ) {
@@ -356,7 +356,7 @@ fn extract_gizmo_lines(
         if visibility.is_some_and(|v| !v.get()) {
             return None;
         }
-        Some(world_mask(layers, world))
+        Some(environment_mask(layers, world))
     };
 
     // Immediate mode: every group's lines land in the handles map.
@@ -728,15 +728,34 @@ mod tests {
             Some(_) => Some(0b1),
         };
         let mut frame = GizmoLineFrame::default();
-        append_buffer(&mut frame, asset.buffer().buffer(), None, 0.0, 2.0, &mask_of);
+        append_buffer(
+            &mut frame,
+            asset.buffer().buffer(),
+            None,
+            0.0,
+            2.0,
+            &mask_of,
+        );
         assert_eq!(
             frame.batches,
             vec![
-                GizmoBatch { first: 0, count: 2, mask: 0b1 },
-                GizmoBatch { first: 2, count: 2, mask: 0b100 },
+                GizmoBatch {
+                    first: 0,
+                    count: 2,
+                    mask: 0b1
+                },
+                GizmoBatch {
+                    first: 2,
+                    count: 2,
+                    mask: 0b100
+                },
                 // Owner 3's line, the unowned line and owner 3's strip (strips follow every
                 // list line): one mask, merged.
-                GizmoBatch { first: 4, count: 8, mask: 0b1 },
+                GizmoBatch {
+                    first: 4,
+                    count: 8,
+                    mask: 0b1
+                },
             ]
         );
         assert_eq!(frame.vertices.len(), 12);

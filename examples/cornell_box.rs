@@ -15,11 +15,11 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 
 /// Panel brightness in nits (cd/m^2): a bright ceiling light panel. The camera's auto
@@ -97,7 +97,7 @@ fn block(
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {

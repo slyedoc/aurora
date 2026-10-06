@@ -94,7 +94,7 @@ pub struct U32Record {
 /// A node's world affine: three rows of a row-major 3x4 (`VkTransformMatrixKHR`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct NodeWorld {
+pub struct NodeEnvironment {
     pub rows: [[f32; 4]; 3],
 }
 
@@ -152,10 +152,10 @@ struct FrontierExpandParams {
 pub struct ReadbackRecord {
     pub slot: u32,
     pub pad: [u32; 3],
-    pub world: NodeWorld,
+    pub world: NodeEnvironment,
 }
 
-impl NodeWorld {
+impl NodeEnvironment {
     pub fn affine(&self) -> Affine3A {
         let [r0, r1, r2] = self.rows;
         Affine3A {
@@ -280,7 +280,7 @@ pub struct GpuTransforms {
     parent_buf: Buffer<u32>,
     first_child_buf: Buffer<u32>,
     next_sibling_buf: Buffer<u32>,
-    world_buf: Buffer<NodeWorld>,
+    world_buf: Buffer<NodeEnvironment>,
     epoch_buf: Buffer<u32>,
     frontier_buf: Buffer<u32>,
     indirect_buf: Buffer<u32>,

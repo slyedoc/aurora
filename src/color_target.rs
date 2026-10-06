@@ -48,9 +48,15 @@ pub struct FormatPipelines {
 }
 
 impl FormatPipelines {
-    pub fn build(formats: &[vk::Format], mut build: impl FnMut(vk::Format) -> vk::Pipeline) -> Self {
+    pub fn build(
+        formats: &[vk::Format],
+        mut build: impl FnMut(vk::Format) -> vk::Pipeline,
+    ) -> Self {
         Self {
-            pipelines: formats.iter().map(|&format| (format, build(format))).collect(),
+            pipelines: formats
+                .iter()
+                .map(|&format| (format, build(format)))
+                .collect(),
         }
     }
 
@@ -75,9 +81,18 @@ mod tests {
 
     #[test]
     fn float_images_hold_radiance_and_the_rest_display() {
-        assert_eq!(TargetKind::of(TextureFormat::Rgba16Float), TargetKind::SceneRadiance);
-        assert_eq!(TargetKind::of(TextureFormat::Bgra8UnormSrgb), TargetKind::Display);
-        assert_eq!(TargetKind::of(TextureFormat::Rgba8Unorm), TargetKind::Display);
+        assert_eq!(
+            TargetKind::of(TextureFormat::Rgba16Float),
+            TargetKind::SceneRadiance
+        );
+        assert_eq!(
+            TargetKind::of(TextureFormat::Bgra8UnormSrgb),
+            TargetKind::Display
+        );
+        assert_eq!(
+            TargetKind::of(TextureFormat::Rgba8Unorm),
+            TargetKind::Display
+        );
         assert_eq!(TargetKind::Display.format(), DISPLAY_FORMAT);
     }
 }

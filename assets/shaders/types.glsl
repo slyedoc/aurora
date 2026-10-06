@@ -40,17 +40,17 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Po
   uvec4 pairs[];
 };
 
-// One sun of a world (src/sky.rs WorldSunGpu): xyz towards it + cos(angular radius); the
+// One sun of a world (src/sky.rs EnvironmentSunGpu): xyz towards it + cos(angular radius); the
 // disc's radiance (nits) + the directly-seen disc's scale.
-struct WorldSun {
+struct EnvironmentSun {
   vec4 direction;
   vec4 radiance;
 };
 
-// One world's sky and suns (src/sky.rs WorldEnvGpu). mode 0 = flat colour (color),
+// One world's sky and suns (src/sky.rs EnvironmentGpu). mode 0 = flat colour (color),
 // 1 = HDR (tex, color = scale), 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex =
 // the space image, color = its scale, 0 = none).
-struct WorldEnv {
+struct EnvironmentGpu {
   uint mode;
   uint tex;
   uint sun_count;
@@ -59,15 +59,15 @@ struct WorldEnv {
   vec4 zenith;
   vec4 horizon;
   vec4 ground;
-  WorldSun suns[4];
+  EnvironmentSun suns[4];
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 16) readonly restrict buffer WorldEnvs {
-  WorldEnv w[];
+  EnvironmentGpu w[];
 };
 
 // The world a ray mask is in: its lowest set bit (the main world for an empty mask).
-uint worldOf(const uint mask) {
+uint environmentOf(const uint mask) {
   return mask == 0u ? 0u : uint(findLSB(mask));
 }
 

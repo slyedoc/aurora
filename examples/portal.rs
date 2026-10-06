@@ -3,7 +3,7 @@
 //! versa -- portals in reflections and through glass come free from the raygen redirect.
 //!
 //! A third gate, between and behind the first two, opens into a second WORLD (an
-//! avian `PhysicsWorld`, so its own render bit) occupying the same space: a red desert under
+//! avian `PhysicsEnvironment`, so its own render bit) occupying the same space: a red desert under
 //! a night sky with its own low orange sun and its own stones. Neither world sees the other's geometry except through
 //! that gate. The camera is a `PortalTraveler`: fly through any gate and you come out of its
 //! partner, in its world.
@@ -18,12 +18,12 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
+    environment::{Environment, MainPhysicsEnvironmentEntity},
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     portal::{AuroraPortal, PortalTraveler},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::{MainPhysicsWorldEntity, PhysicsWorld},
 };
 
 const SKY_SCALE_NITS: f32 = 8000.0;
@@ -39,7 +39,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
@@ -133,8 +133,8 @@ fn setup(
     // gate D there faces -Z, so looking into C carries straight on into the other world.
     let desert = commands
         .spawn((
-            Name::new("Desert World"),
-            PhysicsWorld,
+            Name::new("Desert"),
+            Environment,
             Sky::Hdr {
                 image: asset_server.load(aurora_asset("sky/night_sky.hdr")),
                 scale: SKY_SCALE_NITS,

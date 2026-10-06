@@ -87,7 +87,7 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "experimental_bevy_feathers_inspector",
 ] }
 aurora_mesh = { path = "crates/aurora_mesh" }
-# A render world is an avian physics world (world.rs): each PhysicsWorld gets a layer bit.
+# A render world is an avian physics world (world.rs): each PhysicsEnvironment gets a layer bit.
 # Baked collision becomes avian colliders (collision.rs).
 avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", default-features = false, features = [
     "3d",

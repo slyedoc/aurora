@@ -317,7 +317,10 @@ pub fn level_bytes(format: vk::Format, width: u32, height: u32, level: u32) -> u
 /// light for the sRGB format. Baked formats carry their chain; the float path is the sky,
 /// read by direction at its own resolution.
 fn generates_mips(format: vk::Format) -> bool {
-    matches!(format, vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB)
+    matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+    )
 }
 
 /// A single-level image, mipped on upload when [`generates_mips`].
@@ -330,7 +333,16 @@ pub fn load_texture_from_bytes(
     width: u32,
     height: u32,
 ) -> RenderTexture {
-    load_texture_levels(device, format, usage_flags, desired_layout, bytes, width, height, 1)
+    load_texture_levels(
+        device,
+        format,
+        usage_flags,
+        desired_layout,
+        bytes,
+        width,
+        height,
+        1,
+    )
 }
 
 /// An image from `levels` tightly packed mips (level 0 first). With one level, a chain is
@@ -363,10 +375,8 @@ pub fn load_texture_levels(
     } else {
         levels
     };
-    let mut staging_buffer = device.create_host_buffer::<u8>(
-        bytes.len() as u64,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-    );
+    let mut staging_buffer =
+        device.create_host_buffer::<u8>(bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC);
     {
         let mut staging_buffer = device.map_buffer(&mut staging_buffer);
         staging_buffer.as_slice_mut().copy_from_slice(bytes);
@@ -634,7 +644,10 @@ mod tests {
 
     #[test]
     fn block_levels_round_up_to_whole_blocks() {
-        assert_eq!(level_bytes(vk::Format::BC7_SRGB_BLOCK, 1024, 1024, 0), 256 * 256 * 16);
+        assert_eq!(
+            level_bytes(vk::Format::BC7_SRGB_BLOCK, 1024, 1024, 0),
+            256 * 256 * 16
+        );
         assert_eq!(level_bytes(vk::Format::BC7_SRGB_BLOCK, 1024, 1024, 9), 16);
         assert_eq!(level_bytes(vk::Format::BC4_UNORM_BLOCK, 1024, 1024, 10), 8);
         assert_eq!(level_bytes(vk::Format::R8G8B8A8_SRGB, 4, 2, 1), 2 * 1 * 4);

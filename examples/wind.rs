@@ -16,12 +16,12 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     skinning::{Wind, WindSway},
     sky::Sky,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
@@ -141,7 +141,7 @@ fn field_mesh(seed: u32) -> Mesh {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,

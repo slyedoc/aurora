@@ -23,8 +23,8 @@ use bevy::{
 };
 
 use crate::{
+    environment::{InEnvironment, environment_mask},
     picking::{RayCaster, RayHits},
-    world::{InWorld, world_mask},
 };
 
 /// The caster tracing one pointer ray.
@@ -70,7 +70,7 @@ fn aim_pointer_rays(
     rays: Res<RayMap>,
     mut casters: ResMut<PointerCasters>,
     mut aimed: Query<&mut RayCaster, With<PointerRay>>,
-    cameras: Query<(Option<&RenderLayers>, Option<&InWorld>)>,
+    cameras: Query<(Option<&RenderLayers>, Option<&InEnvironment>)>,
 ) {
     casters.0.retain(|id, entity| {
         let live = rays.map.contains_key(id);
@@ -81,7 +81,7 @@ fn aim_pointer_rays(
     });
     for (&id, &ray) in rays.iter() {
         let (layers, world) = cameras.get(id.camera).unwrap_or((None, None));
-        let mask = world_mask(layers, world);
+        let mask = environment_mask(layers, world);
         match casters.0.get(&id).and_then(|e| aimed.get_mut(*e).ok()) {
             Some(mut caster) => {
                 caster.ray = ray;

@@ -19,7 +19,7 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sky::{Sky, WorldSkies},
+    sky::{EnvironmentSkies, Sky},
 };
 
 pub const ENV_W: u32 = 512;
@@ -132,7 +132,7 @@ fn build_distribution(lum: &[f32]) -> Vec<f32> {
 
 fn prepare_env_light(
     render_device: Res<RenderDevice>,
-    skies: Res<WorldSkies>,
+    skies: Res<EnvironmentSkies>,
     images: Res<Assets<Image>>,
     mut env: ResMut<EnvLight>,
 ) {

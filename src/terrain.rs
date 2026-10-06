@@ -187,7 +187,6 @@ struct PaintParams {
     _pad: u32,
 }
 
-
 /// What the terrain closest-hit reads for a tile (`TerrainShade` in closest_hit.rchit, scalar).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -597,7 +596,6 @@ impl Terrains {
     }
 }
 
-
 // ---- extraction / preparation ------------------------------------------------------------------
 
 type ChangedTerrains = Or<(
@@ -779,7 +777,9 @@ pub fn prepare_terrains(
         if let Some(table) = table {
             let mut buffer: Buffer<[u32; 2]> = render_device
                 .create_host_buffer(table.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
-            render_device.map_buffer(&mut buffer).copy_from_slice(&table);
+            render_device
+                .map_buffer(&mut buffer)
+                .copy_from_slice(&table);
             terrains.palette = Some(buffer);
             log::info!("terrain: palette ready ({} textures)", table.len());
         }
@@ -960,7 +960,9 @@ pub fn prepare_terrains(
                 size: inst.source.size,
                 palette_len: palette_table.1,
             };
-            render_device.map_buffer(&mut gpu.shade).copy_from_slice(&[shade]);
+            render_device
+                .map_buffer(&mut gpu.shade)
+                .copy_from_slice(&[shade]);
         }
         if let Some(gpu) = &inst.gpu
             && gpu.builds > 0

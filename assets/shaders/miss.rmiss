@@ -46,7 +46,7 @@ vec3 hdr_sky(const vec3 d, const uint tex, const vec3 scale, const bool cam_worl
 
 // Zenith / horizon gradient above, horizon / ground below (all nits), with a small aureole
 // around each of the world's suns.
-vec3 gradient_sky(const vec3 d, const WorldEnv env) {
+vec3 gradient_sky(const vec3 d, const EnvironmentGpu env) {
   const float up = d.y;
   vec3 col;
   if (up >= 0.0) {
@@ -63,10 +63,10 @@ vec3 gradient_sky(const vec3 d, const WorldEnv env) {
 // The world's sun discs, on the paths that may see them directly; every other path gathers
 // the suns by next-event estimation in the raygen. Full inside the radius, fading over its
 // outer fifth.
-vec3 sun_discs(const vec3 d, const WorldEnv env) {
+vec3 sun_discs(const vec3 d, const EnvironmentGpu env) {
   vec3 col = vec3(0.0);
   for (uint i = 0u; i < env.sun_count; i++) {
-    const WorldSun sun = env.suns[i];
+    const EnvironmentSun sun = env.suns[i];
     const float cos_r = sun.direction.w;
     const float disc = smoothstep(cos_r - (1.0 - cos_r) * 0.2, cos_r, dot(d, sun.direction.xyz));
     col += sun.radiance.rgb * sun.radiance.a * disc;
@@ -80,11 +80,11 @@ void main() {
   // The raygen packs the ray's cull mask above the want-sun bit: this miss evaluates the
   // sky of the world the ray is IN (portals swap the mask mid-path).
   const bool want_sun = (payload.want_sun & 1u) != 0u;
-  const uint world = worldOf(payload.want_sun >> 1);
-  const WorldEnv env = pc.uniforms.worlds.w[world];
+  const uint world = environmentOf(payload.want_sun >> 1);
+  const EnvironmentGpu env = pc.uniforms.worlds.w[world];
   vec3 sky;
   switch (env.mode) {
-    case 1u: sky = hdr_sky(d, env.tex, env.color.rgb, world == worldOf(pc.uniforms.camera_mask)); break;
+    case 1u: sky = hdr_sky(d, env.tex, env.color.rgb, world == environmentOf(pc.uniforms.camera_mask)); break;
     case 2u: sky = gradient_sky(d, env); break;
     // The atmosphere draws its own (first) sun through the air.
     case 3u: sky = atmosphere_sky(d, want_sun, env.tex, env.color.rgb); break;

@@ -12,7 +12,7 @@ use ash::vk;
 use crate::color_target::TargetKind;
 use crate::post_process_filter::POST_TARGETS;
 
-use crate::sky::{Sky, WorldEnvGpu, WorldSkies};
+use crate::sky::{EnvironmentGpu, EnvironmentSkies, Sky};
 use crate::{
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
     bluenoise_plugin::BlueNoiseBuffer,
@@ -94,7 +94,7 @@ pub struct UniformData {
     /// The camera's render-layer cull mask (tlas_builder::layers_mask); rays start with
     /// it and portals swap it to the exit instance's mask.
     camera_mask: u32,
-    /// Every world's sky and suns (sky.rs `WorldEnvGpu`, 8 entries by world bit): a ray
+    /// Every world's sky and suns (sky.rs `EnvironmentGpu`, 8 entries by world bit): a ray
     /// reads the entry of the world its mask says it is in.
     worlds: u64,
     /// Terrain brush ring (terrain.rs `TerrainCursor`): world x/z, radius, emission; drawn
@@ -350,7 +350,7 @@ pub struct Frame {
     pub uniform_buffers: [Buffer<UniformData>; crate::MAX_VIEWS],
     pub focus_data: Buffer<FocusData>,
     /// The per-world sky / sun table, rewritten each frame.
-    pub world_envs: Buffer<WorldEnvGpu>,
+    pub world_envs: Buffer<EnvironmentGpu>,
 }
 
 fn render_frame(
@@ -360,7 +360,7 @@ fn render_frame(
     dev_ui_stuff: (
         Option<Res<crate::dev_ui::DevUIState>>,
         crate::ui_render::UiDrawParams,
-        Res<WorldSkies>,
+        Res<EnvironmentSkies>,
         Res<crate::env_light::EnvLight>,
         crate::gizmo_render::GizmoDrawParams,
         Res<crate::terrain::TerrainCursor>,
@@ -404,7 +404,7 @@ fn render_frame(
             // whole window, which is what a plain app wants. `order` sorts the views and
             // `is_active` skips them.
             Option<&Camera>,
-            Option<&crate::world::InWorld>,
+            Option<&crate::environment::InEnvironment>,
         ),
         With<Camera3d>,
     >,
@@ -494,9 +494,11 @@ fn render_frame(
         exposure: crate::auto_exposure::AuroraExposure,
     }
 
-    // `AuroraExposure::World`: the fixed exposure of the world the camera is in.
+    // `AuroraExposure::Environment`: the fixed exposure of the world the camera is in.
     let world_ev100 = |layers, world| {
-        let bit = crate::world::view_world(crate::world::world_mask(layers, world));
+        let bit = crate::environment::view_environment(crate::environment::environment_mask(
+            layers, world,
+        ));
         skies.worlds[bit as usize].ev100
     };
     let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {
@@ -524,7 +526,8 @@ fn render_frame(
                             rect: vk::Rect2D::default().extent(swapchain.swapchain_extent),
                         },
                         dlss_mode: camera.3.copied().unwrap_or_default(),
-                        camera_mask: crate::world::world_mask(camera.6, camera.8) as u32,
+                        camera_mask: crate::environment::environment_mask(camera.6, camera.8)
+                            as u32,
                         debug_view: camera.5.copied().unwrap_or_default().shader_index(),
                         camera: camera.0,
                         exposure: camera
@@ -577,7 +580,7 @@ fn render_frame(
                     output_extent: extent,
                     target,
                     dlss_mode: c.3.copied().unwrap_or_default(),
-                    camera_mask: crate::world::world_mask(c.6, c.8) as u32,
+                    camera_mask: crate::environment::environment_mask(c.6, c.8) as u32,
                     debug_view: c.5.copied().unwrap_or_default().shader_index(),
                     camera: c.0,
                     exposure: c
@@ -689,21 +692,21 @@ fn render_frame(
             render_device.register_bindless_texture(t)
         })
     };
-    let envs: Vec<WorldEnvGpu> = skies
+    let envs: Vec<EnvironmentGpu> = skies
         .worlds
         .iter()
         .map(|world| match &world.sky {
-            Sky::Hdr { image, .. } => WorldEnvGpu::new(world, texture_index(image), Vec4::ZERO),
+            Sky::Hdr { image, .. } => EnvironmentGpu::new(world, texture_index(image), Vec4::ZERO),
             // The space image behind the air (colour = its scale; 0 = none).
             Sky::Atmosphere => match &atmosphere.space {
-                Some(image) => WorldEnvGpu::new(
+                Some(image) => EnvironmentGpu::new(
                     world,
                     texture_index(image),
                     Vec4::splat(atmosphere.space_scale),
                 ),
-                None => WorldEnvGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
+                None => EnvironmentGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
             },
-            _ => WorldEnvGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
+            _ => EnvironmentGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
         })
         .collect();
     render_device

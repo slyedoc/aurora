@@ -8,12 +8,12 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 
 /// HDR sky brightness: texel value x this = nits (a clear sky sits around 2000-8000).
@@ -34,7 +34,7 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,

@@ -33,13 +33,13 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::{DevUIPlugin, DevUIState},
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere as RtSphere,
     ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},
     util::{ScreenshotExt, TimeoutAppExt},
-    world::MainPhysicsWorldEntity,
 };
 
 /// The offscreen UI target's resolution: 16:9, matching the quad's 2.4 x 1.35 world aspect
@@ -87,7 +87,7 @@ struct DemoPanel;
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsWorldEntity>,
+    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
