@@ -7,7 +7,8 @@
 //! module is the missing half, shaped exactly like [`crate::ui_render`]:
 //! [`extract_gizmo_lines`] drains every group's segments (immediate-mode groups via the
 //! [`GizmoHandles`] map, plus every retained [`Gizmo`] entity) into a flat world-space vertex
-//! list, and [`draw_gizmos`] rasterizes it as a `LINE_LIST` inside the swapchain's dynamic
+//! list, and [`draw_gizmos`] rasterizes each segment as a soft-edged screen-space quad of its
+//! `line.width` (six vertices from the segment's two) inside the swapchain's dynamic
 //! rendering pass — over the traced scene, under the UI.
 //!
 //! Add `bevy::gizmos::GizmoPlugin` (and any extra config groups) in the app, exactly as on
@@ -22,7 +23,7 @@
 
 use ash::vk;
 use bevy::{
-    camera::visibility::InheritedVisibility,
+    camera::visibility::{InheritedVisibility, RenderLayers},
     color::LinearRgba,
     ecs::system::{SystemParam, lifetimeless::SRes},
     gizmos::{
@@ -38,7 +39,9 @@ use crate::{
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     swapchain::DISPLAY_FORMAT,
+    tlas_builder::layers_mask,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
+    world::{InWorld, world_mask},
 };
 
 /// Hard cap on drawable line vertices per frame (2 per segment). Overflow drops the excess and
@@ -56,6 +59,8 @@ pub struct GizmoVertex {
     pub color: u32,
     /// The line's `depth_bias` (bevy's convention, see the module docs).
     pub depth_bias: f32,
+    /// The line's width in pixels (its group's or retained gizmo's `line.width`).
+    pub width: f32,
 }
 
 /// Must match `gizmo.vert`'s `Registers`.
@@ -195,7 +200,7 @@ impl VulkanAsset for GizmoPipeline {
         // Vertices are pulled from a buffer reference, so there is no vertex input state.
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::LINE_LIST);
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
             .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -305,8 +310,18 @@ fn propagate_modified(
 #[derive(Resource, Default)]
 pub struct GizmoLineFrame {
     pub vertices: Vec<GizmoVertex>,
+    /// Which views draw which vertices.
+    pub batches: Vec<GizmoBatch>,
     /// Warn-once: the vertex cap was hit.
     warned_overflow: bool,
+}
+
+/// A stretch of [`GizmoLineFrame::vertices`] and the world mask a view must share to draw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GizmoBatch {
+    pub first: u32,
+    pub count: u32,
+    pub mask: u8,
 }
 
 /// `Last`, after `GizmoMeshSystems`: drain every gizmo group's lines into [`GizmoLineFrame`].
@@ -315,16 +330,33 @@ pub struct GizmoLineFrame {
 /// retained [`Gizmo`] entities carry their own asset handle plus a transform. Both stream
 /// list (endpoint pairs) and strip (consecutive vertices, runs separated by NaN sentinels)
 /// topologies; the finite check drops any pair touching a sentinel.
+///
+/// A line drawn for an entity (`GizmoBuffer::set_owner`) shows where its owner does: in the
+/// owner's world and layers, and not while the owner is hidden or gone. An unowned line takes
+/// its group's `render_layers`, or its retained entity's world.
 fn extract_gizmo_lines(
     mut frame: ResMut<GizmoLineFrame>,
     handles: Option<Res<GizmoHandles>>,
     assets: Option<Res<Assets<GizmoAsset>>>,
     store: Option<Res<GizmoConfigStore>>,
-    retained: Query<(&Gizmo, &GlobalTransform, Option<&InheritedVisibility>)>,
+    retained: Query<(Entity, &Gizmo, &GlobalTransform)>,
+    owners: Query<(
+        Option<&RenderLayers>,
+        Option<&InWorld>,
+        Option<&InheritedVisibility>,
+    )>,
 ) {
     frame.vertices.clear();
+    frame.batches.clear();
     let (Some(handles), Some(assets)) = (handles, assets) else {
         return;
+    };
+    let owner_mask = |owner: Entity| -> Option<u8> {
+        let (layers, world, visibility) = owners.get(owner).ok()?;
+        if visibility.is_some_and(|v| !v.get()) {
+            return None;
+        }
+        Some(world_mask(layers, world))
     };
 
     // Immediate mode: every group's lines land in the handles map.
@@ -335,17 +367,23 @@ fn extract_gizmo_lines(
             continue;
         }
         let depth_bias = config.map_or(0.0, |(config, _)| config.depth_bias);
+        let width = config.map_or(2.0, |(config, _)| config.line.width);
+        let group_mask = layers_mask(config.map(|(config, _)| &config.render_layers));
         let Some(asset) = assets.get(handle) else {
             continue;
         };
-        append_buffer(&mut frame, asset.buffer().buffer(), None, depth_bias);
+        append_buffer(
+            &mut frame,
+            asset.buffer().buffer(),
+            None,
+            depth_bias,
+            width,
+            &|owner| owner.map_or(Some(group_mask), owner_mask),
+        );
     }
 
-    // Retained `Gizmo` components.
-    for (gizmo, transform, visibility) in &retained {
-        if visibility.is_some_and(|v| !v.get()) {
-            continue;
-        }
+    // Retained `Gizmo` components: the entity owns whatever its asset does not give an owner.
+    for (entity, gizmo, transform) in &retained {
         let Some(asset) = assets.get(&gizmo.handle) else {
             continue;
         };
@@ -354,17 +392,38 @@ fn extract_gizmo_lines(
             asset.buffer().buffer(),
             Some(transform),
             gizmo.depth_bias,
+            gizmo.line_config.width,
+            &|owner| owner_mask(owner.unwrap_or(entity)),
         );
     }
 }
 
+/// Add `count` vertices from `first` drawn by views sharing `mask`, extending the last batch when
+/// it is the same mask and adjacent.
+fn push_batch(batches: &mut Vec<GizmoBatch>, first: u32, count: u32, mask: u8) {
+    if count == 0 {
+        return;
+    }
+    if let Some(last) = batches.last_mut()
+        && last.mask == mask
+        && last.first + last.count == first
+    {
+        last.count += count;
+        return;
+    }
+    batches.push(GizmoBatch { first, count, mask });
+}
+
 /// Fold one [`GizmoAsset`]'s list + strip streams into `frame.vertices`, applying `transform`
-/// (a retained gizmo's placement) when present.
+/// (a retained gizmo's placement) when present. `mask_of` gives each owner's world mask, or
+/// `None` to leave its lines out.
 fn append_buffer(
     frame: &mut GizmoLineFrame,
     buffer: GizmoBufferView<'_>,
     transform: Option<&GlobalTransform>,
     depth_bias: f32,
+    width: f32,
+    mask_of: &dyn Fn(Option<Entity>) -> Option<u8>,
 ) {
     let world = |v: Vec3| -> Option<[f32; 3]> {
         if !v.is_finite() {
@@ -378,7 +437,7 @@ fn append_buffer(
             .to_array(),
         )
     };
-    let mut push = |a: Vec3, b: Vec3, ca: LinearRgba, cb: LinearRgba| {
+    let push = |frame: &mut GizmoLineFrame, a: Vec3, b: Vec3, ca: LinearRgba, cb: LinearRgba| {
         if frame.vertices.len() + 2 > GIZMO_MAX_VERTICES {
             if !frame.warned_overflow {
                 frame.warned_overflow = true;
@@ -395,32 +454,45 @@ fn append_buffer(
             position: a,
             color: pack_rgba8(ca),
             depth_bias,
+            width,
         });
         frame.vertices.push(GizmoVertex {
             position: b,
             color: pack_rgba8(cb),
             depth_bias,
+            width,
         });
     };
 
     // Line list: consecutive endpoint PAIRS, one color per endpoint.
     let fallback = LinearRgba::WHITE;
     let list_color = |i: usize| buffer.list_colors.get(i).copied().unwrap_or(fallback);
-    for (i, points) in buffer.list_positions.chunks_exact(2).enumerate() {
-        push(
-            points[0],
-            points[1],
-            list_color(2 * i),
-            list_color(2 * i + 1),
-        );
+    for (start, end, owner) in buffer.list_owners.ranges(buffer.list_positions.len()) {
+        let Some(mask) = mask_of(owner) else { continue };
+        let first = frame.vertices.len() as u32;
+        let points = &buffer.list_positions[start..end];
+        for (i, pair) in points.chunks_exact(2).enumerate() {
+            let at = start + 2 * i;
+            push(frame, pair[0], pair[1], list_color(at), list_color(at + 1));
+        }
+        let count = frame.vertices.len() as u32 - first;
+        push_batch(&mut frame.batches, first, count, mask);
     }
 
     // Line strips: consecutive vertices, runs separated by NaN sentinels (one is pushed after
-    // every strip) -- `world` rejects the sentinel, and `push` drops any pair touching one.
-    for (i, pair) in buffer.strip_positions.windows(2).enumerate() {
-        let ca = buffer.strip_colors.get(i).copied().unwrap_or(fallback);
-        let cb = buffer.strip_colors.get(i + 1).copied().unwrap_or(ca);
-        push(pair[0], pair[1], ca, cb);
+    // every strip) -- `world` rejects the sentinel, and `push` drops any pair touching one. An
+    // owner changes only between strips, so no pair spans two owners.
+    for (start, end, owner) in buffer.strip_owners.ranges(buffer.strip_positions.len()) {
+        let Some(mask) = mask_of(owner) else { continue };
+        let first = frame.vertices.len() as u32;
+        for (i, pair) in buffer.strip_positions[start..end].windows(2).enumerate() {
+            let at = start + i;
+            let ca = buffer.strip_colors.get(at).copied().unwrap_or(fallback);
+            let cb = buffer.strip_colors.get(at + 1).copied().unwrap_or(ca);
+            push(frame, pair[0], pair[1], ca, cb);
+        }
+        let count = frame.vertices.len() as u32 - first;
+        push_batch(&mut frame.batches, first, count, mask);
     }
 }
 
@@ -452,8 +524,9 @@ pub struct GizmoDrawParams<'w> {
 /// Records the gizmo line draw into `cmd_buffer`. Must be called inside the swapchain's
 /// dynamic rendering pass, with viewport and scissor already set to the full swapchain
 /// (`extent`). `scene_depth` is the raygen's linear view depth in SHADER_READ_ONLY_OPTIMAL,
-/// covering the same window. Records nothing when there are no lines or the pipeline is not
-/// compiled yet.
+/// covering the same window. Draws only the lines whose world mask shares a bit with
+/// `camera_mask`. Records nothing when there are no such lines or the pipeline is not compiled
+/// yet.
 pub unsafe fn draw_gizmos(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
@@ -462,10 +535,12 @@ pub unsafe fn draw_gizmos(
     scene_depth: Option<vk::ImageView>,
     frame_slot: usize,
     view_slot: usize,
+    camera_mask: u32,
     params: &mut GizmoDrawParams,
 ) {
     let vertices = &params.frame.vertices;
-    if vertices.is_empty() {
+    let visible = |batch: &&GizmoBatch| u32::from(batch.mask) & camera_mask != 0;
+    if !params.frame.batches.iter().any(|batch| visible(&batch)) {
         return;
     }
     let Some(config) = params.config.as_ref() else {
@@ -534,7 +609,11 @@ pub unsafe fn draw_gizmos(
             0,
             bytemuck::bytes_of(&push_constants),
         );
-        render_device.cmd_draw(cmd_buffer, vertices.len() as u32, 1, 0, 0);
+        // One draw per stretch this view's worlds share; `gl_VertexIndex` counts from `first`.
+        for batch in params.frame.batches.iter().filter(visible) {
+            // Two buffer vertices per segment, six drawn: the shader reads both ends itself.
+            render_device.cmd_draw(cmd_buffer, batch.count / 2 * 6, 1, batch.first / 2 * 6, 0);
+        }
     }
 }
 
@@ -597,16 +676,17 @@ mod tests {
     use super::*;
     use bytemuck::Zeroable as _;
 
-    /// The vertex is a tightly-packed 20 bytes -- `gizmo.vert` reads a scalar-layout
+    /// The vertex is a tightly-packed 24 bytes -- `gizmo.vert` reads a scalar-layout
     /// `GizmoVertex[]`, so any padding here would shear every vertex after the first.
     #[test]
     fn gizmo_vertex_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<GizmoVertex>(), 20);
+        assert_eq!(std::mem::size_of::<GizmoVertex>(), 24);
         let vertex = GizmoVertex::zeroed();
         let base = &vertex as *const GizmoVertex as usize;
         assert_eq!(vertex.position.as_ptr() as usize - base, 0);
         assert_eq!(&vertex.color as *const u32 as usize - base, 12);
         assert_eq!(&vertex.depth_bias as *const f32 as usize - base, 16);
+        assert_eq!(&vertex.width as *const f32 as usize - base, 20);
     }
 
     /// Scalar-layout mirror of `gizmo.vert`'s `Registers`: mat4 at 0, the buffer reference
@@ -621,6 +701,45 @@ mod tests {
         assert_eq!(&pc.vertex_buffer as *const u64 as usize - base, 64);
         assert_eq!(pc.inv_extent.as_ptr() as usize - base, 72);
         assert_eq!(&pc.depth_guide as *const u32 as usize - base, 80);
+    }
+
+    /// Owned lines take their owner's mask, a hidden owner drops its lines, unowned lines
+    /// take the fallback, and neighbouring stretches with one mask merge.
+    #[test]
+    fn owners_split_lines_into_world_batches() {
+        let owner = |i: u32| Entity::from_raw_u32(i).unwrap();
+        let mut asset = GizmoAsset::default();
+        asset.line(Vec3::ZERO, Vec3::X, LinearRgba::WHITE);
+        asset.set_owner(Some(owner(1)));
+        asset.line(Vec3::ZERO, Vec3::Y, LinearRgba::WHITE);
+        asset.set_owner(Some(owner(2)));
+        asset.line(Vec3::ZERO, Vec3::Z, LinearRgba::WHITE);
+        asset.set_owner(Some(owner(3)));
+        asset.line(Vec3::ZERO, Vec3::X, LinearRgba::WHITE);
+        asset.linestrip([Vec3::ZERO, Vec3::X, Vec3::Y], LinearRgba::WHITE);
+        asset.set_owner(None);
+        asset.line(Vec3::ZERO, Vec3::Y, LinearRgba::WHITE);
+
+        // 1 lives in world 2, 2 is hidden, 3 shares main's bit.
+        let mask_of = |o: Option<Entity>| match o {
+            None => Some(0b1),
+            Some(e) if e == owner(1) => Some(0b100),
+            Some(e) if e == owner(2) => None,
+            Some(_) => Some(0b1),
+        };
+        let mut frame = GizmoLineFrame::default();
+        append_buffer(&mut frame, asset.buffer().buffer(), None, 0.0, 2.0, &mask_of);
+        assert_eq!(
+            frame.batches,
+            vec![
+                GizmoBatch { first: 0, count: 2, mask: 0b1 },
+                GizmoBatch { first: 2, count: 2, mask: 0b100 },
+                // Owner 3's line, the unowned line and owner 3's strip (strips follow every
+                // list line): one mask, merged.
+                GizmoBatch { first: 4, count: 8, mask: 0b1 },
+            ]
+        );
+        assert_eq!(frame.vertices.len(), 12);
     }
 
     /// Packed color order is `r | g<<8 | b<<16 | a<<24` with round-to-nearest, mirrored by the

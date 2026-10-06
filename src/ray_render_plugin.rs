@@ -1254,6 +1254,7 @@ fn render_frame(
                         .map(|g| g.depth),
                     swapchain.frame_count % 2,
                     view.slot,
+                    view.camera_mask,
                     &mut gizmos,
                 );
                 render_device.cmd_end_rendering(cmd_buffer);
@@ -1426,6 +1427,7 @@ fn render_frame(
                 scene_depth,
                 swapchain.frame_count % 2,
                 view.slot,
+                view.camera_mask,
                 &mut gizmos,
             );
         }
