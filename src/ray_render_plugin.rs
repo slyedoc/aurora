@@ -869,7 +869,7 @@ fn render_frame(
         );
         if pick {
             let _submit = info_span!("submit_pick").entered();
-            picker.submit(&render_device, scene_cmd, &modules, &tlas);
+            picker.submit(&render_device, scene_cmd, &modules, &tlas, &sbt);
         }
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).

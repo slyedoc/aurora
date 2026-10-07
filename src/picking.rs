@@ -24,7 +24,9 @@ use crate::{
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
+    raytracing_pipeline::RTGroupHandle,
     render_device::RenderDevice,
+    sbt::SBT,
     tlas_builder::{GpuInstanceSlots, TLAS},
 };
 
@@ -65,6 +67,9 @@ pub struct RayHit {
     pub triangle: u32,
     /// Barycentrics of the hit within the triangle (vertices 1 and 2).
     pub barycentrics: Vec2,
+    /// On a terrain tile: the palette index of the splat layer that dominates at the hit,
+    /// weighted as the closest-hit blends it.
+    pub terrain_layer: Option<u32>,
 }
 
 /// The last traced hits of this entity's [`RayCaster`], nearest first; empty on a miss.
@@ -91,7 +96,8 @@ struct GpuHit {
     instance: u32,
     barycentrics: [f32; 2],
     primitive: u32,
-    pad: u32,
+    /// Dominant terrain palette index, `u32::MAX` off terrain.
+    layer: u32,
 }
 
 #[repr(C)]
@@ -100,8 +106,10 @@ struct PickParams {
     tlas: u64,
     rays: u64,
     hits: u64,
+    /// The SBT hit region's first record past its group handle; 0 before the SBT exists.
+    records: u64,
     count: u32,
-    pad: u32,
+    record_stride: u32,
 }
 
 /// The pick pass: this frame's rays, the buffers they trace from and into, and the early
@@ -182,6 +190,7 @@ impl Picker {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         tlas: &TLAS,
+        sbt: &SBT,
     ) {
         let count = self.staged.len() as u32;
         if count > self.capacity {
@@ -210,8 +219,12 @@ impl Picker {
                 tlas: tlas.acceleration_structure.address,
                 rays: self.rays.address,
                 hits: self.hits.address,
+                records: match sbt.hit_region.device_address {
+                    0 => 0,
+                    region => region + std::mem::size_of::<RTGroupHandle>() as u64,
+                },
                 count,
-                pad: 0,
+                record_stride: sbt.hit_region.stride as u32,
             },
             count,
             None,
@@ -323,6 +336,7 @@ fn read_hits(
                 normal: Vec3::from_array(hit.normal),
                 triangle: hit.primitive,
                 barycentrics: Vec2::from_array(hit.barycentrics),
+                terrain_layer: (hit.layer != u32::MAX).then_some(hit.layer),
             });
         }
     }
