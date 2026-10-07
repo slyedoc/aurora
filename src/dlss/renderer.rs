@@ -114,6 +114,9 @@ impl DlssView {
 pub const DLSS_VIEWS: usize = crate::MAX_VIEWS;
 
 pub struct DlssRenderer {
+    /// NGX shuts down with the renderer however the app ends: left running past the device, its
+    /// exit handlers call into unloaded snippet code at process exit.
+    device: RenderDevice,
     params: *mut NgxParameter,
     rr_available: bool,
     views: [Option<DlssView>; DLSS_VIEWS],
@@ -212,6 +215,7 @@ impl DlssRenderer {
             );
         }
         Some(Self {
+            device: rd.clone(),
             params,
             rr_available,
             views: std::array::from_fn(|_| None),
@@ -623,10 +627,18 @@ impl DlssRenderer {
             );
         }
     }
+}
 
-    pub fn destroy(&mut self, rd: &RenderDevice) {
+impl Drop for DlssRenderer {
+    fn drop(&mut self) {
+        let rd = self.device.clone();
+        // Nothing in flight may still use a feature being released.
+        unsafe {
+            let _queue = rd.queue.lock().unwrap();
+            let _ = rd.device.device_wait_idle();
+        }
         for slot in 0..DLSS_VIEWS {
-            self.release_view(rd, slot);
+            self.release_view(&rd, slot);
         }
         unsafe {
             NVSDK_NGX_VULKAN_DestroyParameters(self.params);

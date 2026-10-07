@@ -6,8 +6,6 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use crate::ray_render_plugin::RenderWindow;
 use crate::render_device::RenderDevice;
 
-const FRAMES_IN_FLIGHT: usize = 1;
-
 /// The format of everything drawn for a display: the window swapchain, the XR eye targets,
 /// and every graphics pipeline's colour attachment (post-process, UI, gizmos). sRGB, so the
 /// shaders write linear light and the hardware applies the transfer function on store and
@@ -32,9 +30,7 @@ pub struct Swapchain {
     /// covered by the in-flight fence, so a single shared semaphore could be re-signaled while
     /// still pending.
     pub render_finished_semaphores: Vec<vk::Semaphore>,
-    pub in_flight_fences: [vk::Fence; FRAMES_IN_FLIGHT],
     pub resized: bool,
-    pub frame_count: usize,
 }
 
 unsafe fn create_surface(
@@ -72,12 +68,6 @@ impl Swapchain {
                 .create_semaphore(&semaphore_info, None)
                 .unwrap();
 
-            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-            let mut in_flight_fences = [vk::Fence::null(); FRAMES_IN_FLIGHT];
-            for i in 0..FRAMES_IN_FLIGHT {
-                in_flight_fences[i] = device.create_fence(&fence_info, None).unwrap();
-            }
-
             Swapchain {
                 device,
                 surface,
@@ -90,9 +80,7 @@ impl Swapchain {
                 image_available_semaphore,
                 render_finished_semaphores: Vec::new(),
                 current_image_idx: 0,
-                in_flight_fences,
                 resized: false,
-                frame_count: 0,
             }
         }
     }
@@ -262,31 +250,8 @@ impl Swapchain {
                 self.on_resize(window);
                 self.resized = true;
             }
-            // Wait for the previous frame before acquiring: its submit is what waits on
-            // `image_available_semaphore`, and the semaphore may only be reused once that wait
-            // has completed. This is also the point after which the frame's resources (TLAS,
-            // instance buffers, per-frame command buffer) can be rewritten in place.
-            let wait = info_span!("frame_fence_wait").entered();
-            self.device
-                .wait_for_fences(
-                    std::slice::from_ref(
-                        &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
-                    ),
-                    true,
-                    u64::MAX,
-                )
-                .unwrap_or_else(|e| {
-                    // Device loss surfaces here first: let the driver finish its crash dump.
-                    crate::aftermath::note_device_lost(e);
-                    panic!("frame fence wait failed: {e:?}");
-                });
-            self.device
-                .reset_fences(std::slice::from_ref(
-                    &self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
-                ))
-                .unwrap();
-            drop(wait);
-
+            // `FrameSync::wait` ran first: the previous frame's submit, which waits on
+            // `image_available_semaphore`, is done, so the semaphore can be signalled again.
             // A swapchain the compositor already invalidated (a fullscreen window settling
             // in) surfaces here; rebuild it and acquire again.
             let _acquire = info_span!("acquire_next_image").entered();
@@ -313,62 +278,40 @@ impl Swapchain {
         }
     }
 
-    pub unsafe fn submit_presentation(
-        &mut self,
-        window: &RenderWindow,
-        cmd_buffer: vk::CommandBuffer,
-        // A semaphore of work submitted ahead of this frame that it depends on (picking.rs).
-        scene_ready: Option<vk::Semaphore>,
-    ) {
+    /// The semaphore this frame's submit waits on before writing the acquired image, and the
+    /// one it signals for the present.
+    pub fn frame_semaphores(&self) -> (vk::Semaphore, vk::Semaphore) {
+        (
+            self.image_available_semaphore,
+            self.render_finished_semaphores[self.current_image_idx as usize],
+        )
+    }
+
+    /// Present the acquired image once the submit has signalled it. The caller holds the queue;
+    /// hand the result to [`Self::after_present`] after letting it go.
+    pub unsafe fn present(&self, queue: vk::Queue) -> ash::prelude::VkResult<bool> {
         unsafe {
-            let mut wait_semaphores = vec![self.image_available_semaphore];
-            let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            if let Some(semaphore) = scene_ready {
-                wait_semaphores.push(semaphore);
-                wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
-            }
-            // submit the command buffer to the queue
-            let submit_info = vk::SubmitInfo::default()
-                .command_buffers(std::slice::from_ref(&cmd_buffer))
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .signal_semaphores(std::slice::from_ref(
-                    &self.render_finished_semaphores[self.current_image_idx as usize],
-                ));
-
-            let queue_lock = info_span!("queue_lock").entered();
-            let queue = self.device.queue.lock().unwrap();
-            drop(queue_lock);
-            let submit = info_span!("queue_submit").entered();
-            self.device
-                .queue_submit(
-                    *queue,
-                    std::slice::from_ref(&submit_info),
-                    self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT],
-                )
-                .unwrap_or_else(|e| {
-                    crate::aftermath::note_device_lost(e);
-                    panic!("frame submit failed: {e:?}");
-                });
-            drop(submit);
-
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(std::slice::from_ref(
                     &self.render_finished_semaphores[self.current_image_idx as usize],
                 ))
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&self.current_image_idx));
-
-            let present = info_span!("queue_present").entered();
-            let present_result = self
-                .device
+            let _present = info_span!("queue_present").entered();
+            self.device
                 .ext_swapchain
-                .queue_present(*queue, &present_info);
-            drop(present);
+                .queue_present(queue, &present_info)
+        }
+    }
 
-            drop(queue);
-
-            match present_result {
+    /// Rebuild after a present the compositor called out of date.
+    pub unsafe fn after_present(
+        &mut self,
+        result: ash::prelude::VkResult<bool>,
+        window: &RenderWindow,
+    ) {
+        unsafe {
+            match result {
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => {
                     log::debug!("------ SWAPCHAIN OUT OF DATE ------");
                     self.on_resize(window);
@@ -382,8 +325,6 @@ impl Swapchain {
                     self.resized = false;
                 }
             }
-
-            self.frame_count += 1;
         }
     }
 }
@@ -401,9 +342,6 @@ impl Drop for Swapchain {
                 .destroy_semaphore(self.image_available_semaphore, None);
             for semaphore in self.render_finished_semaphores.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
-            }
-            for fence in self.in_flight_fences.iter() {
-                self.device.destroy_fence(*fence, None);
             }
 
             for &image_view in self.swapchain_image_views.iter() {

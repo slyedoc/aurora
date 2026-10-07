@@ -29,6 +29,7 @@ pub mod dev_ui;
 pub mod dlss;
 pub mod env_light;
 pub mod environment;
+pub mod frame_sync;
 pub mod gizmo_render;
 pub mod gpu_transform;
 pub mod lights;

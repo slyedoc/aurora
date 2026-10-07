@@ -38,5 +38,4 @@ impl DlssRenderer {
         _r: bool,
     ) {
     }
-    pub fn destroy(&mut self, _rd: &RenderDevice) {}
 }

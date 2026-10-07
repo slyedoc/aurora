@@ -460,13 +460,9 @@ pub fn device_extensions(_: vk::Instance, _: vk::PhysicalDevice) -> Vec<std::ffi
     Vec::new()
 }
 
-fn teardown(world: &mut World) {
-    world.resource_scope(|world, mut state: Mut<DlssState>| {
-        if let Some(mut renderer) = state.renderer.take() {
-            let rd = world.resource::<RenderDevice>();
-            renderer.destroy(rd);
-        }
-    });
+fn teardown(mut state: ResMut<DlssState>) {
+    // Dropping it shuts NGX down.
+    state.renderer = None;
 }
 
 /// Adds DLSS Ray Reconstruction. The `dlss-dev` cargo feature (`--features bevy_aurora/dlss-dev`)

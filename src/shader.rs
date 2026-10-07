@@ -19,13 +19,15 @@ pub enum ShaderLoaderError {
 
 #[derive(TypePath)]
 pub struct ShaderLoader {
-    compiler: shaderc::Compiler,
+    /// One compile at a time: shaders load on several IO threads at once, and concurrent
+    /// compiles through glslang corrupt each other's SPIR-V ("Operand cannot be a type").
+    compiler: std::sync::Mutex<shaderc::Compiler>,
 }
 
 impl Default for ShaderLoader {
     fn default() -> Self {
         Self {
-            compiler: shaderc::Compiler::new().unwrap(),
+            compiler: std::sync::Mutex::new(shaderc::Compiler::new().unwrap()),
         }
     }
 }
@@ -143,7 +145,7 @@ impl AssetLoader for ShaderLoader {
                 })
             });
 
-            let binary_result = self.compiler.compile_into_spirv(
+            let binary_result = self.compiler.lock().unwrap().compile_into_spirv(
                 std::str::from_utf8(&bytes).unwrap(),
                 kind,
                 path.as_str(),

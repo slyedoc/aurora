@@ -173,13 +173,16 @@ pub struct RayRenderPlugin;
 
 impl Plugin for RayRenderPlugin {
     fn build(&self, app: &mut App) {
-        let display_handle = app.world().resource::<DisplayHandleWrapper>();
+        // Absent without `WinitPlugin`: a windowless app renders to image targets only.
+        let display_handle = app.world().get_resource::<DisplayHandleWrapper>();
         // Present when XrPlugin (added before this plugin) brought a runtime up: instance
         // and device creation then go through it (XR_KHR_vulkan_enable2).
         let xr_context = app.world().get_resource::<crate::xr::XrContext>();
         let render_device = unsafe {
             crate::render_device::RenderDevice::from_display(
-                &display_handle.0.display_handle().unwrap(),
+                display_handle
+                    .map(|handle| handle.0.display_handle().unwrap())
+                    .as_ref(),
                 xr_context,
             )
         };
@@ -190,6 +193,7 @@ impl Plugin for RayRenderPlugin {
         if let Some(xr_state) = xr_state {
             app.insert_resource(xr_state);
         }
+        app.insert_resource(crate::frame_sync::FrameSync::new(render_device.clone()));
         app.insert_resource(render_device);
         app.insert_resource(sphere_blas);
         app.init_resource::<Frame>();
@@ -246,6 +250,19 @@ fn shutdown(world: &mut World) {
     if !closing && !exiting {
         return;
     }
+    shutdown_renderer(world);
+    if !exiting {
+        world.write_message(AppExit::Success);
+    }
+}
+
+/// Tear the renderer down in order: the queue drains, then [`TeardownSchedule`] frees what every
+/// plugin holds before the device goes. An app's exit does this; an app dropped without exiting
+/// (a test's) calls it first, or the device is destroyed with its resources still alive.
+pub fn shutdown_renderer(world: &mut World) {
+    if !world.contains_resource::<RenderDevice>() {
+        return;
+    }
     log::info!("Shutting down the renderer");
     {
         let render_device = world.resource::<RenderDevice>();
@@ -253,9 +270,6 @@ fn shutdown(world: &mut World) {
         unsafe { render_device.queue_wait_idle(*queue).unwrap() };
     }
     world.run_schedule(TeardownSchedule);
-    if !exiting {
-        world.write_message(AppExit::Success);
-    }
 }
 
 /// The primary window's size, as the frame and the swapchain see it.
@@ -355,8 +369,13 @@ pub struct Frame {
 
 fn render_frame(
     render_device: Res<crate::render_device::RenderDevice>,
-    window: Res<RenderWindow>,
-    swapchain: Option<ResMut<crate::swapchain::Swapchain>>,
+    // The window and its swapchain are absent in a windowless app: the frame then traces and
+    // composites into image targets and presents nothing.
+    present: (
+        Option<Res<RenderWindow>>,
+        Option<ResMut<crate::swapchain::Swapchain>>,
+        ResMut<crate::frame_sync::FrameSync>,
+    ),
     dev_ui_stuff: (
         Option<Res<crate::dev_ui::DevUIState>>,
         crate::ui_render::UiDrawParams,
@@ -418,9 +437,11 @@ fn render_frame(
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
-    let Some(mut swapchain) = swapchain else {
-        return;
-    };
+    let (window, mut swapchain, mut sync) = present;
+    // Last frame's window size: a view planned against it is clamped again at acquire.
+    let window_extent = swapchain
+        .as_ref()
+        .map_or(vk::Extent2D::default(), |s| s.swapchain_extent);
     // XR frame pacing + swapchain image, when a session is live. None also covers the
     // compositor's "don't render" frames — the window path just runs alone then.
     let xr_frame = xr
@@ -523,7 +544,7 @@ fn render_frame(
                         // The window shows a letterboxed eye; the headset's own swapchain
                         // is written separately by the XR path.
                         target: ViewTarget::Window {
-                            rect: vk::Rect2D::default().extent(swapchain.swapchain_extent),
+                            rect: vk::Rect2D::default().extent(window_extent),
                         },
                         dlss_mode: camera.3.copied().unwrap_or_default(),
                         camera_mask: crate::environment::environment_mask(camera.6, camera.8)
@@ -564,8 +585,10 @@ fn render_frame(
                             height: size.y,
                         },
                     ),
+                    // No window to put it in: a windowless app renders image targets only.
+                    None if swapchain.is_none() => return None,
                     None => {
-                        let rect = view_rect(c.7, swapchain.swapchain_extent);
+                        let rect = view_rect(c.7, window_extent);
                         (ViewTarget::Window { rect }, rect.extent)
                     }
                 };
@@ -805,12 +828,27 @@ fn render_frame(
     }
 
     unsafe {
-        let (swapchain_image, swapchain_view) = swapchain.aquire_next_image(&window);
+        sync.wait();
+        // The window's image for this frame, with its size and format, when there is one.
+        let presenting = match (swapchain.as_deref_mut(), window.as_deref()) {
+            (Some(swapchain), Some(window)) => {
+                let (image, view) = swapchain.aquire_next_image(window);
+                Some((
+                    image,
+                    view,
+                    swapchain.swapchain_extent,
+                    swapchain.swapchain_format,
+                ))
+            }
+            _ => None,
+        };
         render_device.destroyer.tick();
-        let cmd_buffer = render_device.command_buffers[swapchain.frame_count % 2];
+        let cmd_buffer = render_device.command_buffers[sync.frame_count % 2];
 
-        frame.swapchain_image = swapchain_image;
-        frame.swapchain_view = swapchain_view;
+        if let Some((image, view, _, _)) = presenting {
+            frame.swapchain_image = image;
+            frame.swapchain_view = view;
+        }
         let record = info_span!("record_frame").entered();
 
         render_device
@@ -831,11 +869,11 @@ fn render_frame(
         crate::ui_render::draw_ui_surfaces(
             &render_device,
             cmd_buffer,
-            swapchain.frame_count % 2,
+            sync.frame_count % 2,
             &mut ui,
         );
 
-        // The in-flight fence was waited in aquire_next_image, so the previous trace is done:
+        // The in-flight fence was waited above, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
         // them, and rebuild the single TLAS in place. With rays to pick, the instance table and
         // TLAS go into their own command buffer, submitted ahead of the rest with the pick at
@@ -848,7 +886,7 @@ fn render_frame(
         drop(section);
         let pick = picker.active(&modules, &tlas);
         let scene_cmd = if pick {
-            picker.begin(&render_device, swapchain.frame_count)
+            picker.begin(&render_device, sync.frame_count)
         } else {
             cmd_buffer
         };
@@ -946,7 +984,7 @@ fn render_frame(
                             &tlas.acceleration_structure.handle,
                         ));
                     let set = rtx_pipeline.descriptor_sets
-                        [(swapchain.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
+                        [(sync.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
                     let mut writes = vec![
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
@@ -1067,7 +1105,7 @@ fn render_frame(
 
         drop(section);
         let section = info_span!("record_present_pass").entered();
-        let parity = swapchain.frame_count % 2;
+        let parity = sync.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
         let debug_view = camera
             .and_then(|c| c.5.copied())
@@ -1228,7 +1266,7 @@ fn render_frame(
                             .filter(|_| composite.is_some())
                             .and_then(|r| r.guide_views(view.slot))
                             .map(|g| g.depth),
-                        swapchain.frame_count % 2,
+                        sync.frame_count % 2,
                         view.slot,
                         view.camera_mask,
                         &mut gizmos,
@@ -1245,238 +1283,271 @@ fn render_frame(
             }
         }
 
-        // The window: the flat render, or the XR spectator (left eye, aspect-fit).
-        vk_utils::transition_image_layout(
-            &render_device,
-            cmd_buffer,
-            swapchain_image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::ATTACHMENT_OPTIMAL,
-        );
-
-        let render_area = vk::Rect2D::default().extent(swapchain.swapchain_extent);
-
-        let attachment_info = vk::RenderingAttachmentInfo::default()
-            .image_view(swapchain_view)
-            .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE);
-
-        let render_info = vk::RenderingInfo::default()
-            .layer_count(1)
-            .render_area(render_area)
-            .color_attachments(std::slice::from_ref(&attachment_info));
-
-        render_device.cmd_begin_rendering(cmd_buffer, &render_info);
-        render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
-
-        // Until the RT pipeline compiles and the first evaluate lands there is nothing to
-        // sample -- leave the clear (the UI still draws).
-        if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
-            let (window_w, window_h) = (
-                swapchain.swapchain_extent.width as f32,
-                swapchain.swapchain_extent.height as f32,
-            );
-            // XR draws ONE letterboxed eye as the spectator image; a flat frame composites
-            // every window-targeted view into its own rect.
-            let composited: &[ViewFrame] = if xr_frame.is_some() {
-                &views[..1.min(views.len())]
-            } else {
-                &views[..]
-            };
-            for view in composited {
-                let Some(source_view) = dlss
-                    .renderer
-                    .as_ref()
-                    .and_then(|r| r.output_view(view.slot))
-                else {
-                    continue;
-                };
-                let ViewTarget::Window { rect } = view.target else {
-                    // Image targets are composited in their own pass, outside this one:
-                    // this render pass has the swapchain attached.
-                    continue;
-                };
-                let viewport = if xr_frame.is_some() {
-                    // Spectator: letterbox the eye image instead of stretching it.
-                    let source_aspect =
-                        view.output_extent.width as f32 / view.output_extent.height as f32;
-                    let (w, h) = if source_aspect > window_w / window_h {
-                        (window_w, window_w / source_aspect)
-                    } else {
-                        (window_h * source_aspect, window_h)
-                    };
-                    vk::Viewport::default()
-                        .x((window_w - w) * 0.5)
-                        .y((window_h - h) * 0.5)
-                        .width(w)
-                        .height(h)
-                } else {
-                    // Land the traced image on the rect it was traced for. Unset
-                    // `Camera::viewport` gives the whole window, so a plain app is
-                    // unchanged.
-                    vk::Viewport::default()
-                        .x(rect.offset.x as f32)
-                        .y(rect.offset.y as f32)
-                        .width(rect.extent.width as f32)
-                        .height(rect.extent.height as f32)
-                }
-                .min_depth(0.0)
-                .max_depth(1.0);
-                render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
-                // The composite is an OVERSIZED fullscreen triangle -- NDC
-                // (-1,-1)(3,-1)(-1,3) in quad.vert -- so a viewport smaller than the window
-                // is not enough on its own: the vertices past NDC map past the viewport rect
-                // and would paint over roughly twice it, straight across the editor's UI (or
-                // over the view composited before it). Clip to the rect; the UI pass below
-                // puts the full scissor back.
-                let scissor = vk::Rect2D::default()
-                    .offset(vk::Offset2D {
-                        x: viewport.x as i32,
-                        y: viewport.y as i32,
-                    })
-                    .extent(vk::Extent2D {
-                        width: viewport.width as u32,
-                        height: viewport.height as u32,
-                    });
-                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&scissor));
-
-                // The spectator gets its own set; a flat view uses its slot's.
-                let target = if xr_frame.is_some() {
-                    crate::MAX_VIEWS
-                } else {
-                    view.slot
-                };
-                record_post_draw(
-                    &render_device,
-                    cmd_buffer,
-                    pipeline,
-                    TargetKind::Display,
-                    pipeline.descriptor_sets[parity * POST_TARGETS + target],
-                    source_view,
-                    dlss.renderer
-                        .as_ref()
-                        .and_then(|r| r.guide_views(view.slot)),
-                    &crate::post_process_filter::PostProcessPushConstants {
-                        uniforms: frame.uniform_buffers[view.slot].address,
-                        auto_exposure: view.ae.1,
-                        display_exposure: view.exposure.display_exposure(),
-                        debug_view: view.debug_view,
-                        scene_radiance: 0,
-                        _pad: 0,
-                    },
-                );
-            }
-        }
-
-        // bevy_ui / feathers (including the dev panel), drawn over the scene, full-window.
-        // Restore the full scissor: the composite above narrowed it to the view's rect.
-        render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
-        render_device.cmd_set_viewport(
-            cmd_buffer,
-            0,
-            std::slice::from_ref(
-                &vk::Viewport::default()
-                    .width(swapchain.swapchain_extent.width as f32)
-                    .height(swapchain.swapchain_extent.height as f32)
-                    .min_depth(0.0)
-                    .max_depth(1.0),
-            ),
-        );
-        // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI,
-        // depth-tested against the traced frame's depth guide (so not before there is one).
-        // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
-        // full-window projection.
-        // Window-targeted views only; an image target drew its own above. `.find()` because
-        // the lowest-order view may be an image target, or there may be no view at all.
-        let window_view = views
-            .iter()
-            .find(|v| matches!(v.target, ViewTarget::Window { .. }));
-        let scene_depth = window_view.filter(|_| dlss_ran).and_then(|view| {
-            dlss.renderer
-                .as_ref()
-                .and_then(|r| r.guide_views(view.slot))
-                .map(|g| g.depth)
-        });
-        if let (None, Some(view)) = (&xr_frame, window_view) {
-            crate::gizmo_render::draw_gizmos(
+        // The window, when there is one: the flat render or the XR spectator (left eye,
+        // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
+        let capture = if let Some((swapchain_image, swapchain_view, window_size, window_format)) =
+            presenting
+        {
+            // The window: the flat render, or the XR spectator (left eye, aspect-fit).
+            vk_utils::transition_image_layout(
                 &render_device,
                 cmd_buffer,
-                view.view_proj,
-                swapchain.swapchain_extent,
-                scene_depth,
-                swapchain.frame_count % 2,
-                view.slot,
-                view.camera_mask,
-                &mut gizmos,
+                swapchain_image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
             );
-        }
-        crate::ui_render::draw_ui(
-            &render_device,
-            cmd_buffer,
-            swapchain.swapchain_extent,
-            swapchain.frame_count % 2,
-            &mut ui,
-        );
 
-        render_device.cmd_end_rendering(cmd_buffer);
+            let render_area = vk::Rect2D::default().extent(window_size);
 
-        // A pending screenshot copies the finished frame (UI included) out through a host
-        // buffer on its way to present.
-        // The capture reads the WINDOW swapchain (UI included), so it must use the
-        // swapchain extent -- under XR `output_extent` is the eye extent, and sizing the
-        // copy with it reads out of the swapchain image's bounds (F12 crashed XR runs).
-        let capture_extent = swapchain.swapchain_extent;
-        let capture = screenshots.take_next().map(|path| {
-            let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
-            let buffer: Buffer<u8> =
-                render_device.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST);
+            let attachment_info = vk::RenderingAttachmentInfo::default()
+                .image_view(swapchain_view)
+                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE);
+
+            let render_info = vk::RenderingInfo::default()
+                .layer_count(1)
+                .render_area(render_area)
+                .color_attachments(std::slice::from_ref(&attachment_info));
+
+            render_device.cmd_begin_rendering(cmd_buffer, &render_info);
+            render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
+
+            // Until the RT pipeline compiles and the first evaluate lands there is nothing to
+            // sample -- leave the clear (the UI still draws).
+            if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
+                let (window_w, window_h) = (window_size.width as f32, window_size.height as f32);
+                // XR draws ONE letterboxed eye as the spectator image; a flat frame composites
+                // every window-targeted view into its own rect.
+                let composited: &[ViewFrame] = if xr_frame.is_some() {
+                    &views[..1.min(views.len())]
+                } else {
+                    &views[..]
+                };
+                for view in composited {
+                    let Some(source_view) = dlss
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.output_view(view.slot))
+                    else {
+                        continue;
+                    };
+                    let ViewTarget::Window { rect } = view.target else {
+                        // Image targets are composited in their own pass, outside this one:
+                        // this render pass has the swapchain attached.
+                        continue;
+                    };
+                    let viewport = if xr_frame.is_some() {
+                        // Spectator: letterbox the eye image instead of stretching it.
+                        let source_aspect =
+                            view.output_extent.width as f32 / view.output_extent.height as f32;
+                        let (w, h) = if source_aspect > window_w / window_h {
+                            (window_w, window_w / source_aspect)
+                        } else {
+                            (window_h * source_aspect, window_h)
+                        };
+                        vk::Viewport::default()
+                            .x((window_w - w) * 0.5)
+                            .y((window_h - h) * 0.5)
+                            .width(w)
+                            .height(h)
+                    } else {
+                        // Land the traced image on the rect it was traced for. Unset
+                        // `Camera::viewport` gives the whole window, so a plain app is
+                        // unchanged.
+                        vk::Viewport::default()
+                            .x(rect.offset.x as f32)
+                            .y(rect.offset.y as f32)
+                            .width(rect.extent.width as f32)
+                            .height(rect.extent.height as f32)
+                    }
+                    .min_depth(0.0)
+                    .max_depth(1.0);
+                    render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
+                    // The composite is an OVERSIZED fullscreen triangle -- NDC
+                    // (-1,-1)(3,-1)(-1,3) in quad.vert -- so a viewport smaller than the window
+                    // is not enough on its own: the vertices past NDC map past the viewport rect
+                    // and would paint over roughly twice it, straight across the editor's UI (or
+                    // over the view composited before it). Clip to the rect; the UI pass below
+                    // puts the full scissor back.
+                    let scissor = vk::Rect2D::default()
+                        .offset(vk::Offset2D {
+                            x: viewport.x as i32,
+                            y: viewport.y as i32,
+                        })
+                        .extent(vk::Extent2D {
+                            width: viewport.width as u32,
+                            height: viewport.height as u32,
+                        });
+                    render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&scissor));
+
+                    // The spectator gets its own set; a flat view uses its slot's.
+                    let target = if xr_frame.is_some() {
+                        crate::MAX_VIEWS
+                    } else {
+                        view.slot
+                    };
+                    record_post_draw(
+                        &render_device,
+                        cmd_buffer,
+                        pipeline,
+                        TargetKind::Display,
+                        pipeline.descriptor_sets[parity * POST_TARGETS + target],
+                        source_view,
+                        dlss.renderer
+                            .as_ref()
+                            .and_then(|r| r.guide_views(view.slot)),
+                        &crate::post_process_filter::PostProcessPushConstants {
+                            uniforms: frame.uniform_buffers[view.slot].address,
+                            auto_exposure: view.ae.1,
+                            display_exposure: view.exposure.display_exposure(),
+                            debug_view: view.debug_view,
+                            scene_radiance: 0,
+                            _pad: 0,
+                        },
+                    );
+                }
+            }
+
+            // bevy_ui / feathers (including the dev panel), drawn over the scene, full-window.
+            // Restore the full scissor: the composite above narrowed it to the view's rect.
+            render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
+            render_device.cmd_set_viewport(
+                cmd_buffer,
+                0,
+                std::slice::from_ref(
+                    &vk::Viewport::default()
+                        .width(window_size.width as f32)
+                        .height(window_size.height as f32)
+                        .min_depth(0.0)
+                        .max_depth(1.0),
+                ),
+            );
+            // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI,
+            // depth-tested against the traced frame's depth guide (so not before there is one).
+            // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
+            // full-window projection.
+            // Window-targeted views only; an image target drew its own above. `.find()` because
+            // the lowest-order view may be an image target, or there may be no view at all.
+            let window_view = views
+                .iter()
+                .find(|v| matches!(v.target, ViewTarget::Window { .. }));
+            let scene_depth = window_view.filter(|_| dlss_ran).and_then(|view| {
+                dlss.renderer
+                    .as_ref()
+                    .and_then(|r| r.guide_views(view.slot))
+                    .map(|g| g.depth)
+            });
+            if let (None, Some(view)) = (&xr_frame, window_view) {
+                crate::gizmo_render::draw_gizmos(
+                    &render_device,
+                    cmd_buffer,
+                    view.view_proj,
+                    window_size,
+                    scene_depth,
+                    sync.frame_count % 2,
+                    view.slot,
+                    view.camera_mask,
+                    &mut gizmos,
+                );
+            }
+            crate::ui_render::draw_ui(
+                &render_device,
+                cmd_buffer,
+                window_size,
+                sync.frame_count % 2,
+                &mut ui,
+            );
+
+            render_device.cmd_end_rendering(cmd_buffer);
+
+            // A pending screenshot copies the finished frame (UI included) out through a host
+            // buffer on its way to present.
+            // The capture reads the WINDOW swapchain (UI included), so it must use the
+            // swapchain extent -- under XR `output_extent` is the eye extent, and sizing the
+            // copy with it reads out of the swapchain image's bounds (F12 crashed XR runs).
+            let capture_extent = window_size;
+            let capture = screenshots.take_next().map(|path| {
+                let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
+                let buffer: Buffer<u8> =
+                    render_device.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST);
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    frame.swapchain_image,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+                // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: capture_extent.width,
+                        height: capture_extent.height,
+                        depth: 1,
+                    });
+                render_device.cmd_copy_image_to_buffer(
+                    cmd_buffer,
+                    frame.swapchain_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer.handle,
+                    std::slice::from_ref(&region),
+                );
+                (path, buffer)
+            });
+
+            // Make swapchain available for present
             vk_utils::transition_image_layout(
                 &render_device,
                 cmd_buffer,
                 frame.swapchain_image,
-                vk::ImageLayout::ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                if capture.is_some() {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL
+                },
+                vk::ImageLayout::PRESENT_SRC_KHR,
             );
-            // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D {
-                    width: capture_extent.width,
-                    height: capture_extent.height,
-                    depth: 1,
-                });
-            render_device.cmd_copy_image_to_buffer(
-                cmd_buffer,
-                frame.swapchain_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                buffer.handle,
-                std::slice::from_ref(&region),
-            );
-            (path, buffer)
-        });
-
-        // Make swapchain available for present
-        vk_utils::transition_image_layout(
-            &render_device,
-            cmd_buffer,
-            frame.swapchain_image,
-            if capture.is_some() {
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-            } else {
-                vk::ImageLayout::ATTACHMENT_OPTIMAL
-            },
-            vk::ImageLayout::PRESENT_SRC_KHR,
-        );
+            capture.map(|(path, buffer)| (path, buffer, window_size, window_format))
+        } else {
+            None
+        };
 
         render_device.end_command_buffer(cmd_buffer).unwrap();
         drop(section);
         drop(record);
-        swapchain.submit_presentation(&window, cmd_buffer, pick.then_some(picker.semaphore));
+        {
+            let mut waits = Vec::new();
+            let mut signals = Vec::new();
+            if let (Some(swapchain), Some(_)) = (swapchain.as_deref(), presenting) {
+                let (available, finished) = swapchain.frame_semaphores();
+                waits.push((available, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT));
+                signals.push(finished);
+            }
+            // The pick's scene work, submitted ahead of this frame (picking.rs).
+            if pick {
+                waits.push((picker.semaphore, vk::PipelineStageFlags::ALL_COMMANDS));
+            }
+            let queue_lock = info_span!("queue_lock").entered();
+            let queue = render_device.queue.lock().unwrap();
+            drop(queue_lock);
+            sync.submit(*queue, cmd_buffer, &waits, &signals);
+            let presented = match (swapchain.as_deref(), presenting) {
+                (Some(swapchain), Some(_)) => Some(swapchain.present(*queue)),
+                _ => None,
+            };
+            drop(queue);
+            if let (Some(result), Some(swapchain), Some(window)) =
+                (presented, swapchain.as_deref_mut(), window.as_deref())
+            {
+                swapchain.after_present(result, window);
+            }
+            sync.frame_count += 1;
+        }
         // The XR side of the submit: release the image and hand the compositor its layer.
         if let (Some(xr_state), Some(xr_frame)) = (xr.as_deref_mut(), xr_frame) {
             xr_state.end_frame(&render_device, xr_frame);
@@ -1488,7 +1559,7 @@ fn render_frame(
             let _ = render_device.device.device_wait_idle();
         }
 
-        if let Some((path, mut buffer)) = capture {
+        if let Some((path, mut buffer, capture_extent, capture_format)) = capture {
             // Debug tool: one hitch per capture beats plumbing a fence through the frame.
             {
                 let _queue = render_device.queue.lock().unwrap();
@@ -1497,7 +1568,7 @@ fn render_frame(
             let mut view = render_device.map_buffer(&mut buffer);
             let wrote = crate::util::screenshot::save_png(
                 view.as_slice_mut(),
-                swapchain.swapchain_format,
+                capture_format,
                 capture_extent,
                 &path,
             );
@@ -1622,6 +1693,7 @@ pub fn on_shutdown(world: &mut World) {
     render_device.destroyer.tick();
     render_device.destroyer.tick();
     world.remove_resource::<crate::swapchain::Swapchain>();
+    world.remove_resource::<crate::frame_sync::FrameSync>();
 }
 
 /// Run condition for app systems that read [`RenderDevice`]: the device is removed by

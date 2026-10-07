@@ -137,7 +137,12 @@ impl Clone for RenderDevice {
 }
 
 impl RenderDevice {
-    pub unsafe fn from_display(display_handle: &DisplayHandle, xr: Option<&XrContext>) -> Self {
+    /// The device, with the window system's surface support when `display_handle` is some; a
+    /// windowless device (no surface or swapchain extensions) renders only to image targets.
+    pub unsafe fn from_display(
+        display_handle: Option<&DisplayHandle>,
+        xr: Option<&XrContext>,
+    ) -> Self {
         // Before the loader is touched: Aftermath registers ahead of instance/device creation.
         crate::aftermath::enable();
         unsafe {
@@ -145,8 +150,14 @@ impl RenderDevice {
             let (instance, debug_messenger) = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::new(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
-            let (device, queue, micromaps) =
-                create_logical_device(&entry, &instance, physical_device, queue_family_idx, xr);
+            let (device, queue, micromaps) = create_logical_device(
+                &entry,
+                &instance,
+                physical_device,
+                queue_family_idx,
+                xr,
+                display_handle.is_some(),
+            );
             let ext_swapchain = swapchain::Device::new(&instance, &device);
             let ext_sync2 = synchronization2::Device::new(&instance, &device);
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
@@ -412,7 +423,7 @@ impl Drop for RenderDeviceData {
 }
 
 unsafe fn create_instance(
-    display_handle: &DisplayHandle,
+    display_handle: Option<&DisplayHandle>,
     entry: &ash::Entry,
     xr: Option<&XrContext>,
 ) -> (
@@ -442,10 +453,14 @@ unsafe fn create_instance(
             .iter()
             .map(|raw_name| raw_name.as_ptr())
             .collect();
-        let mut instance_extensions: Vec<*const c_char> =
-            ash_window::enumerate_required_extensions(display_handle.as_raw())
-                .unwrap()
-                .to_vec();
+        let mut instance_extensions: Vec<*const c_char> = match display_handle {
+            Some(display_handle) => {
+                ash_window::enumerate_required_extensions(display_handle.as_raw())
+                    .unwrap()
+                    .to_vec()
+            }
+            None => Vec::new(),
+        };
         // DLSS (NGX) asks for its own instance extensions; union them in.
         let ngx_instance_extensions = crate::dlss::instance_extensions();
         for ext in &ngx_instance_extensions {
@@ -678,10 +693,10 @@ unsafe fn create_logical_device(
     physical_device: vk::PhysicalDevice,
     queue_family_idx: u32,
     xr: Option<&XrContext>,
+    windowed: bool,
 ) -> (ash::Device, Mutex<vk::Queue>, bool) {
     unsafe {
         let mut device_extensions = vec![
-            swapchain::NAME.as_ptr(),
             synchronization2::NAME.as_ptr(),
             maintenance4::NAME.as_ptr(),
             acceleration_structure::NAME.as_ptr(),
@@ -694,6 +709,9 @@ unsafe fn create_logical_device(
             spirv_1_4::NAME.as_ptr(),
             descriptor_indexing::NAME.as_ptr(),
         ];
+        if windowed {
+            device_extensions.push(swapchain::NAME.as_ptr());
+        }
         // DLSS (NGX) device extensions (VK_NVX_binary_import, VK_NVX_image_view_handle, ...):
         // they must be present at vkCreateDevice, and a device without them still has to
         // come up -- NGX then reports the feature unavailable.
