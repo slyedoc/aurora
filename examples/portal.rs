@@ -134,7 +134,7 @@ fn setup(
     let desert = commands
         .spawn((
             Name::new("Desert"),
-            Environment,
+            Environment::default(),
             Sky::Hdr {
                 image: asset_server.load(aurora_asset("sky/night_sky.hdr")),
                 scale: SKY_SCALE_NITS,

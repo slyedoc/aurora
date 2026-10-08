@@ -263,7 +263,7 @@ mod tests {
         ))
         .init_resource::<Assets<AuroraMesh>>()
         .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
-        let desert = app.world_mut().spawn(Environment).id();
+        let desert = app.world_mut().spawn(Environment::default()).id();
         // C faces +Z in the main world; D stands at the same spot in the desert, turned
         // around, so walking into C carries straight on.
         let d = app
@@ -321,7 +321,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<AuroraMesh>>()
             .add(AuroraMesh::from_shape(Rectangle::new(2.0, 3.0)));
-        let desert = app.world_mut().spawn(Environment).id();
+        let desert = app.world_mut().spawn(Environment::default()).id();
         let gate = |app: &mut App, world: Option<Entity>, at: Transform| {
             let mut root = app.world_mut().spawn((at, Visibility::default()));
             if let Some(world) = world {

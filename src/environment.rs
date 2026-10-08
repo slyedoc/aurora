@@ -11,16 +11,26 @@ pub use avian3d::environment::{
 };
 use bevy::{camera::visibility::RenderLayers, platform::collections::HashSet, prelude::*};
 
-/// An environment that renders: its own sky, suns and exposure, apart from the others. It brings
-/// its [`PhysicsEnvironment`] with it. The settings are separate components on the same entity
-/// ([`Sky`](crate::sky::Sky), [`GradientSky`](crate::sky::GradientSky),
-/// [`Atmosphere`](crate::atmosphere::Atmosphere), [`CloudLayer`](crate::atmosphere::CloudLayer),
-/// [`EnvironmentExposure`](crate::sky::EnvironmentExposure)), and a scene whose root carries it
-/// is an environment scene. A physics environment without one renders in the environment above.
+/// An environment that renders: its own sky, suns and exposure, apart from the others, and its
+/// own [`PhysicsEnvironment`]. The bit it renders in, `None` until one is free; spawn with
+/// `Some(0)` for the main environment, else leave it `None` and the lowest free bit is taken.
+///
+/// The settings are ordinary components on the same entity ([`Sky`](crate::sky::Sky),
+/// [`GradientSky`](crate::sky::GradientSky), [`Atmosphere`](crate::atmosphere::Atmosphere),
+/// [`CloudLayer`](crate::atmosphere::CloudLayer),
+/// [`EnvironmentExposure`](crate::sky::EnvironmentExposure)), so an environment file is just a
+/// `.bsn` whose root carries them:
+///
+/// ```ignore
+/// commands.spawn((ScenePatchInstance(assets.load("env/midnight.bsn")), Environment::default()));
+/// ```
+///
+/// The bit is aurora's to set after spawn, and never saved: a scene asks for an environment, not
+/// a bit. A physics environment without one renders in the environment above.
 #[derive(Component, Reflect, Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[reflect(Component, Default, Clone, PartialEq)]
 #[require(PhysicsEnvironment)]
-pub struct Environment;
+pub struct Environment(#[reflect(skip_serializing)] pub Option<u8>);
 
 /// Which environment owns each of the 8 instance-mask bits.
 #[derive(Resource, Default, Debug)]
@@ -64,21 +74,58 @@ pub fn view_environment(mask: u8) -> u8 {
     (7 - mask.leading_zeros().min(7)) as u8
 }
 
+/// The bit an environment asks for: `Some(0)` (or avian's main environment) is the main bit,
+/// anything else the lowest free one.
+fn claim(
+    environments: &mut RenderEnvironments,
+    environment: Entity,
+    requested: Option<u8>,
+    main: bool,
+) -> Option<u8> {
+    let want = if main { Some(0) } else { requested.filter(|&b| b < 8) };
+    let bit = match want {
+        Some(bit) if environments.owners[bit as usize].is_none() => Some(bit),
+        Some(bit) => {
+            warn!("aurora: environment bit {bit} is taken; {environment} takes a free one");
+            (1..8).find(|&b| environments.owners[b as usize].is_none())
+        }
+        None => (1..8).find(|&b| environments.owners[b as usize].is_none()),
+    }?;
+    environments.owners[bit as usize] = Some(environment);
+    Some(bit)
+}
+
 fn assign_bit(
     add: On<Add<Environment>>,
     main: Query<(), With<MainPhysicsEnvironment>>,
+    mut ids: Query<&mut Environment>,
     mut environments: ResMut<RenderEnvironments>,
 ) {
     let environment = add.entity;
-    let bit = if main.contains(environment) {
-        Some(0)
-    } else {
-        (1..8).find(|&bit| environments.owners[bit].is_none())
+    let Ok(mut id) = ids.get_mut(environment) else {
+        return;
     };
-    match bit {
-        Some(bit) => environments.owners[bit] = Some(environment),
-        None => {
-            warn!("aurora: more than 8 environments; {environment} renders in the main environment")
+    let bit = claim(&mut environments, environment, id.0, main.contains(environment));
+    if bit.is_none() {
+        warn!("aurora: no environment bit free; {environment} waits for one");
+    }
+    if id.0 != bit {
+        id.0 = bit;
+    }
+}
+
+/// Environments still waiting for a bit take one as soon as another is freed.
+fn assign_waiting(
+    mut waiting: Query<(Entity, &mut Environment)>,
+    main: Query<(), With<MainPhysicsEnvironment>>,
+    mut environments: ResMut<RenderEnvironments>,
+) {
+    for (environment, mut id) in &mut waiting {
+        if id.0.is_some() || environments.bit(environment).is_some() {
+            continue;
+        }
+        if let Some(bit) = claim(&mut environments, environment, None, main.contains(environment)) {
+            id.0 = Some(bit);
         }
     }
 }
@@ -97,10 +144,10 @@ fn free_bit(remove: On<Remove<Environment>>, mut environments: ResMut<RenderEnvi
 pub fn propagate_environments(
     mut commands: Commands,
     worlds: Res<RenderEnvironments>,
-    moved: Query<Entity, Or<(Changed<ChildOf>, Added<Environment>)>>,
+    moved: Query<Entity, Or<(Changed<ChildOf>, Changed<Environment>)>>,
     mut unparented: RemovedComponents<ChildOf>,
     mut unworlded: RemovedComponents<Environment>,
-    is_world: Query<(), With<Environment>>,
+    is_world: Query<&Environment>,
     parents: Query<&ChildOf>,
     children: Query<&Children>,
     current: Query<Option<&InEnvironment>>,
@@ -166,7 +213,10 @@ impl Plugin for RenderEnvironmentPlugin {
             .init_resource::<RenderEnvironments>()
             .add_observer(assign_bit)
             .add_observer(free_bit)
-            .add_systems(PostUpdate, propagate_environments);
+            .add_systems(
+                PostUpdate,
+                (assign_waiting, propagate_environments).chain(),
+            );
     }
 
     /// Without avian's physics plugins nothing spawns the main environment, yet it is where the
@@ -182,7 +232,7 @@ impl Plugin for RenderEnvironmentPlugin {
         }
         // The main environment renders.
         let main = app.world().resource::<MainPhysicsEnvironmentEntity>().0;
-        app.world_mut().entity_mut(main).insert(Environment);
+        app.world_mut().entity_mut(main).insert(Environment(Some(0)));
     }
 }
 
@@ -193,7 +243,8 @@ mod tests {
     fn app() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, RenderEnvironmentPlugin));
-        app.world_mut().spawn((MainPhysicsEnvironment, Environment));
+        app.world_mut()
+            .spawn((MainPhysicsEnvironment, Environment(Some(0))));
         app
     }
 
@@ -205,7 +256,7 @@ mod tests {
     fn descendants_take_their_environments_bit() {
         let mut app = app();
         let outside = app.world_mut().spawn_empty().id();
-        let environment = app.world_mut().spawn(Environment).id();
+        let environment = app.world_mut().spawn(Environment::default()).id();
         let child = app.world_mut().spawn(ChildOf(environment)).id();
         let grandchild = app.world_mut().spawn(ChildOf(child)).id();
         app.update();
@@ -224,8 +275,8 @@ mod tests {
     #[test]
     fn a_reparented_subtree_follows_its_new_environment() {
         let mut app = app();
-        let a = app.world_mut().spawn(Environment).id();
-        let b = app.world_mut().spawn(Environment).id();
+        let a = app.world_mut().spawn(Environment::default()).id();
+        let b = app.world_mut().spawn(Environment::default()).id();
         let body = app.world_mut().spawn(ChildOf(a)).id();
         let part = app.world_mut().spawn(ChildOf(body)).id();
         app.update();
@@ -243,7 +294,7 @@ mod tests {
     #[test]
     fn a_physics_only_environment_renders_in_the_one_above() {
         let mut app = app();
-        let outer = app.world_mut().spawn(Environment).id();
+        let outer = app.world_mut().spawn(Environment::default()).id();
         let physics = app
             .world_mut()
             .spawn((PhysicsEnvironment, ChildOf(outer)))
@@ -258,10 +309,10 @@ mod tests {
     #[test]
     fn a_despawned_environment_frees_its_bit() {
         let mut app = app();
-        let a = app.world_mut().spawn(Environment).id();
+        let a = app.world_mut().spawn(Environment::default()).id();
         app.update();
         app.world_mut().despawn(a);
-        let b = app.world_mut().spawn(Environment).id();
+        let b = app.world_mut().spawn(Environment::default()).id();
         app.update();
         assert_eq!(app.world().resource::<RenderEnvironments>().bit(b), Some(1));
     }
@@ -270,7 +321,7 @@ mod tests {
     fn a_ninth_environment_renders_in_the_main_environment() {
         let mut app = app();
         let environments: Vec<Entity> = (0..8)
-            .map(|_| app.world_mut().spawn(Environment).id())
+            .map(|_| app.world_mut().spawn(Environment::default()).id())
             .collect();
         let child = app.world_mut().spawn(ChildOf(environments[7])).id();
         app.update();
@@ -287,6 +338,35 @@ mod tests {
             None
         );
         assert_eq!(bit(&app, child), 0);
+    }
+
+    #[test]
+    fn an_environment_waiting_for_a_bit_takes_the_next_one_freed() {
+        let mut app = app();
+        let environments: Vec<Entity> = (0..8)
+            .map(|_| app.world_mut().spawn(Environment::default()).id())
+            .collect();
+        app.update();
+        let id = |app: &App, e| app.world().get::<Environment>(e).copied();
+        assert_eq!(id(&app, environments[7]), Some(Environment(None)));
+
+        app.world_mut().despawn(environments[2]);
+        app.update();
+        assert_eq!(id(&app, environments[7]), Some(Environment(Some(3))));
+        let child = app.world_mut().spawn(ChildOf(environments[7])).id();
+        app.update();
+        assert_eq!(bit(&app, child), 3);
+    }
+
+    #[test]
+    fn the_component_shows_the_bit_taken() {
+        let mut app = app();
+        let a = app.world_mut().spawn(Environment::default()).id();
+        let b = app.world_mut().spawn(Environment(Some(5))).id();
+        let c = app.world_mut().spawn(Environment(Some(5))).id();
+        app.update();
+        let id = |e| app.world().get::<Environment>(e).copied().unwrap().0;
+        assert_eq!((id(a), id(b), id(c)), (Some(1), Some(5), Some(2)));
     }
 
     #[test]
