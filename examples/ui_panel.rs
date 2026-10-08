@@ -32,7 +32,8 @@ use bevy::{
 };
 use bevy_aurora::{
     AuroraDefaultPlugins,
-    dev_ui::{DevUIPlugin, DevUIState},
+    dev_ui::DevUIPlugin,
+    render_settings::RenderSettings,
     environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
@@ -133,7 +134,7 @@ fn setup(
     // reflected resource with no widget code at all (the XR wrist-panel posture).
     commands.spawn((
         Name::new("inspector panel"),
-        InspectorPanel3d::resource::<DevUIState>(),
+        InspectorPanel3d::resource::<RenderSettings>(),
         UiPanel3d {
             size: Vec2::new(1.2, 1.6),
             px: UVec2::new(600, 800),

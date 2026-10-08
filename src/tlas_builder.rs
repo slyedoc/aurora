@@ -828,7 +828,7 @@ pub fn prepare_instances(
     sphere_blas: Res<SphereBLAS>,
     mut replaced: ResMut<ReplacedAssets>,
     mut dropped: ResMut<DroppedAssets>,
-    dev_ui: Option<Res<crate::dev_ui::DevUIState>>,
+    settings: Option<Res<crate::render_settings::RenderSettings>>,
     surface_data: Res<crate::surface_group::SurfaceGroupData>,
     mut omm_enabled: Local<Option<bool>>,
 ) {
@@ -880,7 +880,7 @@ pub fn prepare_instances(
         }
     }
     // The micromap toggle lives in the instance flags: flipping it re-resolves every slot.
-    let omm = dev_ui.as_ref().is_none_or(|d| d.omm);
+    let omm = settings.as_ref().is_none_or(|d| d.omm);
     if *omm_enabled != Some(omm) {
         if omm_enabled.is_some() {
             tlas.dirty.extend(

@@ -1,9 +1,6 @@
-//! The dev panel: a feathers inspector over the renderer's tunables.
-//!
-//! [`DevUIState`] is a reflected main-world resource; `bevy_feathers_inspector` generates the
-//! sliders from its `#[reflect(@range)]` attributes and writes edits back through reflection.
-//! The frame reads the tunables straight from the resource
-//! into the frame uniform. Drawn by [`crate::ui_render`], so no wgpu / egui anywhere.
+//! The dev panel, for apps without an editor: fps and the centre-screen exposure probe over
+//! feathers inspectors for [`RenderSettings`] and the first camera's lens, exposure and DLSS
+//! mode. It holds no state of its own; an editor edits the same resource and components.
 //!
 //! Keys: `F2` toggles this panel.
 
@@ -18,176 +15,19 @@ use bevy::{
         tokens,
     },
     feathers_inspector::{
-        DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, InspectorCollapsed, InspectorRoot,
-        build_resource_inspector,
+        BuildComponentInspector, DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins,
+        InspectorCollapsed, InspectorRoot, build_resource_inspector,
     },
     prelude::*,
     ui::{Display, GlobalZIndex},
 };
 
 use crate::{
-    auto_exposure::{AuroraExposure, ev_from_ev100, ev100_from_ev},
-    dlss::{AuroraDlss, RrPreset, set_jitter_scale},
+    auto_exposure::{AuroraExposure, ev100_from_ev},
+    dlss::AuroraDlss,
+    render_settings::{AuroraLens, RenderSettings},
     ui_render::UiRenderPlugin,
 };
-
-/// Renderer tunables edited from the dev panel; the frame reads them directly.
-#[derive(Resource, Reflect, Clone, Debug)]
-#[reflect(Resource, Default)]
-pub struct DevUIState {
-    #[reflect(@0.0..=0.02_f32)]
-    pub aperture: f32,
-    #[reflect(@0.0..=0.2_f32)]
-    pub foginess: f32,
-    #[reflect(@-1.0..=1.0_f32)]
-    pub fog_scatter: f32,
-    #[reflect(@0.0..=1.0_f32)]
-    pub sky_brightness: f32,
-    /// Uniform multiplier on every light's emission -- emissive surfaces and analytic
-    /// lights alike (the sky has `sky_brightness`). Uniform across lights, so NEE stays
-    /// unbiased and the light table's sampling distribution is unchanged.
-    #[reflect(@0.0..=100.0_f32)]
-    pub emissive_boost: f32,
-    /// Firefly suppression: indirect contributions are clamped to this many times the
-    /// metered mid-gray luminance, i.e. what the exposure shows as 18% gray (0 = off), so it
-    /// follows the scene whether a sky or an emitter lights it. Biases bright indirect paths
-    /// down; kills the speckle Ray Reconstruction would otherwise smear.
-    #[reflect(@0.0..=64.0_f32)]
-    pub firefly_clamp: f32,
-    /// Paths per pixel per frame; RR is trained for 1 spp, so extra samples mostly buy
-    /// trace time.
-    #[reflect(@1.0..=4.0_f32)]
-    pub samples: u32,
-    /// Maximum path length. With the firefly clamp a short path is all the denoiser needs.
-    #[reflect(@1.0..=64.0_f32)]
-    pub max_bounces: u32,
-    /// Post-process vignette strength (0 = off); aspect-corrected, darkens towards the corners.
-    #[reflect(@0.0..=1.0_f32)]
-    pub vignette: f32,
-    /// Next-event estimation for emissive triangles (off = BRDF sampling only, the
-    /// reference estimator).
-    pub light_nee: bool,
-    /// Added to the ray-cone texture level of detail, on top of the automatic
-    /// log2(render / output) term. The DLSS guide asks for -1 (sharper: accumulation over
-    /// jittered frames resolves the extra detail); 0 is the unbiased footprint, positive blurs.
-    // Past -2 textureLod clamps to mip 0: dead travel, and mip 0 under jitter feeds RR noise.
-    #[reflect(@-2.0..=1.0_f32)]
-    pub texture_lod_bias: f32,
-    /// Ray Reconstruction's specular hit distance comes from one extra mirror-direction ray
-    /// at the primary vertex, for surfaces up to this perceptual roughness; rougher ones
-    /// report 0 (the reflection moves with the surface). 0 = no guide rays.
-    #[reflect(@0.0..=1.0_f32)]
-    pub spec_hit_roughness: f32,
-    /// Light candidates resampled at every shading point (RIS): each is drawn from the
-    /// power-weighted table, weighted by what it would contribute HERE, one survives and
-    /// gets the shadow ray. 1 = a single table sample, which with hundreds of lights almost
-    /// always lands on one too far away to matter. Deeper bounces use a quarter.
-    #[reflect(@1.0..=32.0_f32)]
-    pub light_candidates: u32,
-    /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse). Off while
-    /// accumulating, so Space stays the uncorrelated reference.
-    pub restir: bool,
-    /// Initial light candidates per pixel.
-    #[reflect(@1.0..=32.0_f32)]
-    pub restir_candidates: u32,
-    /// Temporal history cap, in multiples of the candidate count.
-    #[reflect(@0.0..=64.0_f32)]
-    pub restir_history: f32,
-    /// Radiance cache: paths terminate into converged voxels from bounce 2 on. Biased by
-    /// construction; off while accumulating.
-    pub sharc: bool,
-    /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
-    #[reflect(@0.05..=2.0_f32)]
-    pub sharc_voxel: f32,
-    /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = every instance
-    /// traces through the any-hit alpha test, for A/B).
-    pub omm: bool,
-    /// DLSS Ray Reconstruction mode; mirrors the camera's [`AuroraDlss`] component both ways.
-    pub dlss: AuroraDlss,
-    /// Ray Reconstruction model preset; changing it rebuilds the feature.
-    pub rr_preset: RrPreset,
-    /// Lock exposure to `ev100` instead of the camera's world's exposure. The metering keeps
-    /// running underneath either way -- it is what normalises Ray Reconstruction's input --
-    /// so this changes the LOOK only, instantly and at no cost to denoiser history.
-    pub ev100_lock: bool,
-    /// The locked exposure, EV100: the photographic stop, the same number
-    /// aurora_files/lighting_units.md uses. ~14-16 daylight exterior, ~5-9 interior.
-    /// Only read when `ev100_lock` is on.
-    #[reflect(@0.0..=20.0_f32)]
-    pub ev100: f32,
-    /// Sub-pixel camera jitter amplitude: 1 = the full +-0.5 traced pixel, 0 = pixel centres
-    /// every frame. Lower is calmer -- the raw guide views hop less (they are shown
-    /// unresolved; at ultra-performance half a traced pixel is one and a half screen pixels)
-    /// -- and gives Ray Reconstruction less sub-pixel coverage for anti-aliased edges and
-    /// upscaled detail. NGX is always told the same scaled offset.
-    #[reflect(@0.0..=1.0_f32)]
-    pub jitter_scale: f32,
-}
-
-impl DevUIState {
-    /// The defaults with `$AURORA_DEV_UI` applied: `field=value` pairs separated by commas
-    /// (`sky_brightness=0,emissive_boost=1,restir=true`), for headless runs that cannot
-    /// reach the panel. Unknown fields and unparsable values are logged and skipped.
-    pub fn from_env() -> Self {
-        let mut state = Self::default();
-        let Ok(overrides) = std::env::var("AURORA_DEV_UI") else {
-            return state;
-        };
-        for pair in overrides.split(',').filter(|pair| !pair.trim().is_empty()) {
-            let applied = pair.split_once('=').is_some_and(|(name, value)| {
-                let value = value.trim();
-                let Some(field) = state.field_mut(name.trim()) else {
-                    return false;
-                };
-                if let Some(field) = field.try_downcast_mut::<f32>() {
-                    value.parse().map(|v| *field = v).is_ok()
-                } else if let Some(field) = field.try_downcast_mut::<u32>() {
-                    value.parse().map(|v| *field = v).is_ok()
-                } else if let Some(field) = field.try_downcast_mut::<bool>() {
-                    value.parse().map(|v| *field = v).is_ok()
-                } else {
-                    false
-                }
-            });
-            if !applied {
-                warn!("AURORA_DEV_UI: cannot apply `{pair}`");
-            }
-        }
-        state
-    }
-}
-
-impl Default for DevUIState {
-    fn default() -> Self {
-        Self {
-            aperture: 0.0,
-            foginess: 0.001,
-            fog_scatter: 0.9,
-            sky_brightness: 1.0,
-            emissive_boost: 1.0,
-            firefly_clamp: 8.0,
-            samples: 1,
-            max_bounces: 32,
-            vignette: 0.0,
-            light_nee: true,
-            restir: false, // TODO
-            texture_lod_bias: -1.0,
-            spec_hit_roughness: 0.6,
-            light_candidates: 8,
-            restir_candidates: 8,
-            restir_history: 20.0,
-            sharc: false, // TODO
-            sharc_voxel: 0.25,
-            omm: true,
-            dlss: AuroraDlss::from_env(),
-            rr_preset: RrPreset::current(),
-            // Unlocked: cameras follow their world (AuroraExposure::default()).
-            ev100_lock: false,
-            ev100: 13.0,
-            jitter_scale: 1.0,
-        }
-    }
-}
 
 /// The panel root; `F2` flips its `Display`. Public so apps can hang their own sections
 /// under it (a `Node` child + `BuildComponentInspector` / `BuildResourceInspector`).
@@ -230,110 +70,46 @@ impl Plugin for DevUIPlugin {
             app.add_plugins(FeathersInspectorPlugins);
         }
 
-        app.register_type::<DevUIState>();
-        app.insert_resource(DevUIState::from_env());
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(
-            Update,
-            (
-                toggle_panel,
-                update_stats,
-                sync_dlss_mode,
-                sync_rr_preset,
-                sync_exposure,
-            ),
-        );
+        app.add_systems(Update, (toggle_panel, update_stats, inspect_camera));
     }
 }
 
-/// Keeps the panel's `dlss` field and the camera's [`AuroraDlss`] component equal: whichever
-/// side moved last (the panel, or F3 cycling the component) wins.
-fn sync_dlss_mode(
-    mut state: ResMut<DevUIState>,
-    mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,
-    mut agreed: Local<Option<AuroraDlss>>,
+/// The first 3D camera's lens, exposure and DLSS mode join the panel once it exists.
+fn inspect_camera(
+    cameras: Query<(Entity, Has<AuroraLens>, Has<AuroraExposure>, Has<AuroraDlss>), With<Camera3d>>,
+    host: Single<Entity, With<DevUIInspectorHost>>,
+    mut shown: Local<Option<Entity>>,
+    mut commands: Commands,
 ) {
-    let last = agreed.unwrap_or(state.dlss);
-    if state.dlss != last {
-        for mut mode in &mut cameras {
-            if *mode != state.dlss {
-                *mode = state.dlss;
-            }
-        }
-        *agreed = Some(state.dlss);
-        return;
-    }
-    if let Some(mode) = cameras.iter().find(|m| **m != last) {
-        state.dlss = *mode;
-        *agreed = Some(*mode);
-        return;
-    }
-    *agreed = Some(last);
-}
-
-/// Keeps the panel's EV100 lock and the camera's [`AuroraExposure`] equal, in both
-/// directions, so a lock set here shows up in the F1 inspector and vice versa.
-///
-/// The panel speaks EV100; `AuroraExposure` stores log2 of the radiance multiplier. The
-/// two differ by `log2(1.2)` (Filament), which is why the presets are -15.26 rather than
-/// -15 -- see [`ev_from_ev100`].
-fn sync_exposure(
-    mut state: ResMut<DevUIState>,
-    mut cameras: Query<&mut AuroraExposure, With<Camera3d>>,
-    mut agreed: Local<Option<(bool, f32)>>,
-) {
-    let want = (state.ev100_lock, state.ev100);
-    let Some(last) = *agreed else {
-        // First run. The camera starts on Auto while the panel may already say "locked"
-        // (DevUIState::from_env), so seeding `agreed` from the PANEL would make the two
-        // look agreed, and the pull-back branch below would then quietly clobber the lock
-        // off. The panel is authoritative on frame one; push it out.
-        for mut exposure in &mut cameras {
-            *exposure = if want.0 {
-                AuroraExposure::fixed(ev_from_ev100(want.1))
-            } else {
-                AuroraExposure::Environment
-            };
-        }
-        *agreed = Some(want);
+    let Some((camera, lens, exposure, dlss)) = cameras.iter().next() else {
         return;
     };
-
-    if want != last {
-        // Panel moved: push it out.
-        for mut exposure in &mut cameras {
-            *exposure = if want.0 {
-                AuroraExposure::fixed(ev_from_ev100(want.1))
-            } else {
-                AuroraExposure::Environment
-            };
-        }
-        *agreed = Some(want);
+    if *shown == Some(camera) {
         return;
     }
-
-    // Component moved (F1 inspector, or an app setting it): pull it back.
-    if let Some(exposure) = cameras.iter().next() {
-        let now = match exposure {
-            AuroraExposure::Fixed(fixed) => (true, ev100_from_ev(fixed.ev)),
-            AuroraExposure::Auto(_) | AuroraExposure::Environment => (false, state.ev100),
-        };
-        if now.0 != state.ev100_lock || (now.0 && (now.1 - state.ev100).abs() > 1.0e-3) {
-            state.ev100_lock = now.0;
-            state.ev100 = now.1;
-            *agreed = Some(now);
-            return;
-        }
+    *shown = Some(camera);
+    let mut entity = commands.entity(camera);
+    if !lens {
+        entity.insert(AuroraLens::default());
     }
-    *agreed = Some(want);
-}
-
-/// Applies the panel's preset row; the renderer rebuilds the feature on the next frame.
-fn sync_rr_preset(state: Res<DevUIState>) {
-    if state.rr_preset != RrPreset::current() {
-        state.rr_preset.make_current();
+    if !exposure {
+        entity.insert(AuroraExposure::default());
     }
-    set_jitter_scale(state.jitter_scale);
+    if !dlss {
+        entity.insert(AuroraDlss::default());
+    }
+    for type_id in [
+        TypeId::of::<AuroraLens>(),
+        TypeId::of::<AuroraExposure>(),
+        TypeId::of::<AuroraDlss>(),
+    ] {
+        commands.queue(BuildComponentInspector {
+            target: camera,
+            type_id,
+            panel: *host,
+        });
+    }
 }
 
 /// Stacking order for aurora's own debug overlays: above any app UI, which sits at 0 unless it
@@ -382,7 +158,7 @@ fn spawn_panel(world: &mut World) {
     // The card starts collapsed (expanding is one click; the panel stays compact).
     world.resource_mut::<InspectorCollapsed>().set(
         &InspectorRoot::Resource {
-            type_id: TypeId::of::<DevUIState>(),
+            type_id: TypeId::of::<RenderSettings>(),
         },
         "",
         true,
@@ -393,7 +169,7 @@ fn spawn_panel(world: &mut World) {
         .iter(world)
         .find(|_| true)
         .unwrap_or(panel);
-    build_resource_inspector(world, TypeId::of::<DevUIState>(), host);
+    build_resource_inspector(world, TypeId::of::<RenderSettings>(), host);
 }
 
 fn toggle_panel(

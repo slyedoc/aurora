@@ -46,6 +46,7 @@ pub mod raytracing_pipeline;
 pub mod render_buffer;
 pub mod render_device;
 pub mod render_env;
+pub mod render_settings;
 pub mod render_shaders;
 pub mod render_texture;
 pub mod restir;
@@ -90,7 +91,7 @@ pub mod prelude {
         collision::{CollisionMesh, CollisionShape},
         compute::{ComputeModule, ComputeModules},
         debug_view::AuroraDebugView,
-        dev_ui::{DevUIPanel, DevUIPlugin, DevUIState},
+        dev_ui::{DevUIPanel, DevUIPlugin},
         dlss::{AuroraDlss, RrPreset},
         env_light::EnvLight,
         environment::{InEnvironment, RenderEnvironments},
@@ -99,8 +100,9 @@ pub mod prelude {
         picking::{RayCaster, RayHit, RayHits},
         portal::AuroraPortal,
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
+        render_settings::{AuroraLens, RenderSettings},
         skinning::{SkinJointsByName, Wind, WindSway},
-        sky::{EnvironmentSkies, GradientSky, Sky},
+        sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyBrightness},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
@@ -148,6 +150,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::xr::XrPlugin);
         group = group.add(crate::ray_render_plugin::RayRenderPlugin);
         group = group.add(crate::dlss::DlssPlugin::default());
+        group = group.add(crate::render_settings::RenderSettingsPlugin);
         group = group.add(crate::render_env::RenderEnvPlugin);
         group = group.add(crate::env_light::EnvLightPlugin);
         group = group.add(crate::post_process_filter::PostProcessFilterPlugin);

@@ -58,7 +58,7 @@ pub struct UniformData {
     /// Indirect path contributions are clamped to this multiple of the metered mid-gray
     /// luminance (0 = off); the raygen turns it into nits from the exposure state.
     firefly_clamp: f32,
-    /// Paths per pixel this frame and their maximum length (from [`DevUIState`]).
+    /// Paths per pixel this frame and their maximum length (from [`RenderSettings`]).
     samples: u32,
     max_bounces: u32,
     /// Post-process vignette strength (0 = off).
@@ -86,7 +86,7 @@ pub struct UniformData {
     env: u64,
     env_w: u32,
     env_h: u32,
-    /// Uniform multiplier on every light's emission (from [`DevUIState`]).
+    /// Uniform multiplier on every light's emission (from [`RenderSettings`]).
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -137,6 +137,7 @@ struct ViewFrame {
     /// The camera this view traces for; its exposure meters under this entity.
     camera: Entity,
     exposure: crate::auto_exposure::AuroraExposure,
+    lens: crate::render_settings::AuroraLens,
     /// This camera's (luminance, exposure state) addresses, set when its metering records.
     ae: (u64, u64),
 }
@@ -377,7 +378,7 @@ fn render_frame(
         ResMut<crate::frame_sync::FrameSync>,
     ),
     dev_ui_stuff: (
-        Option<Res<crate::dev_ui::DevUIState>>,
+        Option<Res<crate::render_settings::RenderSettings>>,
         crate::ui_render::UiDrawParams,
         Res<EnvironmentSkies>,
         Res<crate::env_light::EnvLight>,
@@ -424,6 +425,7 @@ fn render_frame(
             // `is_active` skips them.
             Option<&Camera>,
             Option<&crate::environment::InEnvironment>,
+            Option<&crate::render_settings::AuroraLens>,
         ),
         With<Camera3d>,
     >,
@@ -465,9 +467,9 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
-    let (dev_ui_state, mut ui, skies, env_light, mut gizmos, terrain_cursor, atmosphere, clouds) =
+    let (settings, mut ui, skies, env_light, mut gizmos, terrain_cursor, atmosphere, clouds) =
         dev_ui_stuff;
-    let dev_ui_state = dev_ui_state.map(|state| state.clone()).unwrap_or_default();
+    let settings = settings.map(|settings| settings.clone()).unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     // Every active Camera3d becomes a view, lowest `Camera::order` first -- so a camera
     // whose target another camera samples renders before it, which is what `order` means
@@ -513,6 +515,7 @@ fn render_frame(
         debug_view: u32,
         camera: Entity,
         exposure: crate::auto_exposure::AuroraExposure,
+        lens: crate::render_settings::AuroraLens,
     }
 
     // `AuroraExposure::Environment`: the fixed exposure of the world the camera is in.
@@ -556,6 +559,7 @@ fn render_frame(
                             .cloned()
                             .unwrap_or_default()
                             .resolve(world_ev100(camera.6, camera.8)),
+                        lens: camera.9.copied().unwrap_or_default(),
                     }
                 })
                 .collect()
@@ -611,6 +615,7 @@ fn render_frame(
                         .cloned()
                         .unwrap_or_default()
                         .resolve(world_ev100(c.6, c.8)),
+                    lens: c.9.copied().unwrap_or_default(),
                 })
             })
             .collect(),
@@ -633,6 +638,7 @@ fn render_frame(
                 debug_view,
                 camera,
                 exposure,
+                lens,
             } = p;
             let plan = dlss
                 .renderer
@@ -657,6 +663,7 @@ fn render_frame(
                 plan,
                 camera,
                 exposure,
+                lens,
                 ae: (0, 0),
             }
         })
@@ -741,6 +748,8 @@ fn render_frame(
 
     // Update each view's uniform buffer
     for view in &views {
+        let environment =
+            &skies.worlds[crate::environment::view_environment(view.camera_mask as u8) as usize];
         let data = UniformData {
             sky_color: match camera_sky {
                 Sky::Hdr { scale, .. } => Vec4::splat(*scale),
@@ -756,42 +765,42 @@ fn render_frame(
                 .pull_focus
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
-            aperture: dev_ui_state.aperture,
-            foginess: dev_ui_state.foginess,
-            fog_scatter: dev_ui_state.fog_scatter,
-            sky_brightness: dev_ui_state.sky_brightness,
+            aperture: view.lens.aperture,
+            foginess: environment.fog.density,
+            fog_scatter: environment.fog.scatter,
+            sky_brightness: environment.sky_brightness,
             view: view.view_matrix.to_cols_array(),
             view_proj: view.view_proj.to_cols_array(),
             prev_view_proj: view.last_view_proj.to_cols_array(),
             jitter: view.plan.map_or([0.0; 2], |p| p.jitter),
             frame: *frame_counter,
-            firefly_clamp: dev_ui_state.firefly_clamp,
-            samples: dev_ui_state.samples.max(1),
-            max_bounces: dev_ui_state.max_bounces.max(1),
-            vignette: dev_ui_state.vignette,
-            light_entries: if dev_ui_state.light_nee {
+            firefly_clamp: settings.firefly_clamp,
+            samples: settings.samples.max(1),
+            max_bounces: settings.max_bounces.max(1),
+            vignette: view.lens.vignette,
+            light_entries: if settings.light_nee {
                 lights.active_entries
             } else {
                 0
             },
-            restir_candidates: if dev_ui_state.restir {
-                dev_ui_state.restir_candidates.clamp(1, 32)
+            restir_candidates: if settings.restir {
+                settings.restir_candidates.clamp(1, 32)
             } else {
                 0
             },
-            light_candidates: dev_ui_state.light_candidates.clamp(1, 32),
+            light_candidates: settings.light_candidates.clamp(1, 32),
             // DLSS guide 3.5: textures are picked for the OUTPUT resolution, not the trace
             // resolution, so the upscaled image keeps its detail.
             lod_bias: (view.trace_extent.width.max(1) as f32
                 / view.output_extent.width.max(1) as f32)
                 .log2()
-                + dev_ui_state.texture_lod_bias,
-            spec_hit_roughness: dev_ui_state.spec_hit_roughness,
+                + settings.texture_lod_bias,
+            spec_hit_roughness: settings.spec_hit_roughness,
             light_epoch: lights.epoch,
-            restir_m_clamp: (dev_ui_state.restir_candidates as f32 * dev_ui_state.restir_history)
+            restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history)
                 .max(1.0),
-            sharc: dev_ui_state.sharc as u32,
-            sharc_voxel: dev_ui_state.sharc_voxel.max(0.01),
+            sharc: settings.sharc as u32,
+            sharc_voxel: settings.sharc_voxel.max(0.01),
             env: env_light.address(),
             env_w: if env_light.address() != 0 {
                 crate::env_light::ENV_W
@@ -803,7 +812,7 @@ fn render_frame(
             } else {
                 0
             },
-            emissive_boost: dev_ui_state.emissive_boost.max(0.0),
+            emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
             camera_mask: view.camera_mask,
@@ -922,7 +931,7 @@ fn render_frame(
             cmd_buffer,
             &modules,
             *frame_counter,
-            dev_ui_state.sharc,
+            settings.sharc,
         );
         // Exposure: each camera meters its own last frame into this frame's exposure (the
         // raygen reads it). A headset's two eyes are one camera and share one meter.

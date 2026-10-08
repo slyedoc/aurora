@@ -13,7 +13,7 @@
 //! raygen gathers their light by next-event estimation, one shadow ray per sun per hit.
 //!
 //! Radiances are in nits so they sit on the same scale as the importers' emitters;
-//! [`DevUIState::sky_brightness`](crate::dev_ui::DevUIState) multiplies the sky.
+//! [`SkyBrightness`] multiplies the sky. [`Fog`] is the environment's participating medium.
 
 use bevy::{
     camera::visibility::RenderLayers,
@@ -51,6 +51,38 @@ impl Default for EnvironmentExposure {
 /// The exposure a sun of `lux` calls for: incident-meter EV100 = log2(lux * 100 / 250).
 pub fn ev100_for_lux(lux: f32) -> f32 {
     (lux.max(1.0e-3) * 100.0 / 250.0).log2()
+}
+
+/// An environment's fog. On an environment entity; without one, the default haze.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct Fog {
+    /// Extinction per meter (0 = clear).
+    #[reflect(@0.0..=0.2_f32)]
+    pub density: f32,
+    /// Henyey-Greenstein anisotropy: 1 scatters forward, -1 back.
+    #[reflect(@-1.0..=1.0_f32)]
+    pub scatter: f32,
+}
+
+impl Default for Fog {
+    fn default() -> Self {
+        Self {
+            density: 0.001,
+            scatter: 0.9,
+        }
+    }
+}
+
+/// A multiplier on the environment's sky radiance. On an environment entity; without one, 1.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct SkyBrightness(#[reflect(@0.0..=1.0_f32)] pub f32);
+
+impl Default for SkyBrightness {
+    fn default() -> Self {
+        Self(1.0)
+    }
 }
 
 /// What a ray that escapes this environment returns. On an environment entity.
@@ -158,6 +190,8 @@ pub struct EnvironmentSky {
     pub suns: Vec<Sun>,
     /// The fixed exposure its cameras take by default (EV100).
     pub ev100: f32,
+    pub fog: Fog,
+    pub sky_brightness: f32,
 }
 
 impl Default for EnvironmentSky {
@@ -167,6 +201,8 @@ impl Default for EnvironmentSky {
             gradient: GradientSky::default(),
             suns: Vec::new(),
             ev100: DEFAULT_EV100,
+            fog: Fog::default(),
+            sky_brightness: 1.0,
         }
     }
 }
@@ -194,6 +230,8 @@ fn gather_skies(
         Option<&Sky>,
         Option<&GradientSky>,
         Option<&EnvironmentExposure>,
+        Option<&Fog>,
+        Option<&SkyBrightness>,
     )>,
     suns: Query<(
         &DirectionalLight,
@@ -212,10 +250,10 @@ fn gather_skies(
     let mut atmosphere = None;
     let mut exposures = [None; 8];
     for bit in 0..8u8 {
-        let (sky, gradient, exposure) = worlds
+        let (sky, gradient, exposure, fog, brightness) = worlds
             .environment(bit)
             .and_then(|world| skies.get(world).ok())
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None, None));
         exposures[bit as usize] = exposure.map(|e| e.ev100);
         let mut sky = sky.cloned().unwrap_or_default();
         if matches!(sky, Sky::Atmosphere) {
@@ -231,6 +269,8 @@ fn gather_skies(
         let entry = &mut out.worlds[bit as usize];
         entry.sky = sky;
         entry.gradient = gradient.cloned().unwrap_or_default();
+        entry.fog = fog.copied().unwrap_or_default();
+        entry.sky_brightness = brightness.copied().unwrap_or_default().0;
         entry.suns.clear();
     }
     out.atmosphere = atmosphere;
@@ -342,6 +382,8 @@ impl Plugin for SkyPlugin {
         app.register_type::<Sky>()
             .register_type::<GradientSky>()
             .register_type::<EnvironmentExposure>()
+            .register_type::<Fog>()
+            .register_type::<SkyBrightness>()
             .register_type::<DirectionalLight>()
             .register_type::<SunDisk>()
             .init_resource::<EnvironmentSkies>()

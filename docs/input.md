@@ -180,7 +180,7 @@ pub enum InspectorPanel3d { Resource(TypeId), Component { entity: Entity, ty: Ty
 - Port the sim console and `examples/ui_panel.rs` to `UiPanel3d`; that removes the last
   hand-rolled surface.
 - Dev panel: on desktop unchanged; when `XrState` exists, also spawn
-  `InspectorPanel3d::resource::<DevUIState>()` at a fixed rig-relative pose, toggled by
+  `InspectorPanel3d::resource::<RenderSettings>()` at a fixed rig-relative pose, toggled by
   `ToggleDevPanel`. Same resource, two views.
 - Screen-space UI in VR (menus, dialogue, boot): phase 5. Convention will be a head-locked
   `UiPanel3d` at 1.5 m that the screen roots re-target to (`UiTargetCamera` swap) when XR is
@@ -213,11 +213,7 @@ pub enum InspectorPanel3d { Resource(TypeId), Component { entity: Entity, ty: Ty
 | 5 | both | head-locked HUD panel for menus/dialogue in XR; `InputSettings` rebinding file; comfort (vignette on fly, snap-turn angle in dev panel) | not started |
 
 Known rough edges after the build:
-- The eleven gait-style keys in `avatar::controls` are gone: the moving gait is the
-  player's reflected `Gait { style }` component, picked from a button row the avatar hangs
-  under the dev panel (`gait_panel`). Gameplay sets it directly; only semantic actions
-  (sneak/sprint) would ever get keys.
-- The inspector's collapsed state is global per root: `DevUIState` starts collapsed on the XR
+- The inspector's collapsed state is global per root: `RenderSettings` starts collapsed on the XR
   dev panel because the screen panel collapsed it. One click on the header.
 - Wrist panel placement (`wow_terrain::wrist_panel`) and the XR dev panel distance are guesses
   to tune in the headset.
