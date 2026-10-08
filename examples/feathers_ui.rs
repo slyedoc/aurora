@@ -5,7 +5,11 @@
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::{
     feathers::{
-        controls::{FeathersButton, FeathersCheckbox, FeathersSlider, FeathersToggleSwitch},
+        controls::{
+            ColorPlaneValue, ColorSwatchValue, ColorWheelValue, FeathersButton, FeathersCheckbox,
+            FeathersColorPlane, FeathersColorSwatch, FeathersColorWheel, FeathersSlider,
+            FeathersToggleSwitch,
+        },
         display::caption,
         theme::ThemeBackgroundColor,
         tokens,
@@ -14,6 +18,7 @@ use bevy::{
     ui::Checked,
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
+use bevy::feathers_inspector::BuildEntityInspector;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
@@ -26,6 +31,34 @@ use bevy_aurora::{
 #[derive(Resource, Default)]
 struct Counter(i32);
 
+/// Every inspector widget kind on one component.
+#[derive(Component, Reflect, Default)]
+#[reflect(Component, Default)]
+struct Showcase {
+    name: String,
+    #[reflect(@0.0..=1.0_f32)]
+    ranged: f32,
+    speed: f32,
+    count: u32,
+    on: bool,
+    offset: Vec3,
+    turn: Quat,
+    tint: Color,
+    mode: ShowcaseMode,
+    steps: Vec<f32>,
+}
+
+#[derive(Reflect, Default)]
+#[reflect(Default)]
+enum ShowcaseMode {
+    #[default]
+    Off,
+    Ramp {
+        from: f32,
+        to: f32,
+    },
+}
+
 #[derive(Component, Default, Clone)]
 struct CounterText;
 
@@ -36,7 +69,8 @@ fn main() {
     app.add_plugins(DevUIPlugin);
     app.add_plugins(FreeCameraPlugin::default());
     app.init_resource::<Counter>();
-    app.add_systems(Startup, (setup, panel.spawn()));
+    app.register_type::<Showcase>();
+    app.add_systems(Startup, (setup, panel.spawn(), inspector));
     app.add_systems(
         Update,
         update_counter_text.run_if(resource_changed::<Counter>),
@@ -204,8 +238,52 @@ fn panel() -> impl Scene {
             on(|change: On<ValueChange<f32>>| {
                 info!("slider -> {}", change.value);
             })
+            --
+            @FeathersColorSwatch {
+                @opaque_color_percentage: 30.0,
+            }
+            ColorSwatchValue(Color::srgba(0.2, 0.6, 1.0, 0.4))
+            --
+            @FeathersColorPlane::RedBlue
+            ColorPlaneValue(Vec3::new(0.3, 0.7, 0.5))
+            --
+            @FeathersColorWheel
+            ColorWheelValue { hue: 200.0, whiteness: 0.2, blackness: 0.2 }
         ]
     }
+}
+
+/// A `Showcase` entity and an inspector panel over it.
+fn inspector(mut commands: Commands) {
+    let target = commands
+        .spawn(Showcase {
+            name: "demo".into(),
+            ranged: 0.4,
+            speed: 12.5,
+            count: 3,
+            on: true,
+            offset: Vec3::new(1.0, 2.0, 3.0),
+            turn: Quat::from_rotation_y(0.5),
+            tint: Color::srgba(0.9, 0.4, 0.2, 0.8),
+            mode: ShowcaseMode::Ramp { from: 0.0, to: 1.0 },
+            steps: vec![0.25, 0.5],
+        })
+        .id();
+    let panel = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(400.0),
+                top: Val::Px(16.0),
+                width: Val::Px(380.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+            ThemeBackgroundColor(tokens::WINDOW_BG),
+        ))
+        .id();
+    commands.queue(BuildEntityInspector { target, panel });
 }
 
 fn update_counter_text(

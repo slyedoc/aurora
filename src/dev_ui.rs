@@ -5,7 +5,7 @@
 //! The frame reads the tunables straight from the resource
 //! into the frame uniform. Drawn by [`crate::ui_render`], so no wgpu / egui anywhere.
 //!
-//! Keys: `F2` toggles this panel, `F1` the world inspector.
+//! Keys: `F2` toggles this panel.
 
 use std::any::TypeId;
 
@@ -229,9 +229,6 @@ impl Plugin for DevUIPlugin {
         if !app.is_plugin_added::<DefaultInspectorWidgetsPlugin>() {
             app.add_plugins(FeathersInspectorPlugins);
         }
-        // if !app.is_plugin_added::<WorldInspectorPlugin>() {
-        //     app.add_plugins(WorldInspectorPlugin::new().with_toggle_key(KeyCode::F1));
-        // }
 
         app.register_type::<DevUIState>();
         app.insert_resource(DevUIState::from_env());
@@ -365,7 +362,7 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                @caption("aurora  (F2: panel, F1: world inspector)")
+                @caption("aurora  (F2: panel)")
                 --
                 @caption("fps: -") DevUIStats
                 --

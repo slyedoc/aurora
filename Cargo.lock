@@ -1116,9 +1116,11 @@ dependencies = [
  "bevy_input",
  "bevy_input_focus",
  "bevy_log",
+ "bevy_math",
  "bevy_platform",
  "bevy_reflect",
  "bevy_scene",
+ "bevy_text",
  "bevy_ui",
  "bevy_ui_widgets",
 ]

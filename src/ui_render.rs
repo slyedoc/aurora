@@ -24,6 +24,13 @@ use bevy::{
         visibility::{InheritedVisibility, VisibilityPropagatePlugin},
     },
     color::{Hsla, Hsva, LinearRgba, Okhsla, Oklaba, Oklcha, Srgba},
+    feathers::{
+        AlphaPattern,
+        controls::{
+            ColorPlaneInner, ColorPlaneValue, ColorWheelInner, ColorWheelValue,
+            FeathersColorPlane,
+        },
+    },
     ecs::system::{SystemParam, lifetimeless::SRes},
     image::{Image, TextureAtlasLayout, TextureAtlasPlugin},
     input_focus::{InputDispatchPlugin, InputFocusPlugin},
@@ -78,6 +85,29 @@ pub mod shader_flags {
     pub const INVERT: u32 = 4096;
     /// This crate's own: the fragment color comes from the gradient fields.
     pub const GRADIENT: u32 = 8192;
+    /// This crate's own: the fragment color is a [`super::pattern`] fill.
+    pub const PATTERN: u32 = 16384;
+}
+
+/// The procedural fills feathers draws with `UiMaterial`s, which aurora paints itself. Must align
+/// with `ui.frag`.
+pub mod pattern {
+    use bevy::feathers::controls::FeathersColorPlane;
+
+    pub const CHECKER: u32 = 0;
+    pub const WHEEL: u32 = 8;
+
+    pub fn plane(plane: FeathersColorPlane) -> u32 {
+        match plane {
+            FeathersColorPlane::RedGreen => 1,
+            FeathersColorPlane::RedBlue => 2,
+            FeathersColorPlane::GreenBlue => 3,
+            FeathersColorPlane::HueSaturation => 4,
+            FeathersColorPlane::HueLightness => 5,
+            FeathersColorPlane::OkhslHueSaturation => 6,
+            FeathersColorPlane::OkhslHueLightness => 7,
+        }
+    }
 }
 
 /// Z offsets within a stack index; same values as `bevy_ui_render::stack_z_offsets`.
@@ -87,6 +117,7 @@ mod z_offsets {
     pub const GRADIENT: f32 = 0.02;
     pub const BORDER_GRADIENT: f32 = 0.03;
     pub const IMAGE: f32 = 0.04;
+    pub const MATERIAL: f32 = 0.05;
     pub const TEXT: f32 = 0.06;
 }
 
@@ -498,6 +529,14 @@ pub enum UiItem {
         uvs: [Vec2; 4],
         flags: u32,
     },
+    /// A [`pattern`] fill: `kind` with its `params` (a plane's fixed channel; a wheel's hue in
+    /// degrees and scale factor).
+    Pattern {
+        size: Vec2,
+        border_radius: [[f32; 4]; 2],
+        kind: u32,
+        params: [f32; 4],
+    },
     /// A whole gradient; drawn as one segment quad per pair of adjacent stops.
     Gradient {
         size: Vec2,
@@ -555,6 +594,10 @@ type UiNodeQuery = (
             &'static TextLayoutInfo,
         )>,
         Option<&'static ViewportNode>,
+        Option<&'static AlphaPattern>,
+        Option<&'static ColorPlaneInner>,
+        Option<&'static ColorWheelInner>,
+        Option<&'static ChildOf>,
     ),
 );
 
@@ -568,6 +611,8 @@ fn extract_ui(
     nodes: Query<UiNodeQuery>,
     all_nodes: Query<(&ComputedNode, Option<&InheritedVisibility>)>,
     camera_targets: Query<&RenderTarget>,
+    planes: Query<(&FeathersColorPlane, &ColorPlaneValue)>,
+    wheels: Query<&ColorWheelValue>,
     mut diag_tick: Local<u32>,
 ) {
     extracted.window_size = windows
@@ -608,7 +653,7 @@ fn extract_ui(
         background_gradient,
         border_gradient,
         image_node,
-        (text, viewport_node),
+        (text, viewport_node, alpha_pattern, plane_inner, wheel_inner, parent),
     ) in nodes.iter()
     {
         if !inherited_visibility.get() || node.is_some_and(|node| node.display == Display::None) {
@@ -673,6 +718,42 @@ fn extract_ui(
                     });
                 }
             }
+        }
+
+        // Material fills: the checkerboard behind translucent swatches, a color plane's or
+        // wheel's gradient (the parent control holds the values).
+        let parent = parent.map(ChildOf::parent);
+        let fill = if alpha_pattern.is_some() {
+            Some((pattern::CHECKER, [0.0; 4]))
+        } else if plane_inner.is_some() {
+            parent
+                .and_then(|p| planes.get(p).ok())
+                .map(|(plane, value)| (pattern::plane(*plane), [value.0.z, 0.0, 0.0, 0.0]))
+        } else if wheel_inner.is_some() {
+            parent.and_then(|p| wheels.get(p).ok()).map(|value| {
+                (
+                    pattern::WHEEL,
+                    [value.hue, target.scale_factor(), 0.0, 0.0],
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((kind, params)) = fill
+            && !uinode.is_empty()
+        {
+            quads.push(UiQuad {
+                z: z(z_offsets::MATERIAL),
+                image: None,
+                clip: clip.cloned(),
+                transform,
+                item: UiItem::Pattern {
+                    size: uinode.size(),
+                    border_radius: uinode.border_radius().into(),
+                    kind,
+                    params,
+                },
+            });
         }
 
         // Image
@@ -1773,6 +1854,37 @@ fn build_vertices(
                     border: *border,
                     size: (*size).into(),
                     point: point.into(),
+                    ..UiVertex::ZERO
+                });
+            }
+            UiItem::Pattern {
+                size,
+                border_radius,
+                kind,
+                params,
+            } => {
+                let points = QUAD_VERTEX_POSITIONS.map(|p| p * *size);
+                let positions = points.map(|p| quad.transform.transform_point2(p));
+                let polygon = clip_polygon(
+                    quad.clip.as_ref(),
+                    &[
+                        (positions[0], points[0]),
+                        (positions[1], points[1]),
+                        (positions[2], points[2]),
+                        (positions[3], points[3]),
+                    ],
+                    Vec2::lerp,
+                );
+                push_fan(vertices, &polygon, |(position, point)| UiVertex {
+                    position: position.into(),
+                    color: [1.0; 4],
+                    flags: shader_flags::PATTERN,
+                    radius_x: border_radius[0],
+                    radius_y: border_radius[1],
+                    size: (*size).into(),
+                    point: point.into(),
+                    start_color: *params,
+                    color_space: *kind,
                     ..UiVertex::ZERO
                 });
             }

@@ -15,7 +15,7 @@
 //! volumetrics under DLSS-RR, which only holds because the march carries no per-frame
 //! noise. The noise tables it samples are built once by the `cloud_noise` kernel.
 //!
-//! Both resources are reflected: edit them live in the F1 world inspector. The sun
+//! Both resources are reflected, so an inspector edits them live. The sun
 //! (direction, disc size, top-of-atmosphere radiance) is the first `DirectionalLight` of the
 //! world whose sky is the atmosphere (sky.rs).
 

@@ -21,6 +21,7 @@ use bevy::{
 };
 
 use ash::vk;
+use bevy::platform::collections::HashSet;
 
 use crate::{
     color_target::TargetKind,
@@ -100,6 +101,7 @@ pub fn prepare_camera_targets(
     render_device: Res<RenderDevice>,
     mut targets: ResMut<CameraTargets>,
     mut textures: ResMut<VulkanAssets<Image>>,
+    mut refused: Local<HashSet<(AssetId<Image>, UVec2)>>,
 ) {
     // Create on first sight, and RECREATE when the size changed: a viewport in a dock
     // resizes whenever the splitter moves, and `bevy_ui`'s
@@ -116,7 +118,25 @@ pub fn prepare_camera_targets(
         })
         .copied()
         .collect();
+    let max = if pending.is_empty() {
+        u32::MAX
+    } else {
+        max_target_side(&render_device)
+    };
     for (asset, size, kind) in pending {
+        // A size past the device's limit is a layout gone wrong upstream (a UI node grown to
+        // its content); the target keeps its last good image rather than one Vulkan refuses.
+        if size.x > max || size.y > max {
+            if refused.insert((asset, size)) {
+                log::warn!(
+                    "camera: render target {asset:?} asked for {}x{}, past the device's {max}; \
+                     keeping its last size",
+                    size.x,
+                    size.y
+                );
+            }
+            continue;
+        }
         let texture = create_blank_texture(
             &render_device,
             kind.format(),
@@ -155,6 +175,23 @@ pub fn prepare_camera_targets(
             size.y
         );
     }
+}
+
+/// The largest side a camera target may have: an image dimension that is also a framebuffer
+/// and viewport dimension.
+fn max_target_side(render_device: &RenderDevice) -> u32 {
+    let limits = unsafe {
+        render_device
+            .instance
+            .get_physical_device_properties(render_device.physical_device)
+    }
+    .limits;
+    limits
+        .max_image_dimension2_d
+        .min(limits.max_framebuffer_width)
+        .min(limits.max_framebuffer_height)
+        .min(limits.max_viewport_dimensions[0])
+        .min(limits.max_viewport_dimensions[1])
 }
 
 /// `PostUpdate`, after every `target_info` writer: fills `Camera::computed.clip_from_view`

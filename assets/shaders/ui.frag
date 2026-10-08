@@ -40,6 +40,9 @@ const uint BORDER_RIGHT = 1024u;
 const uint BORDER_BOTTOM = 2048u;
 const uint BORDER_ANY = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
 const uint INVERT = 4096u;
+// The fill is a procedural pattern (feathers' material fills): kind in `color_space`, params in
+// `start_color`.
+const uint PATTERN = 16384u;
 
 bool enabled(uint flags, uint mask) {
   return (flags & mask) != 0u;
@@ -250,9 +253,107 @@ vec4 interpolate_gradient(
   );
 }
 
+// ---- patterns (ports of feathers' alpha_pattern / color_plane / color_wheel materials) ----
+
+// must align with `ui_render::pattern`
+const uint PAT_CHECKER = 0u;
+const uint PAT_RG = 1u;
+const uint PAT_RB = 2u;
+const uint PAT_GB = 3u;
+const uint PAT_HS = 4u;
+const uint PAT_HL = 5u;
+const uint PAT_OKHS = 6u;
+const uint PAT_OKHL = 7u;
+const uint PAT_WHEEL = 8u;
+
+// Must match `color_wheel.rs`.
+const float RING_WIDTH = 12.0;
+const float WHEEL_SPACING = 4.0;
+const float MIN_DIAMETER = 100.0 - 2.0 * 4.0;
+
+vec3 hwb_to_linear_rgb(vec3 hwb) {
+  float v = 1.0 - hwb.z;
+  float s = v != 0.0 ? 1.0 - hwb.y / v : 0.0;
+  return hsv_to_linear_rgb(vec3(hwb.x, s, v));
+}
+
+float cross_2d(vec2 a, vec2 b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+// Positive on the left of a -> b.
+float line_distance(vec2 p, vec2 a, vec2 b) {
+  return cross_2d(b - a, p - a) / distance(a, b);
+}
+
+// Hue ring plus the whiteness/blackness triangle; `hue` in degrees, `scale` physical/logical.
+vec4 color_wheel(vec2 uv, vec2 size, float hue, float scale) {
+  float min_side = max(min(size.x, size.y), MIN_DIAMETER * scale);
+  vec2 centered = (uv - vec2(0.5)) / (min_side / size);
+  float radial = length(centered);
+  float aa = fwidth(radial);
+
+  float inner_radius = 0.5 - RING_WIDTH * scale / min_side;
+  float ring_hue = fract(atan(centered.y, centered.x) / UI_PI_2);
+  float ring_alpha = smoothstep(inner_radius - aa, inner_radius, radial)
+      - smoothstep(0.5 - aa, 0.5, radial);
+
+  float triangle_radius = 0.5 - (RING_WIDTH + 2.0 * WHEEL_SPACING) * scale / min_side;
+  float hue_angle = radians(hue);
+  vec2 hue_point = vec2(cos(hue_angle), sin(hue_angle)) * triangle_radius;
+  float white_angle = hue_angle + UI_PI_2 / 3.0;
+  float black_angle = hue_angle - UI_PI_2 / 3.0;
+  vec2 white_point = vec2(cos(white_angle), sin(white_angle)) * triangle_radius;
+  vec2 black_point = vec2(cos(black_angle), sin(black_angle)) * triangle_radius;
+
+  float area = cross_2d(white_point - hue_point, black_point - hue_point);
+  float whiteness = clamp(cross_2d(centered - hue_point, black_point - hue_point) / area, 0.0, 1.0);
+  float blackness = clamp(cross_2d(white_point - hue_point, centered - hue_point) / area, 0.0, 1.0);
+  float wb = whiteness + blackness;
+  if (wb > 1.0) {
+    whiteness /= wb;
+    blackness /= wb;
+  }
+
+  float triangle_sd = min(
+    line_distance(centered, hue_point, white_point),
+    min(line_distance(centered, white_point, black_point), line_distance(centered, black_point, hue_point))
+  );
+  float triangle_alpha = smoothstep(-fwidth(triangle_sd), 0.0, triangle_sd);
+
+  float alpha = min(ring_alpha + triangle_alpha, 1.0);
+  vec3 ring_color = hwb_to_linear_rgb(vec3(ring_hue, 0.0, 0.0));
+  vec3 triangle_color = hwb_to_linear_rgb(vec3(fract(hue / 360.0), whiteness, blackness));
+  vec3 color = (ring_color * ring_alpha + triangle_color * triangle_alpha) / max(alpha, 0.001);
+  return vec4(color, alpha);
+}
+
+vec4 draw_pattern(uint kind, vec4 params, vec2 point, vec2 size) {
+  vec2 uv = point / size + 0.5;
+  float f = params.x;
+  switch (kind) {
+    case PAT_CHECKER: {
+      vec2 c = point / 16.0;
+      float check = ((fract(c.x) < 0.5) != (fract(c.y) < 0.5)) ? 1.0 : 0.0;
+      return vec4(mix(vec3(0.2), vec3(0.6), check), 1.0);
+    }
+    case PAT_RG: return vec4(srgb_to_linear_rgb(vec3(uv.x, 1.0 - uv.y, f)), 1.0);
+    case PAT_RB: return vec4(srgb_to_linear_rgb(vec3(uv.x, f, 1.0 - uv.y)), 1.0);
+    case PAT_GB: return vec4(srgb_to_linear_rgb(vec3(f, uv.x, 1.0 - uv.y)), 1.0);
+    case PAT_HS: return vec4(hsl_to_linear_rgb(vec3(uv.x, 1.0 - uv.y, f)), 1.0);
+    case PAT_HL: return vec4(hsl_to_linear_rgb(vec3(uv.x, f, 1.0 - uv.y)), 1.0);
+    case PAT_OKHS: return vec4(okhsl_to_linear_rgb(vec3(uv.x, 1.0 - uv.y, f)), 1.0);
+    case PAT_OKHL: return vec4(okhsl_to_linear_rgb(vec3(uv.x, f, 1.0 - uv.y)), 1.0);
+    case PAT_WHEEL: return color_wheel(uv, size, params.x, params.y);
+    default: return vec4(1.0, 0.0, 1.0, 1.0);
+  }
+}
+
 void main() {
   vec4 color;
-  if (enabled(in_flags, GRADIENT)) {
+  if (enabled(in_flags, PATTERN)) {
+    color = draw_pattern(in_color_space, in_start_color, in_point, in_size);
+  } else if (enabled(in_flags, GRADIENT)) {
     float g_distance;
     if (enabled(in_flags, RADIAL)) {
       g_distance = radial_distance(in_point, in_g_start, in_g_dir.x);
