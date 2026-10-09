@@ -163,6 +163,7 @@ impl VulkanAsset for RaytracingPipeline {
         for group in registry.groups() {
             let Some(closest_hit) = shaders.get(&group.closest_hit) else {
                 log::warn!("surface group {:?}: closest-hit not ready yet", group.label);
+                WAITING_ON_GROUP.store(true, std::sync::atomic::Ordering::Relaxed);
                 return None;
             };
             let any_hit = match &group.any_hit {
@@ -170,6 +171,7 @@ impl VulkanAsset for RaytracingPipeline {
                     Some(shader) => Some(shader.clone()),
                     None => {
                         log::warn!("surface group {:?}: any-hit not ready yet", group.label);
+                        WAITING_ON_GROUP.store(true, std::sync::atomic::Ordering::Relaxed);
                         return None;
                     }
                 },
@@ -463,6 +465,10 @@ impl VulkanAsset for RaytracingPipeline {
     }
 }
 
+/// Set when extraction gave up on a surface group's shader that had not loaded yet: groups are
+/// not asset dependencies of the pipeline, so its landing has to retry the pipeline by hand.
+static WAITING_ON_GROUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn propagate_modified(
     filters: Res<Assets<RaytracingPipeline>>,
     mut shader_events: MessageReader<AssetEvent<Shader>>,
@@ -484,28 +490,29 @@ fn propagate_modified(
         *seen_generation = Some(registry.generation());
     }
     for event in shader_events.read() {
-        match event {
-            AssetEvent::Modified { id } => {
-                for (parent_id, filter) in filters.iter() {
-                    let in_surface_group = registry.groups().iter().any(|group| {
-                        group.closest_hit.id() == *id
-                            || group.any_hit.as_ref().is_some_and(|h| h.id() == *id)
-                    });
-                    if in_surface_group
-                        || filter.raygen_shader.id() == *id
-                        || filter.miss_shader.id() == *id
-                        || filter.hit_shader.id() == *id
-                        || filter.any_hit_shader.id() == *id
-                        || filter.sphere_intersection_shader.id() == *id
-                        || filter.sphere_hit_shader.id() == *id
-                    {
-                        parent_events.write(AssetEvent::Modified {
-                            id: parent_id.clone(),
-                        });
-                    }
-                }
+        let (id, first_load) = match event {
+            AssetEvent::Modified { id } => (*id, false),
+            AssetEvent::LoadedWithDependencies { id } => (*id, true),
+            _ => continue,
+        };
+        let in_surface_group = registry.groups().iter().any(|group| {
+            group.closest_hit.id() == id || group.any_hit.as_ref().is_some_and(|h| h.id() == id)
+        });
+        for (parent_id, filter) in filters.iter() {
+            let fixed = filter.raygen_shader.id() == id
+                || filter.miss_shader.id() == id
+                || filter.hit_shader.id() == id
+                || filter.any_hit_shader.id() == id
+                || filter.sphere_intersection_shader.id() == id
+                || filter.sphere_hit_shader.id() == id;
+            let retry = in_surface_group
+                && (!first_load
+                    || WAITING_ON_GROUP.swap(false, std::sync::atomic::Ordering::Relaxed));
+            if retry || (fixed && !first_load) {
+                parent_events.write(AssetEvent::Modified {
+                    id: parent_id.clone(),
+                });
             }
-            _ => {}
         }
     }
 }

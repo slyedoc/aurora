@@ -197,6 +197,14 @@ impl VulkanAsset for bevy::prelude::Image {
             );
             return None;
         }
+        // Single-channel 32-bit images are data, not something a shader samples (a terrain's
+        // control and slope maps): their owners read the bytes into buffers of their own.
+        if matches!(
+            self.texture_descriptor.format,
+            wgpu_types::TextureFormat::R32Uint | wgpu_types::TextureFormat::R32Float
+        ) {
+            return None;
+        }
         // Formats the upload path takes as-is (see `vk_format_for`) go straight
         // through, 16-bit included. Anything else -- RGB, grey, palette -- is
         // converted to RGBA8 here, on the main thread's copy.

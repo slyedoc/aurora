@@ -1774,4 +1774,10 @@ mod tests {
         let rect = view_rect(Some(&camera), window());
         assert_eq!(rect.extent, window());
     }
+
+    /// `surface.slang` reads `lod_bias` by its float index into the uniform block.
+    #[test]
+    fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
+        assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 100 * 4);
+    }
 }

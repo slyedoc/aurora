@@ -17,31 +17,17 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    surface_group::{SurfaceClass, SurfaceGroup, SurfaceGroupData, SurfaceGroupRegistry},
+    render_env::WHITE_TEXTURE_IDX,
+    surface_group::{
+        LayeredParams, SurfaceClass, SurfaceGroup, SurfaceGroupData, SurfaceGroupRegistry,
+    },
     util::{ScreenshotExt, TimeoutAppExt},
 };
-
-/// Must match `struct Layered` in `layered.rchit`, field for field: the shader reads this
-/// straight out of the buffer by device address.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Layered {
-    layer_color: [f32; 4],
-    detail_color: [f32; 4],
-    layer_roughness: f32,
-    detail_roughness: f32,
-    layer_metallic: f32,
-    detail_metallic: f32,
-    blend_start: f32,
-    blend_end: f32,
-    blend_contrast: f32,
-    pad: f32,
-}
 
 /// Holds the buffer alive: dropping it would leave `SurfaceGroupData` pointing at freed
 /// memory, which the shader would happily read.
 #[derive(Resource)]
-struct LayeredBuffer(#[allow(dead_code)] Buffer<Layered>);
+struct LayeredBuffer(#[allow(dead_code)] Buffer<LayeredParams>);
 
 #[derive(Resource)]
 struct LayeredClass(SurfaceClass);
@@ -72,24 +58,33 @@ fn register_layered(
 
     // One entry per material slot, indexed the way the shader indexes it. Two here is
     // plenty: the sphere's material sits at slot 0 and everything else reads the default.
-    let mut buffer: Buffer<Layered> = render_device.create_host_buffer(
+    let mut buffer: Buffer<LayeredParams> = render_device.create_host_buffer(
         4,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
     );
     {
         let mut mapped = render_device.map_buffer(&mut buffer);
-        let entry = Layered {
-            // Snow on the flats, wet slate on the slopes.
-            layer_color: [1.05, 1.08, 1.15, 1.0],
-            detail_color: [0.20, 0.19, 0.22, 1.0],
-            layer_roughness: 1.4,
-            detail_roughness: 0.25,
+        // Moss on the upward faces over the sphere's own stone, no detail set: every map is
+        // the white texture, so only the colours and the slope blend show.
+        let entry = LayeredParams {
+            layer_color: [0.18, 0.32, 0.10, 1.0],
+            detail_color: [1.0, 1.0, 1.0, 1.0],
+            layer_uv_scale: 1.0,
+            layer_normal_strength: 1.0,
             layer_metallic: 0.0,
-            detail_metallic: 0.0,
-            blend_start: 0.25,
-            blend_end: 0.75,
-            blend_contrast: 1.6,
-            pad: 0.0,
+            layer_perceptual_roughness: 0.9,
+            detail_uv_scale: 1.0,
+            detail_normal_strength: 0.0,
+            blend_amount: 1.0,
+            blend_power: 0.0,
+            blend_threshold: 0.4,
+            layer_base_color_texture: WHITE_TEXTURE_IDX,
+            layer_normal_map_texture: WHITE_TEXTURE_IDX,
+            layer_orm_texture: WHITE_TEXTURE_IDX,
+            detail_base_color_texture: WHITE_TEXTURE_IDX,
+            detail_normal_map_texture: WHITE_TEXTURE_IDX,
+            detail_orm_texture: WHITE_TEXTURE_IDX,
+            ..Default::default()
         };
         mapped.copy_from_slice(&[entry; 4]);
     }
