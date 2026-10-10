@@ -109,6 +109,11 @@ pub struct RTXMaterial {
     /// parameter array. The material arena's offset is allocated here and recycled, so a
     /// surface group cannot be indexed by it from outside; this is the stable key instead.
     pub surface_param_index: u32,
+    /// Thin translucency and clear coat (`AuroraMaterial` fields of the same names).
+    pub diffuse_transmission: f32,
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub pad: u32,
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:
@@ -141,6 +146,10 @@ impl Default for RTXMaterial {
             absorption: [0.0; 3],
             surface_param_index: 0,
             alpha_cutoff: 0.0,
+            diffuse_transmission: 0.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.5,
+            pad: 0,
         }
     }
 }

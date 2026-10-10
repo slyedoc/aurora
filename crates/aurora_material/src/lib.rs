@@ -86,6 +86,13 @@ pub struct AuroraMaterial {
     /// Displacement / height map, carried for tessellation; unused by the tracer today.
     pub depth_map: Option<Handle<Image>>,
     pub specular_transmission: f32,
+    /// Thin translucency (leaves, paper): the fraction of diffuse light that passes through
+    /// the surface to the far side, tinted by the base colour.
+    pub diffuse_transmission: f32,
+    /// A clear coat over the base (a film of water, dew, lacquer): its strength, and
+    /// `clearcoat_perceptual_roughness` its own roughness.
+    pub clearcoat: f32,
+    pub clearcoat_perceptual_roughness: f32,
     pub ior: f32,
     /// Beer-Lambert volume: light travelling `attenuation_distance` through the surface is
     /// tinted to `attenuation_color`. An infinite distance is a clear medium.
@@ -147,6 +154,9 @@ impl Default for AuroraMaterial {
             normal_map_texture: None,
             depth_map: None,
             specular_transmission: 0.0,
+            diffuse_transmission: 0.0,
+            clearcoat: 0.0,
+            clearcoat_perceptual_roughness: 0.5,
             ior: 1.5,
             attenuation_color: Color::WHITE,
             attenuation_distance: f32::INFINITY,

@@ -63,6 +63,11 @@ pub struct Fog {
     /// Henyey-Greenstein anisotropy: 1 scatters forward, -1 back.
     #[reflect(@-1.0..=1.0_f32)]
     pub scatter: f32,
+    /// Height fog: `density` holds at and below this world height...
+    pub height: f32,
+    /// ...and thins by 1/e every `falloff` metres above it (0 = the same density everywhere).
+    #[reflect(@0.0..=500.0_f32)]
+    pub falloff: f32,
 }
 
 impl Default for Fog {
@@ -70,6 +75,8 @@ impl Default for Fog {
         Self {
             density: 0.001,
             scatter: 0.9,
+            height: 0.0,
+            falloff: 0.0,
         }
     }
 }

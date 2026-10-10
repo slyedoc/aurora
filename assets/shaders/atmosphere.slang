@@ -9,8 +9,8 @@
 // of Horizon Zero Dawn").
 //
 // The runtime side -- sampling these LUTs, aerial perspective, the cloud march -- lives in
-// atmosphere.glsl for the GLSL raygen / miss shaders; the medium and the parametrisations
-// are the same maths in both files. Lengths in metres, coefficients per metre, radiances
+// atmosphere_rt.slang for the raygen and atmosphere.glsl for the miss shader; the medium and
+// the parametrisations are the same maths in all three files. Lengths in metres, coefficients per metre, radiances
 // in nits.
 
 // Must match AtmosphereGpu in src/atmosphere.rs and AtmosphereParams in types.glsl
@@ -68,7 +68,7 @@ struct KernelParams {
 [[vk::push_constant]] KernelParams kp;
 
 static const float PI = 3.14159265359;
-// Must match atmosphere.glsl / src/atmosphere.rs.
+// Must match atmosphere.glsl / atmosphere_rt.slang / src/atmosphere.rs.
 static const uint T_W = 256;
 static const uint T_H = 64;
 static const uint MS_N = 32;

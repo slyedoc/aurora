@@ -10,7 +10,7 @@
 //! every hit and adds aerial perspective on the primary hit.
 //!
 //! [`CloudLayer`] is one procedural shell between two altitudes, marched deterministically
-//! in the raygen along the camera ray (assets/shaders/atmosphere.glsl `cloudMarch`) and
+//! in the raygen along the camera ray (assets/shaders/atmosphere_rt.slang `cloudMarch`) and
 //! folded into the noisy colour BEFORE Ray Reconstruction -- the RTX Remix precedent for
 //! volumetrics under DLSS-RR, which only holds because the march carries no per-frame
 //! noise. The noise tables it samples are built once by the `cloud_noise` kernel.
@@ -32,7 +32,7 @@ use crate::{
     sky::{EnvironmentSkies, Sun},
 };
 
-// LUT and table sizes; must match atmosphere.glsl.
+// LUT and table sizes; must match atmosphere.glsl / atmosphere_rt.slang.
 const T_W: u32 = 256;
 const T_H: u32 = 64;
 const MS_N: u32 = 32;
@@ -185,7 +185,7 @@ impl Default for CloudLayer {
     }
 }
 
-/// Must match `AtmosphereParams` in types.glsl (scalar layout: the 8-byte pointers first,
+/// Must match `AtmosphereParams` in types.glsl and rt_types.slang (scalar layout: the 8-byte pointers first,
 /// then 4-byte fields with no padding).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -516,5 +516,20 @@ impl Plugin for AtmospherePlugin {
             .init_resource::<Atmosphere>()
             .init_resource::<CloudLayer>();
         app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `AtmosphereParams` in rt_types.slang (the raygen) reads the cloud fields at these.
+    #[test]
+    fn atmosphere_gpu_matches_the_slang_raygen() {
+        use core::mem::offset_of;
+        use super::AtmosphereGpu as A;
+        assert_eq!(offset_of!(A, camera_pos), 176);
+        assert_eq!(offset_of!(A, clouds), 188);
+        assert_eq!(offset_of!(A, cloud_wind), 240);
+        assert_eq!(offset_of!(A, cloud_back_g), 268);
+        assert_eq!(core::mem::size_of::<A>(), 272);
     }
 }

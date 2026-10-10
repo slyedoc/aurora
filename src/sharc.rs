@@ -22,7 +22,7 @@ use crate::{
     render_device::RenderDevice,
 };
 
-/// Must match SHARC_ENTRIES in raygen.rgen.
+/// Must match SHARC_ENTRIES in raygen.slang.
 const SHARC_ENTRIES: u32 = 1 << 20;
 /// Must match SharcEntry in types.glsl / sharc.slang.
 const ENTRY_BYTES: u64 = 32;

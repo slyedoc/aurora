@@ -185,6 +185,8 @@ void surfaceWritePayload(const SurfaceHit hit, const vec3 world_normal) {
     payload.prev_world_pos = vec3(dot(r0, p), dot(r1, p), dot(r2, p));
   }
   hitPayloadSetInside(payload, hit.inside);
+  payload.lobes = packLobes(hit.material.diffuse_transmission, hit.material.clearcoat,
+                            hit.material.clearcoat_roughness);
 }
 
 #endif // SURFACE_COMMON_GLSL

@@ -21,6 +21,8 @@ dlss-dev = []
 # VR: render into the active OpenXR runtime (src/xr.rs) -- per-eye stereo, head-tracked,
 # the window a spectator view. `--features bevy_aurora/xr`.
 xr = []
+# Tracy: bevy's spans plus a frame mark per present. `--features bevy_aurora/trace_tracy`.
+trace_tracy = ["bevy/trace_tracy"]
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]

@@ -11,6 +11,11 @@
 //!
 //! One frame in flight: the TLAS is rebuilt in place inside the frame command buffer, after
 //! the fence wait, and only on frames where an instance or a transform changed.
+//!
+//! An [`InstanceBlock`] entity holds a contiguous run of slots sharing its mesh and material
+//! whose transforms no node drives: an app compute kernel writes their rows (GPU scatter,
+//! crowds) straight into the instance array, and may switch each slot between the block's
+//! pose meshes (wind phases) by rewriting its BLAS and hit record from [`TLAS::block_poses`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,7 +32,7 @@ use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
-    gpu_transform::{GpuNode, GpuTransforms, ensure_staging, upload_slice},
+    gpu_transform::{GpuNode, GpuTransforms, NO_NODE, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralMesh, ProceduralMesh3d},
@@ -83,6 +88,34 @@ struct GatherInstancesParams {
 
 // ---- slots ----------------------------------------------------------------------------------
 
+/// `capacity` traced copies of this entity's mesh and material, in contiguous slots whose
+/// transforms a compute kernel writes (no transform node drives them). A slot left with a zero
+/// transform traces nothing. `poses` are further meshes a kernel may switch each copy to by
+/// writing the pose's BLAS address and hit record ([`TLAS::block_poses`]): wind phases baked
+/// once, picked per copy per frame, instead of rebuilding geometry.
+#[derive(Component, Clone, Debug, Default)]
+pub struct InstanceBlock {
+    pub capacity: u32,
+    pub poses: Vec<Handle<AuroraMesh>>,
+}
+
+/// Where a block's slots landed: `first..first + count` in the instance array (64-byte
+/// `VkAccelerationStructureInstanceKHR` rows at [`TLAS::instances_address`]).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstanceBlockSlots {
+    pub first: u32,
+    pub count: u32,
+}
+
+/// A block pose as a kernel writes it into an instance row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct BlockPose {
+    pub blas: u64,
+    pub sbt_and_flags: u32,
+    pub pad: u32,
+}
+
 /// This entity's slot in the GPU instance table.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuInstance(pub u32);
@@ -112,10 +145,35 @@ fn assign_gpu_instances(
             Or<(With<AuroraMesh3d>, With<ProceduralMesh3d>, With<Sphere>)>,
             With<Transform>,
             Without<GpuInstance>,
+            Without<InstanceBlock>,
+        ),
+    >,
+    blocks: Query<
+        (Entity, &InstanceBlock),
+        (
+            Or<(With<AuroraMesh3d>, With<ProceduralMesh3d>)>,
+            With<Transform>,
+            Without<GpuInstance>,
         ),
     >,
     mut slots: ResMut<GpuInstanceSlots>,
 ) {
+    // A block takes a fresh contiguous run; its freed slots later go back one by one.
+    for (entity, block) in &blocks {
+        let count = block.capacity.max(1);
+        let first = slots.next;
+        slots.next += count;
+        let end = (first + count) as usize;
+        if slots.entities.len() < end {
+            slots.entities.resize(end, None);
+        }
+        for held in &mut slots.entities[first as usize..end] {
+            *held = Some(entity);
+        }
+        commands
+            .entity(entity)
+            .insert((GpuInstance(first), InstanceBlockSlots { first, count }));
+    }
     for entity in &unslotted {
         let slot = slots.free.pop().unwrap_or_else(|| {
             let s = slots.next;
@@ -133,14 +191,17 @@ fn assign_gpu_instances(
 
 fn free_gpu_instance(
     remove: On<Remove<GpuInstance>>,
-    instances: Query<&GpuInstance>,
+    instances: Query<(&GpuInstance, Option<&InstanceBlockSlots>)>,
     mut slots: ResMut<GpuInstanceSlots>,
 ) {
-    if let Ok(instance) = instances.get(remove.entity) {
-        slots.free.push(instance.0);
-        slots.freed.push(instance.0);
-        if let Some(held) = slots.entities.get_mut(instance.0 as usize) {
-            *held = None;
+    if let Ok((instance, block)) = instances.get(remove.entity) {
+        let count = block.map_or(1, |b| b.count);
+        for slot in instance.0..instance.0 + count {
+            slots.free.push(slot);
+            slots.freed.push(slot);
+            if let Some(held) = slots.entities.get_mut(slot as usize) {
+                *held = None;
+            }
         }
     }
 }
@@ -330,6 +391,12 @@ pub struct TLAS {
     staging: Buffer<InstanceRecord>,
     rebuild: bool,
     warned_module: bool,
+    /// Instance blocks by first slot: their length and pose meshes.
+    blocks: HashMap<u32, (u32, Vec<AssetId<AuroraMesh>>)>,
+    /// Each block's resolved poses (complete once every pose mesh has a BLAS).
+    block_poses: HashMap<u32, Vec<BlockPose>>,
+    /// Bumped whenever the instance array is reallocated (kernel-written rows are lost).
+    generation: u32,
 }
 
 impl TLAS {
@@ -358,7 +425,38 @@ impl TLAS {
             staging: Buffer::default(),
             rebuild: false,
             warned_module: false,
+            blocks: HashMap::new(),
+            block_poses: HashMap::new(),
+            generation: 0,
         }
+    }
+
+    /// Bumped whenever the instance array is reallocated: rows a kernel wrote are gone and
+    /// must be written again.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The instance array holds the block's slots and their static half (mesh, material,
+    /// poses) is resolved: a kernel may write its rows.
+    pub fn block_ready(&self, block: InstanceBlockSlots) -> bool {
+        self.capacity >= block.first + block.count
+            && self
+                .mirror
+                .get((block.first + block.count - 1) as usize)
+                .is_some_and(|r| r.blas != 0)
+            && !self.pending.contains(&block.first)
+            && self.block_poses.contains_key(&block.first)
+    }
+
+    /// The block's pose meshes, resolved, in [`InstanceBlock::poses`] order.
+    pub fn block_poses(&self, block: InstanceBlockSlots) -> Option<&[BlockPose]> {
+        self.block_poses.get(&block.first).map(Vec::as_slice)
+    }
+
+    /// Rows were written outside the instance table's own passes: rebuild the TLAS this frame.
+    pub fn request_rebuild(&mut self) {
+        self.rebuild = true;
     }
 
     /// Device address of the packed material buffer (`custom_index` indexes it).
@@ -437,6 +535,7 @@ impl TLAS {
 
     fn grow(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
         self.capacity = self.count.max(1024).next_power_of_two();
+        self.generation = self.generation.wrapping_add(1);
         log::debug!("GPU instance table: {} slots", self.capacity);
         rd.destroyer.destroy_buffer(self.instances_buf.handle);
         rd.destroyer.destroy_buffer(self.prev_instances_buf.handle);
@@ -742,6 +841,7 @@ type ChangedInstances = Or<(
     Changed<InheritedVisibility>,
     Changed<bevy::camera::visibility::RenderLayers>,
     Changed<crate::environment::InEnvironment>,
+    Changed<InstanceBlock>,
 )>;
 
 /// [`RenderLayers`](bevy::camera::visibility::RenderLayers) folded into the 8-bit TLAS
@@ -779,6 +879,7 @@ fn extract_instances(
             Option<&bevy::camera::visibility::RenderLayers>,
             Option<&crate::environment::InEnvironment>,
             Option<&crate::surface_group::SurfaceClass>,
+            Option<(&InstanceBlock, &InstanceBlockSlots)>,
         ),
         ChangedInstances,
     >,
@@ -786,10 +887,35 @@ fn extract_instances(
     tlas.count = slots.next;
     for slot in &slots.freed {
         tlas.set_source(*slot, None);
+        tlas.blocks.remove(slot);
+        tlas.block_poses.remove(slot);
+        // A block's other slots never had a source: clear their copied rows explicitly.
+        tlas.dirty.push(*slot);
     }
-    for (instance, node, mesh, procedural, sphere, material, visibility, layers, world, class) in
-        changed.iter()
+    for (
+        instance,
+        node,
+        mesh,
+        procedural,
+        sphere,
+        material,
+        visibility,
+        layers,
+        world,
+        class,
+        block,
+    ) in changed.iter()
     {
+        let node = match block {
+            Some((block, slots)) => {
+                let poses = block.poses.iter().map(|p| p.id()).collect();
+                if tlas.blocks.insert(slots.first, (slots.count, poses)).is_some() {
+                    tlas.dirty.push(slots.first);
+                }
+                NO_NODE
+            }
+            None => node.0,
+        };
         let geometry = if let Some(mesh) = mesh {
             Geometry::Mesh(mesh.0.id())
         } else if let Some(procedural) = procedural {
@@ -804,7 +930,7 @@ fn extract_instances(
             Some(InstanceSource {
                 geometry,
                 material: material.0.id(),
-                node: node.0,
+                node,
                 mask: if visibility.is_none_or(|v| v.get()) {
                     crate::environment::environment_mask(layers, world)
                 } else {
@@ -898,6 +1024,9 @@ pub fn prepare_instances(
     slots.dedup();
 
     for slot in slots {
+        if slot as usize >= tlas.mirror.len() {
+            continue;
+        }
         let Some(source) = tlas.sources.get(slot as usize).cloned().flatten() else {
             tlas.pending.remove(&slot);
             tlas.materials.clear(slot);
@@ -987,6 +1116,38 @@ pub fn prepare_instances(
         if tlas.mirror[slot as usize] != record {
             tlas.mirror[slot as usize] = record;
             tlas.records.push(record);
+        }
+        // A block's other slots copy the head's static half; its poses resolve alongside.
+        if let Some((count, poses)) = tlas.blocks.get(&slot).cloned() {
+            let end = (slot + count) as usize;
+            if tlas.mirror.len() < end {
+                tlas.mirror.resize(end, InstanceRecord::default());
+                tlas.sources.resize(end, None);
+            }
+            for k in slot + 1..slot + count {
+                let copy = InstanceRecord { slot: k, ..record };
+                if tlas.mirror[k as usize] != copy {
+                    tlas.mirror[k as usize] = copy;
+                    tlas.records.push(copy);
+                }
+            }
+            let mut resolved = Vec::with_capacity(poses.len());
+            for pose in &poses {
+                let offset = tlas.hit_offset(HitKey::Asset(pose.untyped(), source.class));
+                match meshes.get_by_id(*pose) {
+                    Some(b) => resolved.push(BlockPose {
+                        blas: b.acceleration_structure.address,
+                        sbt_and_flags: (offset & 0x00FF_FFFF) | (flags << 24),
+                        pad: 0,
+                    }),
+                    None => complete = false,
+                }
+            }
+            if complete {
+                tlas.block_poses.insert(slot, resolved);
+            } else {
+                tlas.block_poses.remove(&slot);
+            }
         }
         if complete {
             tlas.pending.remove(&slot);

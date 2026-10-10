@@ -59,6 +59,10 @@ impl RTXMaterial {
                 | AlphaMode::Multiply => 0.5,
             },
             surface_param_index: 0,
+            diffuse_transmission: material.diffuse_transmission.clamp(0.0, 1.0),
+            clearcoat: material.clearcoat.clamp(0.0, 1.0),
+            clearcoat_roughness: material.clearcoat_perceptual_roughness.clamp(0.0, 1.0),
+            pad: 0,
         }
     }
 }

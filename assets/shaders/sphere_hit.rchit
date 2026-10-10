@@ -42,6 +42,8 @@ void main() {
   payload.surface_and_world_normal = pack2_normals(surface_normal, world_normal);
   payload.slot = 0xFFFFFFFFu;
   payload.prim_tri = 0u;
+  payload.lobes = packLobes(material.diffuse_transmission, material.clearcoat,
+                            material.clearcoat_roughness);
   payload.prev_world_pos = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
   hitPayloadSetTransmission(payload, transmission);
   hitPayloadSetRoughness(payload, roughness);

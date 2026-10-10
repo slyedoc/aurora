@@ -298,9 +298,18 @@ impl Swapchain {
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&self.current_image_idx));
             let _present = info_span!("queue_present").entered();
-            self.device
+            let result = self
+                .device
                 .ext_swapchain
-                .queue_present(queue, &present_info)
+                .queue_present(queue, &present_info);
+            // Tracy's frame boundary (bevy_render's mark, which this renderer replaces).
+            #[cfg(feature = "trace_tracy")]
+            bevy::log::event!(
+                bevy::log::Level::INFO,
+                message = "finished frame",
+                tracy.frame_mark = true
+            );
+            result
         }
     }
 

@@ -71,6 +71,7 @@ uint environmentOf(const uint mask) {
   return mask == 0u ? 0u : uint(findLSB(mask));
 }
 
+// Mirrored for the Slang raygen in rt_types.slang (as is everything PushConstants reaches).
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict buffer UniformData {
   vec4 skycolor;
   mat4 inverse_view;
@@ -136,6 +137,8 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   float brush_radius;
   uint brush_active;
   vec3 brush_color;
+  float fog_height;
+  float fog_falloff;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -312,6 +315,11 @@ struct Material {
   float alpha_cutoff;
   // Row in the surface class's parameter array; 0 when the class published none.
   uint surface_param_index;
+  // Thin translucency and clear coat (raygen's lobes; payload `lobes`).
+  float diffuse_transmission;
+  float clearcoat;
+  float clearcoat_roughness;
+  uint pad;
 };
 
 layout (buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialData {
@@ -346,7 +354,15 @@ struct HitPayload {
   // Raygen -> hit: the ray cone at the ray's origin (x = width, y = spread angle, radians),
   // for the texture level of detail.
   vec2 cone;
+  // Hit -> raygen: thin translucency, clear coat and its roughness, a byte each (0..255).
+  uint lobes;
 };
+
+uint packLobes(float transmission, float clearcoat, float clearcoat_roughness) {
+  return uint(clamp(transmission, 0.0, 1.0) * 255.0 + 0.5)
+       | (uint(clamp(clearcoat, 0.0, 1.0) * 255.0 + 0.5) << 8)
+       | (uint(clamp(clearcoat_roughness, 0.0, 1.0) * 255.0 + 0.5) << 16);
+}
 
 // Per-pixel (incident meter, raw nits) pairs, render resolution: the raygen writes them, the
 // auto-exposure metering (auto_exposure.slang) histograms the meters next frame.

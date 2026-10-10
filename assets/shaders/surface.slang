@@ -13,24 +13,10 @@
 // GLSL side's `scalar` layout with no vector-alignment question.
 module surface;
 
-// `HitPayload` in types.glsl, member for member: the payload is shared memory between stages.
-public struct HitPayload {
-    public float t;
-    public float refract_index;
-    // r = roughness, m = metallic, t = transmission, i = flags (bit 0 inside, bit 1 masked).
-    public int r_m_t_i;
-    public float4 color;
-    public float3 emission;
-    public float4 surface_and_world_normal;
-    public float3 absorption;
-    public float3 prev_world_pos;
-    public uint want_sun;
-    public uint slot;
-    public uint prim_tri;
-    public float2 cone;
-};
+// `HitPayload` (shared with the raygen).
+__exported import hit_payload;
 
-// `Material` in types.glsl (88 bytes, scalar).
+// `Material` in types.glsl (104 bytes, scalar).
 public struct Material {
     public float base_color_r, base_color_g, base_color_b, base_color_a;
     public float emissive_r, emissive_g, emissive_b, emissive_a;
@@ -46,6 +32,10 @@ public struct Material {
     public float absorption_r, absorption_g, absorption_b;
     public float alpha_cutoff;
     public uint surface_param_index;
+    public float diffuse_transmission;
+    public float clearcoat;
+    public float clearcoat_roughness;
+    public uint pad;
 };
 
 // `Triangle` in types.glsl / blas.rs (32 bytes).
@@ -71,13 +61,20 @@ public struct PushConstants {
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 
+// A u32 in a stream the record points at. Typed as a one-field struct, not `uint*`: slangc
+// leaves a `uint*` reached only through the shader record without its ArrayStride (invalid
+// SPIR-V, rejected by the validation layer), while struct pointers are decorated.
+public struct U32 {
+    public uint v;
+};
+
 // The shader record (sbt.rs): the instance's streams, then its class's parameter buffer.
 public struct ShaderRecord {
     public float* vertex_data;
     public Triangle* triangle_data;
-    public uint* index_data;
-    public uint* geometries;
-    public uint* triangles;
+    public U32* index_data;
+    public U32* geometries;
+    public U32* triangles;
     public float* prev_vertex_data;
     public uint2 record_flags;
     // This record's surface class's parameter buffer, 0 when the class published none.
@@ -188,7 +185,7 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
                       attribs.barycentrics.x, attribs.barycentrics.y);
     hit.material = pc.materials[InstanceID() + GeometryIndex()];
 
-    let tri = record.triangle_data[record.triangles[GeometryIndex()] + PrimitiveIndex()];
+    let tri = record.triangle_data[record.triangles[GeometryIndex()].v + PrimitiveIndex()];
     hit.uv = unpackUv(tri.uv0) * hit.bary.x + unpackUv(tri.uv1) * hit.bary.y
         + unpackUv(tri.uv2) * hit.bary.z;
     hit.object_normal = unpackNormal(tri.n0) * hit.bary.x + unpackNormal(tri.n1) * hit.bary.y
@@ -224,14 +221,14 @@ public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3
     payload.surface_and_world_normal =
         float4(toOct(hit.surface_normal), toOct(world_normal));
     payload.slot = InstanceIndex();
-    payload.prim_tri = record.triangles[GeometryIndex()] + PrimitiveIndex();
+    payload.prim_tri = record.triangles[GeometryIndex()].v + PrimitiveIndex();
 
     var object_p = ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection();
     if ((record.record_flags.x & 1u) != 0u) {
-        let index_offset = record.geometries[GeometryIndex()];
+        let index_offset = record.geometries[GeometryIndex()].v;
         float3 q[3];
         for (uint k = 0; k < 3; k++) {
-            let v = record.index_data[index_offset + PrimitiveIndex() * 3 + k] * 8;
+            let v = record.index_data[index_offset + PrimitiveIndex() * 3 + k].v * 8;
             q[k] = float3(record.prev_vertex_data[v], record.prev_vertex_data[v + 1],
                           record.prev_vertex_data[v + 2]);
         }
@@ -243,4 +240,6 @@ public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3
                                     dot(pc.prev_instances[base + 1], p),
                                     dot(pc.prev_instances[base + 2], p));
     hitPayloadSetInside(payload, hit.inside);
+    payload.lobes = packLobes(hit.material.diffuse_transmission, hit.material.clearcoat,
+                              hit.material.clearcoat_roughness);
 }

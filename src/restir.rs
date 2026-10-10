@@ -19,7 +19,7 @@ use crate::{
     render_device::RenderDevice,
 };
 
-/// Must match `Reservoir` in types.glsl.
+/// Must match `Reservoir` in rt_types.slang.
 const RESERVOIR_BYTES: u64 = 32;
 
 /// One view's ping-pong reservoir pair. Temporal reuse reprojects against that view's own

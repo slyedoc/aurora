@@ -103,6 +103,9 @@ pub struct UniformData {
     brush_radius: f32,
     brush_active: u32,
     brush_color: [f32; 3],
+    /// Height fog (sky.rs `Fog`): base height and falloff, metres (0 falloff = uniform).
+    fog_height: f32,
+    fog_falloff: f32,
 }
 
 #[repr(C)]
@@ -821,6 +824,8 @@ fn render_frame(
             brush_radius: terrain_cursor.radius,
             brush_active: terrain_cursor.active as u32,
             brush_color: terrain_cursor.color.to_vec3().to_array(),
+            fog_height: environment.fog.height,
+            fog_falloff: environment.fog.falloff.max(0.0),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -1779,5 +1784,24 @@ mod tests {
     #[test]
     fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
         assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 100 * 4);
+    }
+
+    /// `rt_types.slang` mirrors `UniformData` with scalars only; its offsets are these.
+    #[test]
+    fn uniform_data_matches_the_slang_raygen() {
+        use core::mem::offset_of;
+        use super::UniformData as U;
+        assert_eq!(offset_of!(U, inverse_projection), 80);
+        assert_eq!(offset_of!(U, view), 168);
+        assert_eq!(offset_of!(U, prev_view_proj), 296);
+        assert_eq!(offset_of!(U, frame), 368);
+        assert_eq!(offset_of!(U, sharc_voxel), 420);
+        assert_eq!(offset_of!(U, env), 424);
+        assert_eq!(offset_of!(U, portals), 440);
+        assert_eq!(offset_of!(U, camera_mask), 456);
+        assert_eq!(offset_of!(U, worlds), 464);
+        assert_eq!(offset_of!(U, brush_color), 488);
+        assert_eq!(offset_of!(U, fog_height), 500);
+        assert_eq!(offset_of!(U, fog_falloff), 504);
     }
 }

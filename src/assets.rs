@@ -16,7 +16,7 @@ use bevy::{
     prelude::*,
 };
 
-/// Asset source id for the engine's own assets: `aurora://shaders/raygen.rgen`.
+/// Asset source id for the engine's own assets: `aurora://shaders/raygen.slang`.
 pub const AURORA_ASSET_SOURCE: &str = "aurora";
 
 /// Absolute path of this crate's `assets/` directory at build time.

@@ -8,7 +8,7 @@
 //!
 //! GPU side: a small host table of (instance slot, target slot) pairs, address + count in
 //! the frame uniform; the raygen checks each hit's TLAS slot against it and rewrites the
-//! ray (`portalRedirect` in raygen.rgen), reading both transforms from the live
+//! ray (`portalRedirect` in raygen.slang), reading both transforms from the live
 //! `cur_instances` rows -- portals on moving parents stay exact with no CPU reads. Because
 //! the redirect happens in the continued ray, recursion is free: portals seen through
 //! portals, portals in reflections, portals through glass, bounded by `max_bounces`.
@@ -45,7 +45,7 @@ pub struct AuroraPortal {
     pub target: Entity,
 }
 
-/// One table entry; must match the `uvec4` unpack in raygen.rgen's `portalRedirect`.
+/// One table entry; must match the `uvec4` unpack in raygen.slang's `portalRedirect`.
 /// `valid = 0` covers unresolved endpoints (instances still streaming in) and the
 /// zero-filled tail of the buffer -- slot 0 is real, so zeros must read as inert.
 #[repr(C)]
