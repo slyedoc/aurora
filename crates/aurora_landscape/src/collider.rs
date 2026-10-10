@@ -2,7 +2,10 @@
 //! are copied on the main thread; the shape (tens of ms per page) is built on the async
 //! compute pool and attached when done.
 
-use avian3d::prelude::{Collider, RigidBody};
+use avian3d::{
+    parry::{shape::SharedShape, utils::Array2},
+    prelude::{Collider, RigidBody},
+};
 use bevy::{
     platform::collections::HashMap,
     prelude::*,
@@ -24,20 +27,34 @@ pub struct PageCollider {
 #[derive(Component)]
 pub struct ColliderBuild(Task<Collider>);
 
-/// A page's heightfield: its 256 texels plus the next page's first, so pages meet.
+/// A page's heightfield: its 256 texels plus the next page's first, so pages meet. The main
+/// thread copies the page and its two seams; the transpose and the shape run on the pool.
 fn page_heightfield(pages: &LandscapePages, page: IVec2, size: f32) -> Task<Collider> {
-    let n = PAGE_TEXELS as i32;
-    let base = page * n;
-    // avian: rows run along x, columns along z.
-    let heights: Vec<Vec<f32>> = (0..=n)
-        .map(|x| {
-            (0..=n)
-                .map(|z| pages.texel_height(base + IVec2::new(x, z)))
-                .collect()
-        })
+    let n = PAGE_TEXELS as usize;
+    let base = page * n as i32;
+    let texels = pages.page(page).map(<[f32]>::to_vec);
+    let edge_x: Vec<f32> = (0..=n as i32)
+        .map(|z| pages.texel_height(base + IVec2::new(n as i32, z)))
         .collect();
-    AsyncComputeTaskPool::get()
-        .spawn(async move { Collider::heightfield(heights, Vec3::new(size, 1.0, size)) })
+    let edge_z: Vec<f32> = (0..n as i32)
+        .map(|x| pages.texel_height(base + IVec2::new(x, n as i32)))
+        .collect();
+    AsyncComputeTaskPool::get().spawn(async move {
+        // parry's Array2 is column-major over (z, x): x-major, z contiguous.
+        let mut data = Vec::with_capacity((n + 1) * (n + 1));
+        for x in 0..=n {
+            for z in 0..=n {
+                data.push(match (x == n, z == n, &texels) {
+                    (true, _, _) => edge_x[z],
+                    (_, true, _) => edge_z[x],
+                    (_, _, Some(texels)) => texels[z * n + x],
+                    (_, _, None) => 0.0,
+                });
+            }
+        }
+        SharedShape::heightfield(Array2::new(n + 1, n + 1, data), Vec3::new(size, 1.0, size))
+            .into()
+    })
 }
 
 pub fn update_colliders(

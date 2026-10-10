@@ -136,11 +136,12 @@ impl AssetLoader for BakedPagesLoader {
 pub fn apply_bakes(
     rd: Res<RenderDevice>,
     live: Res<LandscapeLive>,
-    bakes: Res<Assets<BakedPages>>,
+    mut bakes: ResMut<Assets<BakedPages>>,
     mut landscapes: Query<(Entity, &Landscape, &LandscapeBake, &mut LandscapePages)>,
     mut evaluated: MessageWriter<PagesEvaluated>,
     mut materials_evaluated: MessageWriter<MaterialsEvaluated>,
 ) {
+    let mut loaded = Vec::new();
     for (entity, landscape, bake, mut pages) in &mut landscapes {
         let id = bake.file.id();
         if live.0 {
@@ -169,6 +170,7 @@ pub fn apply_bakes(
         }
         pages.load_bake(&rd, baked);
         pages.baked = Some(id);
+        loaded.push(id);
         let all: Vec<IVec2> = pages.window().collect();
         evaluated.write(PagesEvaluated {
             landscape: entity,
@@ -178,6 +180,15 @@ pub fn apply_bakes(
             landscape: entity,
             pages: all,
         });
+    }
+    // The pool and the mirrors hold it now; a second CPU copy is 12 bytes a texel.
+    for id in loaded {
+        if landscapes
+            .iter()
+            .all(|(_, _, bake, pages)| bake.file.id() != id || pages.bake_seen == Some(id))
+        {
+            bakes.remove(id);
+        }
     }
 }
 

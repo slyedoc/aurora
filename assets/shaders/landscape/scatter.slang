@@ -96,8 +96,10 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     let outer = float(push.width) * 0.5 * push.spacing;
     // One roll for both edges: a tier whose inner edge sits `fade` inside the next nearer
     // tier's outer edge takes over every spot that one lets go, and no other.
+    // No inner edge at radius 0: the nearest tier keeps every spot around the viewer.
     let dither = unit(h);
-    if (d < push.inner_radius + push.fade * (1.0 - dither) || d > outer - push.fade * dither) {
+    let inside = push.inner_radius > 0.0 && d < push.inner_radius + push.fade * (1.0 - dither);
+    if (inside || d > outer - push.fade * dither) {
         drop_spot(slot);
         return;
     }
