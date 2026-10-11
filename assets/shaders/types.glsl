@@ -29,12 +29,6 @@ vec2 unpackUv(uint packed) {
   return unpackHalf2x16(packed);
 }
 
-// Environment importance-sampling table (src/env_light.rs): cdf[N + 1] then the solid-angle
-// pdf of each texel, N = env_w * env_h.
-layout (buffer_reference, scalar, buffer_reference_align = 4) readonly buffer EnvData {
-  float data[];
-};
-
 // Ray-portal pair table (src/portal.rs): x = instance slot, y = target slot, z = valid.
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly buffer PortalData {
   uvec4 pairs[];
@@ -47,14 +41,20 @@ struct EnvironmentSun {
   vec4 radiance;
 };
 
-// One world's sky and suns (src/sky.rs EnvironmentGpu). mode 0 = flat colour (color),
-// 1 = HDR (tex, color = scale), 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex =
-// the space image, color = its scale, 0 = none).
+// One environment: everything a ray in it sees (src/sky.rs EnvironmentGpu; read by the
+// Slang miss and raygen, mirrored here for the table's layout).
 struct EnvironmentGpu {
   uint mode;
   uint tex;
   uint sun_count;
-  uint pad;
+  float sky_brightness;
+  uvec2 importance;
+  float fog_density;
+  float fog_scatter;
+  float fog_height;
+  float fog_falloff;
+  float sun_clip;
+  uint pad0;
   vec4 color;
   vec4 zenith;
   vec4 horizon;
@@ -62,26 +62,19 @@ struct EnvironmentGpu {
   EnvironmentSun suns[4];
 };
 
-layout (buffer_reference, scalar, buffer_reference_align = 16) readonly restrict buffer WorldEnvs {
-  EnvironmentGpu w[];
+layout (buffer_reference, scalar, buffer_reference_align = 16) readonly restrict buffer EnvironmentTable {
+  EnvironmentGpu e[];
 };
-
-// The world a ray mask is in: its lowest set bit (the main world for an empty mask).
-uint environmentOf(const uint mask) {
-  return mask == 0u ? 0u : uint(findLSB(mask));
-}
 
 // Mirrored for the Slang raygen in rt_types.slang (as is everything PushConstants reaches).
 layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict buffer UniformData {
-  vec4 skycolor;
   mat4 inverse_view;
   mat4 inverse_projection;
   uint pull_focus_x;
   uint pull_focus_y;
   float aperture;
-  float foginess;
-  float fog_scatter;
-  float sky_brightness;
+  // The environment this view is in.
+  uint environment;
   // DLSS: camera matrices for depth / motion vectors, and the sub-pixel jitter (pixels).
   mat4 view;
   mat4 view_proj;
@@ -116,10 +109,6 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   uint sharc;
   // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
   float sharc_voxel;
-  // Environment importance sampling for the HDR sky (env_w = 0: none).
-  EnvData env;
-  uint env_w;
-  uint env_h;
   // Ray portals (src/portal.rs): pair table + entry count (0 = none).
   PortalData portals;
   uint portal_count;
@@ -128,17 +117,19 @@ layout (buffer_reference, scalar, buffer_reference_align = 8) readonly restrict 
   float emissive_boost;
   // The camera's render-layer cull mask; every ray starts with it (portals swap it).
   uint camera_mask;
-  // Every world's sky and suns, by world bit: a ray reads the entry of the world its mask
-  // says it is in (portals swap the mask mid-path).
-  WorldEnvs worlds;
+  // Layers the camera ray skips (AuroraPrimaryHidden); shadows and bounces still see them.
+  uint primary_hidden;
+  // The mask bits that are environments.
+  uint environment_bits;
+  uint pad_environments;
+  // Every environment's sky, suns and fog, by environment bit.
+  EnvironmentTable environments;
   // Terrain brush ring (terrain.rs TerrainCursor): world x/z, radius, emission (nits);
   // the closest-hit draws it on terrain records while brush_active != 0.
   vec2 brush_center;
   float brush_radius;
   uint brush_active;
   vec3 brush_color;
-  float fog_height;
-  float fog_falloff;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -343,10 +334,9 @@ struct HitPayload {
   vec3 absorption;
   // Where this hit point was last frame (object motion for DLSS motion vectors).
   vec3 prev_world_pos;
-  // Raygen -> miss: 1 when a miss may return the procedural sun disc (camera rays and
-  // pure-specular paths); 0 after a BRDF-sampled bounce, where the sun is gathered by
-  // next-event estimation instead.
-  uint want_sun;
+  // Raygen -> miss (hit_payload.slang): may this miss return the sun discs (bit 0), and the
+  // ray's environment index above it.
+  uint miss_flags;
   // Hit identity for the light-table MIS lookup: TLAS slot (gl_InstanceID; ~0 for
   // spheres) and the global triangle index within the BLAS.
   uint slot;
@@ -445,8 +435,8 @@ struct PushConstants {
   MaterialData materials;
   BluenoiseData bluenoise;
   FocusData focus;
-  uint skydome;
   uint pad0;
+  uint pad1;
   PrevInstances prev_instances;
   // Emissive-triangle light table (valid whenever uniforms.light_entries > 0).
   LightsHeader lights;

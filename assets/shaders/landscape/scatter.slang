@@ -4,9 +4,11 @@
 // palette id) and the slope, dropped onto the heights, and written straight into the
 // species' TLAS instance block; a dropped spot gets a zero transform (traces nothing). With
 // poses, each instance also picks its wind pose from a gust wave travelling across the field:
-// a BLAS pointer and hit record swap, no geometry rebuilt.
+// a BLAS pointer and hit record swap, no geometry rebuilt. With an interaction field, each
+// instance also shears away from whatever walked through its spot (interaction.slang).
 import pages;
 import materials;
+import interaction;
 
 // VkAccelerationStructureInstanceKHR (instances.slang).
 struct Instance {
@@ -25,12 +27,19 @@ struct Pose {
     uint pad;
 };
 
+// `SpeciesTables` in scatter.rs: the keep factor per palette id, and the wind poses.
+struct SpeciesTables {
+    float factors[256];
+    Pose poses[64];
+};
+
 // `ScatterPush` in scatter.rs (the whole 128-byte block).
 struct ScatterPush {
     Instance* instances;
     uint2* materials;
-    Pose* poses;
-    float* factors;
+    SpeciesTables* tables;
+    // The interaction field, or null while nothing disturbs it.
+    FieldTexel* field;
     PagePool pool;
     uint first;
     uint width;
@@ -116,7 +125,7 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     let s = texel_set(int2(round(xz / p.texel)));
     var density = 0.0;
     for (int k = 0; k < 4; k++) {
-        density += s.w[k] * push.factors[s.ids[k]];
+        density += s.w[k] * push.tables.factors[s.ids[k]];
     }
     if (unit(h) >= density) {
         drop_spot(slot);
@@ -136,15 +145,23 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     let c = cos(yaw) * scale;
     let sn = sin(yaw) * scale;
     let at = float3(push.origin_x + xz.x, push.origin_y + ground - push.sink, push.origin_z + xz.y);
-    push.instances[slot].t0 = float4(c, 0.0, sn, at.x);
-    push.instances[slot].t1 = float4(0.0, scale, 0.0, at.y);
-    push.instances[slot].t2 = float4(-sn, 0.0, c, at.z);
+    // Lean away from what walked through: a shear about the base (local y feeds world xz), the
+    // tip lowered to keep the plant's length; at most ~56 degrees (tan 1.5).
+    var lean = fieldPush(push.field, at.xz);
+    let lean_len = length(lean);
+    if (lean_len > 1.5) {
+        lean *= 1.5 / lean_len;
+    }
+    let tall = scale / sqrt(1.0 + dot(lean, lean));
+    push.instances[slot].t0 = float4(c, lean.x * tall, sn, at.x);
+    push.instances[slot].t1 = float4(0.0, tall, 0.0, at.y);
+    push.instances[slot].t2 = float4(-sn, lean.y * tall, c, at.z);
 
     if (pose_count > 0) {
         // A gust front sweeping +x, slightly skewed, with a little per-plant lag.
         let wave = push.wave - (xz.x * 0.045 + xz.y * 0.02) + unit(h) * 0.15;
         let k = uint(floor(frac(wave) * float(pose_count))) % pose_count;
-        let pose = push.poses[k];
+        let pose = push.tables.poses[k];
         push.instances[slot].blas = pose.blas;
         push.instances[slot].sbt_and_flags = pose.sbt_and_flags;
     }

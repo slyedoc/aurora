@@ -14,10 +14,10 @@ public struct HitPayload {
     public float3 absorption;
     // Where this hit point was last frame (object motion for DLSS motion vectors).
     public float3 prev_world_pos;
-    // Raygen -> miss: low bit 1 when a miss may return the procedural sun disc (camera rays
-    // and pure-specular paths), 0 after a BRDF-sampled bounce, where the sun is gathered by
-    // next-event estimation instead; the ray's world mask above it.
-    public uint want_sun;
+    // Raygen -> miss: low bit 1 when a miss may return the sun discs (camera rays and
+    // pure-specular paths), 0 after a BRDF-sampled bounce, where the suns are gathered by
+    // next-event estimation instead; the ray's environment index above it.
+    public uint miss_flags;
     // Hit identity for the light-table MIS lookup: TLAS slot (InstanceIndex; ~0 for
     // spheres) and the global triangle index within the BLAS.
     public uint slot;

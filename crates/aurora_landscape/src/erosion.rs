@@ -130,7 +130,13 @@ struct ErosionPush {
 pub fn start_bakes(
     mut commands: Commands,
     mut layers: Query<
-        (Entity, &mut ErosionLayer, &ChildOf, &Transform, &mut SculptPages),
+        (
+            Entity,
+            &mut ErosionLayer,
+            &ChildOf,
+            &Transform,
+            &mut SculptPages,
+        ),
         Without<ErosionBake>,
     >,
     mut landscapes: Query<(&Landscape, &mut LandscapePages)>,
@@ -158,7 +164,13 @@ pub fn run_bakes(
     rd: Res<RenderDevice>,
     kernels: Res<LandscapeKernels>,
     modules: Res<ComputeModules>,
-    mut layers: Query<(Entity, &ErosionLayer, &ErosionBake, &ChildOf, &mut SculptPages)>,
+    mut layers: Query<(
+        Entity,
+        &ErosionLayer,
+        &ErosionBake,
+        &ChildOf,
+        &mut SculptPages,
+    )>,
     mut landscapes: Query<(&Landscape, &mut LandscapePages)>,
 ) {
     let Some(module) = modules.get(&kernels.erosion) else {
@@ -242,7 +254,14 @@ pub fn run_bakes(
             step("init", 0);
             for iteration in 0..layer.iterations {
                 for entry in [
-                    "rain", "flux", "water", "erode", "advect", "evaporate", "slip_out", "slip_in",
+                    "rain",
+                    "flux",
+                    "water",
+                    "erode",
+                    "advect",
+                    "evaporate",
+                    "slip_out",
+                    "slip_in",
                 ] {
                     step(entry, iteration);
                 }
@@ -275,11 +294,13 @@ pub fn run_bakes(
             }
             log::debug!("landscape: erosion delta {lo:.2}..{hi:.2} m");
         }
-        for handle in scalars
-            .iter()
-            .map(|b| b.handle)
-            .chain([flux.handle, vel.handle, slip.handle, slip2.handle, params.handle])
-        {
+        for handle in scalars.iter().map(|b| b.handle).chain([
+            flux.handle,
+            vel.handle,
+            slip.handle,
+            slip2.handle,
+            params.handle,
+        ]) {
             rd.destroyer.destroy_buffer(handle);
         }
         pages.mark_dirty(region_pages);

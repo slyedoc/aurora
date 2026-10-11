@@ -23,7 +23,10 @@ use bevy::{
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::environment::{InEnvironment, RenderEnvironments, environment_mask};
+use crate::{
+    environment::{InEnvironment, RenderEnvironments, environment_mask},
+    sky_importance::HdrSun,
+};
 
 /// Suns per environment the GPU table holds; more are ignored.
 pub const MAX_SUNS: usize = 4;
@@ -217,16 +220,22 @@ impl Default for EnvironmentSky {
 /// Every environment's sky and suns, indexed by environment bit; rebuilt each frame before rendering.
 #[derive(Resource, Default, Debug)]
 pub struct EnvironmentSkies {
-    pub worlds: [EnvironmentSky; 8],
-    /// The environment bit of the first active camera (its HDR sky gets importance sampling).
-    pub camera_world: u8,
+    pub environments: [EnvironmentSky; 8],
     /// The one environment whose sky is the atmosphere, if any.
     pub atmosphere: Option<u8>,
+    /// Bits that are environments (the main bit always); the rest of a mask are render layers.
+    pub environment_bits: u8,
 }
 
 impl EnvironmentSkies {
-    pub fn camera(&self) -> &EnvironmentSky {
-        &self.worlds[self.camera_world as usize]
+    /// The environment a view of `mask` is in, ignoring its plain render layers.
+    pub fn view_environment(&self, mask: u8) -> u8 {
+        crate::environment::view_environment(mask & (self.environment_bits | 1))
+    }
+
+    /// The sky of the environment a view of `mask` is in.
+    pub fn of_view(&self, mask: u8) -> &EnvironmentSky {
+        &self.environments[self.view_environment(mask) as usize]
     }
 }
 
@@ -248,7 +257,6 @@ fn gather_skies(
         Option<&InEnvironment>,
         Option<&InheritedVisibility>,
     )>,
-    cameras: Query<(&Camera, Option<&RenderLayers>, Option<&InEnvironment>), With<Camera3d>>,
     mut out: ResMut<EnvironmentSkies>,
 ) {
     let Some(worlds) = worlds else {
@@ -273,7 +281,7 @@ fn gather_skies(
                 atmosphere = Some(bit);
             }
         }
-        let entry = &mut out.worlds[bit as usize];
+        let entry = &mut out.environments[bit as usize];
         entry.sky = sky;
         entry.gradient = gradient.cloned().unwrap_or_default();
         entry.fog = fog.copied().unwrap_or_default();
@@ -281,6 +289,7 @@ fn gather_skies(
         entry.suns.clear();
     }
     out.atmosphere = atmosphere;
+    out.environment_bits = worlds.environment_bits();
 
     let mut brightest = [0.0f32; 8];
     for (light, disk, transform, layers, world, visibility) in &suns {
@@ -290,7 +299,7 @@ fn gather_skies(
         let sun = Sun::of(light, disk, transform);
         let mask = environment_mask(layers, world);
         for bit in 0..8 {
-            let suns = &mut out.worlds[bit].suns;
+            let suns = &mut out.environments[bit].suns;
             if mask & (1 << bit) != 0 && suns.len() < MAX_SUNS {
                 suns.push(sun);
                 brightest[bit] = brightest[bit].max(light.illuminance);
@@ -298,20 +307,12 @@ fn gather_skies(
         }
     }
     for bit in 0..8 {
-        out.worlds[bit].ev100 = exposures[bit].unwrap_or(if brightest[bit] > 0.0 {
+        out.environments[bit].ev100 = exposures[bit].unwrap_or(if brightest[bit] > 0.0 {
             ev100_for_lux(brightest[bit])
         } else {
             DEFAULT_EV100
         });
     }
-
-    out.camera_world = cameras
-        .iter()
-        .filter(|(camera, ..)| camera.is_active)
-        .min_by_key(|(camera, ..)| camera.order)
-        .map_or(0, |(_, layers, world)| {
-            crate::environment::view_environment(environment_mask(layers, world))
-        });
 }
 
 /// One sun in the GPU table (must match `EnvironmentSun` in types.glsl).
@@ -324,7 +325,8 @@ pub struct EnvironmentSunGpu {
     pub radiance: [f32; 4],
 }
 
-/// One environment's entry in the GPU table (must match `EnvironmentGpu` in types.glsl).
+/// One environment's entry in the GPU table (must match `EnvironmentGpu` in types.glsl and
+/// rt_types.slang): everything a ray in it sees -- sky, suns, fog.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct EnvironmentGpu {
@@ -333,6 +335,18 @@ pub struct EnvironmentGpu {
     /// Bindless texture: the HDR sky, or the image behind the atmosphere.
     pub tex: u32,
     pub sun_count: u32,
+    /// [`SkyBrightness`].
+    pub sky_brightness: f32,
+    /// The HDR sky's importance-sampling table (sky_importance.rs), 0 = none.
+    pub importance: u64,
+    /// [`Fog`]: extinction per metre, Henyey-Greenstein g, base height, falloff (0 = uniform).
+    pub fog_density: f32,
+    pub fog_scatter: f32,
+    pub fog_height: f32,
+    pub fog_falloff: f32,
+    /// HDR sky with its sun taken out ([`HdrSun`]): the texel luminance the sky is clipped to
+    /// inside a sun's cone (the sun is one of `suns`). 0 = nothing taken out.
+    pub sun_clip: f32,
     pub pad: u32,
     /// Flat: the radiance. HDR: the scale. Atmosphere: the space image's scale (0 = none).
     pub color: [f32; 4],
@@ -344,30 +358,74 @@ pub struct EnvironmentGpu {
 
 impl EnvironmentGpu {
     /// `tex` and `space` are the renderer's: the HDR's (or space image's) bindless index,
-    /// and the space image's scale.
-    pub fn new(world: &EnvironmentSky, tex: u32, space: Vec4) -> Self {
-        let (mode, color) = match &world.sky {
+    /// and the space image's scale; `importance` the HDR sky's sampling table, and `hdr_sun` the
+    /// sun taken out of it.
+    pub fn new(
+        environment: &EnvironmentSky,
+        tex: u32,
+        space: Vec4,
+        importance: u64,
+        hdr_sun: Option<&HdrSun>,
+    ) -> Self {
+        let (mode, color) = match &environment.sky {
             Sky::Color { radiance } => (0, radiance.extend(0.0)),
             Sky::Hdr { scale, .. } => (1, Vec4::splat(*scale)),
             Sky::Gradient => (2, Vec4::ZERO),
             Sky::Atmosphere => (3, space),
         };
         let mut suns = [EnvironmentSunGpu::default(); MAX_SUNS];
-        for (gpu, sun) in suns.iter_mut().zip(&world.suns) {
+        for (gpu, sun) in suns.iter_mut().zip(&environment.suns) {
             *gpu = EnvironmentSunGpu {
                 direction: sun.direction.extend(sun.cos_radius).to_array(),
                 radiance: sun.radiance.extend(sun.disc).to_array(),
             };
         }
+        let mut sun_count = environment.suns.len().min(MAX_SUNS);
+        let mut sun_clip = 0.0;
+        // The HDR sky's own sun (core and halo), in nits: the image's units times the sky's scale
+        // and brightness. All of it or none: the clip takes the whole cone out of the sky.
+        if let (Sky::Hdr { scale, .. }, Some(sun)) = (&environment.sky, hdr_sun)
+            && sun_count + sun.discs().count() <= MAX_SUNS
+        {
+            for disc in sun.discs() {
+                let nits = disc.radiance * *scale * environment.sky_brightness;
+                suns[sun_count] = EnvironmentSunGpu {
+                    direction: sun.direction.extend(disc.cos_radius).to_array(),
+                    radiance: nits.extend(1.0).to_array(),
+                };
+                sun_count += 1;
+            }
+            sun_clip = sun.clip;
+        }
+        let fog = environment.fog;
         Self {
             mode,
             tex,
-            sun_count: world.suns.len().min(MAX_SUNS) as u32,
+            sun_count: sun_count as u32,
+            sky_brightness: environment.sky_brightness,
+            importance: if mode == 1 { importance } else { 0 },
+            fog_density: fog.density,
+            fog_scatter: fog.scatter,
+            fog_height: fog.height,
+            fog_falloff: fog.falloff.max(0.0),
+            sun_clip,
             pad: 0,
             color: color.to_array(),
-            zenith: world.gradient.zenith_radiance().extend(0.0).to_array(),
-            horizon: world.gradient.horizon_radiance().extend(0.0).to_array(),
-            ground: world.gradient.ground_radiance().extend(0.0).to_array(),
+            zenith: environment
+                .gradient
+                .zenith_radiance()
+                .extend(0.0)
+                .to_array(),
+            horizon: environment
+                .gradient
+                .horizon_radiance()
+                .extend(0.0)
+                .to_array(),
+            ground: environment
+                .gradient
+                .ground_radiance()
+                .extend(0.0)
+                .to_array(),
             suns,
         }
     }

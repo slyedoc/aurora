@@ -238,11 +238,7 @@ pub fn apply_dabs(
     kernels: Res<LandscapeKernels>,
     modules: Res<ComputeModules>,
     mut dabs: ResMut<SculptDabs>,
-    mut layers: Query<(
-        &ChildOf,
-        Option<&mut SculptPages>,
-        Option<&mut PaintPages>,
-    )>,
+    mut layers: Query<(&ChildOf, Option<&mut SculptPages>, Option<&mut PaintPages>)>,
     mut landscapes: Query<(&Landscape, &mut LandscapePages)>,
 ) {
     if dabs.0.is_empty() {

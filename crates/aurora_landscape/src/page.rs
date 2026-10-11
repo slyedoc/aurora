@@ -15,8 +15,8 @@ use bytemuck::{Pod, Zeroable};
 use gpu_allocator::MemoryLocation;
 
 use crate::{
-    bake::{LandscapeBake, LandscapeLive},
     Landscape, LandscapeKernels, PAGE_TEXELS,
+    bake::{LandscapeBake, LandscapeLive},
     generator::{GeneratorLayer, GeneratorPush, GeneratorSource},
     layer::{
         HeightBlend, HeightLayer, HeightmapLayer, HeightmapSource, LayerFootprint,
@@ -397,10 +397,10 @@ pub fn allocate_pages(
                         let q = *p - landscape.pages_min;
                         q.x >= 0 && q.y >= 0 && q.x < count.x && q.y < count.y
                     });
-                    pages
-                        .dirty_materials
-                        .retain(|p| (*p - landscape.pages_min).cmpge(IVec2::ZERO).all()
-                            && (*p - landscape.pages_min).cmplt(count).all());
+                    pages.dirty_materials.retain(|p| {
+                        (*p - landscape.pages_min).cmpge(IVec2::ZERO).all()
+                            && (*p - landscape.pages_min).cmplt(count).all()
+                    });
                     pages.mark_dirty(entered);
                 }
                 continue;
@@ -778,7 +778,11 @@ pub fn evaluate_pages(
                 for pass in &passes {
                     compute_to_compute_barrier(&rd, cmd);
                     for &page in &heights {
-                        if landscape.page_rect(page).intersect(pass.footprint).is_empty() {
+                        if landscape
+                            .page_rect(page)
+                            .intersect(pass.footprint)
+                            .is_empty()
+                        {
                             continue;
                         }
                         if let Some(genome) = pass.genome {
@@ -810,8 +814,7 @@ pub fn evaluate_pages(
                         push.page_x = page.x;
                         push.page_z = page.y;
                         if let Some(layer) = pass.sculpt {
-                            let Some(delta) =
-                                sculpts.get(layer).ok().and_then(|s| s.address(page))
+                            let Some(delta) = sculpts.get(layer).ok().and_then(|s| s.address(page))
                             else {
                                 continue;
                             };
@@ -885,7 +888,11 @@ pub fn evaluate_pages(
             for pass in &mat_passes {
                 compute_to_compute_barrier(&rd, cmd);
                 for &page in &batch {
-                    if landscape.page_rect(page).intersect(pass.footprint).is_empty() {
+                    if landscape
+                        .page_rect(page)
+                        .intersect(pass.footprint)
+                        .is_empty()
+                    {
                         continue;
                     }
                     let mut push = pass.push;

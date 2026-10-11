@@ -278,7 +278,7 @@ void atmoIntegrate(float3 p, float3 d, float3 sun, float t_max_in, uint steps,
 // Sky radiance (nits) and the transmittance to space along `dir` from the camera, from
 // the sky-view LUT. `ground` reports whether the ray hits the planet (no sun disc, and
 // the space image stays hidden).
-void atmoSkyView(float3 dir, out float3 L, out float3 T, out bool ground) {
+public void atmoSkyView(float3 dir, out float3 L, out float3 T, out bool ground) {
     let p = cameraPos() - planetCenter();
     let Rg = pc.atmo.planet_radius;
     let Rt = Rg + pc.atmo.atmosphere_height;
@@ -294,6 +294,14 @@ void atmoSkyView(float3 dir, out float3 L, out float3 T, out bool ground) {
     let uv = atmoSkyViewParamsToUv(r, vcz, lvc, ground);
     L = atmoLut2D(pc.atmo.skyview_rad, ATM_SV_W, ATM_SV_H, uv).rgb;
     T = ground ? float3(0.0) : atmoLut2D(pc.atmo.skyview_trn, ATM_SV_W, ATM_SV_H, uv).rgb;
+}
+
+// The sun disc seen through the air: its radiance times the transmittance to space.
+public float3 atmoSunDisc(float3 dir, float3 T_space) {
+    let c = dot(dir, sunDirection());
+    let cos_r = pc.atmo.sun_cos_radius;
+    let disc = smoothstep(cos_r - (1.0 - cos_r) * 0.2, cos_r, c);
+    return sunRadiance() * disc * T_space;
 }
 
 // Transmittance towards the sun from a world point (the atmosphere only).

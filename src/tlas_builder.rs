@@ -909,7 +909,11 @@ fn extract_instances(
         let node = match block {
             Some((block, slots)) => {
                 let poses = block.poses.iter().map(|p| p.id()).collect();
-                if tlas.blocks.insert(slots.first, (slots.count, poses)).is_some() {
+                if tlas
+                    .blocks
+                    .insert(slots.first, (slots.count, poses))
+                    .is_some()
+                {
                     tlas.dirty.push(slots.first);
                 }
                 NO_NODE

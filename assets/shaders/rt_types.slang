@@ -37,14 +37,27 @@ public struct EnvironmentSun {
     public float4 radiance;
 };
 
-// One world's sky and suns (src/sky.rs EnvironmentGpu). mode 0 = flat colour (color),
-// 1 = HDR (tex, color = scale), 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex =
-// the space image, color = its scale, 0 = none).
+// One environment: everything a ray in it sees (src/sky.rs EnvironmentGpu). mode 0 = flat
+// colour (color), 1 = HDR (tex, color = scale, importance = its sampling table or null),
+// 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex = the space image, color = its
+// scale, 0 = none).
 public struct EnvironmentGpu {
     public uint mode;
     public uint tex;
     public uint sun_count;
-    public uint pad;
+    public float sky_brightness;
+    // The HDR sky's importance-sampling table (src/sky_importance.rs): cdf[N + 1] then the
+    // solid-angle pdf of each texel, N = SKY_IMPORTANCE_W * SKY_IMPORTANCE_H.
+    public float* importance;
+    // Fog: extinction per metre, Henyey-Greenstein g, base height, falloff (0 = uniform).
+    public float fog_density;
+    public float fog_scatter;
+    public float fog_height;
+    public float fog_falloff;
+    // HDR sky with its sun taken out (sky_importance.rs HdrSun): the texel luminance it is
+    // clipped to inside a sun's cone; 0 = nothing taken out.
+    public float sun_clip;
+    public uint pad0;
     public float4 color;
     public float4 zenith;
     public float4 horizon;
@@ -52,22 +65,67 @@ public struct EnvironmentGpu {
     public EnvironmentSun suns[4];
 };
 
-// The world a ray mask is in: its lowest set bit (the main world for an empty mask).
-public uint environmentOf(uint mask) {
-    return mask == 0u ? 0u : firstbitlow(mask);
+// Where a ray leaving a surface at `p` starts: pushed off the surface along `n` (the side it
+// leaves through) by a fixed number of float ulps, so the offset scales with the hit's distance
+// from the world origin and the ray never re-hits the surface it left, near or far (Waechter &
+// Binder, "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing Gems ch. 6).
+// Within 1/32 of the origin, where ulps get too fine, a small absolute offset instead. Rays
+// that start this way trace with tmin 0.
+public float3 offsetRay(float3 p, float3 n) {
+    static const float ORIGIN = 1.0 / 32.0;
+    static const float FLOAT_SCALE = 1.0 / 65536.0;
+    static const float INT_SCALE = 256.0;
+    let of_i = int3(INT_SCALE * n.x, INT_SCALE * n.y, INT_SCALE * n.z);
+    let p_i = float3(
+        asfloat(asint(p.x) + (p.x < 0.0 ? -of_i.x : of_i.x)),
+        asfloat(asint(p.y) + (p.y < 0.0 ? -of_i.y : of_i.y)),
+        asfloat(asint(p.z) + (p.z < 0.0 ? -of_i.z : of_i.z)));
+    return float3(
+        abs(p.x) < ORIGIN ? p.x + FLOAT_SCALE * n.x : p_i.x,
+        abs(p.y) < ORIGIN ? p.y + FLOAT_SCALE * n.y : p_i.y,
+        abs(p.z) < ORIGIN ? p.z + FLOAT_SCALE * n.z : p_i.z);
+}
+
+// `offsetRay` off the surface with normal `n`, to the side direction `d` leaves through.
+public float3 leaveSurface(float3 p, float3 n, float3 d) {
+    return offsetRay(p, dot(d, n) >= 0.0 ? n : -n);
+}
+
+// The HDR sky's texel at `d` without the sun taken out of it: clipped to `sun_clip` inside a
+// sun's cone (the sun renders as one of `suns`). The miss and the sky sampler both read the sky
+// through this, so the sun is counted once.
+public float3 skyResidual(EnvironmentGpu env, float3 d, float3 texel) {
+    if (env.sun_clip <= 0.0) {
+        return texel;
+    }
+    for (uint i = 0u; i < env.sun_count; i++) {
+        if (dot(d, env.suns[i].direction.xyz) >= env.suns[i].direction.w) {
+            let l = dot(texel, float3(0.2126, 0.7152, 0.0722));
+            return l > env.sun_clip ? texel * (env.sun_clip / l) : texel;
+        }
+    }
+    return texel;
+}
+
+// The sampling grid of every importance table (src/sky_importance.rs ENV_W / ENV_H).
+public static const uint SKY_IMPORTANCE_W = 512;
+public static const uint SKY_IMPORTANCE_H = 256;
+
+// The environment a mask is in: its highest environment bit (the main one for none).
+public uint environmentOf(uint mask, uint environment_bits) {
+    let m = mask & (environment_bits | 1u);
+    return m == 0u ? 0u : firstbithigh(m);
 }
 
 // `UniformData` in types.glsl / ray_render_plugin.rs (offsets pinned by a test there).
 public struct UniformData {
-    public float skycolor_r, skycolor_g, skycolor_b, skycolor_a;
     public float inverse_view[16];
     public float inverse_projection[16];
     public uint pull_focus_x;
     public uint pull_focus_y;
     public float aperture;
-    public float foginess;
-    public float fog_scatter;
-    public float sky_brightness;
+    // The environment this view is in: its camera rays start there (portals move them).
+    public uint environment;
     // DLSS: camera matrices for depth / motion vectors, and the sub-pixel jitter (pixels).
     public float view[16];
     public float view_proj[16];
@@ -102,11 +160,6 @@ public struct UniformData {
     public uint sharc;
     // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
     public float sharc_voxel;
-    // Environment importance sampling for the HDR sky (env_w = 0: none): cdf[N + 1] then
-    // the solid-angle pdf of each texel, N = env_w * env_h (src/env_light.rs).
-    public float* env;
-    public uint env_w;
-    public uint env_h;
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -116,18 +169,18 @@ public struct UniformData {
     public float emissive_boost;
     // The camera's render-layer cull mask; every ray starts with it (portals swap it).
     public uint camera_mask;
-    public uint pad_worlds;
-    // Every world's sky and suns, by world bit: a ray reads the entry of the world its mask
-    // says it is in (portals swap the mask mid-path).
-    public EnvironmentGpu* worlds;
+    // Layers the camera ray skips (AuroraPrimaryHidden); shadows and bounces still see them.
+    public uint primary_hidden;
+    // The mask bits that are environments; a portal ray takes the exit's from these.
+    public uint environment_bits;
+    public uint pad_environments;
+    // Every environment's sky, suns and fog, by environment bit.
+    public EnvironmentGpu* environments;
     // Terrain brush ring (the closest-hit draws it); not read here.
     public float brush_center_x, brush_center_y;
     public float brush_radius;
     public uint brush_active;
     public float brush_color_r, brush_color_g, brush_color_b;
-    // Height fog (sky.rs `Fog`): base height and falloff, metres (0 falloff = uniform).
-    public float fog_height;
-    public float fog_falloff;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -298,8 +351,7 @@ public struct PushConstants {
     // 64 bluenoise slices of 128x128 byte pairs.
     public uint* bluenoise;
     public float* focus;
-    public uint skydome;
-    public uint pad0;
+    public uint pad0, pad1;
     // Last frame's VkAccelerationStructureInstanceKHR array: 4 float4 per instance, rows
     // 0..2 are the 3x4 transform (row-major).
     public float4* prev_instances;

@@ -37,15 +37,13 @@ pub struct RenderConfig {
 
 #[repr(C)]
 pub struct UniformData {
-    sky_color: Vec4,
     inverse_view: Mat4,
     inverse_projection: Mat4,
     pull_focus_x: u32,
     pull_focus_y: u32,
     aperture: f32,
-    foginess: f32,
-    fog_scatter: f32,
-    sky_brightness: f32,
+    /// The environment this view is in: its camera rays start there (portals move them).
+    environment: u32,
     // Flat arrays, not `Mat4`: the GLSL side is `scalar` layout (4-byte aligned), and glam's
     // 16-byte alignment would pad here.
     view: [f32; 16],
@@ -82,30 +80,28 @@ pub struct UniformData {
     sharc: u32,
     /// Base cache voxel size (meters) at the camera.
     sharc_voxel: f32,
-    /// Environment importance sampling (env_light.rs): CDF + pdf buffer, 0 = none.
-    env: u64,
-    env_w: u32,
-    env_h: u32,
-    /// Uniform multiplier on every light's emission (from [`RenderSettings`]).
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
+    /// Uniform multiplier on every light's emission (from [`RenderSettings`]).
     emissive_boost: f32,
     /// The camera's render-layer cull mask (tlas_builder::layers_mask); rays start with
     /// it and portals swap it to the exit instance's mask.
     camera_mask: u32,
-    /// Every world's sky and suns (sky.rs `EnvironmentGpu`, 8 entries by world bit): a ray
-    /// reads the entry of the world its mask says it is in.
-    worlds: u64,
+    /// Layers the camera ray skips ([`AuroraPrimaryHidden`](crate::environment::AuroraPrimaryHidden)).
+    primary_hidden: u32,
+    /// The mask bits that are environments; a portal ray takes the exit's from these.
+    environment_bits: u32,
+    pad: u32,
+    /// Every environment's sky, suns and fog (sky.rs `EnvironmentGpu`, 8 entries by bit): a
+    /// ray reads the entry of the environment it is in.
+    environments: u64,
     /// Terrain brush ring (terrain.rs `TerrainCursor`): world x/z, radius, emission; drawn
     /// by the closest-hit shader on terrain records when `brush_active != 0`.
     brush_center: [f32; 2],
     brush_radius: f32,
     brush_active: u32,
     brush_color: [f32; 3],
-    /// Height fog (sky.rs `Fog`): base height and falloff, metres (0 falloff = uniform).
-    fog_height: f32,
-    fog_falloff: f32,
 }
 
 #[repr(C)]
@@ -129,6 +125,8 @@ struct ViewFrame {
     trace_extent: vk::Extent2D,
     /// `RenderLayers` as a bitmask: which instances this view can see.
     camera_mask: u32,
+    /// Of those, the layers its camera ray skips.
+    primary_hidden: u32,
     /// `AuroraDebugView`'s shader index for this view.
     debug_view: u32,
     inverse_view: Mat4,
@@ -367,8 +365,8 @@ pub struct Frame {
     /// its own matrices.
     pub uniform_buffers: [Buffer<UniformData>; crate::MAX_VIEWS],
     pub focus_data: Buffer<FocusData>,
-    /// The per-world sky / sun table, rewritten each frame.
-    pub world_envs: Buffer<EnvironmentGpu>,
+    /// The per-environment sky / sun / fog table, rewritten each frame.
+    pub environments: Buffer<EnvironmentGpu>,
 }
 
 fn render_frame(
@@ -384,7 +382,7 @@ fn render_frame(
         Option<Res<crate::render_settings::RenderSettings>>,
         crate::ui_render::UiDrawParams,
         Res<EnvironmentSkies>,
-        Res<crate::env_light::EnvLight>,
+        Res<crate::sky_importance::SkyImportance>,
         crate::gizmo_render::GizmoDrawParams,
         Res<crate::terrain::TerrainCursor>,
         Res<Atmosphere>,
@@ -429,6 +427,7 @@ fn render_frame(
             Option<&Camera>,
             Option<&crate::environment::InEnvironment>,
             Option<&crate::render_settings::AuroraLens>,
+            Option<&crate::environment::AuroraPrimaryHidden>,
         ),
         With<Camera3d>,
     >,
@@ -470,9 +469,11 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
-    let (settings, mut ui, skies, env_light, mut gizmos, terrain_cursor, atmosphere, clouds) =
+    let (settings, mut ui, skies, importance, mut gizmos, terrain_cursor, atmosphere, clouds) =
         dev_ui_stuff;
-    let settings = settings.map(|settings| settings.clone()).unwrap_or_default();
+    let settings = settings
+        .map(|settings| settings.clone())
+        .unwrap_or_default();
     *frame_counter = frame_counter.wrapping_add(1);
     // Every active Camera3d becomes a view, lowest `Camera::order` first -- so a camera
     // whose target another camera samples renders before it, which is what `order` means
@@ -515,6 +516,7 @@ fn render_frame(
         target: ViewTarget,
         dlss_mode: crate::dlss::AuroraDlss,
         camera_mask: u32,
+        primary_hidden: u32,
         debug_view: u32,
         camera: Entity,
         exposure: crate::auto_exposure::AuroraExposure,
@@ -523,10 +525,9 @@ fn render_frame(
 
     // `AuroraExposure::Environment`: the fixed exposure of the world the camera is in.
     let world_ev100 = |layers, world| {
-        let bit = crate::environment::view_environment(crate::environment::environment_mask(
-            layers, world,
-        ));
-        skies.worlds[bit as usize].ev100
+        skies
+            .of_view(crate::environment::environment_mask(layers, world))
+            .ev100
     };
     let planned: Vec<PlannedView> = match (&xr_frame, xr.as_deref()) {
         // A headset with no camera has nothing to anchor to.
@@ -555,6 +556,7 @@ fn render_frame(
                         dlss_mode: camera.3.copied().unwrap_or_default(),
                         camera_mask: crate::environment::environment_mask(camera.6, camera.8)
                             as u32,
+                        primary_hidden: camera.10.map_or(0, |h| h.mask() as u32),
                         debug_view: camera.5.copied().unwrap_or_default().shader_index(),
                         camera: camera.0,
                         exposure: camera
@@ -611,6 +613,7 @@ fn render_frame(
                     target,
                     dlss_mode: c.3.copied().unwrap_or_default(),
                     camera_mask: crate::environment::environment_mask(c.6, c.8) as u32,
+                    primary_hidden: c.10.map_or(0, |h| h.mask() as u32),
                     debug_view: c.5.copied().unwrap_or_default().shader_index(),
                     camera: c.0,
                     exposure: c
@@ -638,6 +641,7 @@ fn render_frame(
                 target,
                 dlss_mode,
                 camera_mask,
+                primary_hidden,
                 debug_view,
                 camera,
                 exposure,
@@ -657,6 +661,7 @@ fn render_frame(
                 output_extent,
                 trace_extent: plan.map_or(output_extent, |p| p.render),
                 camera_mask,
+                primary_hidden,
                 debug_view,
                 inverse_view,
                 view_matrix,
@@ -715,9 +720,9 @@ fn render_frame(
             .destroy_buffer(staging_buffer.handle);
     }
 
-    // Every world's sky and suns, by world bit.
-    if frame.world_envs.handle == vk::Buffer::null() {
-        frame.world_envs =
+    // Every environment's sky, suns and fog, by environment bit.
+    if frame.environments.handle == vk::Buffer::null() {
+        frame.environments =
             render_device.create_host_buffer(8, vk::BufferUsageFlags::STORAGE_BUFFER);
     }
     let texture_index = |image: &Handle<Image>| {
@@ -726,38 +731,29 @@ fn render_frame(
         })
     };
     let envs: Vec<EnvironmentGpu> = skies
-        .worlds
+        .environments
         .iter()
-        .map(|world| match &world.sky {
-            Sky::Hdr { image, .. } => EnvironmentGpu::new(world, texture_index(image), Vec4::ZERO),
-            // The space image behind the air (colour = its scale; 0 = none).
-            Sky::Atmosphere => match &atmosphere.space {
-                Some(image) => EnvironmentGpu::new(
-                    world,
-                    texture_index(image),
-                    Vec4::splat(atmosphere.space_scale),
-                ),
-                None => EnvironmentGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
-            },
-            _ => EnvironmentGpu::new(world, WHITE_TEXTURE_IDX, Vec4::ZERO),
+        .enumerate()
+        .map(|(bit, environment)| {
+            let importance_address = importance.address(bit);
+            let (tex, space) = match &environment.sky {
+                Sky::Hdr { image, .. } => (texture_index(image), Vec4::ZERO),
+                // The space image behind the air (colour = its scale; 0 = none).
+                Sky::Atmosphere => match &atmosphere.space {
+                    Some(image) => (texture_index(image), Vec4::splat(atmosphere.space_scale)),
+                    None => (WHITE_TEXTURE_IDX, Vec4::ZERO),
+                },
+                _ => (WHITE_TEXTURE_IDX, Vec4::ZERO),
+            };
+            EnvironmentGpu::new(environment, tex, space, importance_address, importance.sun(bit))
         })
         .collect();
     render_device
-        .map_buffer(&mut frame.world_envs)
+        .map_buffer(&mut frame.environments)
         .copy_from_slice(&envs);
-    // The camera world's HDR sky: importance-sampled (env_light.rs) through `skycolor` (its
-    // scale) and the `skydome` texture.
-    let camera_sky = &skies.camera().sky;
-
     // Update each view's uniform buffer
     for view in &views {
-        let environment =
-            &skies.worlds[crate::environment::view_environment(view.camera_mask as u8) as usize];
         let data = UniformData {
-            sky_color: match camera_sky {
-                Sky::Hdr { scale, .. } => Vec4::splat(*scale),
-                _ => Vec4::ONE,
-            },
             inverse_view: view.inverse_view,
             inverse_projection: view.projection.inverse(),
             pull_focus_x: render_config
@@ -769,9 +765,7 @@ fn render_frame(
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
             aperture: view.lens.aperture,
-            foginess: environment.fog.density,
-            fog_scatter: environment.fog.scatter,
-            sky_brightness: environment.sky_brightness,
+            environment: skies.view_environment(view.camera_mask as u8) as u32,
             view: view.view_matrix.to_cols_array(),
             view_proj: view.view_proj.to_cols_array(),
             prev_view_proj: view.last_view_proj.to_cols_array(),
@@ -800,32 +794,21 @@ fn render_frame(
                 + settings.texture_lod_bias,
             spec_hit_roughness: settings.spec_hit_roughness,
             light_epoch: lights.epoch,
-            restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history)
-                .max(1.0),
+            restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
             sharc: settings.sharc as u32,
             sharc_voxel: settings.sharc_voxel.max(0.01),
-            env: env_light.address(),
-            env_w: if env_light.address() != 0 {
-                crate::env_light::ENV_W
-            } else {
-                0
-            },
-            env_h: if env_light.address() != 0 {
-                crate::env_light::ENV_H
-            } else {
-                0
-            },
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
             camera_mask: view.camera_mask,
-            worlds: frame.world_envs.address,
+            primary_hidden: view.primary_hidden,
+            environment_bits: skies.environment_bits as u32,
+            pad: 0,
+            environments: frame.environments.address,
             brush_center: terrain_cursor.center.to_array(),
             brush_radius: terrain_cursor.radius,
             brush_active: terrain_cursor.active as u32,
             brush_color: terrain_cursor.color.to_vec3().to_array(),
-            fog_height: environment.fog.height,
-            fog_falloff: environment.fog.falloff.max(0.0),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -980,10 +963,6 @@ fn render_frame(
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
                 && sbt.data.address != 0
             {
-                let sky_texture = match camera_sky {
-                    Sky::Hdr { image, .. } => texture_index(image),
-                    _ => WHITE_TEXTURE_IDX,
-                };
                 render_device.cmd_bind_pipeline(
                     cmd_buffer,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1066,8 +1045,7 @@ fn render_frame(
                         material_buffer: tlas.material_address(),
                         bluenoise_buffer2: bluenoise_buffer.0.address,
                         focus_buffer: frame.focus_data.address,
-                        sky_texture,
-                        padding: [0; 1],
+                        padding: [0; 2],
                         prev_instances: tlas.prev_instances_address(),
                         lights: lights.header_address(),
                         instances: tlas.instances_address(),
@@ -1694,7 +1672,7 @@ pub fn on_shutdown(world: &mut World) {
         .destroy_buffer(frame.focus_data.handle);
     render_device
         .destroyer
-        .destroy_buffer(frame.world_envs.handle);
+        .destroy_buffer(frame.environments.handle);
     let sphere_blas = world
         .remove_resource::<crate::sphere::SphereBLAS>()
         .unwrap();
@@ -1783,25 +1761,25 @@ mod tests {
     /// `surface.slang` reads `lod_bias` by its float index into the uniform block.
     #[test]
     fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
-        assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 100 * 4);
+        assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 94 * 4);
     }
 
     /// `rt_types.slang` mirrors `UniformData` with scalars only; its offsets are these.
     #[test]
     fn uniform_data_matches_the_slang_raygen() {
-        use core::mem::offset_of;
         use super::UniformData as U;
-        assert_eq!(offset_of!(U, inverse_projection), 80);
-        assert_eq!(offset_of!(U, view), 168);
-        assert_eq!(offset_of!(U, prev_view_proj), 296);
-        assert_eq!(offset_of!(U, frame), 368);
-        assert_eq!(offset_of!(U, sharc_voxel), 420);
-        assert_eq!(offset_of!(U, env), 424);
-        assert_eq!(offset_of!(U, portals), 440);
-        assert_eq!(offset_of!(U, camera_mask), 456);
-        assert_eq!(offset_of!(U, worlds), 464);
-        assert_eq!(offset_of!(U, brush_color), 488);
-        assert_eq!(offset_of!(U, fog_height), 500);
-        assert_eq!(offset_of!(U, fog_falloff), 504);
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(U, inverse_projection), 64);
+        assert_eq!(offset_of!(U, environment), 140);
+        assert_eq!(offset_of!(U, view), 144);
+        assert_eq!(offset_of!(U, prev_view_proj), 272);
+        assert_eq!(offset_of!(U, frame), 344);
+        assert_eq!(offset_of!(U, sharc_voxel), 396);
+        assert_eq!(offset_of!(U, portals), 400);
+        assert_eq!(offset_of!(U, camera_mask), 416);
+        assert_eq!(offset_of!(U, primary_hidden), 420);
+        assert_eq!(offset_of!(U, environment_bits), 424);
+        assert_eq!(offset_of!(U, environments), 432);
+        assert_eq!(offset_of!(U, brush_color), 456);
     }
 }

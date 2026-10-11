@@ -24,14 +24,13 @@ use bevy::{
         visibility::{InheritedVisibility, VisibilityPropagatePlugin},
     },
     color::{Hsla, Hsva, LinearRgba, Okhsla, Oklaba, Oklcha, Srgba},
+    ecs::system::{SystemParam, lifetimeless::SRes},
     feathers::{
         AlphaPattern,
         controls::{
-            ColorPlaneInner, ColorPlaneValue, ColorWheelInner, ColorWheelValue,
-            FeathersColorPlane,
+            ColorPlaneInner, ColorPlaneValue, ColorWheelInner, ColorWheelValue, FeathersColorPlane,
         },
     },
-    ecs::system::{SystemParam, lifetimeless::SRes},
     image::{Image, TextureAtlasLayout, TextureAtlasPlugin},
     input_focus::{InputDispatchPlugin, InputFocusPlugin},
     math::{Affine2, FloatOrd, Rect, Vec2},
@@ -730,12 +729,9 @@ fn extract_ui(
                 .and_then(|p| planes.get(p).ok())
                 .map(|(plane, value)| (pattern::plane(*plane), [value.0.z, 0.0, 0.0, 0.0]))
         } else if wheel_inner.is_some() {
-            parent.and_then(|p| wheels.get(p).ok()).map(|value| {
-                (
-                    pattern::WHEEL,
-                    [value.hue, target.scale_factor(), 0.0, 0.0],
-                )
-            })
+            parent
+                .and_then(|p| wheels.get(p).ok())
+                .map(|value| (pattern::WHEEL, [value.hue, target.scale_factor(), 0.0, 0.0]))
         } else {
             None
         };

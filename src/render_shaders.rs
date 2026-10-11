@@ -19,7 +19,7 @@ impl Plugin for RenderShadersPlugin {
 
         let rtx_pipeline = RaytracingPipeline {
             raygen_shader: asset_server.load(aurora_asset("shaders/raygen.slang")),
-            miss_shader: asset_server.load(aurora_asset("shaders/miss.rmiss")),
+            miss_shader: asset_server.load(aurora_asset("shaders/miss.slang")),
             hit_shader: asset_server.load(aurora_asset("shaders/closest_hit.rchit")),
             any_hit_shader: asset_server.load(aurora_asset("shaders/any_hit.rahit")),
             sphere_intersection_shader: asset_server

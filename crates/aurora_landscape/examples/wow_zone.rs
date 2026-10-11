@@ -22,9 +22,9 @@ use std::path::Path;
 use aurora_landscape::prelude::*;
 use bevy::{
     asset::RenderAssetUsages,
-    mesh::{Indices, PrimitiveTopology},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     gizmos::GizmoPlugin,
+    mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
 use bevy_aurora::{
@@ -53,7 +53,12 @@ const GRASS_GROWS_ON: [(u8, f32); 4] = [(3, 1.0), (5, 0.8), (4, 0.6), (0, 0.5)];
 
 fn main() -> AppExit {
     App::new()
-        .add_plugins((AuroraDefaultPlugins, GizmoPlugin, FreeCameraPlugin, LandscapePlugin))
+        .add_plugins((
+            AuroraDefaultPlugins,
+            GizmoPlugin,
+            FreeCameraPlugin,
+            LandscapePlugin,
+        ))
         .init_resource::<Brush>()
         .add_systems(Startup, setup)
         .add_systems(Update, (move_stamp, sculpt, save_load))
@@ -174,11 +179,14 @@ fn grass_tuft(bend: f32) -> AuroraMesh {
             indices.extend_from_slice(&[a, a + 1, a + 3, a, a + 3, a + 2]);
         }
     }
-    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(Indices::U32(indices));
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices));
     AuroraMesh::from_mesh(&mesh).expect("grass tuft")
 }
 
@@ -198,7 +206,11 @@ fn r32_image(width: u32, height: u32, words: &[u32]) -> Image {
 
 /// An ADT's splat as (ids, weights) words: per alpha texel the chunk's four layers, WoW's
 /// sequential lerp (`base`, then layers 1..3 by the alpha's r, g, b) turned into weights.
-fn adt_splat(dir: &Path, stem: &str, json: &serde_json::Value) -> Option<(u32, Vec<u32>, Vec<u32>)> {
+fn adt_splat(
+    dir: &Path,
+    stem: &str,
+    json: &serde_json::Value,
+) -> Option<(u32, Vec<u32>, Vec<u32>)> {
     let alpha = image::open(dir.join(format!("{stem}_alpha.png")))
         .inspect_err(|e| error!("{stem}: {e}"))
         .ok()?
@@ -238,7 +250,11 @@ fn adt_splat(dir: &Path, stem: &str, json: &serde_json::Value) -> Option<(u32, V
             ];
             let (mut id_word, mut weight_word) = (0u32, 0u32);
             for i in 0..4 {
-                let id = if layers[i] == u32::MAX { 0 } else { layers[i] & 0xFF };
+                let id = if layers[i] == u32::MAX {
+                    0
+                } else {
+                    layers[i] & 0xFF
+                };
                 id_word |= id << (8 * i);
                 weight_word |= ((w[i] * 255.0).round() as u32) << (8 * i);
             }
@@ -318,18 +334,17 @@ fn setup(
             let Some(image) = load_png16(&dir.join(format!("{stem}_height.png"))) else {
                 continue;
             };
-            let json: serde_json::Value = match std::fs::read_to_string(
-                dir.join(format!("{stem}_layers.json")),
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-            {
-                Ok(json) => json,
-                Err(e) => {
-                    error!("{stem}: {e}");
-                    continue;
-                }
-            };
+            let json: serde_json::Value =
+                match std::fs::read_to_string(dir.join(format!("{stem}_layers.json")))
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+                {
+                    Ok(json) => json,
+                    Err(e) => {
+                        error!("{stem}: {e}");
+                        continue;
+                    }
+                };
             let mut tile = commands.spawn((
                 Name::new(stem.clone()),
                 ChildOf(landscape),
@@ -388,7 +403,12 @@ fn setup(
         },
         Transform::from_xyz(220.0, 0.0, -180.0),
     ));
-    commands.spawn((Name::new("Sculpt"), Sculpt, ChildOf(landscape), SculptLayer::default()));
+    commands.spawn((
+        Name::new("Sculpt"),
+        Sculpt,
+        ChildOf(landscape),
+        SculptLayer::default(),
+    ));
     commands.spawn((
         Name::new("Rock on steep ground"),
         RockRule,
@@ -404,7 +424,12 @@ fn setup(
             ..default()
         },
     ));
-    commands.spawn((Name::new("Paint"), Paint, ChildOf(landscape), PaintLayer::default()));
+    commands.spawn((
+        Name::new("Paint"),
+        Paint,
+        ChildOf(landscape),
+        PaintLayer::default(),
+    ));
 
     const POSES: usize = 12;
     let poses: Vec<Handle<AuroraMesh>> = (0..POSES)

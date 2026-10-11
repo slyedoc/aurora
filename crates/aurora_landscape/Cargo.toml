@@ -22,6 +22,8 @@ avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", defa
     "default-collider",
 ] }
 ash = "0.38.0"
+# Footstep samples on palette materials (typed handles only; the app picks decoders).
+bevy_seedling = { git = "https://github.com/slyedoc/bevy_seedling", branch = "bevy-main", default-features = false }
 bytemuck = { version = "1.14.3", features = ["derive"] }
 gpu-allocator = "0.28.0"
 log = "0.4.20"

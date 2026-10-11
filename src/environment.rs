@@ -5,11 +5,22 @@
 //! (portals swap a ray's mask). The mask is 8 bits, so at most 8 environments are live at once:
 //! [`MainPhysicsEnvironment`] and everything outside any environment is bit 0, other environments take the lowest
 //! free bit. An explicit `RenderLayers` on an entity overrides its environment's bit.
+//!
+//! The same 8 bits carry plain render layers (a cull bit that is no environment, e.g. the
+//! player's own head, hidden from the first-person camera): claim one with
+//! [`RenderLayerApp::claim_render_layer`], which takes the highest free bit. `RenderLayers`
+//! is per entity; `Propagate(RenderLayers)` puts one on a whole subtree. A `RenderLayers`
+//! naming a bit nobody claimed panics -- a stray layer would otherwise read as an environment.
 
 pub use avian3d::environment::{
     MainPhysicsEnvironment, MainPhysicsEnvironmentEntity, PhysicsEnvironment,
 };
-use bevy::{camera::visibility::RenderLayers, platform::collections::HashSet, prelude::*};
+use bevy::{
+    app::{HierarchyPropagatePlugin, PropagateSet},
+    camera::visibility::RenderLayers,
+    platform::collections::HashSet,
+    prelude::*,
+};
 
 /// An environment that renders: its own sky, suns and exposure, apart from the others, and its
 /// own [`PhysicsEnvironment`]. The bit it renders in, `None` until one is free; spawn with
@@ -32,13 +43,54 @@ use bevy::{camera::visibility::RenderLayers, platform::collections::HashSet, pre
 #[require(PhysicsEnvironment)]
 pub struct Environment(#[reflect(skip_serializing)] pub Option<u8>);
 
-/// Which environment owns each of the 8 instance-mask bits.
+/// Which environment, or which named render layer, owns each of the 8 instance-mask bits.
 #[derive(Resource, Default, Debug)]
 pub struct RenderEnvironments {
     owners: [Option<Entity>; 8],
+    layers: [Option<&'static str>; 8],
 }
 
 impl RenderEnvironments {
+    /// The bit of the render layer `name`, claiming the highest free one the first time.
+    /// Panics when all 8 are taken.
+    pub fn claim_layer(&mut self, name: &'static str) -> u8 {
+        if let Some(bit) = self.layer(name) {
+            return bit;
+        }
+        let bit = (1..8)
+            .rev()
+            .find(|&b| self.is_free(b))
+            .unwrap_or_else(|| panic!("aurora: no mask bit free for render layer {name:?}"));
+        self.layers[bit as usize] = Some(name);
+        bit
+    }
+
+    /// The bit of a claimed render layer.
+    pub fn layer(&self, name: &str) -> Option<u8> {
+        self.layers
+            .iter()
+            .position(|l| *l == Some(name))
+            .map(|bit| bit as u8)
+    }
+
+    /// Bits that are environments: the main one always, and every live one.
+    pub fn environment_bits(&self) -> u8 {
+        (1..8u8)
+            .filter(|&b| self.owners[b as usize].is_some())
+            .fold(1, |m, b| m | (1 << b))
+    }
+
+    /// Bits anything owns: environments and render layers.
+    pub fn claimed_bits(&self) -> u8 {
+        (0..8u8)
+            .filter(|&b| self.layers[b as usize].is_some())
+            .fold(self.environment_bits(), |m, b| m | (1 << b))
+    }
+
+    fn is_free(&self, bit: u8) -> bool {
+        self.owners[bit as usize].is_none() && self.layers[bit as usize].is_none()
+    }
+
     /// The mask bit of `environment`, if it is a live environment.
     pub fn bit(&self, world: Entity) -> Option<u8> {
         self.owners
@@ -82,14 +134,18 @@ fn claim(
     requested: Option<u8>,
     main: bool,
 ) -> Option<u8> {
-    let want = if main { Some(0) } else { requested.filter(|&b| b < 8) };
+    let want = if main {
+        Some(0)
+    } else {
+        requested.filter(|&b| b < 8)
+    };
     let bit = match want {
-        Some(bit) if environments.owners[bit as usize].is_none() => Some(bit),
+        Some(bit) if environments.is_free(bit) => Some(bit),
         Some(bit) => {
             warn!("aurora: environment bit {bit} is taken; {environment} takes a free one");
-            (1..8).find(|&b| environments.owners[b as usize].is_none())
+            (1..8).find(|&b| environments.is_free(b))
         }
-        None => (1..8).find(|&b| environments.owners[b as usize].is_none()),
+        None => (1..8).find(|&b| environments.is_free(b)),
     }?;
     environments.owners[bit as usize] = Some(environment);
     Some(bit)
@@ -105,7 +161,12 @@ fn assign_bit(
     let Ok(mut id) = ids.get_mut(environment) else {
         return;
     };
-    let bit = claim(&mut environments, environment, id.0, main.contains(environment));
+    let bit = claim(
+        &mut environments,
+        environment,
+        id.0,
+        main.contains(environment),
+    );
     if bit.is_none() {
         warn!("aurora: no environment bit free; {environment} waits for one");
     }
@@ -124,7 +185,12 @@ fn assign_waiting(
         if id.0.is_some() || environments.bit(environment).is_some() {
             continue;
         }
-        if let Some(bit) = claim(&mut environments, environment, None, main.contains(environment)) {
+        if let Some(bit) = claim(
+            &mut environments,
+            environment,
+            None,
+            main.contains(environment),
+        ) {
             id.0 = Some(bit);
         }
     }
@@ -204,18 +270,95 @@ pub fn propagate_environments(
     }
 }
 
+/// On a camera: the layers its camera rays skip while its shadows, bounces and reflections
+/// still see them, and so does every other camera -- a first-person body's own head, a
+/// vehicle's cockpit shell. The layers must also be in the camera's `RenderLayers`.
+#[derive(Component, Reflect, Clone, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct AuroraPrimaryHidden(pub RenderLayers);
+
+impl Default for AuroraPrimaryHidden {
+    fn default() -> Self {
+        Self(RenderLayers::none())
+    }
+}
+
+impl AuroraPrimaryHidden {
+    /// The hidden layers as an instance-mask bitmask.
+    pub fn mask(&self) -> u8 {
+        crate::tlas_builder::layers_mask(Some(&self.0))
+    }
+}
+
+/// Claiming render-layer bits while the app builds.
+pub trait RenderLayerApp {
+    /// The bit of the render layer `name` (see [`RenderEnvironments::claim_layer`]).
+    fn claim_render_layer(&mut self, name: &'static str) -> u8;
+}
+
+impl RenderLayerApp for App {
+    fn claim_render_layer(&mut self, name: &'static str) -> u8 {
+        self.world_mut()
+            .get_resource_or_init::<RenderEnvironments>()
+            .claim_layer(name)
+    }
+}
+
+/// Every `RenderLayers` names claimed bits only: the main bit, a live environment's, or a
+/// claimed render layer's; and a camera's names one environment.
+fn check_render_layers(
+    environments: Res<RenderEnvironments>,
+    layers: Query<(Entity, &RenderLayers, Option<&Name>), Changed<RenderLayers>>,
+    hidden: Query<(Entity, &AuroraPrimaryHidden, Option<&Name>), Changed<AuroraPrimaryHidden>>,
+    cameras: Query<(), With<Camera>>,
+) {
+    let claimed = environments.claimed_bits();
+    // A view is in exactly one environment: its sky, suns, fog and exposure are that one's.
+    for (entity, layers, name) in &layers {
+        let views =
+            crate::tlas_builder::layers_mask(Some(layers)) & environments.environment_bits();
+        if cameras.contains(entity) && views.count_ones() > 1 {
+            panic!(
+                "aurora: camera {} ({entity}) has RenderLayers in {} environments; a camera views \
+                 exactly one (plus any render layers)",
+                name.map_or("<unnamed>", |n| n.as_str()),
+                views.count_ones()
+            );
+        }
+    }
+    let all = layers.iter().chain(
+        hidden
+            .iter()
+            .map(|(entity, hidden, name)| (entity, &hidden.0, name)),
+    );
+    for (entity, layers, name) in all {
+        if let Some(layer) = layers.iter().find(|&l| l >= 8 || claimed & (1 << l) == 0) {
+            panic!(
+                "aurora: {} ({entity}) has RenderLayers {layer}, which no environment or render \
+                 layer claims; claim it with `app.claim_render_layer(..)`",
+                name.map_or("an entity", |n| n.as_str())
+            );
+        }
+    }
+}
+
 pub struct RenderEnvironmentPlugin;
 
 impl Plugin for RenderEnvironmentPlugin {
     fn build(&self, app: &mut App) {
         avian3d::environment::register_environment_types(app);
         app.register_type::<Environment>()
+            .register_type::<AuroraPrimaryHidden>()
             .init_resource::<RenderEnvironments>()
             .add_observer(assign_bit)
             .add_observer(free_bit)
+            // `Propagate(RenderLayers)` puts a layer set on a whole subtree, later children too.
+            .add_plugins(HierarchyPropagatePlugin::<RenderLayers>::new(PostUpdate))
             .add_systems(
                 PostUpdate,
-                (assign_waiting, propagate_environments).chain(),
+                (assign_waiting, propagate_environments, check_render_layers)
+                    .chain()
+                    .after(PropagateSet::<RenderLayers>::default()),
             );
     }
 
@@ -232,7 +375,9 @@ impl Plugin for RenderEnvironmentPlugin {
         }
         // The main environment renders.
         let main = app.world().resource::<MainPhysicsEnvironmentEntity>().0;
-        app.world_mut().entity_mut(main).insert(Environment(Some(0)));
+        app.world_mut()
+            .entity_mut(main)
+            .insert(Environment(Some(0)));
     }
 }
 
@@ -315,6 +460,50 @@ mod tests {
         let b = app.world_mut().spawn(Environment::default()).id();
         app.update();
         assert_eq!(app.world().resource::<RenderEnvironments>().bit(b), Some(1));
+    }
+
+    #[test]
+    fn a_render_layer_claims_from_the_top_and_environments_skip_it() {
+        let mut app = app();
+        let head = app.claim_render_layer("head");
+        assert_eq!(head, 7);
+        assert_eq!(app.claim_render_layer("head"), 7);
+        let environments: Vec<Entity> = (0..7)
+            .map(|_| app.world_mut().spawn(Environment::default()).id())
+            .collect();
+        app.update();
+        let worlds = app.world().resource::<RenderEnvironments>();
+        assert_eq!(worlds.bit(environments[5]), Some(6));
+        assert_eq!(worlds.bit(environments[6]), None);
+        assert_eq!(worlds.environment_bits(), 0b0111_1111);
+        assert_eq!(worlds.claimed_bits(), 0xFF);
+    }
+
+    #[test]
+    fn claimed_render_layers_pass() {
+        let mut app = app();
+        let head = app.claim_render_layer("head") as usize;
+        app.world_mut().spawn(RenderLayers::from_layers(&[0, head]));
+        app.update();
+    }
+
+    #[test]
+    #[should_panic(expected = "a camera views exactly one")]
+    fn a_camera_in_two_environments_panics() {
+        let mut app = app();
+        app.world_mut().spawn(Environment::default());
+        app.update();
+        app.world_mut()
+            .spawn((Camera::default(), RenderLayers::from_layers(&[0, 1])));
+        app.update();
+    }
+
+    #[test]
+    #[should_panic(expected = "no environment or render layer claims")]
+    fn an_unclaimed_render_layer_panics() {
+        let mut app = app();
+        app.world_mut().spawn(RenderLayers::from_layers(&[0, 1]));
+        app.update();
     }
 
     #[test]

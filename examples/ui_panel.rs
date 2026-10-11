@@ -33,10 +33,10 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
-    render_settings::RenderSettings,
     environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
+    render_settings::RenderSettings,
     sky::Sky,
     sphere::Sphere as RtSphere,
     ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},

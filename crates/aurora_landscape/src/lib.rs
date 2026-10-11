@@ -22,6 +22,7 @@ pub mod generator;
 pub mod layer;
 pub mod page;
 pub mod quadtree;
+pub mod interaction;
 pub mod scatter;
 pub mod sculpt;
 pub mod shading;
@@ -44,6 +45,7 @@ pub use layer::{
     SculptLayer, SplatmapLayer,
 };
 pub use page::{LandscapePages, MaterialsEvaluated, PagesEvaluated};
+pub use interaction::{InteractionSettings, ScatterPusher};
 pub use scatter::ScatterSpecies;
 pub use sculpt::{BrushKind, LayerPages, PaintPages, SculptDab, SculptDabs, SculptPages};
 pub use shading::{LandscapeMaterial, LandscapePalette};
@@ -52,10 +54,10 @@ pub use tiles::LandscapeTile;
 
 pub mod prelude {
     pub use crate::{
-        BrushKind, ErosionLayer, GeneratorLayer, HeightBlend, HeightLayer, HeightmapLayer, Landscape, LandscapeMaterial,
-        LandscapePages, LandscapePalette, LandscapePlugin, LandscapeViewer, MaterialLayer, SphereFace,
-        MaterialRuleLayer, PaintLayer, PaintPages, ScatterSpecies, SculptDab, SculptDabs,
-        SculptLayer, SculptPages, SplatmapLayer,
+        BrushKind, ErosionLayer, GeneratorLayer, HeightBlend, HeightLayer, HeightmapLayer,
+        Landscape, LandscapeMaterial, LandscapePages, LandscapePalette, LandscapePlugin,
+        LandscapeViewer, MaterialLayer, MaterialRuleLayer, PaintLayer, PaintPages, ScatterPusher, ScatterSpecies,
+        SculptDab, SculptDabs, SculptLayer, SculptPages, SphereFace, SplatmapLayer,
     };
 }
 
@@ -232,6 +234,7 @@ pub struct LandscapeKernels {
     pub brush: Handle<ComputeModule>,
     pub erosion: Handle<ComputeModule>,
     pub scatter: Handle<ComputeModule>,
+    pub interaction: Handle<ComputeModule>,
     pub tile: Handle<ComputeModule>,
 }
 
@@ -250,7 +253,12 @@ impl Plugin for LandscapePlugin {
         ));
         let material = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/material_eval.slang")),
-            &["clear_materials", "apply_splatmap", "apply_rule", "apply_paint"],
+            &[
+                "clear_materials",
+                "apply_splatmap",
+                "apply_rule",
+                "apply_paint",
+            ],
         ));
         let brush = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/brush.slang")),
@@ -275,6 +283,10 @@ impl Plugin for LandscapePlugin {
             server.load(aurora_asset("shaders/landscape/scatter.slang")),
             &["scatter"],
         ));
+        let interaction = server.add(ComputeModule::new(
+            server.load(aurora_asset("shaders/landscape/interaction.slang")),
+            &["field_update"],
+        ));
         let tile = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/tile.slang")),
             &["tile_fill"],
@@ -286,6 +298,7 @@ impl Plugin for LandscapePlugin {
             brush,
             erosion,
             scatter,
+            interaction,
             tile,
         });
 
@@ -293,6 +306,10 @@ impl Plugin for LandscapePlugin {
             .register_asset_reflect::<bake::BakedPages>()
             .init_asset_loader::<bake::BakedPagesLoader>()
             .init_resource::<LandscapeLive>()
+            .init_resource::<interaction::InteractionField>()
+            .init_resource::<InteractionSettings>()
+            .register_type::<ScatterPusher>()
+            .register_type::<InteractionSettings>()
             .register_type::<LandscapeBake>()
             .init_asset::<sculpt::LayerPagesFile>()
             // Reflected so a layer's file handle saves as its path.
@@ -361,6 +378,7 @@ impl Plugin for LandscapePlugin {
                     // Scatter and shading.
                     (
                         scatter::size_blocks,
+                        interaction::update_field,
                         scatter::scatter_species,
                         (shading::sync_shading, shading::wear_class)
                             .chain()
@@ -389,6 +407,7 @@ impl Plugin for LandscapePlugin {
                     shading::release_shading,
                     generator::release_genomes,
                     scatter::release_states,
+                    interaction::release_field,
                 )
                     .before(on_shutdown),
             );

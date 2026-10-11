@@ -1,6 +1,7 @@
 //! Scatter: plants and rocks grown on the GPU from the material pages (`landscape/scatter.slang`).
 //!
-//! A [`ScatterSpecies`] child of a landscape, carrying the plant's `AuroraMesh3d` and
+//! A [`ScatterSpecies`] under a landscape (its nearest landscape ancestor: a child, or grouped
+//! under a folder entity or an instanced clutter scene), carrying the plant's `AuroraMesh3d` and
 //! `AuroraMaterial3d`, becomes one aurora `InstanceBlock`: a slot per cell of a square window
 //! around the viewer. The kernel writes each slot's transform (or a zero one where nothing
 //! grows) straight into the TLAS instance array; nothing is read back. With `poses`, it also
@@ -19,6 +20,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{
     Landscape, LandscapeKernels, LandscapeViewer,
+    interaction::InteractionField,
     page::{GpuPagePool, LandscapePages},
     shading::PALETTE_MAX,
     tiles::viewer_position,
@@ -56,6 +58,8 @@ pub struct ScatterSpecies {
     /// Gust cycles per second.
     pub wind_speed: f32,
     pub seed: u32,
+    /// Multiplies every `grows_on` factor: thins (or fills) the species without moving it.
+    pub density: f32,
 }
 
 impl Default for ScatterSpecies {
@@ -72,6 +76,7 @@ impl Default for ScatterSpecies {
             poses: Vec::new(),
             wind_speed: 0.35,
             seed: 1,
+            density: 1.0,
         }
     }
 }
@@ -89,8 +94,9 @@ impl ScatterSpecies {
 struct ScatterPush {
     instances: u64,
     materials: u64,
-    poses: u64,
-    factors: u64,
+    tables: u64,
+    /// The interaction field (interaction.rs), 0 while nothing disturbs it.
+    field: u64,
     pool: GpuPagePool,
     first: u32,
     width: u32,
@@ -110,23 +116,27 @@ struct ScatterPush {
     fade: f32,
 }
 
+/// `SpeciesTables` in scatter.slang: the keep factor per palette id, and the wind poses.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SpeciesTables {
+    factors: [f32; PALETTE_MAX],
+    poses: [BlockPose; POSES_MAX],
+}
+
 /// A species' GPU tables and what its block last held.
 #[derive(Component)]
 pub struct ScatterState {
-    factors: Buffer<f32>,
-    poses: Buffer<BlockPose>,
+    tables: Buffer<SpeciesTables>,
     last: Option<(IVec2, u32)>,
 }
 
 impl ScatterState {
     fn destroy(&mut self, rd: &RenderDevice) {
-        for handle in [self.factors.handle, self.poses.handle] {
-            if handle != vk::Buffer::null() {
-                rd.destroyer.destroy_buffer(handle);
-            }
+        if self.tables.handle != vk::Buffer::null() {
+            rd.destroyer.destroy_buffer(self.tables.handle);
         }
-        self.factors = Buffer::default();
-        self.poses = Buffer::default();
+        self.tables = Buffer::default();
     }
 }
 
@@ -136,7 +146,12 @@ pub fn size_blocks(
     mut commands: Commands,
     rd: Res<RenderDevice>,
     species: Query<
-        (Entity, &ScatterSpecies, Option<&InstanceBlock>, Has<ScatterState>),
+        (
+            Entity,
+            &ScatterSpecies,
+            Option<&InstanceBlock>,
+            Has<ScatterState>,
+        ),
         Changed<ScatterSpecies>,
     >,
 ) {
@@ -152,11 +167,7 @@ pub fn size_blocks(
         }
         if !has_state {
             commands.entity(entity).insert(ScatterState {
-                factors: rd.create_host_buffer(
-                    PALETTE_MAX as u64,
-                    vk::BufferUsageFlags::STORAGE_BUFFER,
-                ),
-                poses: rd.create_host_buffer(POSES_MAX as u64, vk::BufferUsageFlags::STORAGE_BUFFER),
+                tables: rd.create_host_buffer(1, vk::BufferUsageFlags::STORAGE_BUFFER),
                 last: None,
             });
         }
@@ -175,6 +186,8 @@ pub fn scatter_species(
     viewers: Query<&GlobalTransform, With<LandscapeViewer>>,
     cameras: Query<(&GlobalTransform, &Camera), With<Camera3d>>,
     landscapes: Query<(&Landscape, Ref<LandscapePages>, &GlobalTransform)>,
+    parents: Query<&ChildOf>,
+    field: Res<InteractionField>,
     mut species: Query<(
         Ref<ScatterSpecies>,
         &ChildOf,
@@ -189,9 +202,14 @@ pub fn scatter_species(
         return;
     };
     let generation = tlas.generation();
+    // A disturbed field re-grows every frame, so plants spring back as it decays.
+    let field = field.address(time.elapsed_secs_f64());
     let mut jobs: Vec<ScatterPush> = Vec::new();
     for (spec, child_of, slots, mut state) in &mut species {
-        let Ok((landscape, pages, transform)) = landscapes.get(child_of.parent()) else {
+        let Some((landscape, pages, transform)) = std::iter::once(child_of.parent())
+            .chain(parents.iter_ancestors(child_of.parent()))
+            .find_map(|e| landscapes.get(e).ok())
+        else {
             continue;
         };
         // Scatter places on the flat plane; planets are not supported yet.
@@ -211,23 +229,21 @@ pub fn scatter_species(
         let local = (viewer - origin).xz();
         let cell0 = (local / spec.spacing).floor().as_ivec2() - IVec2::splat(width as i32 / 2);
         let moved = state.last != Some((cell0, generation));
-        if !(windy || moved || spec.is_changed() || pages.is_changed()) {
+        if !(windy || field != 0 || moved || spec.is_changed() || pages.is_changed()) {
             continue;
         }
-        if moved || spec.is_changed() {
-            let mut factors = [0.0f32; PALETTE_MAX];
-            for &(id, f) in &spec.grows_on {
-                factors[id as usize] = f.clamp(0.0, 1.0);
-            }
-            rd.map_buffer(&mut state.factors).copy_from_slice(&factors);
+        let mut tables = SpeciesTables::zeroed();
+        for &(id, f) in &spec.grows_on {
+            tables.factors[id as usize] = (f * spec.density).clamp(0.0, 1.0);
         }
-        rd.map_buffer(&mut state.poses).copy_from_slice(poses);
+        tables.poses[..poses.len()].copy_from_slice(poses);
+        rd.map_buffer(&mut state.tables).copy_from_slice(&[tables]);
         state.last = Some((cell0, generation));
         jobs.push(ScatterPush {
             instances: tlas.instances_address(),
             materials: pages.materials_address(),
-            poses: state.poses.address,
-            factors: state.factors.address,
+            tables: state.tables.address,
+            field,
             pool: pages.pool(),
             first: slots.first,
             width,
@@ -253,7 +269,15 @@ pub fn scatter_species(
     }
     rd.run_transfer_commands(|cmd| {
         for job in &jobs {
-            record_dispatch(&rd, cmd, module, "scatter", job, job.width * job.width, None);
+            record_dispatch(
+                &rd,
+                cmd,
+                module,
+                "scatter",
+                job,
+                job.width * job.width,
+                None,
+            );
         }
         compute_to_compute_barrier(&rd, cmd);
     });

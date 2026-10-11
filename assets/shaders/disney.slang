@@ -308,8 +308,7 @@ float coatSpecular(float3 v, float3 n, float3 l, float alpha) {
 
 // The whole surface for next-event estimation (no cosine): above it, the base under the coat
 // (both scaled by what is not transmitted); below it, the light coming through, Lambertian,
-// tinted by the albedo. `coat` false leaves the coat to BRDF sampling (the environment, whose
-// MIS knows only the base's pdf).
+// tinted by the albedo. `coat` false leaves the coat out.
 public float3 evalLayered(float3 v, float3 n, float3 l, DisneyMaterial mat, Lobes lob, bool coat) {
     let NoL = dot(n, l);
     if (NoL <= 0.0) {
@@ -323,6 +322,26 @@ public float3 evalLayered(float3 v, float3 n, float3 l, DisneyMaterial mat, Lobe
         }
     }
     return f * (1.0 - lob.transmission);
+}
+
+// The solid-angle pdf the raygen's layered sampler draws `l` with -- exactly its order: through
+// the surface with probability `transmission` (cosine about -n), else off the coat with
+// probability q = clearcoat x Fresnel(n.v) (GGX VNDF at the coat's alpha), else the base
+// (pdfDisneyBRDF). Every MIS weight, on either side, uses this one pdf, so the strategies' weights
+// sum to one.
+public float layeredPdf(float3 v, float3 n, float3 l, DisneyMaterial mat, Lobes lob) {
+    let NoL = dot(n, l);
+    if (NoL < 0.0) {
+        return lob.transmission * -NoL / PI;
+    }
+    let NoV = dot(n, v);
+    let q = lob.clearcoat * coatFresnel(NoV);
+    var pdf = (1.0 - q) * pdfDisneyBRDF(v, n, l, mat);
+    if (q > 0.0 && NoL > 0.0 && NoV > 0.0) {
+        let h = normalize(l + v);
+        pdf += q * GGXVNDFPdf(min(dot(n, h), 0.9999), NoV, lob.coat_alpha);
+    }
+    return (1.0 - lob.transmission) * pdf;
 }
 
 // A cosine-weighted direction through the surface (the translucent lobe).

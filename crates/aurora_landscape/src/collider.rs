@@ -52,8 +52,7 @@ fn page_heightfield(pages: &LandscapePages, page: IVec2, size: f32) -> Task<Coll
                 });
             }
         }
-        SharedShape::heightfield(Array2::new(n + 1, n + 1, data), Vec3::new(size, 1.0, size))
-            .into()
+        SharedShape::heightfield(Array2::new(n + 1, n + 1, data), Vec3::new(size, 1.0, size)).into()
     })
 }
 

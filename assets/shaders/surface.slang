@@ -47,7 +47,7 @@ public struct Triangle {
 };
 
 // `UniformData` is read for one field; its byte offset is pinned by a test in ray_render_plugin.rs.
-static const uint UNIFORM_LOD_BIAS_FLOAT = 100;
+static const uint UNIFORM_LOD_BIAS_FLOAT = 94;
 
 // `PushConstants` in types.glsl, up to the last field a hit shader reads.
 public struct PushConstants {
@@ -55,8 +55,7 @@ public struct PushConstants {
     public Material* materials;
     public void* bluenoise;
     public void* focus;
-    public uint skydome;
-    public uint pad0;
+    public uint pad0, pad1;
     public float4* prev_instances;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
@@ -163,6 +162,9 @@ public struct SurfaceHit {
     public float3 tangent;
     // World space.
     public float3 surface_normal;
+    // The triangle's true face normal (world space), facing the ray: what a ray leaving the hit
+    // offsets along (raygen offsetRay) -- vertex normals can lie in the face.
+    public float3 face_normal;
     // Ray-cone texture LOD before the per-texture texel-count term; feed `sampleLod`.
     public float lod_base;
     public bool inside;
@@ -197,6 +199,13 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
         hit.object_normal = -hit.object_normal;
     }
     hit.surface_normal = normalize(objectToWorldDir(hit.object_normal));
+    // From the BLAS's own positions (position fetch): world-space edges.
+    let e1 = objectToWorldDir(HitTriangleVertexPosition(1) - HitTriangleVertexPosition(0));
+    let e2 = objectToWorldDir(HitTriangleVertexPosition(2) - HitTriangleVertexPosition(0));
+    hit.face_normal = normalize(cross(e1, e2));
+    if (dot(hit.face_normal, WorldRayDirection()) > 0.0) {
+        hit.face_normal = -hit.face_normal;
+    }
 
     let object_scale = max(length(objectToWorldDir(float3(1.0, 0.0, 0.0))), 1.0e-6);
     let incidence = max(abs(dot(hit.surface_normal, WorldRayDirection())), 0.1);
@@ -219,7 +228,7 @@ public float3 surfaceWorldNormal(SurfaceHit hit, float3 texture_normal) {
 public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3 world_normal) {
     payload.t = RayTCurrent();
     payload.surface_and_world_normal =
-        float4(toOct(hit.surface_normal), toOct(world_normal));
+        float4(toOct(hit.face_normal), toOct(world_normal));
     payload.slot = InstanceIndex();
     payload.prim_tri = record.triangles[GeometryIndex()].v + PrimitiveIndex();
 

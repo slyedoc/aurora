@@ -57,7 +57,12 @@ impl Builder {
     fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
         let n = (b - a).cross(d - a).normalize_or(Vec3::Y);
         let first = self.positions.len() as u32;
-        for (p, uv) in [(a, [0.0, 0.0]), (b, [1.0, 0.0]), (c, [1.0, 1.0]), (d, [0.0, 1.0])] {
+        for (p, uv) in [
+            (a, [0.0, 0.0]),
+            (b, [1.0, 0.0]),
+            (c, [1.0, 1.0]),
+            (d, [0.0, 1.0]),
+        ] {
             self.positions.push(p.to_array());
             self.normals.push(n.to_array());
             self.uvs.push(uv);
@@ -67,11 +72,14 @@ impl Builder {
     }
 
     fn build(self) -> AuroraMesh {
-        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
-            .with_inserted_indices(Indices::U32(self.indices));
+        let mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
+        .with_inserted_indices(Indices::U32(self.indices));
         AuroraMesh::from_mesh(&mesh).expect("procedural mesh")
     }
 }
@@ -137,7 +145,8 @@ fn crown_of(leaves: usize, widen: f32, sway: f32) -> AuroraMesh {
         let base = top + Vec3::new(rnd() - 0.5, rnd() * 1.5 - 1.0, rnd() - 0.5) * 0.8;
         // Three segments: up and out, then drooping, the tip pushed by the wind.
         let point = |t: f32| {
-            base + out * length * t + Vec3::Y * (lift * t - 1.6 * t * t) * length * 0.5
+            base + out * length * t
+                + Vec3::Y * (lift * t - 1.6 * t * t) * length * 0.5
                 + Vec3::X * sway * t * t * length
         };
         let half = |t: f32| side * width * (1.0 - (2.0 * t - 1.0).powi(2)).max(0.05);
@@ -164,7 +173,8 @@ fn fern(sway: f32) -> AuroraMesh {
         let side = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
         let length = 0.7 + rnd() * 0.5;
         let point = |t: f32| {
-            out * length * t * 0.8 + Vec3::Y * (1.1 * t - 0.8 * t * t) * length
+            out * length * t * 0.8
+                + Vec3::Y * (1.1 * t - 0.8 * t * t) * length
                 + Vec3::X * sway * t * t * length
         };
         let half = |t: f32| side * 0.09 * (1.0 - t).max(0.05);
@@ -397,8 +407,6 @@ fn place_camera(
     // Toward the sun: the fog scatters forward, so its shafts show against the light.
     let look = Vec2::new(-60.0, -45.0);
     info!("ground under the camera: {:.1} m", ground(eye));
-    **camera = Transform::from_xyz(eye.x, ground(eye) + 1.7, eye.y).looking_at(
-        Vec3::new(look.x, ground(look) + 14.0, look.y),
-        Vec3::Y,
-    );
+    **camera = Transform::from_xyz(eye.x, ground(eye) + 1.7, eye.y)
+        .looking_at(Vec3::new(look.x, ground(look) + 14.0, look.y), Vec3::Y);
 }

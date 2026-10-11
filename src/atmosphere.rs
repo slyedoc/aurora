@@ -321,7 +321,7 @@ impl AtmosphereState {
             return;
         };
         // No sun: the air still scatters the sky, just unlit by one.
-        let sun = skies.worlds[world as usize]
+        let sun = skies.environments[world as usize]
             .suns
             .first()
             .copied()
@@ -524,8 +524,8 @@ mod tests {
     /// `AtmosphereParams` in rt_types.slang (the raygen) reads the cloud fields at these.
     #[test]
     fn atmosphere_gpu_matches_the_slang_raygen() {
-        use core::mem::offset_of;
         use super::AtmosphereGpu as A;
+        use core::mem::offset_of;
         assert_eq!(offset_of!(A, camera_pos), 176);
         assert_eq!(offset_of!(A, clouds), 188);
         assert_eq!(offset_of!(A, cloud_wind), 240);

@@ -16,8 +16,7 @@ use bevy::{
     prelude::*,
 };
 use bevy_aurora::{
-    AuroraDefaultPlugins, environment::MainPhysicsEnvironmentEntity, sky::Fog,
-    util::ScreenshotExt,
+    AuroraDefaultPlugins, environment::MainPhysicsEnvironmentEntity, sky::Fog, util::ScreenshotExt,
 };
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
@@ -74,7 +73,11 @@ fn setup(
         material([196, 180, 132], 0.95),
     ]);
     let planet = commands
-        .spawn((Name::new("Planet"), Transform::default(), Visibility::default()))
+        .spawn((
+            Name::new("Planet"),
+            Transform::default(),
+            Visibility::default(),
+        ))
         .id();
     for face in 0..6u8 {
         let landscape = commands

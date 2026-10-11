@@ -76,7 +76,9 @@ fn grass_tuft(bend: f32) -> AuroraMesh {
             let t = i as f32 / 4.0;
             let centre = base + Vec3::Y * height * t + lean * height * t * t;
             let half = side * 0.0175 * (1.0 - t);
-            let n = side.cross((Vec3::Y + lean * 2.0 * t).normalize()).normalize();
+            let n = side
+                .cross((Vec3::Y + lean * 2.0 * t).normalize())
+                .normalize();
             for (p, u) in [(centre - half, 0.0), (centre + half, 1.0)] {
                 positions.push(p.to_array());
                 normals.push(n.to_array());
@@ -88,11 +90,14 @@ fn grass_tuft(bend: f32) -> AuroraMesh {
             indices.extend_from_slice(&[a, a + 1, a + 3, a, a + 3, a + 2]);
         }
     }
-    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(Indices::U32(indices));
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices));
     AuroraMesh::from_mesh(&mesh).expect("grass tuft")
 }
 
@@ -124,7 +129,11 @@ fn setup(
             LandscapePalette(palette),
         ))
         .id();
-    commands.spawn((Name::new("Terrain"), ChildOf(landscape), GeneratorLayer::default()));
+    commands.spawn((
+        Name::new("Terrain"),
+        ChildOf(landscape),
+        GeneratorLayer::default(),
+    ));
     for (name, rule) in [
         (
             "Dirt in the low ground",
@@ -159,7 +168,11 @@ fn setup(
     ] {
         commands.spawn((Name::new(name), ChildOf(landscape), rule));
     }
-    commands.spawn((Name::new("Paint"), ChildOf(landscape), PaintLayer::default()));
+    commands.spawn((
+        Name::new("Paint"),
+        ChildOf(landscape),
+        PaintLayer::default(),
+    ));
 
     const POSES: usize = 12;
     let poses: Vec<Handle<AuroraMesh>> = (0..POSES)

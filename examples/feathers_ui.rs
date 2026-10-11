@@ -3,6 +3,7 @@
 //! The UI stack is `bevy_feathers_core`: bevy lays the nodes out, `ui_render` rasterizes them.
 
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
+use bevy::feathers_inspector::BuildEntityInspector;
 use bevy::{
     feathers::{
         controls::{
@@ -18,7 +19,6 @@ use bevy::{
     ui::Checked,
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
-use bevy::feathers_inspector::BuildEntityInspector;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,

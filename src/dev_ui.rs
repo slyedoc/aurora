@@ -77,7 +77,15 @@ impl Plugin for DevUIPlugin {
 
 /// The first 3D camera's lens, exposure and DLSS mode join the panel once it exists.
 fn inspect_camera(
-    cameras: Query<(Entity, Has<AuroraLens>, Has<AuroraExposure>, Has<AuroraDlss>), With<Camera3d>>,
+    cameras: Query<
+        (
+            Entity,
+            Has<AuroraLens>,
+            Has<AuroraExposure>,
+            Has<AuroraDlss>,
+        ),
+        With<Camera3d>,
+    >,
     host: Single<Entity, With<DevUIInspectorHost>>,
     mut shown: Local<Option<Entity>>,
     mut commands: Commands,
@@ -190,7 +198,14 @@ fn toggle_panel(
 fn update_stats(
     time: Res<Time>,
     ae: Option<Res<crate::auto_exposure::AutoExposureState>>,
-    cameras: Query<&AuroraExposure, With<Camera3d>>,
+    cameras: Query<
+        (
+            &AuroraExposure,
+            Option<&bevy::camera::visibility::RenderLayers>,
+            Option<&crate::environment::InEnvironment>,
+        ),
+        With<Camera3d>,
+    >,
     skies: Option<Res<crate::sky::EnvironmentSkies>>,
     mut stats: Query<&mut Text, (With<DevUIStats>, Without<DevUIProbe>)>,
     mut probe: Query<&mut Text, (With<DevUIProbe>, Without<DevUIStats>)>,
@@ -204,11 +219,20 @@ fn update_stats(
     // exposure-independent, so an emitter authored too dim and a look keyed to something
     // bright stop being the same symptom.
     let nits = ae.as_ref().map_or(0.0, |ae| ae.probe_nits());
-    let ev100 = cameras.iter().next().map(|exposure| match exposure {
-        AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), 'L'),
-        AuroraExposure::Environment => (skies.as_ref().map_or(f32::NAN, |s| s.camera().ev100), 'W'),
-        AuroraExposure::Auto(_) => (f32::NAN, 'A'),
-    });
+    let ev100 = cameras
+        .iter()
+        .next()
+        .map(|(exposure, layers, world)| match exposure {
+            AuroraExposure::Fixed(fixed) => (ev100_from_ev(fixed.ev), 'L'),
+            AuroraExposure::Environment => (
+                skies.as_ref().map_or(f32::NAN, |s| {
+                    s.of_view(crate::environment::environment_mask(layers, world))
+                        .ev100
+                }),
+                'W',
+            ),
+            AuroraExposure::Auto(_) => (f32::NAN, 'A'),
+        });
     for mut text in &mut stats {
         text.0 = format!("fps: {:>6.1}", *fps_avg);
     }

@@ -91,8 +91,7 @@ pub struct RaytracingPushConstants {
     pub material_buffer: u64,
     pub bluenoise_buffer2: u64,
     pub focus_buffer: u64,
-    pub sky_texture: u32,
-    pub padding: [u32; 1],
+    pub padding: [u32; 2],
     /// Last frame's instance transforms (`tlas_builder`), for motion vectors.
     pub prev_instances: u64,
     /// The emissive-triangle light table header (`lights`; 0 until built).

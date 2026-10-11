@@ -42,28 +42,28 @@ void trace(uint flags, uint mask, float3 origin, float tmin, float3 direction, f
     TraceRay(topLevelAS, flags, mask, 0, 0, 0, ray, payload);
 }
 
-float sampleDistanceInFog() {
-    return -log(randf()) / pc.uniforms.foginess;
+// The fog of the environment a ray is in (src/sky.rs `Fog`).
+float sampleDistanceInFog(EnvironmentGpu env) {
+    return -log(randf()) / env.fog_density;
 }
 
-// Fog extinction at a height: `foginess` at and below `fog_height`, thinning by 1/e every
+// Fog extinction at a height: `fog_density` at and below `fog_height`, thinning by 1/e every
 // `fog_falloff` metres above it.
-float fogDensity(float y) {
-    let u = pc.uniforms;
-    return u.foginess * exp(-max(0.0, y - u.fog_height) / u.fog_falloff);
+float fogDensity(EnvironmentGpu env, float y) {
+    return env.fog_density * exp(-max(0.0, y - env.fog_height) / env.fog_falloff);
 }
 
 // Whether the ray scatters in the fog before `t_max` (0 = it reached the sky: no fog), and
 // where. Uniform fog draws one exponential distance; height fog delta-tracks against the
 // density at the segment's lowest point (the majorant), accepting a tentative collision with
 // probability density / majorant.
-bool sampleFogScatter(float3 o, float3 d, float t_max, out float t) {
-    if (pc.uniforms.fog_falloff <= 0.0) {
-        t = sampleDistanceInFog();
+bool sampleFogScatter(EnvironmentGpu env, float3 o, float3 d, float t_max, out float t) {
+    if (env.fog_falloff <= 0.0) {
+        t = sampleDistanceInFog(env);
         return t < t_max;
     }
     t = 0.0;
-    let majorant = fogDensity(min(o.y, o.y + d.y * t_max));
+    let majorant = fogDensity(env, min(o.y, o.y + d.y * t_max));
     if (t_max <= 0.0 || majorant <= 1.0e-9) {
         return false;
     }
@@ -72,7 +72,7 @@ bool sampleFogScatter(float3 o, float3 d, float t_max, out float t) {
         if (t >= t_max) {
             return false;
         }
-        if (randf() * majorant < fogDensity(o.y + d.y * t)) {
+        if (randf() * majorant < fogDensity(env, o.y + d.y * t)) {
             return true;
         }
     }
@@ -83,8 +83,8 @@ bool sampleFogScatter(float3 o, float3 d, float t_max, out float t) {
 static const float FOG_ALBEDO = 0.95;
 
 // Henyey-Greenstein phase function, per steradian.
-float fogPhase(float cos_theta) {
-    let g = pc.uniforms.fog_scatter;
+float fogPhase(EnvironmentGpu env, float cos_theta) {
+    let g = env.fog_scatter;
     let denom = 1.0 + g * g - 2.0 * g * cos_theta;
     return (1.0 - g * g) / (4.0 * PI * denom * sqrt(denom));
 }
@@ -93,14 +93,14 @@ float calcFogTransmittance(float distance) {
     return exp(-g_extinction * distance);
 }
 
-float3 sampleFogScatterDirection(float3 incoming) {
+float3 sampleFogScatterDirection(EnvironmentGpu env, float3 incoming) {
     // Henyey-Greenstein phase function sampling
     // g is the asymmetry parameter (-1 <= g <= 1)
     // g > 0 means forward scattering
     // g < 0 means backward scattering
     // g = 0 means isotropic scattering
 
-    let g = pc.uniforms.fog_scatter;
+    let g = env.fog_scatter;
     float cosTheta;
     if (g == 0.0) {
         // isotropic
@@ -306,6 +306,19 @@ uint lightsFindInstance(uint e) {
     return lo;
 }
 
+// A surface's response to light from `dir`, cosine included: the whole layered BSDF in front
+// (base, coat, less what is transmitted), and behind a thin translucent one the light coming
+// through it. Zero where it takes none (and wherever the geometric normal disagrees).
+float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+    let NoL = dot(n, dir);
+    let above = NoL > 0.0 && dot(dir, ns) > 0.0;
+    let through = lob.transmission > 0.0 && NoL < 0.0 && dot(dir, ns) < 0.0;
+    if (!above && !through) {
+        return float3(0.0);
+    }
+    return evalLayered(v, n, dir, mat, lob, true) * abs(NoL);
+}
+
 // Unshadowed contribution of analytic light `e` (same contract as lightSampleEval below).
 // A radius-0 point or spot is a delta: `p_area` is just the pick probability and
 // `pdf_solid` a huge sentinel, so the MIS weight against BRDF sampling goes to 1. Points,
@@ -313,7 +326,7 @@ uint lightsFindInstance(uint e) {
 // complementary weight. A sphere emitter (kind 3) does: see sphereEmitterPdf.
 float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
                           float3 sp, float3 n, float3 ns, float3 v,
-                          DisneyMaterial mat,
+                          DisneyMaterial mat, Lobes lob,
                           out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     p_area = 0.0;
     pdf_solid = 0.0;
@@ -340,8 +353,8 @@ float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
         if ((al.flags & 1u) != 0u) {
             cos_l = abs(cos_l);
         }
-        let NoL = dot(n, dir);
-        if (cos_l <= 1.0e-4 || NoL <= 0.0 || dot(dir, ns) <= 0.0) {
+        let surf = thinSurface(v, n, ns, dir, mat, lob);
+        if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
             return float3(0.0);
         }
         let area = 4.0 * al.half_extents_x * al.half_extents_y;
@@ -350,7 +363,7 @@ float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
         }
         p_area = p_pick / area;
         pdf_solid = p_area * dist * dist / cos_l;
-        return evalDisneyBRDF(v, n, dir, mat) * NoL * al_emission * (cos_l / (dist * dist));
+        return surf * al_emission * (cos_l / (dist * dist));
     }
     // Point / spot / sphere emitter. With a radius the light is a Lambertian sphere of that
     // size: a point or spot (bevy's `radius`) has no geometry and spreads its intensity over
@@ -379,13 +392,13 @@ float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
         }
         dist = centre_dist;
         dir = centre_dir;
-        let NoL = dot(n, dir);
-        if (NoL <= 0.0 || dot(dir, ns) <= 0.0) {
+        let surf = thinSurface(v, n, ns, dir, mat, lob);
+        if (all(surf == float3(0.0))) {
             return float3(0.0);
         }
         p_area = p_pick;
         pdf_solid = 1.0e16;
-        return evalDisneyBRDF(v, n, dir, mat) * NoL * al_emission * (atten / (dist * dist));
+        return surf * al_emission * (atten / (dist * dist));
     }
     // Uniform over the CONE the sphere subtends from here: every sample lands on the visible
     // cap, where uniform-area sampling threw the far half away and piled variance onto
@@ -403,8 +416,8 @@ float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
     if (surface_dist <= 1.0e-4) {
         return float3(0.0);
     }
-    let NoL = dot(n, dir);
-    if (NoL <= 0.0 || dot(dir, ns) <= 0.0) {
+    let surf = thinSurface(v, n, ns, dir, mat, lob);
+    if (all(surf == float3(0.0))) {
         return float3(0.0);
     }
     let sn = (sp + dir * surface_dist - al_position) / al.radius;
@@ -414,8 +427,7 @@ float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
     // The shadow ray stops short of the surface: a sphere emitter's own geometry is there.
     dist = surface_dist * 0.9995;
     let radiance = al.kind == 3u ? al_emission : al_emission / (PI * al.radius * al.radius);
-    return evalDisneyBRDF(v, n, dir, mat) * NoL * radiance
-        * (atten * cos_l / (surface_dist * surface_dist));
+    return surf * radiance * (atten * cos_l / (surface_dist * surface_dist));
 }
 
 // Solid-angle pdf with which next-event estimation at `from` would have sampled sphere
@@ -442,7 +454,7 @@ float sphereEmitterPdf(uint e, float3 from) {
 // otherwise light through).
 float3 lightSampleEval(uint e, uint li_idx, float p_pick, float su, float sv,
                        float3 sp, float3 n, float3 ns, float3 v,
-                       DisneyMaterial mat, uint ray_mask,
+                       DisneyMaterial mat, Lobes lob, uint ray_mask,
                        out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     if (e < pc.lights.analytic_count) {
         if (((pc.lights.analytics[e].flags >> 8) & ray_mask & 0xFFu) == 0u) {
@@ -452,7 +464,7 @@ float3 lightSampleEval(uint e, uint li_idx, float p_pick, float su, float sv,
             dist = 0.0;
             return float3(0.0);
         }
-        return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat,
+        return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat, lob,
                                   p_area, pdf_solid, dir, dist)
             * pc.uniforms.emissive_boost;
     }
@@ -482,17 +494,16 @@ float3 lightSampleEval(uint e, uint li_idx, float p_pick, float su, float sv,
     }
     dir = to_light / dist;
     let cos_l = abs(dot(lng / area2, dir));
-    let NoL = dot(n, dir);
-    if (cos_l <= 1.0e-4 || NoL <= 0.0 || dot(dir, ns) <= 0.0) {
+    let surf = thinSurface(v, n, ns, dir, mat, lob);
+    if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
         return float3(0.0);
     }
-    let f = evalDisneyBRDF(v, n, dir, mat);
     p_area = p_pick / (0.5 * area2);
     pdf_solid = p_area * dist * dist / cos_l;
     let emission = float3(li.geom_emission[g * 3u + 0u],
                           li.geom_emission[g * 3u + 1u],
                           li.geom_emission[g * 3u + 2u]);
-    return f * NoL * emission * (pc.uniforms.emissive_boost * cos_l / (dist * dist));
+    return surf * emission * (pc.uniforms.emissive_boost * cos_l / (dist * dist));
 }
 
 // The shading normal bent the least amount into the viewer's hemisphere: n' = n + v * (eps - n.v)
@@ -522,45 +533,45 @@ float3 envBRDFApprox2(float3 f0, float alpha, float NoV) {
     return f0 * max(0.0, scale) + max(0.0, bias);
 }
 
-// ---- HDR environment importance sampling (env_light.rs) ------------------------------------
+// ---- HDR sky importance sampling (src/sky_importance.rs) ----------------------------------
 
-// The environment sampler serves the camera world's HDR sky only (env_light.rs).
-bool envSampled(uint ray_mask) {
-    return pc.uniforms.env_w > 0u && environmentOf(ray_mask) == environmentOf(pc.uniforms.camera_mask);
+// Whether the environment's HDR sky has a sampling table (no table: BRDF sampling only).
+bool skySampled(EnvironmentGpu env) {
+    return env.importance != nullptr;
 }
 
-// Solid-angle pdf of the environment sampler picking direction `d`.
-float envPdf(float3 d) {
+// Solid-angle pdf of the sky sampler picking direction `d`.
+float skyPdf(EnvironmentGpu env, float3 d) {
     let uv = env_dir_to_uv(d);
-    let x = min(uint(uv.x * float(pc.uniforms.env_w)), pc.uniforms.env_w - 1u);
-    let y = min(uint(uv.y * float(pc.uniforms.env_h)), pc.uniforms.env_h - 1u);
-    let n = pc.uniforms.env_w * pc.uniforms.env_h;
-    return pc.uniforms.env[n + 1u + y * pc.uniforms.env_w + x];
+    let w = SKY_IMPORTANCE_W;
+    let h = SKY_IMPORTANCE_H;
+    let x = min(uint(uv.x * float(w)), w - 1u);
+    let y = min(uint(uv.y * float(h)), h - 1u);
+    return env.importance[w * h + 1u + y * w + x];
 }
 
-// Draws a direction from the environment's luminance CDF (binary search, jittered inside
-// the texel); returns its radiance, with the direction and its solid-angle pdf.
-float3 envSample(float u1, float u2, float u3, out float3 dir, out float pdf) {
-    let w = pc.uniforms.env_w;
-    let n = w * pc.uniforms.env_h;
+// Draws a direction from the sky's luminance CDF (binary search, jittered inside the texel);
+// returns its radiance, with the direction and its solid-angle pdf.
+float3 skySample(EnvironmentGpu env, float u1, float u2, float u3, out float3 dir, out float pdf) {
+    let w = SKY_IMPORTANCE_W;
+    let n = w * SKY_IMPORTANCE_H;
     uint lo = 0u;
     uint hi = n;
     while (lo + 1u < hi) {
         let mid = (lo + hi) / 2u;
-        if (pc.uniforms.env[mid] <= u1) {
+        if (env.importance[mid] <= u1) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
     let i = min(lo, n - 1u);
-    let uv = float2((float(i % w) + u2) / float(w), (float(i / w) + u3) / float(pc.uniforms.env_h));
+    let uv = float2((float(i % w) + u2) / float(w), (float(i / w) + u3) / float(SKY_IMPORTANCE_H));
     dir = env_uv_to_dir(uv);
-    pdf = pc.uniforms.env[n + 1u + i];
-    let u = pc.uniforms;
-    let skycolor = float3(u.skycolor_r, u.skycolor_g, u.skycolor_b);
+    pdf = env.importance[n + 1u + i];
     // Explicit LOD 0: a ray-tracing stage has no derivatives (glslang emits the same).
-    return skycolor * textures[pc.skydome].SampleLevel(uv, 0.0).rgb * u.sky_brightness;
+    let texel = textures[NonUniformResourceIndex(env.tex)].SampleLevel(uv, 0.0).rgb;
+    return env.color.rgb * skyResidual(env, dir, texel) * env.sky_brightness;
 }
 
 // ---- ray portals (src/portal.rs) -------------------------------------------------------
@@ -593,8 +604,8 @@ float3 portalXformDir(float4 r0, float4 r1, float4 r2, float3 v) {
 // If `hit_slot` is a portal surface, rewrite the ray to continue from the paired portal
 // (into portal-local, a half-turn about local Y, out through the target's frame) and
 // return true; else leave the ray untouched.
-bool portalRedirect(uint hit_slot, float3 hit_pos,
-                    inout float3 origin, inout float3 direction, inout uint ray_mask) {
+bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout float3 direction,
+                    inout uint ray_mask, inout uint ray_env) {
     for (uint i = 0u; i < pc.uniforms.portal_count; i++) {
         let pair = pc.uniforms.portals[i];
         if (pair.z == 0u || pair.x != hit_slot) {
@@ -618,9 +629,10 @@ bool portalRedirect(uint hit_slot, float3 hit_pos,
         direction = normalize(portalXformDir(t0, t1, t2, d));
         // Nudge past the exit surface so the continued ray doesn't immediately re-hit it.
         origin = portalXformPoint(t0, t1, t2, p) + direction * 1.0e-4;
-        // The ray now lives in whatever world the exit does: adopt the exit INSTANCE's
-        // render-layer mask (instance row 3 packs custom_index | mask << 24).
+        // The ray now lives in whatever environment the exit does: adopt the exit INSTANCE's
+        // render-layer mask (instance row 3 packs custom_index | mask << 24) and its environment.
         ray_mask = (asuint(pc.cur_instances[tb + 3u].x) >> 24) & 0xFFu;
+        ray_env = environmentOf(ray_mask, pc.uniforms.environment_bits);
         return true;
     }
     return false;
@@ -639,7 +651,8 @@ void main() {
 
     let px = int2(launch_id);
 
-    let tmin = 0.0001;
+    // Rays leaving a surface start off it (`offsetRay`), so nothing needs a minimum distance.
+    let tmin = 0.0;
     // Far range: the sim-scale sky domes sit kilometers out, a planet's horizon tens of km.
     let tmax = 1.0e6;
 
@@ -696,8 +709,16 @@ void main() {
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
         // camera ray and delta continuations): the MIS partner of light-table sampling.
         var prev_pdf = 0.0;
-        // The world this ray sees: the camera's layer mask until a portal swaps it.
+        // What this ray sees and where it is: the camera's layer mask and environment until a
+        // portal swaps them.
         var ray_mask = pc.uniforms.camera_mask;
+        var ray_env = pc.uniforms.environment;
+        // The normal of the surface `origin` sits on, for the next ray to leave it by; zero where
+        // the ray does not start on a surface (the camera, a fog scatter, a portal exit).
+        var surf_n = float3(0.0);
+        // Still on the camera ray (through cutouts and portals, before any scatter): it skips
+        // the camera's primary-hidden layers, which every other ray sees.
+        var camera_segment = true;
         // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
         // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
         // once the path ends.
@@ -728,11 +749,13 @@ void main() {
         var guide_dist = 0.0;
 
         for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
-            // Low bit: may this miss return the sun disc; high bits: the ray's world mask
-            // (the miss picks that layer's sky).
-            payload.want_sun = (want_sun ? 1u : 0u) | (ray_mask << 1);
+            // Low bit: may this miss return the sun discs; above it the ray's environment (the
+            // miss returns that environment's sky).
+            payload.miss_flags = (want_sun ? 1u : 0u) | (ray_env << 1);
             payload.cone = float2(cone_width, cone_spread);
-            trace(FLAGS_OPAQUE, ray_mask, origin, tmin, direction, tmax, payload);
+            let trace_mask = camera_segment ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
+            let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
+            trace(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             if (sample_idx == 0u && bounce_idx == 0u) {
                 primary_t = payload.t;
             }
@@ -754,11 +777,12 @@ void main() {
             if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
                 var p_origin = origin;
                 var p_dir = direction;
-                if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask)) {
+                if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask, ray_env)) {
                     if (!guides_written) {
                         guide_dist += payload.t;
                     }
                     origin = p_origin;
+                    surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
                     continue;
@@ -867,9 +891,9 @@ void main() {
                                 mirror = reflect(direction, surface_normal);
                             }
                             let vertex = payload;
-                            payload.want_sun = ray_mask << 1;
+                            payload.miss_flags = ray_env << 1;
                             payload.cone = float2(cone_width, cone_spread);
-                            trace(FLAGS_OPAQUE, ray_mask, hit_pos, tmin, mirror, tmax, payload);
+                            trace(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, payload);
                             spec_hit = payload.t == 0.0 ? SPEC_HIT_FAR : min(payload.t, SPEC_HIT_FAR);
                             payload = vertex;
                         }
@@ -890,15 +914,16 @@ void main() {
             // this case, having an extra check for this is slower than
             // deferring to the generic emitter check)
             float fogDistance;
-            if (sampleFogScatter(origin, direction, payload.t, fogDistance)) {
+            let env = pc.uniforms.environments[ray_env];
+            if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
+                surf_n = float3(0.0);
                 // Uniform fog keeps its old ad-hoc loss; height fog is delta-tracked, so the
                 // collision's weight is just the medium's single-scattering albedo.
-                mask *= pc.uniforms.fog_falloff > 0.0 ? FOG_ALBEDO : calcFogTransmittance(fogDistance);
+                mask *= env.fog_falloff > 0.0 ? FOG_ALBEDO : calcFogTransmittance(fogDistance);
                 // The sun straight into the scatter point, through the phase function: the
                 // shafts of light through gaps (a scattered ray would rarely find its disc).
                 {
-                    let env = pc.uniforms.worlds[environmentOf(ray_mask)];
                     for (uint si = 0u; si < env.sun_count; si++) {
                         let sun = env.suns[si];
                         let r1 = randf();
@@ -912,11 +937,11 @@ void main() {
                         trace(FLAGS_SHADOW, ray_mask, origin, 0.0, l, tmax, payload);
                         if (payload.t == 0.0) {
                             let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                            acc += mask * fogPhase(dot(direction, l)) * sun_radiance * solid_angle;
+                            acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle;
                         }
                     }
                 }
-                direction = sampleFogScatterDirection(direction);
+                direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
                 want_sun = false;
                 continue;
@@ -953,8 +978,8 @@ void main() {
                 }
                 // MIS against the environment sampler: a BRDF-sampled ray that escapes to the HDR
                 // sky shares credit with the previous vertex's environment estimate.
-                if (payload.t == 0.0 && prev_pdf > 0.0 && envSampled(ray_mask)) {
-                    contribution *= prev_pdf / (prev_pdf + envPdf(direction));
+                if (payload.t == 0.0 && prev_pdf > 0.0 && skySampled(env)) {
+                    contribution *= prev_pdf / (prev_pdf + skyPdf(env, direction));
                 }
                 // Firefly suppression: an indirect path that reaches an emitter far brighter than the
                 // sky would take hundreds of frames to average out; clamp its luminance instead.
@@ -967,9 +992,11 @@ void main() {
 
             // Alpha-cutout pass-through: carry on along the same ray from the hit.
             origin = origin + direction * payload.t;
+            surf_n = surface_normal;
             if (pass_through) {
                 continue;
             }
+            camera_segment = false;
 
             // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
             // vector is sampled from the NDF, Fresnel is evaluated about it, and the ray
@@ -1122,7 +1149,7 @@ void main() {
                         float3 cdir;
                         let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
                                                   origin, world_normal, surface_normal,
-                                                  -direction, disney_mat, ray_mask,
+                                                  -direction, disney_mat, lob, ray_mask,
                                                   p_area, pdf_solid, cdir, cdist);
                         r_M += 1.0;
                         let phat = luma(val);
@@ -1164,7 +1191,7 @@ void main() {
                                 let val = lightSampleEval(prev.y, lightsFindInstance(prev.y), 1.0,
                                                           suv.x, suv.y, origin, world_normal,
                                                           surface_normal, -direction, disney_mat,
-                                                          ray_mask, p_area_ign, pdf_solid_ign, cdir,
+                                                          lob, ray_mask, p_area_ign, pdf_solid_ign, cdir,
                                                           cdist);
                                 let phat = luma(val);
                                 let Mprev = min(prev.M, pc.uniforms.restir_m_clamp);
@@ -1188,7 +1215,7 @@ void main() {
                     var r_W = (r_phat > 0.0 && r_M > 0.0) ? r_wsum / (r_M * r_phat) : 0.0;
                     if (r_W > 0.0) {
                         payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, origin, tmin, r_dir, r_dist - 2.0 * tmin, payload);
+                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, r_dir), tmin, r_dir, r_dist * (1.0 - 1.0e-4), payload);
                         if (payload.t == 0.0) {
                             acc += mask * r_val * r_W;
                         } else {
@@ -1232,12 +1259,12 @@ void main() {
                         float3 cdir;
                         let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
                                                   origin, world_normal, surface_normal, -direction,
-                                                  disney_mat, ray_mask, p_area, pdf_solid, cdir,
+                                                  disney_mat, lob, ray_mask, p_area, pdf_solid, cdir,
                                                   cdist);
                         if (luma(val) <= 0.0 || p_area <= 0.0) {
                             continue;
                         }
-                        let w = pdf_solid / (pdf_solid + pdfDisneyBRDF(-direction, world_normal, cdir, disney_mat));
+                        let w = pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
                         let g = val * w;
                         let phat = luma(g);
                         let wi = phat / p_area;
@@ -1251,7 +1278,7 @@ void main() {
                     }
                     if (wsum > 0.0 && sel_phat > 0.0) {
                         payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, origin, tmin, ldir, ldist - 2.0 * tmin, payload);
+                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, ldir), tmin, ldir, ldist * (1.0 - 1.0e-4), payload);
                         if (payload.t == 0.0) {
                             var contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
                             if (bounce_idx > 0 && radiance_clamp > 0.0) {
@@ -1264,25 +1291,27 @@ void main() {
             }
 
             // Next-event estimation for an HDR environment: one importance-sampled direction
-            // (luminance x sin theta CDF, env_light.rs), MIS-weighted against BRDF sampling; the
+            // (luminance x sin theta CDF, sky_importance.rs), MIS-weighted against BRDF sampling; the
             // BRDF-sampled rays that reach the sky take the complementary weight on miss.
-            if (envSampled(ray_mask)) {
+            if (skySampled(env)) {
                 float3 l;
                 float pdf_env;
                 let u1 = randf();
                 let u2 = randf();
                 let u3 = randf();
-                let L = envSample(u1, u2, u3, l, pdf_env);
+                let L = skySample(env, u1, u2, u3, l, pdf_env);
                 let NoL = dot(world_normal, l);
-                if (pdf_env > 0.0 && NoL > 0.0 && dot(l, surface_normal) > 0.0 && luma(L) > 0.0) {
-                    // The coat is left to BRDF sampling: this MIS knows only the base's pdf.
-                    let f = evalLayered(-direction, world_normal, l, disney_mat, lob, false);
+                // A thin translucent surface also takes the sky (its sun) from behind.
+                let through = lob.transmission > 0.0 && NoL < 0.0 && dot(l, surface_normal) < 0.0;
+                let above = NoL > 0.0 && dot(l, surface_normal) > 0.0;
+                if (pdf_env > 0.0 && (above || through) && luma(L) > 0.0) {
+                    let f = evalLayered(-direction, world_normal, l, disney_mat, lob, true);
                     if (any(f > float3(0.0))) {
-                        let w = pdf_env / (pdf_env + pdfDisneyBRDF(-direction, world_normal, l, disney_mat));
+                        let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
                         payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, origin, tmin, l, tmax, payload);
+                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax, payload);
                         if (payload.t == 0.0) {
-                            acc += mask * f * NoL * L * (w / pdf_env);
+                            acc += mask * f * abs(NoL) * L * (w / pdf_env);
                         }
                     }
                 }
@@ -1291,10 +1320,9 @@ void main() {
             // Next-event estimation for the world's suns (its DirectionalLights, src/sky.rs): one
             // shadow ray per sun towards a uniformly sampled point on its disc. Direct sunlight is
             // the dominant, low-variance term, so it is not firefly-clamped; BRDF-sampled rays that
-            // reach a disc afterwards return the sky only (`want_sun` = 0), so nothing is counted
+            // reach a disc afterwards return the sky only (`want_sun` false), so nothing is counted
             // twice.
             {
-                let env = pc.uniforms.worlds[environmentOf(ray_mask)];
                 for (uint si = 0u; si < env.sun_count; si++) {
                     let sun = env.suns[si];
                     let r1 = randf();
@@ -1321,7 +1349,7 @@ void main() {
                         // shader, so the payload's t only becomes 0 when the miss shader ran. Not
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
                         payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, origin, tmin, l, tmax, payload);
+                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax, payload);
                         if (payload.t == 0.0) {
                             let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                             acc += mask * f * abs(NoL) * sun_radiance * solid_angle;
@@ -1334,12 +1362,14 @@ void main() {
             // (weight = albedo: a Lambertian lobe drawn by its own cosine), off the coat with
             // probability clearcoat x Fresnel (weight F G1 / that). What is left samples the
             // base, whose weight the two cancel out of. Ordinary materials draw nothing here.
+            // The view the sampler below draws from (its MIS pdf needs it after `direction` moves).
+            let wo = -direction;
             if (lob.transmission > 0.0 && randf() < lob.transmission) {
                 let r1 = randf();
                 let r2 = randf();
                 direction = sampleTransmission(world_normal, r1, r2);
                 mask *= disney_mat.albedo;
-                prev_pdf = 0.0;
+                prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                 want_sun = false;
                 cone_spread = max(cone_spread, 0.37);
                 continue;
@@ -1356,7 +1386,7 @@ void main() {
                     }
                     direction = l;
                     mask *= lob.clearcoat * w / q;
-                    prev_pdf = 0.0;
+                    prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                     want_sun = false;
                     cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
                     continue;
@@ -1396,9 +1426,9 @@ void main() {
             if (brdf.a < 0.0) {
                 break;
             }
-            // brdf.a is the lobe-weighted solid-angle pdf; 0 marks a delta (mirror) bounce whose
-            // weight is applied as is.
-            prev_pdf = brdf.a > 0.0001 ? brdf.a : 0.0;
+            // brdf.a is the base lobe's pdf; 0 marks a delta (mirror) bounce whose weight is
+            // applied as is. Otherwise the MIS pdf is the whole layered sampler's.
+            prev_pdf = brdf.a > 0.0001 ? layeredPdf(wo, world_normal, direction, disney_mat, lob) : 0.0;
 
             // Prevent going into the surface (leaks light through walls)
             if (dot(direction, surface_normal) < 0) {
@@ -1426,7 +1456,7 @@ void main() {
     var mean = acc / float(SAMPLES);
     // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
     // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
-    if (pc.uniforms.worlds[environmentOf(pc.uniforms.camera_mask)].mode == 3u) {
+    if (pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
         mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

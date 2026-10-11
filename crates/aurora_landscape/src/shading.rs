@@ -14,6 +14,7 @@ use bevy_aurora::{
     surface_group::{SurfaceClass, SurfaceGroup, SurfaceGroupData, SurfaceGroupRegistry},
     vulkan_asset::VulkanAssets,
 };
+use bevy_seedling::prelude::AudioSample;
 use bytemuck::{Pod, Zeroable};
 
 use crate::{Landscape, LandscapePages, LandscapeTile};
@@ -28,21 +29,27 @@ pub const PALETTE_MAX: usize = 256;
 /// water over it (wet stone, mud).
 #[derive(Clone, Debug, Reflect)]
 pub struct LandscapeMaterial {
+    /// What the material is (`elwynn_grassbase`), for the editor and the importers.
+    pub name: String,
     pub albedo: Option<Handle<Image>>,
     pub normal: Option<Handle<Image>>,
     pub tile_size: f32,
     pub roughness: f32,
     pub clearcoat: f32,
+    /// What a step on it sounds like: one sample picked at random per step (empty = silent).
+    pub footsteps: Vec<Handle<AudioSample>>,
 }
 
 impl Default for LandscapeMaterial {
     fn default() -> Self {
         Self {
+            name: String::new(),
             albedo: None,
             normal: None,
             tile_size: 4.0,
             roughness: 0.9,
             clearcoat: 0.0,
+            footsteps: Vec::new(),
         }
     }
 }
@@ -51,6 +58,13 @@ impl Default for LandscapeMaterial {
 #[derive(Component, Clone, Debug, Default, Reflect)]
 #[reflect(Component, Default)]
 pub struct LandscapePalette(pub Vec<LandscapeMaterial>);
+
+impl LandscapePalette {
+    /// Palette entry `id`.
+    pub fn material(&self, id: u8) -> Option<&LandscapeMaterial> {
+        self.0.get(id as usize)
+    }
+}
 
 /// `PaletteEntry` in hit.slang.
 #[repr(C)]
@@ -112,7 +126,8 @@ pub fn register_class(
         closest_hit: server.load(aurora_asset("shaders/landscape/hit.slang")),
         any_hit: None,
     });
-    let rows: Buffer<LandscapeRow> = rd.create_host_buffer(ROWS, vk::BufferUsageFlags::STORAGE_BUFFER);
+    let rows: Buffer<LandscapeRow> =
+        rd.create_host_buffer(ROWS, vk::BufferUsageFlags::STORAGE_BUFFER);
     data.set(class, rows.address);
     commands.insert_resource(LandscapeClass {
         class,
@@ -227,7 +242,12 @@ pub fn wear_class(
     mut commands: Commands,
     class: Res<LandscapeClass>,
     shadings: Query<&LandscapeShading>,
-    tiles: Query<(Entity, &LandscapeTile, &AuroraMaterial3d, Option<&SurfaceClass>)>,
+    tiles: Query<(
+        Entity,
+        &LandscapeTile,
+        &AuroraMaterial3d,
+        Option<&SurfaceClass>,
+    )>,
 ) {
     for (entity, tile, material, worn) in &tiles {
         let Ok(shading) = shadings.get(tile.landscape) else {

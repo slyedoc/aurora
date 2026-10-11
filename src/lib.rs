@@ -27,7 +27,6 @@ pub mod compute;
 pub mod debug_view;
 pub mod dev_ui;
 pub mod dlss;
-pub mod env_light;
 pub mod environment;
 pub mod frame_sync;
 pub mod gizmo_render;
@@ -55,6 +54,7 @@ pub mod shader;
 pub mod sharc;
 pub mod skinning;
 pub mod sky;
+pub mod sky_importance;
 pub mod sphere;
 pub mod surface_group;
 pub mod swapchain;
@@ -93,8 +93,7 @@ pub mod prelude {
         debug_view::AuroraDebugView,
         dev_ui::{DevUIPanel, DevUIPlugin},
         dlss::{AuroraDlss, RrPreset},
-        env_light::EnvLight,
-        environment::{InEnvironment, RenderEnvironments},
+        environment::{AuroraPrimaryHidden, InEnvironment, RenderEnvironments, RenderLayerApp},
         material::{AuroraMaterial, AuroraMaterial3d},
         mesh::{AuroraMesh, AuroraMesh3d},
         picking::{RayCaster, RayHit, RayHits},
@@ -103,6 +102,7 @@ pub mod prelude {
         render_settings::{AuroraLens, RenderSettings},
         skinning::{SkinJointsByName, Wind, WindSway},
         sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyBrightness},
+        sky_importance::SkyImportance,
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
@@ -152,7 +152,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::dlss::DlssPlugin::default());
         group = group.add(crate::render_settings::RenderSettingsPlugin);
         group = group.add(crate::render_env::RenderEnvPlugin);
-        group = group.add(crate::env_light::EnvLightPlugin);
+        group = group.add(crate::sky_importance::SkyImportancePlugin);
         group = group.add(crate::post_process_filter::PostProcessFilterPlugin);
         group = group.add(crate::raytracing_pipeline::RaytracingPipelinePlugin);
         group = group.add(crate::shader::ShaderPlugin);

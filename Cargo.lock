@@ -456,6 +456,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-core"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f93ebbf82d06013f4c41fe71303feb980cddd78496d904d06be627972de51a24"
+
+[[package]]
+name = "audioadapter"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91f87b70b051c5866680ad79f6743a42ccab264c009d1a71f4d33a3872ae60c8"
+dependencies = [
+ "audio-core",
+ "num-traits",
+]
+
+[[package]]
+name = "audioadapter-buffers"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9097d67933fb083d382ce980430afdb758aada60846010aee6be068c06cef0ca"
+dependencies = [
+ "audioadapter",
+ "audioadapter-sample",
+ "num-traits",
+]
+
+[[package]]
+name = "audioadapter-sample"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ab94f2bc04a14e1f49ee5f222f66460e8a1b51627bdfedf34eed394d747938"
+dependencies = [
+ "audio-core",
+ "num-traits",
+]
+
+[[package]]
 name = "aurora_landscape"
 version = "0.1.0"
 dependencies = [
@@ -463,6 +500,7 @@ dependencies = [
  "avian3d",
  "bevy",
  "bevy_aurora",
+ "bevy_seedling",
  "bytemuck",
  "gpu-allocator",
  "image",
@@ -781,7 +819,7 @@ dependencies = [
  "bevy_animation_graph",
  "bytemuck",
  "crossbeam",
- "glam",
+ "glam 0.33.12",
  "gpu-allocator",
  "half",
  "log",
@@ -1404,7 +1442,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
- "toml_edit",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -1444,7 +1482,7 @@ dependencies = [
  "approx",
  "bevy_reflect",
  "derive_more",
- "glam",
+ "glam 0.33.12",
  "libm",
  "rand 0.10.2",
  "serde",
@@ -1470,7 +1508,7 @@ dependencies = [
  "bytemuck",
  "derive_more",
  "encase",
- "glam",
+ "glam 0.33.12",
  "half",
  "hexasphere",
  "serde",
@@ -1612,7 +1650,7 @@ dependencies = [
  "downcast-rs 2.0.2",
  "erased-serde",
  "foldhash 0.2.0",
- "glam",
+ "glam 0.33.12",
  "indexmap",
  "inventory",
  "petgraph",
@@ -1673,7 +1711,7 @@ dependencies = [
  "derive_more",
  "downcast-rs 2.0.2",
  "encase",
- "glam",
+ "glam 0.33.12",
  "image",
  "indexmap",
  "itertools 0.14.0",
@@ -1729,6 +1767,35 @@ name = "bevy_scene_macros"
 version = "0.20.0-dev"
 dependencies = [
  "bevy_ecs_macro_logic",
+ "bevy_macro_utils",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "bevy_seedling"
+version = "0.8.0"
+dependencies = [
+ "bevy_app",
+ "bevy_asset",
+ "bevy_ecs",
+ "bevy_log",
+ "bevy_math",
+ "bevy_platform",
+ "bevy_reflect",
+ "bevy_seedling_macros",
+ "bevy_time",
+ "bevy_transform",
+ "bevy_utils",
+ "firewheel",
+ "smallvec",
+]
+
+[[package]]
+name = "bevy_seedling_macros"
+version = "0.7.0"
+dependencies = [
  "bevy_macro_utils",
  "proc-macro2",
  "quote",
@@ -2562,7 +2629,7 @@ dependencies = [
  "jni 0.21.1",
  "js-sys",
  "libc",
- "mach2",
+ "mach2 0.5.0",
  "ndk",
  "ndk-context",
  "num-derive",
@@ -2578,6 +2645,40 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows",
+]
+
+[[package]]
+name = "cpal"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1"
+dependencies = [
+ "alsa",
+ "block2 0.6.2",
+ "coreaudio-rs",
+ "dasp_sample",
+ "futures-channel",
+ "futures-util",
+ "jni 0.22.4",
+ "js-sys",
+ "libc",
+ "mach2 0.6.0",
+ "ndk",
+ "ndk-context",
+ "num-derive",
+ "num-traits",
+ "objc2 0.6.4",
+ "objc2-audio-toolbox",
+ "objc2-avf-audio",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -2998,6 +3099,146 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "firewheel"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "firewheel-core",
+ "firewheel-cpal",
+ "firewheel-graph",
+ "firewheel-nodes",
+ "firewheel-rtaudio",
+ "firewheel-symphonium",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "firewheel-core"
+version = "0.10.1"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "arrayvec",
+ "audioadapter",
+ "audioadapter-buffers",
+ "audioadapter-sample",
+ "bevy_ecs",
+ "bevy_platform",
+ "bevy_reflect",
+ "bitflags 2.13.1",
+ "firewheel-macros",
+ "glam 0.29.3",
+ "glam 0.30.10",
+ "glam 0.31.1",
+ "glam 0.32.1",
+ "glam 0.33.12",
+ "num-traits",
+ "portable-atomic",
+ "ringbuf",
+ "smallvec",
+ "thiserror 2.0.19",
+ "thunderdome",
+ "wmidi",
+]
+
+[[package]]
+name = "firewheel-cpal"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "audioadapter-buffers",
+ "bevy_platform",
+ "cpal 0.18.2",
+ "firewheel-core",
+ "firewheel-graph",
+ "fixed-resample",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "firewheel-graph"
+version = "0.10.2"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "arrayvec",
+ "audioadapter",
+ "bevy_platform",
+ "bevy_reflect",
+ "bitflags 2.13.1",
+ "firewheel-core",
+ "num-traits",
+ "ringbuf",
+ "smallvec",
+ "thiserror 2.0.19",
+ "thunderdome",
+ "tracing",
+ "triple_buffer",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "firewheel-macros"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "bevy_macro_utils",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "toml_edit 0.24.1+spec-1.1.0",
+]
+
+[[package]]
+name = "firewheel-nodes"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "bevy_ecs",
+ "bevy_platform",
+ "bevy_reflect",
+ "firewheel-core",
+ "num-traits",
+ "smallvec",
+ "thiserror 2.0.19",
+ "triple_buffer",
+]
+
+[[package]]
+name = "firewheel-rtaudio"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "audioadapter-buffers",
+ "bevy_platform",
+ "firewheel-core",
+ "firewheel-graph",
+ "rtaudio",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "firewheel-symphonium"
+version = "0.10.0"
+source = "git+https://github.com/slyedoc/Firewheel?branch=aurora#c3fe815f9ec4425f02968a34f37d78e2d01a63fe"
+dependencies = [
+ "bevy_platform",
+ "firewheel-core",
+ "symphonium",
+]
+
+[[package]]
+name = "fixed-resample"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "119588c9d2456c65ddbe9360b8643d77de3c2b6c4a588eb2fdb512d715167be3"
+dependencies = [
+ "audioadapter",
+ "audioadapter-buffers",
+ "ringbuf",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,6 +3517,30 @@ dependencies = [
 
 [[package]]
 name = "glam"
+version = "0.29.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8babf46d4c1c9d92deac9f7be466f76dfc4482b6452fc5024b5e8daf6ffeb3ee"
+
+[[package]]
+name = "glam"
+version = "0.30.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+
+[[package]]
+name = "glam"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556f6b2ea90b8d15a74e0e7bb41671c9bdf38cd9f78c284d750b9ce58a2b5be7"
+
+[[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+
+[[package]]
+name = "glam"
 version = "0.33.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
@@ -3294,7 +3559,7 @@ version = "0.2.0-dev"
 source = "git+https://github.com/slyedoc/glam_matrix_extras?branch=bevy-main#bfaa1e11caedf777ee74bcb766fd165651e91502"
 dependencies = [
  "bevy_reflect",
- "glam",
+ "glam 0.33.12",
 ]
 
 [[package]]
@@ -3304,7 +3569,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d74079318e3a077bd3d15faa90fde24fa37bb9f157f92f853e6019a15fd413"
 dependencies = [
  "approx",
- "glam",
+ "glam 0.33.12",
  "num-traits",
  "simba",
 ]
@@ -3457,7 +3722,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "163385eff5a0cf606ebe2c10b3a44ab02f4306e83fbd068a64f5e1d72a3049ac"
 dependencies = [
  "constgebra",
- "glam",
+ "glam 0.33.12",
  "tinyvec",
 ]
 
@@ -4107,6 +4372,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mach2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4508,6 +4779,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
 dependencies = [
+ "bitflags 2.13.1",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
 ]
@@ -4800,7 +5072,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf590a9310ba69b2340562d39f0c9bddd3677130bfd24a5df22941552e791bac"
 dependencies = [
  "bytemuck",
- "glam",
+ "glam 0.33.12",
  "half",
  "log",
  "rdst",
@@ -5200,7 +5472,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -5496,6 +5768,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5506,6 +5784,17 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "ringbuf"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
+dependencies = [
+ "crossbeam-utils",
+ "portable-atomic",
+ "portable-atomic-util",
+]
 
 [[package]]
 name = "rmp"
@@ -5538,7 +5827,7 @@ version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a536bb79db59098ef71a4dd4246c02eb87b316deceb1b68e0cde7167ec01eb"
 dependencies = [
- "cpal",
+ "cpal 0.17.3",
  "dasp_sample",
  "num-rational",
  "thiserror 2.0.19",
@@ -5590,6 +5879,28 @@ dependencies = [
  "heapless 0.8.0",
  "num-traits",
  "smallvec",
+]
+
+[[package]]
+name = "rtaudio"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba9a8d9df10361b3c7d1229ca7da8d73515338f516723b98f3e3fed9b6d7b54"
+dependencies = [
+ "bitflags 2.13.1",
+ "rtaudio-sys",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "rtaudio-sys"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "931ec9a72c48e96e8e2f9868aef1d4e452723354779d01159f7399647427b57b"
+dependencies = [
+ "cmake",
+ "pkg-config",
 ]
 
 [[package]]
@@ -5993,6 +6304,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "symphonia"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7edef6a96b696d4e0cab5ee9ebb7ca155ed95f30a6b45bbb8b97d2727f02424"
+dependencies = [
+ "lazy_static",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-core"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01c412864d599d4750d0c3d684d7e093ec05e5309681ef5252cc1096a437f6e0"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "lazy_static",
+ "log",
+ "num-complex",
+ "smallvec",
+]
+
+[[package]]
+name = "symphonia-metadata"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83713a97705d77bdef7cdbc0768fd6e5a54e4cd7e48d60a806ae85639e2c87c6"
+dependencies = [
+ "lazy_static",
+ "log",
+ "regex-lite",
+ "smallvec",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonium"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cefe2d9bc8dae6238683ddf49b1de6da6dd2349d3d279ec266d3c4abedaa4702"
+dependencies = [
+ "symphonia",
+ "tracing",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6116,6 +6475,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "thunderdome"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e170f93360bf9ae6fe3c31116bbf27adb1d054cedd6bc3d7857e34f2d98d0b"
+
+[[package]]
 name = "tikv-jemalloc-sys"
 version = "0.5.4+5.3.0-patched"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6198,6 +6563,15 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
@@ -6207,14 +6581,26 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
+version = "0.24.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01f2eadbbc6b377a847be05f60791ef1058d9f696ecb51d2c07fe911d8569d8e"
+dependencies = [
+ "indexmap",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_edit"
 version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
  "indexmap",
- "toml_datetime",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
- "winnow",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -6223,7 +6609,7 @@ version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
- "winnow",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -6361,6 +6747,15 @@ dependencies = [
  "memchr",
  "nom",
  "petgraph",
+]
+
+[[package]]
+name = "triple_buffer"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e875ab7068a75b74f419da453927e05527c36f0001b3c7aad3ce443640683487"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -7385,6 +7780,15 @@ dependencies = [
 
 [[package]]
 name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
@@ -7415,6 +7819,12 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
 ]
+
+[[package]]
+name = "wmidi"
+version = "4.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b1b1e28ac6301b1c097d21c11130090f7ecc5db9d5ef4e52595ab942f8d76d5"
 
 [[package]]
 name = "writeable"

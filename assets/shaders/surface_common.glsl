@@ -55,6 +55,9 @@ struct SurfaceHit {
   vec3 tangent;
   // World space.
   vec3 surface_normal;
+  // The triangle's true face normal (world space), facing the ray: what a ray leaving the hit
+  // offsets along (raygen offsetRay) -- vertex normals can lie in the face (foliage cards).
+  vec3 face_normal;
   // Ray-cone texture LOD before the per-texture texel-count term; feed `sampleLod`.
   float lod_base;
   // The hardware's geometric answer, not a normal dot test.
@@ -128,6 +131,15 @@ SurfaceHit surfaceHit() {
     hit.object_normal = -hit.object_normal;
   }
   hit.surface_normal = normalize((gl_ObjectToWorldEXT * vec4(hit.object_normal, 0.0)).xyz);
+  // From the BLAS's own positions (position fetch; every BLAS allows data access): world-space
+  // edges, so a non-uniform scale bends it right.
+  const mat3 o2w = mat3(gl_ObjectToWorldEXT);
+  const vec3 e1 = o2w * (gl_HitTriangleVertexPositionsEXT[1] - gl_HitTriangleVertexPositionsEXT[0]);
+  const vec3 e2 = o2w * (gl_HitTriangleVertexPositionsEXT[2] - gl_HitTriangleVertexPositionsEXT[0]);
+  hit.face_normal = normalize(cross(e1, e2));
+  if (dot(hit.face_normal, gl_WorldRayDirectionEXT) > 0.0) {
+    hit.face_normal = -hit.face_normal;
+  }
 
   // Texture level of detail by ray cone (Akenine-Moller et al., Ray Tracing Gems ch. 20): a
   // ray-tracing stage has no derivatives, so the footprint comes from the cone the raygen
@@ -163,7 +175,7 @@ vec3 surfaceShadingNormal(const SurfaceHit hit) {
 // vectors. Call it AFTER writing colour/emission/roughness; it does not touch those.
 void surfaceWritePayload(const SurfaceHit hit, const vec3 world_normal) {
   payload.t = gl_HitTEXT;
-  payload.surface_and_world_normal = pack2_normals(hit.surface_normal, world_normal);
+  payload.surface_and_world_normal = pack2_normals(hit.face_normal, world_normal);
   payload.slot = gl_InstanceID;
   payload.prim_tri = triangles.index_offsets[gl_GeometryIndexEXT] + gl_PrimitiveID;
   {

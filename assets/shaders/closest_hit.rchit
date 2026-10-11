@@ -1,6 +1,7 @@
 #version 460
 #extension GL_EXT_buffer_reference2 : enable
 #extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_tracing_position_fetch : require
 #extension GL_EXT_nonuniform_qualifier : enable
 #extension GL_EXT_scalar_block_layout : enable
 // `surfaceData` is a device address carried as a uvec2; recombining it needs int64.

@@ -272,11 +272,7 @@ pub fn spawn_tiles(
     kernels: Res<LandscapeKernels>,
     engine_kernels: Res<ProceduralKernels>,
     modules: Res<ComputeModules>,
-    landscapes: Query<(
-        &Landscape,
-        &LandscapePages,
-        Option<&AuroraMaterial3d>,
-    )>,
+    landscapes: Query<(&Landscape, &LandscapePages, Option<&AuroraMaterial3d>)>,
     mut roots: Query<(Entity, &LandscapeRoot, &mut QuadTree)>,
     tiles: Query<&LandscapeTile>,
 ) {
@@ -355,8 +351,16 @@ pub fn spawn_tiles(
             cell_z: cell.y,
             res: landscape.patch_resolution.clamp(2, 255),
             root_size: size,
-            origin_x: if landscape.sphere.is_some() { at.x } else { origin.x },
-            origin_z: if landscape.sphere.is_some() { at.z } else { origin.y },
+            origin_x: if landscape.sphere.is_some() {
+                at.x
+            } else {
+                origin.x
+            },
+            origin_z: if landscape.sphere.is_some() {
+                at.z
+            } else {
+                origin.y
+            },
             skirt_depth: 0.0,
             edge_steps: u32::from_le_bytes(item.steps),
             face: landscape.sphere.map_or(0, |f| f.face as u32),
