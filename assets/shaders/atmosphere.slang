@@ -13,7 +13,7 @@
 // parametrisations are the same maths in both files. Lengths in metres, coefficients per metre, radiances
 // in nits.
 
-// Must match AtmosphereGpu in src/atmosphere.rs and AtmosphereParams in types.glsl
+// Must match AtmosphereGpu in src/atmosphere.rs and AtmosphereParams in rt_types.slang
 // (pointers first, then scalars only: no vector alignment questions).
 struct AtmosphereParams {
     float4* transmittance;   // T_W x T_H

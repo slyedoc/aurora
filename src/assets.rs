@@ -1,4 +1,4 @@
-//! The engine's own assets (GLSL shaders, blue-noise textures) served through an `aurora://`
+//! The engine's own assets (Slang shaders, blue-noise textures) served through an `aurora://`
 //! asset source rooted at this crate's `assets/` directory, so apps that use the engine from
 //! another repo — with their own asset root — still find them. The source is watched, so shader
 //! hot-reload works wherever the engine is checked out.

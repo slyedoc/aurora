@@ -6,7 +6,7 @@
 // average (weighted by sample counts), clears the accumulators, and evicts entries that
 // have not been touched for a while.
 
-// Must match SharcEntry in types.glsl. 32 bytes; resolved values are packed f16 pairs
+// Must match `SharcEntry` in src/sharc.rs. 32 bytes; resolved values are packed f16 pairs
 // (shaderFloat16 is enabled at device creation).
 struct SharcEntry {
     uint tag;      // 0 = empty; hash tag of the voxel key otherwise.

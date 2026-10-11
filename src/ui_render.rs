@@ -68,7 +68,7 @@ use crate::{
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssetLoadingState, VulkanAssets},
 };
 
-/// Shader flags; must align with `assets/shaders/ui.frag`.
+/// Shader flags; must align with `assets/shaders/ui.slang`.
 pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     pub const TEXTURED: u32 = 1;
@@ -89,7 +89,7 @@ pub mod shader_flags {
 }
 
 /// The procedural fills feathers draws with `UiMaterial`s, which aurora paints itself. Must align
-/// with `ui.frag`.
+/// with `ui.slang`.
 pub mod pattern {
     use bevy::feathers::controls::FeathersColorPlane;
 
@@ -127,7 +127,7 @@ const QUAD_VERTEX_POSITIONS: [Vec2; 4] = [
     Vec2::new(-0.5, 0.5),
 ];
 
-/// One vertex as read by `ui.vert` through a buffer reference. Must match `ui_types.glsl`.
+/// One vertex as read by `ui.slang` through a pointer. Must match its `UiVertex`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UiVertex {
@@ -245,10 +245,15 @@ impl VulkanAsset for UiPipeline {
         };
 
         let shader_stages = [
-            render_device.load_shader(&vertex_shader.spirv.unwrap(), vk::ShaderStageFlags::VERTEX),
-            render_device.load_shader(
+            render_device.load_shader_entry(
+                &vertex_shader.spirv.unwrap(),
+                vk::ShaderStageFlags::VERTEX,
+                c"vertex",
+            ),
+            render_device.load_shader_entry(
                 &fragment_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::FRAGMENT,
+                c"fragment",
             ),
         ];
 
@@ -415,8 +420,8 @@ impl Plugin for UiRenderPlugin {
 
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();
         let pipeline = UiPipeline {
-            vertex_shader: asset_server.load(aurora_asset("shaders/ui.vert")),
-            fragment_shader: asset_server.load(aurora_asset("shaders/ui.frag")),
+            vertex_shader: asset_server.load(aurora_asset("shaders/ui.slang")),
+            fragment_shader: asset_server.load(aurora_asset("shaders/ui.slang")),
         };
         let config = UiRenderConfig {
             pipeline: asset_server.add(pipeline),
@@ -1376,7 +1381,7 @@ fn compute_color_stops(
     resolved
 }
 
-/// Index the fragment shader switches on; must align with the `CS_*` constants in `ui.frag`.
+/// Index the fragment shader switches on; must align with the `CS_*` constants in `ui_color.slang`.
 fn color_space_index(space: InterpolationColorSpace) -> u32 {
     match space {
         InterpolationColorSpace::LinearRgba => 0,

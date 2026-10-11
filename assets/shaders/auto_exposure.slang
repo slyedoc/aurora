@@ -10,7 +10,7 @@
 // Fixed thread count for `ae_histogram`: 256 groups of 64, each thread striding the buffer.
 static const uint AE_HISTOGRAM_THREADS = 16384;
 
-// Must match AeGpu in src/auto_exposure.rs (and AeData in types.glsl).
+// Must match AeGpu in src/auto_exposure.rs (and AeData in rt_types.slang).
 struct AeState {
     float ev;              // Smoothed log2 exposure (the Auto look).
     float exposure;        // exp2(ev).

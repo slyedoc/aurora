@@ -1,7 +1,7 @@
-// The ray payload, shared by the Slang raygen and every hit / miss shader (GLSL ones too).
+// The ray payload, shared by the Slang raygen and every hit / miss shader.
 module hit_payload;
 
-// `HitPayload` in types.glsl, member for member: the payload is shared memory between stages.
+// `HitPayload`: the payload is shared memory between the raygen, miss and hit stages.
 public struct HitPayload {
     public float t;
     public float refract_index;

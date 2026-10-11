@@ -1,6 +1,6 @@
 //! Aurora's own guide-buffer visualizer -- stable, unlike the NGX dev snippet's.
 //!
-//! The composite (quad.frag) can sample any of the DLSS guide images instead of the
+//! The composite (quad.slang) can sample any of the DLSS guide images instead of the
 //! reconstructed output. Everything renders through aurora's exposure/tonemap control, so a
 //! static scene shows a static visualization; the snippet's overlay redraws everything it
 //! shows through a per-frame auto-exposure estimate over the noisy input, which flickers by
@@ -52,7 +52,7 @@ impl AuroraDebugView {
         Self::Luminance,
     ];
 
-    /// The value quad.frag switches on.
+    /// The value quad.slang switches on.
     pub fn shader_index(self) -> u32 {
         self as u32
     }

@@ -1,5 +1,5 @@
-// The closest-hit contract in Slang: what `surface_common.glsl` (+ the parts of `types.glsl` a
-// hit shader touches) gives the GLSL hit shaders. A Slang surface group's shader is
+// The closest-hit contract: what every hit shader shares (the triangle fetch, tangent frame,
+// ray-cone LOD, payload write). A surface group's shader is
 //
 //   import surface;
 //   [shader("closesthit")]
@@ -10,13 +10,13 @@
 //   }
 //
 // Everything read through a pointer is declared with scalars only, so its byte layout is the
-// GLSL side's `scalar` layout with no vector-alignment question.
+// `scalar` layout the Rust side writes, with no vector-alignment question.
 module surface;
 
 // `HitPayload` (shared with the raygen).
 __exported import hit_payload;
 
-// `Material` in types.glsl (104 bytes, scalar).
+// `RTXMaterial` (104 bytes, scalar).
 public struct Material {
     public float base_color_r, base_color_g, base_color_b, base_color_a;
     public float emissive_r, emissive_g, emissive_b, emissive_a;
@@ -38,7 +38,7 @@ public struct Material {
     public uint pad;
 };
 
-// `Triangle` in types.glsl / blas.rs (32 bytes).
+// `Triangle` in blas.rs (32 bytes).
 public struct Triangle {
     public uint tangent;
     public uint n0, n1, n2;
@@ -46,10 +46,12 @@ public struct Triangle {
     public float lod;
 };
 
-// `UniformData` is read for one field; its byte offset is pinned by a test in ray_render_plugin.rs.
+// `UniformData` fields a hit shader reads, as float indices; pinned by a test in
+// ray_render_plugin.rs.
 static const uint UNIFORM_LOD_BIAS_FLOAT = 94;
+static const uint UNIFORM_EMISSIVE_BOOST_FLOAT = 103;
 
-// `PushConstants` in types.glsl, up to the last field a hit shader reads.
+// `PushConstants` in rt_types.slang, up to the last field a hit shader reads.
 public struct PushConstants {
     public float* uniforms;
     public Material* materials;
@@ -90,6 +92,18 @@ public uint64_t surfaceData() {
 
 public float uniformLodBias() {
     return pc.uniforms[UNIFORM_LOD_BIAS_FLOAT];
+}
+
+public float uniformEmissiveBoost() {
+    return pc.uniforms[UNIFORM_EMISSIVE_BOOST_FLOAT];
+}
+
+public float4 materialBaseColor(Material m) {
+    return float4(m.base_color_r, m.base_color_g, m.base_color_b, m.base_color_a);
+}
+
+public float3 materialEmissive(Material m) {
+    return float3(m.emissive_r, m.emissive_g, m.emissive_b);
 }
 
 public float3 unpackNormal(uint packed) {
@@ -151,6 +165,11 @@ float2 signNotZero(float2 v) {
 float2 toOct(float3 v) {
     let p = v.xy * (1.0 / (abs(v.x) + abs(v.y) + abs(v.z)));
     return v.z <= 0.0 ? (1.0 - abs(p.yx)) * signNotZero(p) : p;
+}
+
+// Two unit normals, octahedral, as the payload carries them (surface, shading).
+public float4 packNormals(float3 surface, float3 world) {
+    return float4(toOct(surface), toOct(world));
 }
 
 // The triangle this ray hit, resolved into everything shading needs.
@@ -222,13 +241,18 @@ public float3 surfaceWorldNormal(SurfaceHit hit, float3 texture_normal) {
     return normalize(objectToWorldDir(object));
 }
 
+// The material's own normal map, or the geometric normal when it has none.
+public float3 surfaceShadingNormal(SurfaceHit hit) {
+    return surfaceWorldNormal(
+        hit, normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base)));
+}
+
 // Hit distance, normals, identity for the light-table MIS lookup, and last frame's position
-// for motion vectors (`surfaceWritePayload` in surface_common.glsl). Call it after writing
+// for motion vectors Call it after writing
 // colour, emission and roughness.
 public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3 world_normal) {
     payload.t = RayTCurrent();
-    payload.surface_and_world_normal =
-        float4(toOct(hit.face_normal), toOct(world_normal));
+    payload.surface_and_world_normal = packNormals(hit.face_normal, world_normal);
     payload.slot = InstanceIndex();
     payload.prim_tri = record.triangles[GeometryIndex()].v + PrimitiveIndex();
 

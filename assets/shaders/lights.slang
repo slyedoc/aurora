@@ -6,7 +6,7 @@
 // the CDF the raygen binary-searches, and stores the total in the header. Both run inside
 // the frame command buffer whenever the light set changed, after the instance gather.
 
-// One emissive instance (must match LightInstance in types.glsl / LightInstGpu in lights.rs).
+// One emissive instance (must match LightInstGpu in lights.rs).
 struct LightInst {
     float* verts;            // Vertex stream: 8 floats each, position at 0..2.
     uint* indices;
@@ -30,7 +30,7 @@ struct Instance {
     uint64_t blas;
 };
 
-// Must match LightsHeader in types.glsl / LightsHeaderGpu in lights.rs.
+// Must match LightsHeaderGpu in lights.rs.
 struct LightsHeader {
     uint entry_count;
     uint linst_count;
@@ -44,7 +44,7 @@ struct LightsHeader {
     uint64_t analytics;
 };
 
-// Must match AnalyticLight in types.glsl / AnalyticLightGpu in lights.rs. 80 bytes; the
+// Must match AnalyticLightGpu in lights.rs. 80 bytes; the
 // power kernel only reads the CPU-computed `power`.
 struct AnalyticLight {
     float3 position;

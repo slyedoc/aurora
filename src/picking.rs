@@ -2,11 +2,11 @@
 //!
 //! A [`RayCaster`] holds a world-space ray. Every frame its ray is traced inside that frame's
 //! command buffer, right after the TLAS rebuild, so it sees exactly the scene the frame draws:
-//! skinned meshes, terrain and spheres included. Each caster gets its nearest
+//! skinned meshes, landscapes and spheres included. Each caster gets its nearest
 //! [`MAX_HITS`] hits, nearest first, so a consumer can skip what it does not want (editor
 //! helpers, the thing being dragged) without GPU-side filters.
 //!
-//! When a ray is pending, the frame is submitted in two parts: transforms, skins, terrain,
+//! When a ray is pending, the frame is submitted in two parts: transforms, skins,
 //! TLAS and the pick go first under their own fence, the trace and present follow behind a
 //! semaphore. That first part is a millisecond of work, so by the next frame's [`First`] its
 //! fence has signaled even while the rest of the frame is still on the GPU, and the hits are
@@ -23,10 +23,8 @@ use crate::{
     assets::aurora_asset,
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
-    raytracing_pipeline::RTGroupHandle,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    sbt::SBT,
     tlas_builder::{GpuInstanceSlots, TLAS},
 };
 
@@ -67,9 +65,6 @@ pub struct RayHit {
     pub triangle: u32,
     /// Barycentrics of the hit within the triangle (vertices 1 and 2).
     pub barycentrics: Vec2,
-    /// On a terrain tile: the palette index of the splat layer that dominates at the hit,
-    /// weighted as the closest-hit blends it.
-    pub terrain_layer: Option<u32>,
 }
 
 /// The last traced hits of this entity's [`RayCaster`], nearest first; empty on a miss.
@@ -96,8 +91,7 @@ struct GpuHit {
     instance: u32,
     barycentrics: [f32; 2],
     primitive: u32,
-    /// Dominant terrain palette index, `u32::MAX` off terrain.
-    layer: u32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -106,10 +100,8 @@ struct PickParams {
     tlas: u64,
     rays: u64,
     hits: u64,
-    /// The SBT hit region's first record past its group handle; 0 before the SBT exists.
-    records: u64,
     count: u32,
-    record_stride: u32,
+    pad: u32,
 }
 
 /// The pick pass: this frame's rays, the buffers they trace from and into, and the early
@@ -190,7 +182,6 @@ impl Picker {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         tlas: &TLAS,
-        sbt: &SBT,
     ) {
         let count = self.staged.len() as u32;
         if count > self.capacity {
@@ -219,12 +210,8 @@ impl Picker {
                 tlas: tlas.acceleration_structure.address,
                 rays: self.rays.address,
                 hits: self.hits.address,
-                records: match sbt.hit_region.device_address {
-                    0 => 0,
-                    region => region + std::mem::size_of::<RTGroupHandle>() as u64,
-                },
                 count,
-                record_stride: sbt.hit_region.stride as u32,
+                pad: 0,
             },
             count,
             None,
@@ -336,7 +323,6 @@ fn read_hits(
                 normal: Vec3::from_array(hit.normal),
                 triangle: hit.primitive,
                 barycentrics: Vec2::from_array(hit.barycentrics),
-                terrain_layer: (hit.layer != u32::MAX).then_some(hit.layer),
             });
         }
     }

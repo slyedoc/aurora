@@ -24,7 +24,7 @@ use crate::{
 
 /// Must match SHARC_ENTRIES in raygen.slang.
 const SHARC_ENTRIES: u32 = 1 << 20;
-/// Must match SharcEntry in types.glsl / sharc.slang.
+/// Must match SharcEntry in sharc.slang.
 const ENTRY_BYTES: u64 = 32;
 
 #[repr(C)]

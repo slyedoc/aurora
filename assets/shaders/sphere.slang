@@ -1,0 +1,62 @@
+// The analytic sphere (sphere.rs): a unit-diameter sphere in object space, its intersection
+// and closest-hit shaders.
+import surface;
+
+struct SphereAttributes {
+    float3 point;
+};
+
+// Ray Tracing Gems ch. 7: both ray parameters of the hits, or (-1, -1).
+float2 gemsIntersections(float3 orig, float3 dir, float3 center, float radius) {
+    let f = orig - center;
+    let a = dot(dir, dir);
+    let bi = dot(-f, dir);
+    let c = dot(f, f) - radius * radius;
+    let s = f + (bi / a) * dir;
+    let discr = radius * radius - dot(s, s);
+    var t = float2(-1.0, -1.0);
+    if (discr >= 0.0) {
+        let q = bi + sign(bi) * sqrt(a * discr);
+        t = float2(c / q, q / a);
+    }
+    return t;
+}
+
+[shader("intersection")]
+void intersection() {
+    let orig = ObjectRayOrigin();
+    let dir = ObjectRayDirection();
+    let t = gemsIntersections(orig, dir, float3(0.0), 0.5);
+    SphereAttributes a;
+    a.point = orig + t.x * dir;
+    ReportHit(t.x, 0, a);
+    a.point = orig + t.y * dir;
+    ReportHit(t.y, 0, a);
+}
+
+[shader("closesthit")]
+void closesthit(inout HitPayload payload, SphereAttributes attribs) {
+    let material = pc.materials[InstanceID()];
+    var surface_normal = normalize(objectToWorldDir(normalize(attribs.point)));
+    let inside = dot(surface_normal, WorldRayDirection()) > 0.0;
+    if (inside) {
+        surface_normal = -surface_normal;
+    }
+
+    payload.t = RayTCurrent();
+    payload.absorption = float3(0.0);
+    payload.color = materialBaseColor(material);
+    payload.emission = materialEmissive(material) * uniformEmissiveBoost();
+    payload.refract_index = material.refract_index;
+    payload.surface_and_world_normal = packNormals(surface_normal, surface_normal);
+    payload.slot = 0xFFFFFFFFu;
+    payload.prim_tri = 0u;
+    payload.lobes = packLobes(material.diffuse_transmission, material.clearcoat,
+                              material.clearcoat_roughness);
+    payload.prev_world_pos = WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+    hitPayloadSetTransmission(payload, material.specular_transmission_factor);
+    hitPayloadSetRoughness(payload, material.roughness_factor);
+    hitPayloadSetMetallic(payload, material.metallic_factor);
+    hitPayloadSetInside(payload, inside);
+    hitPayloadSetMasked(payload, false);
+}

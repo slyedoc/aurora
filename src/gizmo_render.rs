@@ -17,7 +17,7 @@
 //!
 //! Lines are constant 1 px wide, never lit and never in the acceleration structure; line
 //! width and `perspective` are ignored. The swapchain pass has no depth attachment -- the
-//! scene is traced -- so `gizmo.frag` tests each line against the raygen's linear depth guide
+//! scene is traced -- so `gizmo.slang` tests each line against the raygen's linear depth guide
 //! instead, with `GizmoConfig::depth_bias` (and a retained `Gizmo`'s own) carried per vertex:
 //! -1 always in front, 0 the plain test, towards 1 pushed behind.
 
@@ -49,7 +49,7 @@ use crate::{
 /// wireframe reads as anything.
 pub const GIZMO_MAX_VERTICES: usize = 2 << 20;
 
-/// One line-list vertex as read by `gizmo.vert` through a buffer reference.
+/// One line-list vertex as read by `gizmo.slang` through a pointer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GizmoVertex {
@@ -63,7 +63,7 @@ pub struct GizmoVertex {
     pub width: f32,
 }
 
-/// Must match `gizmo.vert`'s `Registers`.
+/// Must match `GizmoPush` in gizmo.slang.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GizmoPushConstants {
@@ -190,10 +190,15 @@ impl VulkanAsset for GizmoPipeline {
         };
 
         let shader_stages = [
-            render_device.load_shader(&vertex_shader.spirv.unwrap(), vk::ShaderStageFlags::VERTEX),
-            render_device.load_shader(
+            render_device.load_shader_entry(
+                &vertex_shader.spirv.unwrap(),
+                vk::ShaderStageFlags::VERTEX,
+                c"vertex",
+            ),
+            render_device.load_shader_entry(
                 &fragment_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::FRAGMENT,
+                c"fragment",
             ),
         ];
 
@@ -646,8 +651,8 @@ impl Plugin for GizmoRenderPlugin {
 
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();
         let pipeline = GizmoPipeline {
-            vertex_shader: asset_server.load(aurora_asset("shaders/gizmo.vert")),
-            fragment_shader: asset_server.load(aurora_asset("shaders/gizmo.frag")),
+            vertex_shader: asset_server.load(aurora_asset("shaders/gizmo.slang")),
+            fragment_shader: asset_server.load(aurora_asset("shaders/gizmo.slang")),
         };
         let config = GizmoRenderConfig {
             pipeline: asset_server.add(pipeline),
@@ -676,7 +681,7 @@ mod tests {
     use super::*;
     use bytemuck::Zeroable as _;
 
-    /// The vertex is a tightly-packed 24 bytes -- `gizmo.vert` reads a scalar-layout
+    /// The vertex is a tightly-packed 24 bytes -- `gizmo.slang` reads a scalar-layout
     /// `GizmoVertex[]`, so any padding here would shear every vertex after the first.
     #[test]
     fn gizmo_vertex_matches_the_shader_layout() {
@@ -689,7 +694,7 @@ mod tests {
         assert_eq!(&vertex.width as *const f32 as usize - base, 20);
     }
 
-    /// Scalar-layout mirror of `gizmo.vert`'s `Registers`: mat4 at 0, the buffer reference
+    /// Scalar-layout mirror of gizmo.slang's `GizmoPush`: mat4 at 0, the buffer reference
     /// behind it, the extent, then the depth-guide flag. The shader's block is 84 bytes;
     /// the struct pads to 88 for its u64 alignment, which the trailing bytes cover.
     #[test]

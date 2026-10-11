@@ -16,7 +16,7 @@
 //! ```ignore
 //! let class = app.world_mut().resource_mut::<SurfaceGroupRegistry>().register(SurfaceGroup {
 //!     label: "water",
-//!     closest_hit: asset_server.load("shaders/water.rchit"),
+//!     closest_hit: asset_server.load("shaders/water.slang"),
 //!     any_hit: None,
 //! });
 //! ```
@@ -37,7 +37,7 @@ use crate::shader::Shader;
 pub struct SurfaceClass(pub u32);
 
 impl SurfaceClass {
-    /// The built-in opaque triangle group -- `closest_hit.rchit` plus the alpha-mask
+    /// The built-in opaque triangle group -- `closest_hit.slang` plus the alpha-mask
     /// any-hit. Every material that does not name a class shades with this.
     pub const OPAQUE: Self = Self(0);
 }
@@ -138,7 +138,7 @@ impl SurfaceGroupData {
     }
 }
 
-/// `layered.rchit`'s parameter row: a second PBR set blended over the base by the surface's
+/// `layered.slang`'s parameter row: a second PBR set blended over the base by the surface's
 /// slope, and a detail set multiplied over the result. Field order and types must match
 /// `struct Layered` in that shader, which the test below checks.
 ///
@@ -197,10 +197,10 @@ mod tests {
     /// moved on one side and not the other makes every field after it read its neighbour.
     #[test]
     fn layered_params_match_the_shader_field_for_field() {
-        let source = include_str!("../assets/shaders/layered.rchit");
+        let source = include_str!("../assets/shaders/layered.slang");
         let body = source
             .split_once("struct Layered {")
-            .expect("layered.rchit declares struct Layered")
+            .expect("layered.slang declares struct Layered")
             .1;
         let body = &body[..body.find('}').expect("struct Layered is closed")];
         // Comment lines carry prose that would match field names by accident.
@@ -210,8 +210,14 @@ mod tests {
             .filter(|l| !l.is_empty() && !l.starts_with("//"))
             .collect();
         let expected = [
-            ("vec4", "layer_color"),
-            ("vec4", "detail_color"),
+            ("float", "layer_color_r"),
+            ("float", "layer_color_g"),
+            ("float", "layer_color_b"),
+            ("float", "layer_color_a"),
+            ("float", "detail_color_r"),
+            ("float", "detail_color_g"),
+            ("float", "detail_color_b"),
+            ("float", "detail_color_a"),
             ("float", "layer_uv_scale"),
             ("float", "layer_normal_strength"),
             ("float", "layer_metallic"),

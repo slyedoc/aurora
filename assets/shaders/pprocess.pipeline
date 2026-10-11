@@ -1,5 +1,0 @@
-(
-    vertex_shader: "shaders/quad.vert",
-    fragment_shader: "shaders/quad.frag",
-)
-

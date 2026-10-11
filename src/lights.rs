@@ -46,7 +46,7 @@ use crate::{
 };
 
 /// One emissive instance on the GPU (must match `LightInst` in lights.slang and
-/// `LightInstance` in types.glsl). 64 bytes.
+/// `LightInstance` in lights.slang). 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightInstGpu {
@@ -63,7 +63,7 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in types.glsl / lights.slang. 56 bytes.
+/// Must match `LightsHeader` in lights.slang. 56 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -82,10 +82,10 @@ struct LightsHeaderGpu {
 }
 
 /// `slot_map` values with this bit are a sphere emitter's analytic entry rather than a light
-/// instance index (must match `LIGHT_SLOT_ANALYTIC` in types.glsl).
+/// instance index (must match `LIGHT_SLOT_ANALYTIC` in lights.slang).
 const SLOT_ANALYTIC: u32 = 0x8000_0000;
 
-/// One analytic light (point / spot / rect / sphere emitter). Must match `AnalyticLight` in types.glsl /
+/// One analytic light (point / spot / rect / sphere emitter). Must match `AnalyticLight` in
 /// lights.slang. 80 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]

@@ -208,7 +208,7 @@ impl Default for AutoExposureSettings {
     }
 }
 
-/// Must match `AeState` in auto_exposure.slang / `AeData` in types.glsl.
+/// Must match `AeState` in auto_exposure.slang / `AeData` in rt_types.slang.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AeGpu {

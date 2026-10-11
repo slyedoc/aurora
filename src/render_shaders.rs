@@ -13,18 +13,18 @@ impl Plugin for RenderShadersPlugin {
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();
 
         let filter = PostProcessFilter {
-            vertex_shader: asset_server.load(aurora_asset("shaders/quad.vert")),
-            fragment_shader: asset_server.load(aurora_asset("shaders/quad.frag")),
+            vertex_shader: asset_server.load(aurora_asset("shaders/quad.slang")),
+            fragment_shader: asset_server.load(aurora_asset("shaders/quad.slang")),
         };
 
         let rtx_pipeline = RaytracingPipeline {
             raygen_shader: asset_server.load(aurora_asset("shaders/raygen.slang")),
             miss_shader: asset_server.load(aurora_asset("shaders/miss.slang")),
-            hit_shader: asset_server.load(aurora_asset("shaders/closest_hit.rchit")),
-            any_hit_shader: asset_server.load(aurora_asset("shaders/any_hit.rahit")),
-            sphere_intersection_shader: asset_server
-                .load(aurora_asset("shaders/sphere_intersection.rint")),
-            sphere_hit_shader: asset_server.load(aurora_asset("shaders/sphere_hit.rchit")),
+            hit_shader: asset_server.load(aurora_asset("shaders/closest_hit.slang")),
+            any_hit_shader: asset_server.load(aurora_asset("shaders/any_hit.slang")),
+            // One module, two entry points (`intersection`, `closesthit`).
+            sphere_intersection_shader: asset_server.load(aurora_asset("shaders/sphere.slang")),
+            sphere_hit_shader: asset_server.load(aurora_asset("shaders/sphere.slang")),
         };
 
         let render_config = RenderConfig {

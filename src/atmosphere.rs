@@ -185,7 +185,7 @@ impl Default for CloudLayer {
     }
 }
 
-/// Must match `AtmosphereParams` in types.glsl and rt_types.slang (scalar layout: the 8-byte pointers first,
+/// Must match `AtmosphereParams` in rt_types.slang (scalar layout: the 8-byte pointers first,
 /// then 4-byte fields with no padding).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

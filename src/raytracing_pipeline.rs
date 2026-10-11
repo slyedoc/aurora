@@ -284,13 +284,15 @@ impl VulkanAsset for RaytracingPipeline {
                 &hit_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::CLOSEST_HIT_KHR,
             ),
-            render_device.load_shader(
+            render_device.load_shader_entry(
                 &sphere_intersection_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::INTERSECTION_KHR,
+                c"intersection",
             ),
-            render_device.load_shader(
+            render_device.load_shader_entry(
                 &sphere_hit_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                c"closesthit",
             ),
             render_device.load_shader(
                 &any_hit_shader.spirv.unwrap(),

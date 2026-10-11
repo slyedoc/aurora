@@ -120,7 +120,7 @@ pub struct AuroraMaterial {
     pub cull_mode: Option<Face>,
     /// Green channel of the normal map is inverted (DirectX-style maps). Wiring it means a
     /// flag in `RTXMaterial` and a sign flip in the hit shaders' normal decode -- a
-    /// coordinated change to the GPU record and `types.glsl`.
+    /// coordinated change to the GPU record (`RTXMaterial`) and `surface.slang`'s `Material`.
     pub flip_normal_map_y: bool,
     /// Emit `base_color` directly with no lighting.
     pub unlit: bool,

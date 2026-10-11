@@ -44,7 +44,7 @@ pub struct UniformData {
     aperture: f32,
     /// The environment this view is in: its camera rays start there (portals move them).
     environment: u32,
-    // Flat arrays, not `Mat4`: the GLSL side is `scalar` layout (4-byte aligned), and glam's
+    // Flat arrays, not `Mat4`: the Slang side reads it scalar (4-byte aligned), and glam's
     // 16-byte alignment would pad here.
     view: [f32; 16],
     view_proj: [f32; 16],
@@ -96,13 +96,6 @@ pub struct UniformData {
     /// Every environment's sky, suns and fog (sky.rs `EnvironmentGpu`, 8 entries by bit): a
     /// ray reads the entry of the environment it is in.
     environments: u64,
-    /// Terrain brush ring (terrain.rs `TerrainCursor`): world x/z, radius, emission; drawn
-    /// by the closest-hit shader on terrain records when `brush_active != 0`.
-    brush_center: [f32; 2],
-    brush_radius: f32,
-    brush_active: u32,
-    brush_color: [f32; 3],
-    pad_fog: u32,
     /// Fog volume table (src/fog_volume.rs): buffer address + entry count (0 = none).
     fog_volumes: u64,
     fog_volume_count: u32,
@@ -396,7 +389,6 @@ fn render_frame(
         Res<EnvironmentSkies>,
         Res<crate::sky_importance::SkyImportance>,
         crate::gizmo_render::GizmoDrawParams,
-        Res<crate::terrain::TerrainCursor>,
         Res<Atmosphere>,
         Res<CloudLayer>,
     ),
@@ -419,7 +411,6 @@ fn render_frame(
         Res<Time>,
         ResMut<crate::skinning::Skins>,
         Res<crate::portal::PortalTable>,
-        ResMut<crate::terrain::Terrains>,
         ResMut<AtmosphereState>,
         ResMut<crate::picking::Picker>,
         Res<crate::fog_volume::FogVolumeTable>,
@@ -477,7 +468,6 @@ fn render_frame(
         time,
         mut skins,
         portal_table,
-        mut terrains,
         mut atmo,
         mut picker,
         fog_volumes,
@@ -485,7 +475,7 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
-    let (settings, mut ui, skies, importance, mut gizmos, terrain_cursor, atmosphere, clouds) =
+    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds) =
         dev_ui_stuff;
     let settings = settings
         .map(|settings| settings.clone())
@@ -838,11 +828,6 @@ fn render_frame(
             environment_bits: skies.environment_bits as u32,
             pad: 0,
             environments: frame.environments.address,
-            brush_center: terrain_cursor.center.to_array(),
-            brush_radius: terrain_cursor.radius,
-            brush_active: terrain_cursor.active as u32,
-            brush_color: terrain_cursor.color.to_vec3().to_array(),
-            pad_fog: 0,
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
             time: time.elapsed_secs_wrapped(),
@@ -932,20 +917,17 @@ fn render_frame(
         let section = info_span!("record_skins").entered();
         let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
         drop(section);
-        let section = info_span!("record_terrains").entered();
-        let terrain_changed = terrains.record(&render_device, scene_cmd, &modules);
-        drop(section);
         let section = info_span!("record_tlas").entered();
         tlas.record(
             &render_device,
             scene_cmd,
             &modules,
             &transforms,
-            world_changed || skinned || terrain_changed,
+            world_changed || skinned,
         );
         if pick {
             let _submit = info_span!("submit_pick").entered();
-            picker.submit(&render_device, scene_cmd, &modules, &tlas, &sbt);
+            picker.submit(&render_device, scene_cmd, &modules, &tlas);
         }
         // The light table's weight/CDF kernels, whenever the light set changed (they read
         // the instance rows the gather above wrote).
@@ -1399,7 +1381,7 @@ fn render_frame(
                     .max_depth(1.0);
                     render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
                     // The composite is an OVERSIZED fullscreen triangle -- NDC
-                    // (-1,-1)(3,-1)(-1,3) in quad.vert -- so a viewport smaller than the window
+                    // (-1,-1)(3,-1)(-1,3) in quad.slang -- so a viewport smaller than the window
                     // is not enough on its own: the vertices past NDC map past the viewport rect
                     // and would paint over roughly twice it, straight across the editor's UI (or
                     // over the view composited before it). Clip to the rect; the UI pass below
@@ -1804,6 +1786,7 @@ mod tests {
     #[test]
     fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
         assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 94 * 4);
+        assert_eq!(core::mem::offset_of!(super::UniformData, emissive_boost), 103 * 4);
     }
 
     /// `rt_types.slang` mirrors `UniformData` with scalars only; its offsets are these.
@@ -1822,10 +1805,9 @@ mod tests {
         assert_eq!(offset_of!(U, primary_hidden), 420);
         assert_eq!(offset_of!(U, environment_bits), 424);
         assert_eq!(offset_of!(U, environments), 432);
-        assert_eq!(offset_of!(U, brush_color), 456);
-        assert_eq!(offset_of!(U, fog_volumes), 472);
-        assert_eq!(offset_of!(U, time), 484);
-        assert_eq!(offset_of!(U, fog_grid_prev), 488);
-        assert_eq!(offset_of!(U, fog_grid_cells), 504);
+        assert_eq!(offset_of!(U, fog_volumes), 440);
+        assert_eq!(offset_of!(U, time), 452);
+        assert_eq!(offset_of!(U, fog_grid_prev), 456);
+        assert_eq!(offset_of!(U, fog_grid_cells), 472);
     }
 }

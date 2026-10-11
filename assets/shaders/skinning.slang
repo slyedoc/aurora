@@ -9,7 +9,7 @@
 //                   instance's own world so the output is MESH-LOCAL -- the TLAS places the
 //                   instance with its ordinary transform-table row, exactly like a static mesh.
 //   pack_triangles  one thread per triangle: rebuilds the packed per-triangle shading record
-//                   (`Triangle` in blas.rs / types.glsl) from the deformed vertices, so the
+//                   (`Triangle` in blas.rs / surface.slang) from the deformed vertices, so the
 //                   closest-hit's normals and tangents follow the deformation.
 //
 // Joint worlds come from the `World` table (transform.slang): the frontier there expands every

@@ -4,7 +4,7 @@ use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 use crate::color_target::{DISPLAY_FORMAT, FormatPipelines, SCENE_RADIANCE_FORMAT};
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
-/// Must match `Registers` in quad.frag.
+/// Must match `QuadPush` in quad.slang.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostProcessPushConstants {
@@ -70,7 +70,7 @@ impl VulkanAsset for PostProcessFilter {
         let (vertex_shader, fragment_shader) = asset;
 
         // 8 sampled images: the DLSS output plus the guide buffers for the debug views
-        // (quad.frag's `test[8]`).
+        // (quad.slang's `test[8]`).
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .binding(0)
@@ -116,10 +116,15 @@ impl VulkanAsset for PostProcessFilter {
         };
 
         let shader_stages = [
-            render_device.load_shader(&vertex_shader.spirv.unwrap(), vk::ShaderStageFlags::VERTEX),
-            render_device.load_shader(
+            render_device.load_shader_entry(
+                &vertex_shader.spirv.unwrap(),
+                vk::ShaderStageFlags::VERTEX,
+                c"vertex",
+            ),
+            render_device.load_shader_entry(
                 &fragment_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::FRAGMENT,
+                c"fragment",
             ),
         ];
 

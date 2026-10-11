@@ -35,9 +35,9 @@ pipeline matching its target.
 
 | Pipeline | Built for | Notes |
 |---|---|---|
-| Composite (`quad.frag`) | `DISPLAY_FORMAT`, `SCENE_RADIANCE_FORMAT` | `scene_radiance` push constant picks the output |
-| Gizmos (`gizmo.frag`) | `DISPLAY_FORMAT` | overlays draw on display targets only |
-| UI (`ui.frag`) | `DISPLAY_FORMAT` | window and UI surfaces |
+| Composite (`quad.slang`) | `DISPLAY_FORMAT`, `SCENE_RADIANCE_FORMAT` | `scene_radiance` push constant picks the output |
+| Gizmos (`gizmo.slang`) | `DISPLAY_FORMAT` | overlays draw on display targets only |
+| UI (`ui.slang`) | `DISPLAY_FORMAT` | window and UI surfaces |
 
 ## Textures
 

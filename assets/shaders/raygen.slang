@@ -1118,7 +1118,7 @@ void main() {
         // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
         var guides_written = false;
-        // Ray cone for texture level of detail (closest_hit.rchit): width at the ray's origin
+        // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
         // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
         var cone_width = 0.0;

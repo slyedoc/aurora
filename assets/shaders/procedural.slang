@@ -2,8 +2,8 @@
 //
 // A ProceduralMesh's fill kernel (the app's own Slang, e.g. a planet's terrain function)
 // writes the `Vertex` stream; `pack_triangles` then derives the per-triangle shading records
-// the closest-hit reads (tangent + packed normals / uvs), exactly as skinning.slang and
-// terrain.slang do for their streams. Same `Vertex` / `Triangle` layouts as blas.rs.
+// the closest-hit reads (tangent + packed normals / uvs), exactly as skinning.slang does for
+// its streams. Same `Vertex` / `Triangle` layouts as blas.rs.
 
 // Every fill kernel's push-constant block starts with this header (blas.rs
 // `ProceduralHeader`): the engine fills it in, the app's own parameters follow.

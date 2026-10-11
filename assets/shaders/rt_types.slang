@@ -1,8 +1,8 @@
-// The raygen's view of the frame (types.glsl + common.glsl in Slang): the push-constant
+// The raygen's view of the frame: the push-constant
 // block and every buffer it points at.
 //
 // Everything read through a pointer is declared with scalars (or 16-byte-aligned vectors at
-// 16-byte offsets) only, so its byte layout is the GLSL side's `scalar` layout with no
+// 16-byte offsets) only, so its byte layout is the Rust side's `scalar` layout with no
 // vector-alignment question. Matrices are column-major float[16] (glam / GLSL order).
 module rt_types;
 
@@ -142,7 +142,7 @@ public uint environmentOf(uint mask, uint environment_bits) {
     return m == 0u ? 0u : firstbithigh(m);
 }
 
-// `UniformData` in types.glsl / ray_render_plugin.rs (offsets pinned by a test there).
+// `UniformData` in ray_render_plugin.rs (offsets pinned by a test there).
 public struct UniformData {
     public float inverse_view[16];
     public float inverse_projection[16];
@@ -201,12 +201,6 @@ public struct UniformData {
     public uint pad_environments;
     // Every environment's sky, suns and fog, by environment bit.
     public EnvironmentGpu* environments;
-    // Terrain brush ring (the closest-hit draws it); not read here.
-    public float brush_center_x, brush_center_y;
-    public float brush_radius;
-    public uint brush_active;
-    public float brush_color_r, brush_color_g, brush_color_b;
-    public uint pad_fog;
     // Fog volumes (src/fog_volume.rs): the table + entry count (0 = none).
     public FogVolumeGpu* fog_volumes;
     public uint fog_volume_count;
@@ -381,7 +375,7 @@ public struct AtmosphereParams {
     public float cloud_back_g;
 };
 
-// `PushConstants` in types.glsl.
+// `RaytracingPushConstants` in raytracing_pipeline.rs.
 public struct PushConstants {
     public UniformData* uniforms;
     public void* materials;

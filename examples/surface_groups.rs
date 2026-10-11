@@ -2,7 +2,7 @@
 //!
 //! The left sphere is the built-in opaque class. The right one is the same mesh and the
 //! same `AuroraMaterial`, but carries `SurfaceClass` for a registered LAYERED group, so its
-//! SBT record routes to `layered.rchit` instead -- which blends two PBR sets by the
+//! SBT record routes to `layered.slang` instead -- which blends two PBR sets by the
 //! surface's slope. Identical inputs, different shader: that is the whole mechanism.
 //!
 //!   AUTO_SCREENSHOT_MS=9000 cargo run --release --example surface_groups
@@ -53,7 +53,7 @@ fn register_layered(
 ) {
     let class = registry.register(SurfaceGroup {
         label: "layered".to_string(),
-        closest_hit: asset_server.load(aurora_asset("shaders/layered.rchit")),
+        closest_hit: asset_server.load(aurora_asset("shaders/layered.slang")),
         any_hit: None,
     });
 
@@ -142,7 +142,7 @@ fn setup(
     });
 
     // MESH spheres, not aurora's `Sphere` component: that one is a PROCEDURAL hit group
-    // with its own record at offset 0, so it always routes to `sphere_hit.rchit` and never
+    // with its own record at offset 0, so it always routes to sphere.slang's `closesthit` and never
     // sees a surface class. Class routing is a property of triangle records.
     let ball = meshes.add(AuroraMesh::from_shape(
         bevy::shape::Sphere::new(1.0).mesh().uv(48, 32),

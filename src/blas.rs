@@ -59,7 +59,7 @@ pub struct Triangle {
     pub normals: [u32; 3],
     pub uvs: [u32; 3],
     /// `0.5 * log2(uv area / object-space area)`: the triangle term of the ray-cone texture
-    /// level of detail (closest_hit.rchit). Also rounds the record to 32 bytes.
+    /// level of detail (surface.slang). Also rounds the record to 32 bytes.
     pub lod: f32,
 }
 

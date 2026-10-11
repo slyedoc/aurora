@@ -60,7 +60,6 @@ pub mod sky_importance;
 pub mod sphere;
 pub mod surface_group;
 pub mod swapchain;
-pub mod terrain;
 pub mod tlas_builder;
 pub mod transform;
 pub mod ui_panel;
@@ -175,7 +174,6 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::picking::PickingPlugin);
         group = group.add(crate::pointer_picking::PointerPickingPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
-        group = group.add(crate::terrain::TerrainPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
         group = group.add(crate::fog_grid::FogGridPlugin);

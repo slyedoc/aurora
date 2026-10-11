@@ -1,5 +1,6 @@
-use ash::vk;
-use std::{borrow::Cow, cell::RefCell, fs::read_to_string, rc::Rc};
+//! Shaders are Slang modules, compiled to SPIR-V by `slangc` when they load.
+
+use std::{borrow::Cow, fs::read_to_string};
 use thiserror::Error;
 
 use bevy::{asset::AssetLoader, prelude::*, tasks::ConditionalSendFuture};
@@ -9,35 +10,17 @@ use bevy::{asset::AssetLoader, prelude::*, tasks::ConditionalSendFuture};
 pub enum ShaderLoaderError {
     #[error("Could not load shader: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Could not parse shader: {0}")]
-    Parse(#[from] std::string::FromUtf8Error),
-    #[error("Could not compile shader: {0}")]
-    Compile(#[from] shaderc::Error),
     #[error("slangc failed for {path}:\n{stderr}")]
     Slang { path: String, stderr: String },
 }
 
-#[derive(TypePath)]
-pub struct ShaderLoader {
-    /// One compile at a time: shaders load on several IO threads at once, and concurrent
-    /// compiles through glslang corrupt each other's SPIR-V ("Operand cannot be a type").
-    compiler: std::sync::Mutex<shaderc::Compiler>,
-}
-
-impl Default for ShaderLoader {
-    fn default() -> Self {
-        Self {
-            compiler: std::sync::Mutex::new(shaderc::Compiler::new().unwrap()),
-        }
-    }
-}
+#[derive(TypePath, Default)]
+pub struct ShaderLoader;
 
 #[derive(Asset, TypePath, Debug, Clone)]
 pub struct Shader {
     pub path: String,
     pub spirv: Option<Cow<'static, [u8]>>,
-    #[dependency]
-    pub dependencies: Vec<Handle<Shader>>,
 }
 
 impl AssetLoader for ShaderLoader {
@@ -46,145 +29,112 @@ impl AssetLoader for ShaderLoader {
     type Error = ShaderLoaderError;
 
     fn extensions(&self) -> &[&str] {
-        &[
-            "vert", "frag", "comp", "rgen", "rint", "rchit", "rahit", "rmiss", "slang",
-        ]
+        &["slang"]
     }
 
     fn load(
         &self,
-        reader: &mut dyn bevy::asset::io::Reader,
+        _reader: &mut dyn bevy::asset::io::Reader,
         _settings: &Self::Settings,
         load_context: &mut bevy::asset::LoadContext,
     ) -> impl ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>> {
         Box::pin(async move {
-            let ext = load_context.path().get_extension().unwrap().to_string();
-            let ext = ext.as_str();
-            let path = load_context.path().to_string();
-            // On windows, the path will inconsistently use \ or /.
-            // TODO: remove this once AssetPath forces cross-platform "slash" consistency. See #10511
-            let path = path.replace(std::path::MAIN_SEPARATOR, "/");
-            let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes).await?;
-
-            if ext == "glsl" {
-                return Ok(Shader {
-                    path: load_context.path().path().to_str().unwrap().to_string(),
-                    spirv: None,
-                    dependencies: Vec::new(),
-                });
-            }
-
-            if ext == "slang" {
-                // slangc wants a real file (module `import`s resolve beside it): the
-                // engine's own dir for `aurora://`, the app's assets dir otherwise.
-                let source_path = match load_context.path().source() {
-                    bevy::asset::io::AssetSourceId::Name(name)
-                        if name.as_ref() == crate::assets::AURORA_ASSET_SOURCE =>
-                    {
-                        format!(
-                            "{}/{}",
-                            crate::assets::AURORA_ASSET_DIR,
-                            load_context.path().path().display()
-                        )
-                    }
-                    _ => bevy::asset::io::file::FileAssetReader::get_base_path()
-                        .join("assets")
-                        .join(load_context.path().path())
-                        .display()
-                        .to_string(),
-                };
-                let spirv = compile_slang(&source_path)?;
-                log::debug!("Loaded shader: {path} (slang)");
-                return Ok(Shader {
-                    path: load_context.path().path().to_str().unwrap().to_string(),
-                    spirv: Some(spirv.into()),
-                    dependencies: Vec::new(),
-                });
-            }
-
-            let kind = match ext {
-                "vert" => shaderc::ShaderKind::Vertex,
-                "frag" => shaderc::ShaderKind::Fragment,
-                "comp" => shaderc::ShaderKind::Compute,
-                "rgen" => shaderc::ShaderKind::RayGeneration,
-                "rint" => shaderc::ShaderKind::Intersection,
-                "rchit" => shaderc::ShaderKind::ClosestHit,
-                "rahit" => shaderc::ShaderKind::AnyHit,
-                "rmiss" => shaderc::ShaderKind::Miss,
-                _ => panic!("Unsupported shader extension: {}", ext),
-            };
-
-            let mut options = shaderc::CompileOptions::new().unwrap();
-            options.set_target_env(shaderc::TargetEnv::Vulkan, vk::make_api_version(0, 1, 3, 0));
-            options.set_target_spirv(shaderc::SpirvVersion::V1_6);
-            options.set_generate_debug_info();
-            options.set_optimization_level(shaderc::OptimizationLevel::Performance);
-
-            let load_context = Rc::new(RefCell::new(load_context));
-            let load_context_copy = load_context.clone();
-            let dependencies = Rc::new(RefCell::new(Vec::new()));
-            let dependencies_copy = dependencies.clone();
-
-            options.set_include_callback(move |fname, _type, _, _depth| {
-                // Includes live next to the engine's shaders, wherever the crate is checked out.
-                let full_path = format!("{}/shaders/{}", crate::assets::AURORA_ASSET_DIR, fname);
-                let Ok(contents) = read_to_string(&full_path) else {
-                    return Err(format!("Failed to read shader include: {full_path}"));
-                };
-
-                dependencies_copy.borrow_mut().push(
-                    load_context_copy
-                        .borrow_mut()
-                        .load::<Shader>(crate::assets::aurora_asset(&format!("shaders/{fname}"))),
-                );
-
-                Ok(shaderc::ResolvedInclude {
-                    resolved_name: fname.to_string(),
-                    content: contents,
-                })
-            });
-
-            let binary_result = self.compiler.lock().unwrap().compile_into_spirv(
-                std::str::from_utf8(&bytes).unwrap(),
-                kind,
-                path.as_str(),
-                "main",
-                Some(&options),
-            );
-
-            let Ok(binary) = binary_result else {
-                let e = binary_result.err().unwrap();
-                return Err(ShaderLoaderError::Compile(e));
-            };
-
-            let dependencies = dependencies.borrow().clone();
-
-            let shader = Shader {
-                path: load_context
-                    .borrow()
-                    .path()
-                    .path()
-                    .to_str()
-                    .unwrap()
+            // slangc wants a real file (module `import`s resolve beside it): the engine's own
+            // dir for `aurora://`, the app's assets dir otherwise.
+            let source_path = match load_context.path().source() {
+                bevy::asset::io::AssetSourceId::Name(name)
+                    if name.as_ref() == crate::assets::AURORA_ASSET_SOURCE =>
+                {
+                    format!(
+                        "{}/{}",
+                        crate::assets::AURORA_ASSET_DIR,
+                        load_context.path().path().display()
+                    )
+                }
+                _ => bevy::asset::io::file::FileAssetReader::get_base_path()
+                    .join("assets")
+                    .join(load_context.path().path())
+                    .display()
                     .to_string(),
-                spirv: Some(Vec::from(binary.as_binary_u8()).into()),
-                dependencies,
             };
-
-            log::debug!("Loaded shader: {:?}", shader.path);
-            Ok(shader)
+            let spirv = compile_slang(&source_path)?;
+            // Every module it imports, read through the loader: bevy then reloads this shader
+            // when any of them changes.
+            for import in slang_imports(std::path::Path::new(&source_path)) {
+                if let Some(asset) = slang_asset_path(&import) {
+                    let _ = load_context.read_asset_bytes(asset).await;
+                }
+            }
+            let path = load_context.path().path().to_string_lossy().replace('\\', "/");
+            log::debug!("Loaded shader: {path}");
+            Ok(Shader {
+                path,
+                spirv: Some(spirv.into()),
+            })
         })
     }
 }
 
+/// Where slangc looks for an `import`: beside the importer, then the engine's and the app's
+/// shader roots (the `-I` dirs [`compile_slang`] passes).
+fn slang_search_dirs(importer: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = importer.parent() {
+        dirs.push(dir.to_path_buf());
+    }
+    dirs.push(std::path::PathBuf::from(format!("{}/shaders", crate::assets::AURORA_ASSET_DIR)));
+    dirs.push(bevy::asset::io::file::FileAssetReader::get_base_path().join("assets/shaders"));
+    dirs
+}
+
+/// The files `source` imports, transitively (`import a.b;` is `a/b.slang`).
+fn slang_imports(source: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    let mut todo = vec![source.to_path_buf()];
+    while let Some(file) = todo.pop() {
+        let Ok(text) = read_to_string(&file) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim_start();
+            let line = line.strip_prefix("__exported ").unwrap_or(line);
+            let Some(module) = line.strip_prefix("import ").and_then(|m| m.split(';').next())
+            else {
+                continue;
+            };
+            let relative = format!("{}.slang", module.trim().replace('.', "/"));
+            let Some(path) = slang_search_dirs(&file)
+                .into_iter()
+                .map(|dir| dir.join(&relative))
+                .find(|path| path.exists())
+            else {
+                continue;
+            };
+            if path != source && !found.contains(&path) {
+                found.push(path.clone());
+                todo.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A shader file on disk as an asset path: `aurora://` under the engine's assets, the default
+/// source under the app's.
+fn slang_asset_path(file: &std::path::Path) -> Option<bevy::asset::AssetPath<'static>> {
+    let engine = std::path::Path::new(crate::assets::AURORA_ASSET_DIR);
+    if let Ok(rel) = file.strip_prefix(engine) {
+        return Some(crate::assets::aurora_asset(&rel.to_string_lossy()));
+    }
+    let app = bevy::asset::io::file::FileAssetReader::get_base_path().join("assets");
+    let rel = file.strip_prefix(&app).ok()?;
+    Some(bevy::asset::AssetPath::from(rel.to_path_buf()).into_owned())
+}
+
 /// Compiles a `.slang` module to SPIR-V with the Vulkan SDK's `slangc` (`$VULKAN_SDK/bin`, else
 /// `PATH`). Every `[shader("...")]` entry point in the file lands in the one module under its
-/// own name, so a kernel file with several entries is one asset and one compile.
-///
-/// Slang is the engine's shader language going forward; the GLSL stages above are the legacy
-/// path. Modules reference buffers through raw pointers in push constants
-/// (`SPV_KHR_physical_storage_buffer`), so they need no descriptor sets.
+/// own name, so a file with several entries is one asset and one compile. Modules reference
+/// buffers through raw pointers (`SPV_KHR_physical_storage_buffer`).
 pub fn compile_slang(source_path: &str) -> Result<Vec<u8>, ShaderLoaderError> {
     let slangc = std::env::var_os("VULKAN_SDK")
         .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"))
@@ -235,26 +185,5 @@ impl Plugin for ShaderPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<crate::shader::Shader>();
         app.init_asset_loader::<crate::shader::ShaderLoader>();
-
-        app.add_systems(Update, reload_modified);
-    }
-}
-
-fn reload_modified(
-    shaders: Res<Assets<Shader>>,
-    asset_server: Res<AssetServer>,
-    mut shader_events: MessageReader<AssetEvent<Shader>>,
-) {
-    for event in shader_events.read() {
-        match event {
-            AssetEvent::Modified { id } => {
-                for (parent_id, shader) in shaders.iter() {
-                    if shader.dependencies.iter().any(|dep| dep.id() == *id) {
-                        asset_server.reload(asset_server.get_path(parent_id).unwrap());
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 }

@@ -298,6 +298,17 @@ impl RenderDevice {
         spirv: &[u8],
         stage: vk::ShaderStageFlags,
     ) -> vk::PipelineShaderStageCreateInfo<'_> {
+        self.load_shader_entry(spirv, stage, c"main")
+    }
+
+    /// [`Self::load_shader`] for a module whose entry point for this stage is `entry` (a Slang
+    /// file holding several stages names each one).
+    pub fn load_shader_entry<'a>(
+        &self,
+        spirv: &[u8],
+        stage: vk::ShaderStageFlags,
+        entry: &'a std::ffi::CStr,
+    ) -> vk::PipelineShaderStageCreateInfo<'a> {
         let spirv: &[u32] =
             unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u32, spirv.len() / 4) };
         let shader_module = unsafe {
@@ -309,7 +320,7 @@ impl RenderDevice {
         vk::PipelineShaderStageCreateInfo::default()
             .stage(stage)
             .module(shader_module)
-            .name(std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap())
+            .name(entry)
     }
 
     /// Records `f` into a one-shot command buffer, submits it, and blocks until it finishes.

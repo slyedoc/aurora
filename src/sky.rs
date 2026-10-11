@@ -332,7 +332,7 @@ fn gather_skies(
     }
 }
 
-/// One sun in the GPU table (must match `EnvironmentSun` in types.glsl).
+/// One sun in the GPU table (must match `EnvironmentSun` in rt_types.slang).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct EnvironmentSunGpu {
@@ -342,7 +342,7 @@ pub struct EnvironmentSunGpu {
     pub radiance: [f32; 4],
 }
 
-/// One environment's entry in the GPU table (must match `EnvironmentGpu` in types.glsl and
+/// One environment's entry in the GPU table (must match `EnvironmentGpu` in
 /// rt_types.slang): everything a ray in it sees -- sky, suns, fog.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]

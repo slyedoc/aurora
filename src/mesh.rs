@@ -112,7 +112,7 @@ impl VulkanAsset for AuroraMesh {
     }
 }
 
-/// The three streams the shaders' `Vertex` (types.glsl) reads -- position, normal, uv --
+/// The three streams the shaders read -- position, normal, uv --
 /// interleaved as 8 floats per vertex, plus the indices and the skinning influences.
 fn pack_vertex_streams(flat: FlatMesh) -> (Vec<f32>, Vec<u32>, Option<Vec<SkinVertex>>) {
     let mut vertex_floats: Vec<f32> = Vec::with_capacity(flat.positions.len() * 8);
