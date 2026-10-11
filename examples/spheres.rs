@@ -8,7 +8,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
@@ -45,19 +45,22 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     // HDR environment sky (equirectangular), texel x scale = nits.
-    commands.entity(main_world.0).insert(Sky::Hdr {
+    commands.entity(environment).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: SKY_SCALE_NITS,
     });
 
     // camera
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -69,6 +72,7 @@ fn setup(
 
     // plane
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(100.0, 100.0),
         ))),
@@ -80,6 +84,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Transform::from_translation(Vec3::new(0.0, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -89,6 +94,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Transform::from_translation(Vec3::new(3.8, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -101,6 +107,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Transform::from_translation(Vec3::new(-3.8, 1.5, 0.0)).with_scale(Vec3::splat(3.0)),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -152,6 +159,7 @@ fn setup(
             }
 
             let mut entity_builder = commands.spawn((
+                ChildOf(environment),
                 Transform::from_translation(Vec3::new(xf, scale / 2.0, yf))
                     .with_scale(Vec3::splat(scale))
                     .with_rotation(Quat::from_rotation_y(rng.r#gen::<f32>() * 2.0 * PI)),

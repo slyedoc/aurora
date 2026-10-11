@@ -20,10 +20,7 @@
 //! `TransferToEnvironment`, anything else by re-parenting under the exit's world).
 
 use ash::vk;
-use avian3d::{
-    environment::{MainPhysicsEnvironmentEntity, TransferToEnvironment},
-    prelude::RigidBody,
-};
+use avian3d::{environment::TransferToEnvironment, prelude::RigidBody};
 use bevy::{math::Affine3A, prelude::*, transform::TransformSystems};
 use bytemuck::{Pod, Zeroable};
 
@@ -166,7 +163,6 @@ fn travel(
     meshes: Res<Assets<AuroraMesh>>,
     in_world: Query<&InEnvironment>,
     worlds: Res<RenderEnvironments>,
-    main_world: Option<Res<MainPhysicsEnvironmentEntity>>,
 ) {
     for (entity, mut traveler, mut transform, child_of, body) in &mut travelers {
         // This frame's pose, ahead of propagation: the teleport lands in the same frame.
@@ -200,15 +196,20 @@ fn travel(
             let Ok(target) = frames.get(portal.target) else {
                 continue;
             };
-            let moved = portal_map(portal_pose, target.affine()) * global;
-            // The exit's world: its render bit's owner, else the main world.
-            let world = in_world
+            // The exit's world: the owner of its render bit. An exit in no environment leads
+            // nowhere.
+            let Some(world) = in_world
                 .get(portal.target)
                 .ok()
                 .and_then(|w| worlds.environment(w.0))
-                .or(main_world.as_ref().map(|m| m.0));
-            let parent = world.and_then(|w| frames.get(w).ok());
-            let local = parent.map_or(moved, |p| p.affine().inverse() * moved);
+            else {
+                warn_once!("aurora: portal exit {} is in no environment", portal.target);
+                continue;
+            };
+            let moved = portal_map(portal_pose, target.affine()) * global;
+            let local = frames
+                .get(world)
+                .map_or(moved, |p| p.affine().inverse() * moved);
             let (scale, rotation, translation) = local.to_scale_rotation_translation();
             *transform = Transform {
                 translation,
@@ -216,14 +217,10 @@ fn travel(
                 scale,
             };
             traveler.last = Some(moved.translation.into());
-            match world {
-                Some(world) if body => commands.trigger(TransferToEnvironment { entity, world }),
-                Some(world) => {
-                    commands.entity(entity).insert(ChildOf(world));
-                }
-                None => {
-                    commands.entity(entity).remove::<ChildOf>();
-                }
+            if body {
+                commands.trigger(TransferToEnvironment { entity, world });
+            } else {
+                commands.entity(entity).insert(ChildOf(world));
             }
             break;
         }
@@ -263,9 +260,10 @@ mod tests {
         ))
         .init_resource::<Assets<AuroraMesh>>()
         .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
+        let home = app.world_mut().spawn(Environment(Some(0))).id();
         let desert = app.world_mut().spawn(Environment::default()).id();
-        // C faces +Z in the main world; D stands at the same spot in the desert, turned
-        // around, so walking into C carries straight on.
+        // C faces +Z at home; D stands at the same spot in the desert, turned around, so
+        // walking into C carries straight on.
         let d = app
             .world_mut()
             .spawn((
@@ -275,7 +273,11 @@ mod tests {
             .id();
         let c = app
             .world_mut()
-            .spawn((Transform::IDENTITY, AuroraPortal { target: d }))
+            .spawn((
+                ChildOf(home),
+                Transform::IDENTITY,
+                AuroraPortal { target: d },
+            ))
             .id();
         app.world_mut()
             .entity_mut(d)
@@ -283,6 +285,7 @@ mod tests {
         let walker = app
             .world_mut()
             .spawn((
+                ChildOf(home),
                 PortalTraveler::default(),
                 Transform::from_xyz(0.1, 0.0, 1.0),
             ))
@@ -321,13 +324,13 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<AuroraMesh>>()
             .add(AuroraMesh::from_shape(Rectangle::new(2.0, 3.0)));
+        let home = app.world_mut().spawn(Environment(Some(0))).id();
         let desert = app.world_mut().spawn(Environment::default()).id();
-        let gate = |app: &mut App, world: Option<Entity>, at: Transform| {
-            let mut root = app.world_mut().spawn((at, Visibility::default()));
-            if let Some(world) = world {
-                root.insert(ChildOf(world));
-            }
-            let root = root.id();
+        let gate = |app: &mut App, world: Entity, at: Transform| {
+            let root = app
+                .world_mut()
+                .spawn((at, Visibility::default(), ChildOf(world)))
+                .id();
             app.world_mut()
                 .spawn((
                     ChildOf(root),
@@ -336,10 +339,10 @@ mod tests {
                 ))
                 .id()
         };
-        let c = gate(&mut app, None, Transform::from_xyz(0.0, 0.0, -8.0));
+        let c = gate(&mut app, home, Transform::from_xyz(0.0, 0.0, -8.0));
         let d = gate(
             &mut app,
-            Some(desert),
+            desert,
             Transform::from_xyz(0.0, 0.0, -8.0).with_rotation(Quat::from_rotation_y(PI)),
         );
         app.world_mut()
@@ -351,6 +354,7 @@ mod tests {
         let walker = app
             .world_mut()
             .spawn((
+                ChildOf(home),
                 PortalTraveler::default(),
                 Transform::from_xyz(0.3, 1.7, -6.0),
             ))

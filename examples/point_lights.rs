@@ -12,7 +12,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
@@ -36,22 +36,25 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let mut window = windows.single_mut().unwrap();
     window.title = "aurora — point lights".into();
     window.resolution.set_scale_factor_override(Some(1.0));
     window.resolution.set(1600.0, 900.0);
 
     // Night: the lanterns carry the scene.
-    commands.entity(main_world.0).insert(Sky::Color {
+    commands.entity(environment).insert(Sky::Color {
         radiance: Vec3::new(2.0, 3.0, 6.0),
     });
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -67,6 +70,7 @@ fn setup(
         ..default()
     });
     commands.spawn((
+        ChildOf(environment),
         Name::new("floor"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(40.0, 40.0),
@@ -74,6 +78,7 @@ fn setup(
         AuroraMaterial3d(grey.clone()),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("back wall"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(40.0, 6.0, 0.2)))),
         AuroraMaterial3d(grey.clone()),
@@ -89,18 +94,21 @@ fn setup(
     for (i, radius) in [0.0f32, 0.1, 0.3, 0.6].into_iter().enumerate() {
         let x = i as f32 * 4.0 - 8.0;
         commands.spawn((
+            ChildOf(environment),
             Name::new(format!("pillar {i}")),
             AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.3, 3.0, 0.3)))),
             AuroraMaterial3d(grey.clone()),
             Transform::from_xyz(x, 1.5, -2.0),
         ));
         commands.spawn((
+            ChildOf(environment),
             Name::new(format!("core {i}")),
             Sphere,
             AuroraMaterial3d(core.clone()),
             Transform::from_xyz(x, 2.2, 0.0).with_scale(Vec3::splat(0.08)),
         ));
         commands.spawn((
+            ChildOf(environment),
             Name::new(format!("lantern light {i} (radius {radius})")),
             Transform::from_xyz(x, 2.2, 0.0),
             PointLight {
@@ -114,18 +122,21 @@ fn setup(
 
     // The same lantern from a scene file.
     commands.spawn((
+        ChildOf(environment),
         Name::new("bsn lantern"),
         Transform::IDENTITY,
         Visibility::Visible,
         ScenePatchInstance(asset_server.load(aurora_asset("scenes/point_lights.bsn"))),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("bsn pillar"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.3, 3.0, 0.3)))),
         AuroraMaterial3d(grey),
         Transform::from_xyz(6.0, 1.5, -2.0),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("bsn core"),
         Sphere,
         AuroraMaterial3d(core),

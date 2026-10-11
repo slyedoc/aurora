@@ -117,7 +117,9 @@ pub fn spawn_roots(
     // in turn by the levels further in. Built finest first.
     let rooted: HashMap<Entity, HashSet<IVec2>> = landscapes
         .iter()
-        .filter_map(|(entity, _, roots, _)| roots.map(|r| (entity, r.roots.keys().copied().collect())))
+        .filter_map(|(entity, _, roots, _)| {
+            roots.map(|r| (entity, r.roots.keys().copied().collect()))
+        })
         .collect();
     let mut levels: Vec<(Entity, Entity, u8)> = landscapes
         .iter()

@@ -20,7 +20,7 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     atmosphere::Atmosphere,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::{Fog, Sky},
@@ -108,11 +108,13 @@ fn grass_tuft(bend: f32) -> AuroraMesh {
 
 fn setup(
     mut commands: Commands,
-    main: Res<MainPhysicsEnvironmentEntity>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let mut material = |rgb: [u8; 3], roughness: f32| LandscapeMaterial {
         albedo: Some(swatch(&mut images, rgb)),
         tile_size: 4.0,
@@ -127,6 +129,7 @@ fn setup(
     ];
     let landscape = commands
         .spawn((
+            ChildOf(environment),
             Name::new("Infinite"),
             Landscape {
                 stream_radius: 3,
@@ -208,7 +211,7 @@ fn setup(
 
     // The atmosphere is the sky and the haze; the environment's own fog would fade the far
     // rings to nothing. An Earth-sized planet under the world, for a real horizon.
-    commands.entity(main.0).insert((
+    commands.entity(environment).insert((
         Sky::Atmosphere,
         Fog {
             density: 0.0,
@@ -222,6 +225,7 @@ fn setup(
     });
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             near: 0.1,
@@ -237,6 +241,7 @@ fn setup(
         Transform::from_xyz(0.0, 600.0, 0.0).looking_to(Vec3::new(1.0, -0.12, 1.0), Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         DirectionalLight {
             illuminance: 100_000.0,
             ..default()
@@ -259,4 +264,3 @@ fn place_camera(
     let local = camera.translation - at.translation();
     camera.translation.y = at.translation().y + pages.height_at(local.xz()) + 300.0;
 }
-

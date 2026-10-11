@@ -19,6 +19,7 @@ use bevy::{
     ui::Checked,
     ui_widgets::{Activate, SliderValue, ValueChange},
 };
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
@@ -87,12 +88,16 @@ fn setup(
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let mut window = windows.single_mut().unwrap();
     window.resolution.set_scale_factor_override(Some(1.0));
     window.resolution.set(1600.0, 900.0);
 
     // The sun (the sky draws its disc; it lights the scene).
     commands.spawn((
+        ChildOf(environment),
         Name::new("Sun"),
         DirectionalLight {
             illuminance: 20_000.0,
@@ -101,6 +106,7 @@ fn setup(
         Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 60.0 * std::f32::consts::PI / 180.0,
@@ -119,6 +125,7 @@ fn setup(
     .enumerate()
     {
         commands.spawn((
+            ChildOf(environment),
             Transform::from_xyz(i as f32 * 2.5 - 2.5, 1.0, 0.0),
             Sphere,
             AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -133,6 +140,7 @@ fn setup(
 
     // glowing sphere
     commands.spawn((
+        ChildOf(environment),
         Transform::from_xyz(0.0, 6.0, -2.0).with_scale(Vec3::splat(2.0)),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {

@@ -22,7 +22,7 @@ use bevy::{
 };
 use bevy_aurora::{
     AuroraDefaultPlugins,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Fog,
@@ -211,15 +211,18 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
-    main: Res<MainPhysicsEnvironmentEntity>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     // Fog pooled on the forest floor: thick below 85 m (the valley floors), a tenth as thick
     // 35 m higher.
-    commands.entity(main.0).insert(Fog {
+    commands.entity(environment).insert(Fog {
         density: 0.02,
         scatter: 0.75,
         height: 85.0,
         falloff: 15.0,
+        ..default()
     });
 
     let mut material = |rgb: [u8; 3], roughness: f32, clearcoat: f32| LandscapeMaterial {
@@ -237,6 +240,7 @@ fn setup(
     let half = Vec2::splat(600.0);
     let landscape = commands
         .spawn((
+            ChildOf(environment),
             Name::new("Jungle"),
             Landscape::covering(-half, half, 0.5),
             LandscapePalette(palette),
@@ -375,6 +379,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         LandscapeViewer,
@@ -382,6 +387,7 @@ fn setup(
     ));
     // Low and raking, so it comes through the canopy in shafts.
     commands.spawn((
+        ChildOf(environment),
         DirectionalLight {
             illuminance: 100_000.0,
             ..default()

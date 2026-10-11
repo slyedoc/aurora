@@ -15,9 +15,7 @@ use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     prelude::*,
 };
-use bevy_aurora::{
-    AuroraDefaultPlugins, environment::MainPhysicsEnvironmentEntity, sky::Fog, util::ScreenshotExt,
-};
+use bevy_aurora::{AuroraDefaultPlugins, environment::Environment, sky::Fog, util::ScreenshotExt};
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
 /// Six 1 km pages across each face (4 m texels).
@@ -50,13 +48,12 @@ fn swatch(images: &mut Assets<Image>, rgb: [u8; 3]) -> Handle<Image> {
     ))
 }
 
-fn setup(
-    mut commands: Commands,
-    mut images: ResMut<Assets<Image>>,
-    main: Res<MainPhysicsEnvironmentEntity>,
-) {
+fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     // Space is clear: the default haze (1 km mean free path) would swallow the view from orbit.
-    commands.entity(main.0).insert(Fog {
+    commands.entity(environment).insert(Fog {
         density: 0.0,
         ..default()
     });
@@ -74,6 +71,7 @@ fn setup(
     ]);
     let planet = commands
         .spawn((
+            ChildOf(environment),
             Name::new("Planet"),
             Transform::default(),
             Visibility::default(),
@@ -144,6 +142,7 @@ fn setup(
     }
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera {
             walk_speed: 200.0,
@@ -154,6 +153,7 @@ fn setup(
         Transform::from_xyz(2500.0, 3500.0, 6500.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         DirectionalLight {
             illuminance: 100_000.0,
             ..default()

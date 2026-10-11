@@ -179,7 +179,15 @@ pub fn update_field(
         centre_z: centre.y,
     };
     rd.run_transfer_commands(|cmd| {
-        record_dispatch(&rd, cmd, module, "field_update", &push, FIELD_N * FIELD_N, None);
+        record_dispatch(
+            &rd,
+            cmd,
+            module,
+            "field_update",
+            &push,
+            FIELD_N * FIELD_N,
+            None,
+        );
         compute_to_compute_barrier(&rd, cmd);
     });
 }

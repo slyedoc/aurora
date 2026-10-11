@@ -753,7 +753,13 @@ fn render_frame(
                 },
                 _ => (WHITE_TEXTURE_IDX, Vec4::ZERO),
             };
-            EnvironmentGpu::new(environment, tex, space, importance_address, importance.sun(bit))
+            EnvironmentGpu::new(
+                environment,
+                tex,
+                space,
+                importance_address,
+                importance.sun(bit),
+            )
         })
         .collect();
     render_device

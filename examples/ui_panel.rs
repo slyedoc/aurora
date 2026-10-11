@@ -33,7 +33,7 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     render_settings::RenderSettings,
@@ -88,18 +88,21 @@ struct DemoPanel;
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     // Dim overcast void: bright enough to see the scene, dim enough that the panel's glow
     // reads on the ground.
-    commands.entity(main_world.0).insert(Sky::Color {
+    commands.entity(environment).insert(Sky::Color {
         radiance: Vec3::splat(250.0),
     });
 
     // ---- the scene --------------------------------------------------------------------
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(30.0, 30.0),
         ))),
@@ -116,6 +119,7 @@ fn setup(
     // (window mouse, VR controller) operates. The surface stores straight-alpha sRGB with a
     // transparent background, so only lit UI pixels emit.
     commands.spawn((
+        ChildOf(environment),
         Name::new("panel"),
         DemoPanel,
         UiPanel3d {
@@ -133,6 +137,7 @@ fn setup(
     // A second panel: the renderer's dev tunables as a feathers inspector, built from the
     // reflected resource with no widget code at all (the XR wrist-panel posture).
     commands.spawn((
+        ChildOf(environment),
         Name::new("inspector panel"),
         InspectorPanel3d::resource::<RenderSettings>(),
         UiPanel3d {
@@ -147,6 +152,7 @@ fn setup(
 
     // A chrome sphere beside the panel: its reflection shows the UI too.
     commands.spawn((
+        ChildOf(environment),
         Transform::from_xyz(2.4, 0.8, -0.6).with_scale(Vec3::splat(1.6)),
         RtSphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -158,6 +164,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {

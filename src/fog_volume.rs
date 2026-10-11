@@ -121,7 +121,11 @@ fn upload_fog_volumes(
         let local = global.affine()
             * bevy::math::Affine3A::from_scale(volume.half_extents.max(Vec3::splat(1.0e-3)));
         let m = Mat4::from(local.inverse());
-        let rows = [m.row(0).to_array(), m.row(1).to_array(), m.row(2).to_array()];
+        let rows = [
+            m.row(0).to_array(),
+            m.row(1).to_array(),
+            m.row(2).to_array(),
+        ];
         entries.push(GpuFogVolume {
             rows,
             density: volume.density,

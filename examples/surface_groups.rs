@@ -10,6 +10,7 @@
 use ash::vk;
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::prelude::*;
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
@@ -100,13 +101,18 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     layered: Res<LayeredClass>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     commands.spawn((
+        ChildOf(environment),
         Name::new("camera"),
         Camera3d::default(),
         FreeCamera::default(),
         Transform::from_xyz(0.0, 2.4, 6.5).looking_at(Vec3::new(0.0, 0.9, 0.0), Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("key"),
         DirectionalLight {
             illuminance: 14_000.0,
@@ -121,6 +127,7 @@ fn setup(
         ..default()
     });
     commands.spawn((
+        ChildOf(environment),
         Name::new("ground"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(16.0, 0.2, 10.0)))),
         AuroraMaterial3d(ground),
@@ -141,12 +148,14 @@ fn setup(
         bevy::shape::Sphere::new(1.0).mesh().uv(48, 32),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("opaque class"),
         AuroraMesh3d(ball.clone()),
         AuroraMaterial3d(stone.clone()),
         Transform::from_xyz(-1.6, 1.0, 0.0),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("layered class"),
         AuroraMesh3d(ball),
         AuroraMaterial3d(stone),

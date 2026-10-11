@@ -14,6 +14,7 @@ use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     prelude::*,
 };
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     animclip::AnimationTargetsByName,
@@ -53,6 +54,9 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let mut graph = AnimationGraph::new();
     let clips: Vec<AnimationNodeIndex> = CLIPS
         .iter()
@@ -65,6 +69,7 @@ fn setup(
     // The player on the scene root; `AnimationTargetsByName` binds the bones once they spawn.
     // The sun (the sky draws its disc; it lights the scene).
     commands.spawn((
+        ChildOf(environment),
         Name::new("Sun"),
         DirectionalLight {
             illuminance: 20_000.0,
@@ -73,6 +78,7 @@ fn setup(
         Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("fox"),
         ScenePatchInstance(asset_server.load("fox/fox.bsn")),
         Transform::default(),
@@ -83,6 +89,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(40.0, 40.0),
         ))),
@@ -94,6 +101,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {

@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
@@ -32,20 +32,23 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut windows: Query<&mut Window>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let mut window = windows.single_mut().unwrap();
     window.title = "aurora — analytic lights".into();
 
     // A near-black night sky (nits), so the analytic lights carry the scene.
-    commands.entity(main_world.0).insert(Sky::Color {
+    commands.entity(environment).insert(Sky::Color {
         radiance: Vec3::splat(20.0),
     });
 
     commands.spawn((
+        ChildOf(environment),
         Name::new("camera"),
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -57,6 +60,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Name::new("floor"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(40.0, 40.0),
@@ -72,6 +76,7 @@ fn setup(
     for i in 0..5 {
         let x = (i as f32 - 2.0) * 2.5;
         commands.spawn((
+            ChildOf(environment),
             Name::new(format!("pillar {i}")),
             AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(0.8, 2.0, 0.8)))),
             Transform::from_xyz(x, 1.0, 0.0),
@@ -84,6 +89,7 @@ fn setup(
     }
 
     commands.spawn((
+        ChildOf(environment),
         Name::new("warm point"),
         Transform::from_xyz(-3.0, 4.0, 3.0),
         PointLight {
@@ -95,6 +101,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Name::new("green spot"),
         Transform::from_xyz(3.0, 6.0, 1.0).looking_at(Vec3::new(3.0, 0.0, -1.0), Vec3::Y),
         SpotLight {
@@ -109,6 +116,7 @@ fn setup(
 
     // Faces local -Z: angled down at the floor from behind the pillars.
     commands.spawn((
+        ChildOf(environment),
         Name::new("blue rect panel"),
         Transform::from_xyz(0.0, 3.5, -4.0).looking_at(Vec3::new(0.0, 0.0, 2.0), Vec3::Y),
         RectLight {

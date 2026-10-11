@@ -856,41 +856,41 @@ pub fn evaluate_pages(
                     }
                 }
                 if pages.mirrored {
-                memory_barrier(
-                    &rd,
-                    cmd,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_WRITE,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                );
-                let bytes = (PAGE_LEN * 4) as u64;
-                let regions: Vec<vk::BufferCopy> = heights
-                    .iter()
-                    .map(|&p| {
-                        let offset = pages.slot(p).unwrap() as u64 * bytes;
-                        vk::BufferCopy::default()
-                            .src_offset(offset)
-                            .dst_offset(offset)
-                            .size(bytes)
-                    })
-                    .collect();
-                unsafe {
-                    rd.device.cmd_copy_buffer(
+                    memory_barrier(
+                        &rd,
                         cmd,
-                        pages.buffer.handle,
-                        pages.mirror.handle,
-                        &regions,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_WRITE,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
                     );
-                }
-                memory_barrier(
-                    &rd,
-                    cmd,
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::PipelineStageFlags2::HOST,
-                    vk::AccessFlags2::HOST_READ,
-                );
+                    let bytes = (PAGE_LEN * 4) as u64;
+                    let regions: Vec<vk::BufferCopy> = heights
+                        .iter()
+                        .map(|&p| {
+                            let offset = pages.slot(p).unwrap() as u64 * bytes;
+                            vk::BufferCopy::default()
+                                .src_offset(offset)
+                                .dst_offset(offset)
+                                .size(bytes)
+                        })
+                        .collect();
+                    unsafe {
+                        rd.device.cmd_copy_buffer(
+                            cmd,
+                            pages.buffer.handle,
+                            pages.mirror.handle,
+                            &regions,
+                        );
+                    }
+                    memory_barrier(
+                        &rd,
+                        cmd,
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::HOST,
+                        vk::AccessFlags2::HOST_READ,
+                    );
                 }
             }
 

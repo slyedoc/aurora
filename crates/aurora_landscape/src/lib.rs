@@ -19,11 +19,11 @@ pub mod bake;
 pub mod collider;
 pub mod erosion;
 pub mod generator;
+pub mod interaction;
 pub mod layer;
 pub mod page;
 pub mod quadtree;
 pub mod ring;
-pub mod interaction;
 pub mod scatter;
 pub mod sculpt;
 pub mod shading;
@@ -41,12 +41,12 @@ use bevy_aurora::{
 pub use bake::{BakedPages, LandscapeBake, LandscapeLive};
 pub use erosion::ErosionLayer;
 pub use generator::GeneratorLayer;
+pub use interaction::{InteractionSettings, ScatterPusher};
 pub use layer::{
     HeightBlend, HeightLayer, HeightmapLayer, MaterialLayer, MaterialRuleLayer, PaintLayer,
     SculptLayer, SplatmapLayer,
 };
 pub use page::{LandscapePages, MaterialsEvaluated, PagesEvaluated};
-pub use interaction::{InteractionSettings, ScatterPusher};
 pub use ring::LandscapeRing;
 pub use scatter::ScatterSpecies;
 pub use sculpt::{BrushKind, LayerPages, PaintPages, SculptDab, SculptDabs, SculptPages};
@@ -57,9 +57,10 @@ pub use tiles::LandscapeTile;
 pub mod prelude {
     pub use crate::{
         BrushKind, ErosionLayer, GeneratorLayer, HeightBlend, HeightLayer, HeightmapLayer,
-        Landscape, LandscapeMaterial, LandscapePages, LandscapePalette, LandscapePlugin, LandscapeRing,
-        LandscapeViewer, MaterialLayer, MaterialRuleLayer, PaintLayer, PaintPages, ScatterPusher, ScatterSpecies,
-        SculptDab, SculptDabs, SculptLayer, SculptPages, SphereFace, SplatmapLayer,
+        Landscape, LandscapeMaterial, LandscapePages, LandscapePalette, LandscapePlugin,
+        LandscapeRing, LandscapeViewer, MaterialLayer, MaterialRuleLayer, PaintLayer, PaintPages,
+        ScatterPusher, ScatterSpecies, SculptDab, SculptDabs, SculptLayer, SculptPages, SphereFace,
+        SplatmapLayer,
     };
 }
 

@@ -18,7 +18,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
-    environment::{Environment, MainPhysicsEnvironmentEntity},
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     portal::{AuroraPortal, PortalTraveler},
@@ -39,17 +39,20 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
-    commands.entity(main_world.0).insert(Sky::Hdr {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
+    commands.entity(environment).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: SKY_SCALE_NITS,
     });
     // The plain's sun: high and white.
     commands.spawn((
+        ChildOf(environment),
         Name::new("Sun"),
         DirectionalLight {
             illuminance: 20_000.0,
@@ -59,6 +62,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         PortalTraveler::default(),
@@ -72,6 +76,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(200.0, 200.0),
         ))),
@@ -102,12 +107,14 @@ fn setup(
     for gx in [-8.0_f32, 8.0] {
         for px in [-1.1, 1.1] {
             commands.spawn((
+                ChildOf(environment),
                 AuroraMesh3d(frame_mesh.clone()),
                 AuroraMaterial3d(frame_mat.clone()),
                 Transform::from_xyz(gx + px, 1.7, 0.0),
             ));
         }
         commands.spawn((
+            ChildOf(environment),
             AuroraMesh3d(lintel_mesh.clone()),
             AuroraMaterial3d(frame_mat.clone()),
             Transform::from_xyz(gx, 3.5, 0.0),
@@ -115,6 +122,7 @@ fn setup(
         gates.push(
             commands
                 .spawn((
+                    ChildOf(environment),
                     AuroraMesh3d(quad.clone()),
                     AuroraMaterial3d(quad_mat.clone()),
                     Transform::from_xyz(gx, 1.7, 0.0),
@@ -129,10 +137,11 @@ fn setup(
         .entity(gates[1])
         .insert(AuroraPortal { target: gates[0] });
 
-    // Gate C (main world, z = -8, front +Z) opens into the desert world at the same spot:
+    // Gate C (home environment, z = -8, front +Z) opens into the desert world at the same spot:
     // gate D there faces -Z, so looking into C carries straight on into the other world.
     let desert = commands
         .spawn((
+            ChildOf(environment),
             Name::new("Desert"),
             Environment::default(),
             Sky::Hdr {
@@ -155,7 +164,7 @@ fn setup(
     ));
     let c = spawn_gate(
         &mut commands,
-        None,
+        environment,
         Transform::from_xyz(0.0, 0.0, -8.0),
         &frame_mesh,
         &lintel_mesh,
@@ -165,7 +174,7 @@ fn setup(
     );
     let d = spawn_gate(
         &mut commands,
-        Some(desert),
+        desert,
         Transform::from_xyz(0.0, 0.0, -8.0).with_rotation(Quat::from_rotation_y(PI)),
         &frame_mesh,
         &lintel_mesh,
@@ -229,6 +238,7 @@ fn setup(
         (1.5, 3.0, Color::srgb(0.95, 0.8, 0.1)),
     ] {
         commands.spawn((
+            ChildOf(environment),
             AuroraMesh3d(pillar.clone()),
             AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: color,
@@ -245,7 +255,7 @@ fn setup(
 #[allow(clippy::too_many_arguments)]
 fn spawn_gate(
     commands: &mut Commands,
-    world: Option<Entity>,
+    world: Entity,
     at: Transform,
     frame_mesh: &Handle<AuroraMesh>,
     lintel_mesh: &Handle<AuroraMesh>,
@@ -253,11 +263,9 @@ fn spawn_gate(
     quad: &Handle<AuroraMesh>,
     quad_mat: &Handle<AuroraMaterial>,
 ) -> Entity {
-    let mut root = commands.spawn((at, Visibility::default()));
-    if let Some(world) = world {
-        root.insert(ChildOf(world));
-    }
-    let root = root.id();
+    let root = commands
+        .spawn((at, Visibility::default(), ChildOf(world)))
+        .id();
     for px in [-1.1, 1.1] {
         commands.spawn((
             ChildOf(root),

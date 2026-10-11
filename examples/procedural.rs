@@ -8,6 +8,7 @@ use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     prelude::*,
 };
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
@@ -56,6 +57,9 @@ fn setup(
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let shader = asset_server.load(aurora_asset("shaders/procedural_demo.slang"));
     let module = asset_server.add(ComputeModule::new(shader, &["demo_fill"]));
     commands.insert_resource(DemoKernel(module));
@@ -63,6 +67,7 @@ fn setup(
     // Reference geometry through the ordinary mesh path.
     // The sun (the sky draws its disc; it lights the scene).
     commands.spawn((
+        ChildOf(environment),
         Name::new("Sun"),
         DirectionalLight {
             illuminance: 20_000.0,
@@ -71,6 +76,7 @@ fn setup(
         Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(3.0, 3.0, 3.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.85, 0.3, 0.2),
@@ -81,6 +87,7 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Transform::from_xyz(0.0, 16.0, 34.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
@@ -96,6 +103,7 @@ fn spawn_when_ready(
     modules: Res<ComputeModules>,
     mut procedural: ResMut<Assets<ProceduralMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
+    environment: Single<Entity, With<Environment>>,
 ) {
     if spawned.0 || !kernels.ready(&modules, &kernel.0) {
         return;
@@ -125,6 +133,7 @@ fn spawn_when_ready(
     });
     commands.spawn((
         Name::new("procedural waves"),
+        ChildOf(*environment),
         ProceduralMesh3d(mesh),
         AuroraMaterial3d(materials.add(AuroraMaterial {
             base_color: Color::srgb(0.35, 0.6, 0.3),

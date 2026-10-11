@@ -15,7 +15,7 @@ use bevy::{
 use bevy_aurora::{
     AuroraDefaultPlugins,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
@@ -73,6 +73,7 @@ fn quad(meshes: &mut Assets<AuroraMesh>, corners: [Vec3; 4], toward: Vec3) -> Ha
 /// A block from its top face (published order) down to the floor.
 fn block(
     commands: &mut Commands,
+    environment: Entity,
     meshes: &mut Assets<AuroraMesh>,
     material: &Handle<AuroraMaterial>,
     top: [Vec3; 4],
@@ -89,6 +90,7 @@ fn block(
     for face in faces {
         let face_centre = (face[0] + face[1] + face[2] + face[3]) * 0.25;
         commands.spawn((
+            ChildOf(environment),
             AuroraMesh3d(quad(meshes, face, away(face_centre))),
             AuroraMaterial3d(material.clone()),
         ));
@@ -97,17 +99,20 @@ fn block(
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
-    commands.entity(main_world.0).insert(Sky::Color {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
+    commands.entity(environment).insert(Sky::Color {
         radiance: Vec3::ZERO,
     });
 
     // The published camera: 278, 273, -800 looking down +z, 39.3 degrees for a square
     // image; a touch wider here for a landscape window.
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -190,6 +195,7 @@ fn setup(
     ];
     for (corners, material) in walls {
         commands.spawn((
+            ChildOf(environment),
             AuroraMesh3d(quad(&mut meshes, corners, room)),
             AuroraMaterial3d(material.clone()),
         ));
@@ -197,6 +203,7 @@ fn setup(
 
     // The light panel, a hair below the ceiling so the two never coincide.
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(quad(
             &mut meshes,
             [
@@ -213,6 +220,7 @@ fn setup(
     // Short block.
     block(
         &mut commands,
+        environment,
         &mut meshes,
         &white,
         [
@@ -225,6 +233,7 @@ fn setup(
     // Tall block.
     block(
         &mut commands,
+        environment,
         &mut meshes,
         &white,
         [

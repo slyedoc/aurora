@@ -1,7 +1,7 @@
 //! Each environment's sky and suns: what a ray that escapes the scene returns, and the directional
 //! light it is lit by.
 //!
-//! An environment (the main environment, or any other avian `PhysicsEnvironment`, src/environment.rs) carries its own
+//! An environment (an avian `PhysicsEnvironment` that renders, src/environment.rs) carries its own
 //! [`Sky`], and [`GradientSky`] for the gradient's colours; an environment without one gets the
 //! defaults. A ray evaluates the sky of the environment it is IN (portals swap that), so two
 //! portal-linked environments each have their own.
@@ -229,14 +229,15 @@ pub struct EnvironmentSkies {
     pub environments: [EnvironmentSky; 8],
     /// The one environment whose sky is the atmosphere, if any.
     pub atmosphere: Option<u8>,
-    /// Bits that are environments (the main bit always); the rest of a mask are render layers.
+    /// Bits that are live environments; the rest of a mask are render layers.
     pub environment_bits: u8,
 }
 
 impl EnvironmentSkies {
-    /// The environment a view of `mask` is in, ignoring its plain render layers.
+    /// The environment a view of `mask` is in, ignoring its plain render layers. A view in none
+    /// (it sees nothing anyway) reads entry 0.
     pub fn view_environment(&self, mask: u8) -> u8 {
-        crate::environment::view_environment(mask & (self.environment_bits | 1))
+        crate::environment::view_environment(mask & self.environment_bits)
     }
 
     /// The sky of the environment a view of `mask` is in.

@@ -423,7 +423,10 @@ mod tests {
             .discs()
             .map(|d| luma3(d.radiance) as f64 * std::f64::consts::TAU * (1.0 - d.cos_radius as f64))
             .sum();
-        assert!(((after + carried) / before - 1.0).abs() < 1.0e-3, "{after} + {carried} vs {before}");
+        assert!(
+            ((after + carried) / before - 1.0).abs() < 1.0e-3,
+            "{after} + {carried} vs {before}"
+        );
     }
 
     #[test]
@@ -440,7 +443,10 @@ mod tests {
         assert!(degrees(sun.core.cos_radius) < 0.8, "{sun:?}");
         let halo = sun.halo.expect("a halo");
         assert!((degrees(halo.cos_radius) - 3.0).abs() < 0.5, "{sun:?}");
-        assert!(luma3(halo.radiance) < 1.0e-2 * luma3(sun.core.radiance), "{sun:?}");
+        assert!(
+            luma3(halo.radiance) < 1.0e-2 * luma3(sun.core.radiance),
+            "{sun:?}"
+        );
         assert!(sun.clip <= SUN_HALO_OVER_SKY * 200.0);
     }
 

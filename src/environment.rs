@@ -2,9 +2,10 @@
 //!
 //! An entity belongs to the environment of its nearest [`PhysicsEnvironment`] ancestor (avian's rule), and
 //! renders with that environment's bit in the TLAS instance mask, so rays only see their own environment
-//! (portals swap a ray's mask). The mask is 8 bits, so at most 8 environments are live at once:
-//! [`MainPhysicsEnvironment`] and everything outside any environment is bit 0, other environments take the lowest
-//! free bit. An explicit `RenderLayers` on an entity overrides its environment's bit.
+//! (portals swap a ray's mask). The mask is 8 bits, so at most 8 environments are live at once, each
+//! taking the lowest free bit. There is no default environment: an entity outside every
+//! environment renders nowhere (warned once), and a camera outside one sees nothing. An explicit
+//! `RenderLayers` on an entity overrides its environment's bit.
 //!
 //! The same 8 bits carry plain render layers (a cull bit that is no environment, e.g. the
 //! player's own head, hidden from the first-person camera): claim one with
@@ -12,9 +13,7 @@
 //! is per entity; `Propagate(RenderLayers)` puts one on a whole subtree. A `RenderLayers`
 //! naming a bit nobody claimed panics -- a stray layer would otherwise read as an environment.
 
-pub use avian3d::environment::{
-    MainPhysicsEnvironment, MainPhysicsEnvironmentEntity, PhysicsEnvironment,
-};
+pub use avian3d::environment::PhysicsEnvironment;
 use bevy::{
     app::{HierarchyPropagatePlugin, PropagateSet},
     camera::visibility::RenderLayers,
@@ -23,8 +22,8 @@ use bevy::{
 };
 
 /// An environment that renders: its own sky, suns and exposure, apart from the others, and its
-/// own [`PhysicsEnvironment`]. The bit it renders in, `None` until one is free; spawn with
-/// `Some(0)` for the main environment, else leave it `None` and the lowest free bit is taken.
+/// own [`PhysicsEnvironment`]. The bit it renders in, `None` until one is free; leave it `None`
+/// and the lowest free bit is taken (ask for a bit only to pin one).
 ///
 /// The settings are ordinary components on the same entity ([`Sky`](crate::sky::Sky),
 /// [`GradientSky`](crate::sky::GradientSky), [`Atmosphere`](crate::atmosphere::Atmosphere),
@@ -73,11 +72,11 @@ impl RenderEnvironments {
             .map(|bit| bit as u8)
     }
 
-    /// Bits that are environments: the main one always, and every live one.
+    /// Bits that are live environments.
     pub fn environment_bits(&self) -> u8 {
-        (1..8u8)
+        (0..8u8)
             .filter(|&b| self.owners[b as usize].is_some())
-            .fold(1, |m, b| m | (1 << b))
+            .fold(0, |m, b| m | (1 << b))
     }
 
     /// Bits anything owns: environments and render layers.
@@ -106,46 +105,38 @@ impl RenderEnvironments {
 }
 
 /// The environment bit an entity renders in, from its nearest [`PhysicsEnvironment`] ancestor. Absent means
-/// the main environment (bit 0); set by [`propagate_environments`], not by hand. Not reflected: derived
-/// state, never saved into a scene.
+/// it is in no environment (or its environment has no bit yet) and renders nowhere; set by
+/// [`propagate_environments`], not by hand. Not reflected: derived state, never saved into a scene.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InEnvironment(pub u8);
 
 /// The 8-bit instance / ray mask of an entity: its explicit `RenderLayers` if it has them,
-/// else its environment's bit.
+/// else its environment's bit (none: 0, seen by nothing).
 pub fn environment_mask(layers: Option<&RenderLayers>, world: Option<&InEnvironment>) -> u8 {
     match layers {
         Some(_) => crate::tlas_builder::layers_mask(layers),
-        None => 1 << world.map_or(0, |w| w.0.min(7)),
+        None => world.map_or(0, |w| 1 << w.0.min(7)),
     }
 }
 
-/// The environment a view of `mask` belongs to: its highest bit, so a view of {main, environment} is that
-/// environment's (its sky, suns and exposure).
+/// The environment a view of `mask` belongs to: its highest bit (its sky, suns and exposure).
 pub fn view_environment(mask: u8) -> u8 {
     (7 - mask.leading_zeros().min(7)) as u8
 }
 
-/// The bit an environment asks for: `Some(0)` (or avian's main environment) is the main bit,
-/// anything else the lowest free one.
+/// The bit an environment asks for, else the lowest free one.
 fn claim(
     environments: &mut RenderEnvironments,
     environment: Entity,
     requested: Option<u8>,
-    main: bool,
 ) -> Option<u8> {
-    let want = if main {
-        Some(0)
-    } else {
-        requested.filter(|&b| b < 8)
-    };
-    let bit = match want {
+    let bit = match requested.filter(|&b| b < 8) {
         Some(bit) if environments.is_free(bit) => Some(bit),
         Some(bit) => {
             warn!("aurora: environment bit {bit} is taken; {environment} takes a free one");
-            (1..8).find(|&b| environments.is_free(b))
+            (0..8).find(|&b| environments.is_free(b))
         }
-        None => (1..8).find(|&b| environments.is_free(b)),
+        None => (0..8).find(|&b| environments.is_free(b)),
     }?;
     environments.owners[bit as usize] = Some(environment);
     Some(bit)
@@ -153,7 +144,6 @@ fn claim(
 
 fn assign_bit(
     add: On<Add<Environment>>,
-    main: Query<(), With<MainPhysicsEnvironment>>,
     mut ids: Query<&mut Environment>,
     mut environments: ResMut<RenderEnvironments>,
 ) {
@@ -161,12 +151,7 @@ fn assign_bit(
     let Ok(mut id) = ids.get_mut(environment) else {
         return;
     };
-    let bit = claim(
-        &mut environments,
-        environment,
-        id.0,
-        main.contains(environment),
-    );
+    let bit = claim(&mut environments, environment, id.0);
     if bit.is_none() {
         warn!("aurora: no environment bit free; {environment} waits for one");
     }
@@ -178,19 +163,13 @@ fn assign_bit(
 /// Environments still waiting for a bit take one as soon as another is freed.
 fn assign_waiting(
     mut waiting: Query<(Entity, &mut Environment)>,
-    main: Query<(), With<MainPhysicsEnvironment>>,
     mut environments: ResMut<RenderEnvironments>,
 ) {
     for (environment, mut id) in &mut waiting {
         if id.0.is_some() || environments.bit(environment).is_some() {
             continue;
         }
-        if let Some(bit) = claim(
-            &mut environments,
-            environment,
-            None,
-            main.contains(environment),
-        ) {
+        if let Some(bit) = claim(&mut environments, environment, None) {
             id.0 = Some(bit);
         }
     }
@@ -224,14 +203,14 @@ pub fn propagate_environments(
     if roots.is_empty() {
         return;
     }
-    let bit_of = |world: Entity| worlds.bit(world).unwrap_or(0);
+    let bit_of = |world: Entity| worlds.bit(world);
     let resolve = |mut entity: Entity| loop {
         if is_world.contains(entity) {
             return bit_of(entity);
         }
         match parents.get(entity) {
             Ok(parent) => entity = parent.parent(),
-            Err(_) => return 0,
+            Err(_) => return None,
         }
     };
 
@@ -254,13 +233,16 @@ pub fn propagate_environments(
             } else {
                 inherited
             };
-            // Never removed once set: a move back to the main environment writes 0, so the change
-            // reaches everything watching `Changed<InEnvironment>`.
-            match current.get(entity).ok().flatten() {
-                Some(had) if had.0 == bit => {}
-                None if bit == 0 => {}
-                _ => {
+            // Out of every environment: removed, and `RemovedComponents<InEnvironment>` tells
+            // the watchers.
+            match (current.get(entity).ok().flatten(), bit) {
+                (Some(had), Some(bit)) if had.0 == bit => {}
+                (None, None) => {}
+                (_, Some(bit)) => {
                     commands.entity(entity).try_insert(InEnvironment(bit));
+                }
+                (Some(_), None) => {
+                    commands.entity(entity).try_remove::<InEnvironment>();
                 }
             }
             if let Ok(kids) = children.get(entity) {
@@ -342,6 +324,38 @@ fn check_render_layers(
     }
 }
 
+/// Cameras, everything ray-traced (meshes, procedural meshes, spheres) and lights outside every
+/// environment render nowhere: said once, when they appear (an explicit `RenderLayers` places
+/// them itself).
+#[allow(clippy::type_complexity)]
+fn report_unhoused(
+    added: Query<
+        (Entity, Option<&Name>, Has<Camera3d>),
+        (
+            Or<(
+                Added<Camera3d>,
+                Added<crate::mesh::AuroraMesh3d>,
+                Added<crate::procedural_mesh::ProceduralMesh3d>,
+                Added<crate::sphere::Sphere>,
+                Added<DirectionalLight>,
+                Added<PointLight>,
+                Added<SpotLight>,
+            )>,
+            Without<InEnvironment>,
+            Without<RenderLayers>,
+        ),
+    >,
+) {
+    for (entity, name, camera) in &added {
+        let name = name.map_or("unnamed", |n| n.as_str());
+        if camera {
+            error!("aurora: camera {entity} ({name}) is in no environment: it sees nothing");
+        } else {
+            warn!("aurora: {entity} ({name}) is in no environment: it renders nowhere");
+        }
+    }
+}
+
 pub struct RenderEnvironmentPlugin;
 
 impl Plugin for RenderEnvironmentPlugin {
@@ -356,28 +370,15 @@ impl Plugin for RenderEnvironmentPlugin {
             .add_plugins(HierarchyPropagatePlugin::<RenderLayers>::new(PostUpdate))
             .add_systems(
                 PostUpdate,
-                (assign_waiting, propagate_environments, check_render_layers)
+                (
+                    assign_waiting,
+                    propagate_environments,
+                    check_render_layers,
+                    report_unhoused,
+                )
                     .chain()
                     .after(PropagateSet::<RenderLayers>::default()),
             );
-    }
-
-    /// Without avian's physics plugins nothing spawns the main environment, yet it is where the
-    /// main environment's sky lives: spawn it here (after every plugin has built, so avian's own
-    /// is seen first). Either way it renders.
-    fn finish(&self, app: &mut App) {
-        if !app
-            .world()
-            .contains_resource::<MainPhysicsEnvironmentEntity>()
-        {
-            let main = app.world_mut().spawn(MainPhysicsEnvironment).id();
-            app.insert_resource(MainPhysicsEnvironmentEntity(main));
-        }
-        // The main environment renders.
-        let main = app.world().resource::<MainPhysicsEnvironmentEntity>().0;
-        app.world_mut()
-            .entity_mut(main)
-            .insert(Environment(Some(0)));
     }
 }
 
@@ -388,13 +389,13 @@ mod tests {
     fn app() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, RenderEnvironmentPlugin));
-        app.world_mut()
-            .spawn((MainPhysicsEnvironment, Environment(Some(0))));
+        // A first environment holding bit 0, so the ones under test number from 1.
+        app.world_mut().spawn(Environment(Some(0)));
         app
     }
 
-    fn bit(app: &App, entity: Entity) -> u8 {
-        app.world().get::<InEnvironment>(entity).map_or(0, |w| w.0)
+    fn bit(app: &App, entity: Entity) -> Option<u8> {
+        app.world().get::<InEnvironment>(entity).map(|w| w.0)
     }
 
     #[test]
@@ -411,10 +412,10 @@ mod tests {
                 .bit(environment),
             Some(1)
         );
-        assert_eq!(bit(&app, environment), 1);
-        assert_eq!(bit(&app, child), 1);
-        assert_eq!(bit(&app, grandchild), 1);
-        assert_eq!(bit(&app, outside), 0);
+        assert_eq!(bit(&app, environment), Some(1));
+        assert_eq!(bit(&app, child), Some(1));
+        assert_eq!(bit(&app, grandchild), Some(1));
+        assert_eq!(bit(&app, outside), None);
     }
 
     #[test]
@@ -425,15 +426,15 @@ mod tests {
         let body = app.world_mut().spawn(ChildOf(a)).id();
         let part = app.world_mut().spawn(ChildOf(body)).id();
         app.update();
-        assert_eq!((bit(&app, body), bit(&app, part)), (1, 1));
+        assert_eq!((bit(&app, body), bit(&app, part)), (Some(1), Some(1)));
 
         app.world_mut().entity_mut(body).insert(ChildOf(b));
         app.update();
-        assert_eq!((bit(&app, body), bit(&app, part)), (2, 2));
+        assert_eq!((bit(&app, body), bit(&app, part)), (Some(2), Some(2)));
 
         app.world_mut().entity_mut(body).remove::<ChildOf>();
         app.update();
-        assert_eq!((bit(&app, body), bit(&app, part)), (0, 0));
+        assert_eq!((bit(&app, body), bit(&app, part)), (None, None));
     }
 
     #[test]
@@ -448,7 +449,7 @@ mod tests {
         app.update();
         let bits = app.world().resource::<RenderEnvironments>();
         assert_eq!((bits.bit(outer), bits.bit(physics)), (Some(1), None));
-        assert_eq!(bit(&app, body), 1);
+        assert_eq!(bit(&app, body), Some(1));
     }
 
     #[test]
@@ -507,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ninth_environment_renders_in_the_main_environment() {
+    fn a_ninth_environment_waits_and_renders_nowhere() {
         let mut app = app();
         let environments: Vec<Entity> = (0..8)
             .map(|_| app.world_mut().spawn(Environment::default()).id())
@@ -526,7 +527,8 @@ mod tests {
                 .bit(environments[7]),
             None
         );
-        assert_eq!(bit(&app, child), 0);
+        // Its environment has no bit yet: it renders nowhere until one is freed.
+        assert_eq!(bit(&app, child), None);
     }
 
     #[test]
@@ -544,7 +546,7 @@ mod tests {
         assert_eq!(id(&app, environments[7]), Some(Environment(Some(3))));
         let child = app.world_mut().spawn(ChildOf(environments[7])).id();
         app.update();
-        assert_eq!(bit(&app, child), 3);
+        assert_eq!(bit(&app, child), Some(3));
     }
 
     #[test]
@@ -566,6 +568,6 @@ mod tests {
             0b1000
         );
         assert_eq!(environment_mask(None, Some(&InEnvironment(2))), 0b100);
-        assert_eq!(environment_mask(None, None), 0b1);
+        assert_eq!(environment_mask(None, None), 0);
     }
 }

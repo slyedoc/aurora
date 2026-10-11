@@ -8,7 +8,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
@@ -34,23 +34,27 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     // HDR environment sky (equirectangular), texel x scale = nits.
-    commands.entity(main_world.0).insert(Sky::Hdr {
+    commands.entity(environment).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: SKY_SCALE_NITS,
     });
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         Transform::from_xyz(0.0, 2.0, 8.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
     ));
 
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(50.0, 50.0),
         ))),
@@ -63,6 +67,7 @@ fn setup(
 
     // The emissive sphere (procedural) and cube (mesh), side by side.
     commands.spawn((
+        ChildOf(environment),
         Transform::from_xyz(-1.5, 1.0, 0.0),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -71,6 +76,7 @@ fn setup(
         })),
     ));
     commands.spawn((
+        ChildOf(environment),
         Transform::from_xyz(1.5, 1.0, 0.0),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(1.0, 1.0, 1.0)))),
         AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -81,6 +87,7 @@ fn setup(
 
     // A plain diffuse reference sphere.
     commands.spawn((
+        ChildOf(environment),
         Transform::from_xyz(0.0, 1.0, -2.0),
         Sphere,
         AuroraMaterial3d(materials.add(AuroraMaterial {

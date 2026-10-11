@@ -10,6 +10,7 @@
 
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy::prelude::*;
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
@@ -33,7 +34,11 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     commands.spawn((
+        ChildOf(environment),
         Name::new("camera"),
         Camera3d::default(),
         FreeCamera::default(),
@@ -42,6 +47,7 @@ fn setup(
 
     // A key light, so the metal has something to reflect and the glass something to bend.
     commands.spawn((
+        ChildOf(environment),
         Name::new("key"),
         DirectionalLight {
             illuminance: 12_000.0,
@@ -58,6 +64,7 @@ fn setup(
         ..default()
     });
     commands.spawn((
+        ChildOf(environment),
         Name::new("ground"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::new(16.0, 0.2, 10.0)))),
         AuroraMaterial3d(ground),
@@ -66,6 +73,7 @@ fn setup(
 
     // The spheres and their materials come from the scene file.
     commands.spawn((
+        ChildOf(environment),
         Name::new("material matrix"),
         Transform::IDENTITY,
         Visibility::Visible,

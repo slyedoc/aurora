@@ -27,6 +27,7 @@ use bevy::{
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     material::{AuroraMaterial, AuroraMaterial3d},
@@ -312,9 +313,13 @@ fn setup(
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let half = Vec2::splat(TILE * 1.5);
     let landscape = commands
         .spawn((
+            ChildOf(environment),
             Name::new("Northshire"),
             Landscape::covering(-half, half, 0.5),
             Transform::from_xyz(0.0, -GROUND_H, 0.0),
@@ -479,12 +484,14 @@ fn setup(
     ));
 
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         LandscapeViewer,
         Transform::from_xyz(0.0, 340.0, 650.0).looking_at(Vec3::new(0.0, 0.0, 0.0), Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         DirectionalLight {
             illuminance: 100_000.0,
             ..default()

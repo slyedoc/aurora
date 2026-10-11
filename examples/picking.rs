@@ -6,6 +6,7 @@ use bevy::{
     prelude::*,
     window::PrimaryWindow,
 };
+use bevy_aurora::environment::Environment;
 use bevy_aurora::{
     AuroraDefaultPlugins,
     material::{AuroraMaterial, AuroraMaterial3d},
@@ -39,12 +40,16 @@ fn setup(
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
 ) {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
     let grey = materials.add(AuroraMaterial {
         base_color: Color::srgb(0.5, 0.5, 0.5),
         ..default()
     });
     // The sun (the sky draws its disc; it lights the scene).
     commands.spawn((
+        ChildOf(environment),
         Name::new("Sun"),
         DirectionalLight {
             illuminance: 20_000.0,
@@ -53,11 +58,13 @@ fn setup(
         Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Transform::from_xyz(0.0, 3.0, 6.0).looking_at(Vec3::new(0.0, 0.5, 0.0), Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("Ground"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(20.0, 20.0),
@@ -65,24 +72,28 @@ fn setup(
         AuroraMaterial3d(grey.clone()),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("Cube"),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(Cuboid::default()))),
         AuroraMaterial3d(grey.clone()),
         Transform::from_xyz(-1.5, 1.0, 0.0),
     ));
     commands.spawn((
+        ChildOf(environment),
         Name::new("Ball"),
         Sphere,
         AuroraMaterial3d(grey),
         Transform::from_xyz(1.5, 0.5, 0.0),
     ));
     commands.spawn((
+        ChildOf(environment),
         CursorRay,
         RayCaster::new(Ray3d::new(Vec3::ZERO, Dir3::NEG_Y)),
     ));
     // Straight down through the floating cube (top y = 1.5, bottom 0.5) onto the ground, and
     // onto the ball's top (y = 1).
     commands.spawn((
+        ChildOf(environment),
         Probe {
             expect: &[("Cube", 3.5), ("Cube", 4.5), ("Ground", 5.0)],
             done: false,
@@ -90,6 +101,7 @@ fn setup(
         RayCaster::new(Ray3d::new(Vec3::new(-1.5, 5.0, 0.0), Dir3::NEG_Y)),
     ));
     commands.spawn((
+        ChildOf(environment),
         Probe {
             expect: &[("Ball", 4.0), ("Ground", 5.0)],
             done: false,

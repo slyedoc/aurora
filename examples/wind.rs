@@ -16,7 +16,7 @@ use bevy_aurora::{
     AuroraDefaultPlugins,
     assets::aurora_asset,
     dev_ui::DevUIPlugin,
-    environment::MainPhysicsEnvironmentEntity,
+    environment::Environment,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     skinning::{Wind, WindSway},
@@ -141,22 +141,26 @@ fn field_mesh(seed: u32) -> Mesh {
 
 fn setup(
     mut commands: Commands,
-    main_world: Res<MainPhysicsEnvironmentEntity>,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    commands.entity(main_world.0).insert(Sky::Hdr {
+    let environment = commands
+        .spawn((Name::new("Environment"), Environment::default()))
+        .id();
+    commands.entity(environment).insert(Sky::Hdr {
         image: asset_server.load(aurora_asset("sky/symmetrical_garden_4k.hdr")),
         scale: 8000.0,
     });
     commands.spawn((
+        ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
         Transform::from_xyz(0.0, 2.2, 9.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
     ));
     commands.spawn((
+        ChildOf(environment),
         AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
             Plane3d::default().mesh().size(80.0, 80.0),
         ))),
@@ -183,6 +187,7 @@ fn setup(
     .enumerate()
     {
         let mut entity = commands.spawn((
+            ChildOf(environment),
             AuroraMesh3d(meshes.add(AuroraMesh::from_shape(field_mesh(i as u32)))),
             AuroraMaterial3d(grass.clone()),
             Transform::from_xyz(x, 0.0, z),
