@@ -22,6 +22,7 @@ pub mod generator;
 pub mod layer;
 pub mod page;
 pub mod quadtree;
+pub mod ring;
 pub mod interaction;
 pub mod scatter;
 pub mod sculpt;
@@ -46,6 +47,7 @@ pub use layer::{
 };
 pub use page::{LandscapePages, MaterialsEvaluated, PagesEvaluated};
 pub use interaction::{InteractionSettings, ScatterPusher};
+pub use ring::LandscapeRing;
 pub use scatter::ScatterSpecies;
 pub use sculpt::{BrushKind, LayerPages, PaintPages, SculptDab, SculptDabs, SculptPages};
 pub use shading::{LandscapeMaterial, LandscapePalette};
@@ -55,7 +57,7 @@ pub use tiles::LandscapeTile;
 pub mod prelude {
     pub use crate::{
         BrushKind, ErosionLayer, GeneratorLayer, HeightBlend, HeightLayer, HeightmapLayer,
-        Landscape, LandscapeMaterial, LandscapePages, LandscapePalette, LandscapePlugin,
+        Landscape, LandscapeMaterial, LandscapePages, LandscapePalette, LandscapePlugin, LandscapeRing,
         LandscapeViewer, MaterialLayer, MaterialRuleLayer, PaintLayer, PaintPages, ScatterPusher, ScatterSpecies,
         SculptDab, SculptDabs, SculptLayer, SculptPages, SphereFace, SplatmapLayer,
     };
@@ -87,6 +89,11 @@ pub struct Landscape {
     /// Streaming: when > 0, the pages are a window this many pages around the viewer that
     /// follows it (`pages_min` / `pages_max` are kept up to date), for infinite worlds.
     pub stream_radius: u32,
+    /// Streaming only: coarser levels around the window, each a ring of pages at twice the
+    /// texel size of the level inside it (`ring.rs`), so the ground reaches `2^lod_rings`
+    /// times further for `lod_rings` more windows of memory. Edits, colliders, scatter and
+    /// height queries stay on the finest level.
+    pub lod_rings: u8,
     /// One face of a planet: the pages lie on a cube face around the entity's translation
     /// (the planet's centre) and are pushed out onto the sphere. Flat when `None`.
     pub sphere: Option<SphereFace>,
@@ -145,6 +152,7 @@ impl Default for Landscape {
             split_factor: 3.0,
             colliders: true,
             stream_radius: 0,
+            lod_rings: 0,
             sphere: None,
         }
     }
@@ -195,28 +203,66 @@ impl Landscape {
     }
 }
 
-/// Streaming landscapes recentre their window on the viewer's page.
+/// Streaming landscapes recentre their window on the viewer's page. With LOD rings the window
+/// is aligned to whole pages of the first ring, and each ring's window follows the level inside
+/// it rather than the viewer, so the levels always fit together.
 fn follow_viewer(
     viewers: Query<&GlobalTransform, With<LandscapeViewer>>,
     cameras: Query<(&GlobalTransform, &Camera), With<Camera3d>>,
-    mut landscapes: Query<(&mut Landscape, &GlobalTransform)>,
+    mut landscapes: Query<(
+        Entity,
+        &mut Landscape,
+        &GlobalTransform,
+        Option<&mut ring::LandscapeRing>,
+    )>,
 ) {
     let Some(viewer) = tiles::viewer_position(&viewers, &cameras) else {
         return;
     };
-    for (mut landscape, transform) in &mut landscapes {
-        if landscape.stream_radius == 0 || landscape.sphere.is_some() {
+    let set = |landscape: &mut Mut<Landscape>, min: IVec2, count: i32| {
+        let max = min + IVec2::splat(count);
+        if landscape.pages_min != min || landscape.pages_max != max {
+            landscape.pages_min = min;
+            landscape.pages_max = max;
+        }
+    };
+    // The finest levels first, then each ring from the one inside it.
+    let mut windows: bevy::platform::collections::HashMap<(Entity, u8), IVec2> = default();
+    for (entity, mut landscape, transform, ring) in &mut landscapes {
+        if ring.is_some() || landscape.stream_radius == 0 || landscape.sphere.is_some() {
             continue;
         }
         let r = landscape.stream_radius as i32;
         let centre = ((viewer - transform.translation()).xz() / landscape.page_size())
             .floor()
             .as_ivec2();
-        let min = centre - IVec2::splat(r);
-        if landscape.pages_min != min || landscape.pages_max != min + IVec2::splat(2 * r + 1) {
-            landscape.pages_min = min;
-            landscape.pages_max = min + IVec2::splat(2 * r + 1);
+        if landscape.lod_rings == 0 {
+            set(&mut landscape, centre - IVec2::splat(r), 2 * r + 1);
+            continue;
         }
+        let (min, count) = ring::ringed_window(centre, landscape.stream_radius);
+        set(&mut landscape, min, count);
+        windows.insert((entity, 0), min);
+    }
+    let mut rings: Vec<(Entity, u8)> = landscapes
+        .iter()
+        .filter_map(|(entity, _, _, ring)| ring.map(|r| (entity, r.level)))
+        .collect();
+    rings.sort_by_key(|&(_, level)| level);
+    for (entity, level) in rings {
+        let Ok((_, mut landscape, _, Some(mut ring))) = landscapes.get_mut(entity) else {
+            continue;
+        };
+        let Some(&inner) = windows.get(&(ring.of, level - 1)) else {
+            continue;
+        };
+        let (min, hole) = ring::ring_window(inner, landscape.stream_radius);
+        let count = 2 * (landscape.stream_radius as i32 + 1);
+        set(&mut landscape, min, count);
+        if ring.hole != hole {
+            ring.hole = hole;
+        }
+        windows.insert((ring.of, level), min);
     }
 }
 
@@ -347,6 +393,7 @@ impl Plugin for LandscapePlugin {
                 (
                     // The stacks: sources, edits, evaluation.
                     (
+                        ring::sync_rings,
                         follow_viewer,
                         page::allocate_pages,
                         layer::upload_heightmaps,
@@ -354,6 +401,7 @@ impl Plugin for LandscapePlugin {
                         layer::upload_splatmaps,
                         layer::track_layers,
                         layer::track_materials,
+                        ring::track_ring_layers,
                         sculpt::load_page_files,
                         sculpt::apply_dabs,
                         bake::apply_bakes,

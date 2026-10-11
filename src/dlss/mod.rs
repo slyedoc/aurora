@@ -100,7 +100,7 @@ impl RrPreset {
 /// (there is no unfiltered path), so every mode is an NGX `PerfQuality` value: the render
 /// resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution. `Dlaa`
 /// is 1:1 (denoise + AA, no upscale). A camera spawned without one gets `$AURORA_DLSS`
-/// (or `Dlaa`); F3 cycles it.
+/// (or `Dlaa`); F5 cycles it.
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
@@ -316,12 +316,12 @@ fn dev_snippet_hotkeys(keyboard: Res<ButtonInput<KeyCode>>, mut state: ResMut<Dl
     }
 }
 
-/// F3 cycles the DLSS mode on every 3D camera (D is the free camera's strafe).
+/// F5 cycles the DLSS mode on every 3D camera (D is the free camera's strafe).
 fn cycle_mode(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut cameras: Query<&mut AuroraDlss, With<Camera3d>>,
 ) {
-    if keyboard.just_pressed(KeyCode::F3) {
+    if keyboard.just_pressed(KeyCode::F5) {
         for mut mode in &mut cameras {
             *mode = mode.next();
             log::info!("dlss: {}", *mode);

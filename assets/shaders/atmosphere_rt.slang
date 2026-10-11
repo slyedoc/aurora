@@ -1,5 +1,4 @@
-// Planetary atmosphere + cloud shell for the raygen (atmosphere.glsl in Slang; the miss
-// shader still includes the GLSL one, src/atmosphere.rs).
+// Planetary atmosphere + cloud shell for the raygen and the miss shader (src/atmosphere.rs).
 //
 // Atmosphere: Hillaire 2020, "A Scalable and Production Ready Sky and Atmosphere Rendering
 // Technique". Three LUTs (transmittance, multiple scattering, sky-view) are rebuilt every
@@ -282,6 +281,16 @@ public void atmoSkyView(float3 dir, out float3 L, out float3 T, out bool ground)
     let p = cameraPos() - planetCenter();
     let Rg = pc.atmo.planet_radius;
     let Rt = Rg + pc.atmo.atmosphere_height;
+    // Above the air the LUT's horizon (taken at its top) is wider than the planet's own
+    // silhouette: march the ray instead.
+    if (length(p) >= Rt - 1.0) {
+        ground = atmoNearest(p, dir, Rg) >= 0.0;
+        atmoIntegrate(p, dir, sunDirection(), 1.0e30, 32u, true, true, atmoSunIlluminance(), L, T);
+        if (ground) {
+            T = float3(0.0);
+        }
+        return;
+    }
     let r = clamp(length(p), Rg + 1.0, Rt - 1.0);
     let up = normalize(p);
     let vcz = dot(dir, up);
@@ -350,25 +359,34 @@ float cloudNoise3D(float* table, uint n, float3 p) {
     return lerp(lerp(c00, c10, f.y), lerp(c01, c11, f.y), f.z);
 }
 
-float cloudHash2(float2 p) {
-    let p3 = frac(float3(p.xyx) * 0.1031);
-    let h = dot(p3, p3.yzx + 33.33);
-    return frac((p3.x + p3.y) * h + p3.z * h);
+float cloudHash3(float3 p) {
+    var p3 = frac(p * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return frac((p3.x + p3.y) * p3.z);
 }
 
-float cloudValueNoise2(float2 p) {
+float cloudValueNoise3(float3 p) {
     let i = floor(p);
     let f = p - i;
     let u = f * f * (3.0 - 2.0 * f);
-    return lerp(lerp(cloudHash2(i), cloudHash2(i + float2(1.0, 0.0)), u.x),
-                lerp(cloudHash2(i + float2(0.0, 1.0)), cloudHash2(i + float2(1.0, 1.0)), u.x), u.y);
+    let a = lerp(lerp(cloudHash3(i), cloudHash3(i + float3(1.0, 0.0, 0.0)), u.x),
+                 lerp(cloudHash3(i + float3(0.0, 1.0, 0.0)), cloudHash3(i + float3(1.0, 1.0, 0.0)), u.x), u.y);
+    let b = lerp(lerp(cloudHash3(i + float3(0.0, 0.0, 1.0)), cloudHash3(i + float3(1.0, 0.0, 1.0)), u.x),
+                 lerp(cloudHash3(i + float3(0.0, 1.0, 1.0)), cloudHash3(i + float3(1.0, 1.0, 1.0)), u.x), u.y);
+    return lerp(a, b, u.z);
 }
 
-// The weather: coverage over the ground, 0..1 (three octaves of value noise).
-float cloudCoverageAt(float2 xz) {
-    let p = (xz + cloudWind().xz * 0.25) / max(pc.atmo.cloud_coverage_scale, 1.0);
-    let v = 0.55 * cloudValueNoise2(p) + 0.3 * cloudValueNoise2(p * 2.3 + 7.1)
-        + 0.15 * cloudValueNoise2(p * 5.1 + 3.7);
+// Weight of the isotropic high-order scattering lobe in the cloud march.
+static const float CLOUD_MS_WEIGHT = 2.0;
+
+// The weather: coverage over the ground, 0..1 (three octaves of value noise). Sampled at
+// the point under `x` (planet-relative) on the ground sphere, so it wraps a planet of any
+// size; under an Earth-sized one that is the world position near the ground.
+float cloudCoverageAt(float3 x) {
+    let ground = x * (pc.atmo.planet_radius / max(length(x), 1.0)) + planetCenter();
+    let p = (ground + cloudWind() * 0.25) / max(pc.atmo.cloud_coverage_scale, 1.0);
+    let v = 0.55 * cloudValueNoise3(p) + 0.3 * cloudValueNoise3(p * 2.3 + 7.1)
+        + 0.15 * cloudValueNoise3(p * 5.1 + 3.7);
     // The coverage setting slides a soft threshold through the weather field: 0 = clear,
     // 1 = overcast.
     let edge = 1.0 - pc.atmo.cloud_coverage;
@@ -384,7 +402,7 @@ float cloudHeightGradient(float hf) {
 float cloudDensity(float3 x, float hf, bool detail) {
     let a = pc.atmo;
     let w = x + planetCenter() + cloudWind();
-    let cov = cloudCoverageAt(w.xz);
+    let cov = cloudCoverageAt(x);
     if (cov <= 0.0) {
         return 0.0;
     }
@@ -498,14 +516,13 @@ void cloudMarch(float3 world_pos, float3 dir, float hit_dist, float dither,
     let far_end = min(t1, t0 + 6.0 * a.cloud_max_dist);
     let sun = sunDirection();
 
-    // Per-pixel lighting constants: the sun through the air at the shell, the sky above it.
+    // Per-pixel ambient: the sky straight up from where the ray enters the shell (marched
+    // from there, not looked up from the camera, which may be anywhere -- even in orbit).
     let x0 = p + dir * t0;
-    let r0 = length(x0);
-    let up0 = x0 / r0;
-    let sun_e = atmoSunIlluminance() * atmoTransmittance(r0, dot(up0, sun));
+    let up0 = normalize(x0);
+    let sun_top = atmoSunIlluminance();
     float3 sky_L, sky_T;
-    bool sky_ground;
-    atmoSkyView(up0, sky_L, sky_T, sky_ground);
+    atmoIntegrate(x0, up0, sun, 1.0e30, 8u, true, false, sun_top, sky_L, sky_T);
     let ambient = sky_L * a.cloud_ambient;
     let cos_theta = dot(dir, sun);
     let albedo = 0.95;
@@ -542,27 +559,36 @@ void cloudMarch(float3 world_pos, float3 dir, float hit_dist, float dither,
             continue;
         }
 
-        // Sun: a short march towards it (base shape only).
-        var tau = 0.0;
-        for (uint j = 0u; j < ln; j++) {
-            let xs = x + sun * ((float(j) + 0.5) * light_dt);
-            let hfs = cloudHeightFraction(xs);
-            if (hfs < 0.0 || hfs > 1.0) {
-                break;
-            }
-            tau += cloudDensity(xs, hfs, false) * light_dt;
-        }
-        tau *= a.cloud_extinction;
-        // Multi-octave scattering approximation (Frostbite): attenuated, wider octaves.
+        // The sun through the air to this sample; none past the terminator.
         var sun_l = 0.0;
-        float oa = 1.0, ob = 1.0, oc = 1.0;
-        for (uint k = 0u; k < 3u; k++) {
-            let ph = lerp(cloudHG(cos_theta, a.cloud_forward_g * oc),
-                          cloudHG(cos_theta, a.cloud_back_g * oc), 0.5);
-            sun_l += oa * exp(-tau * ob) * ph;
-            oa *= 0.5;
-            ob *= 0.5;
-            oc *= 0.5;
+        var sun_e = float3(0.0);
+        if (atmoNearest(x, sun, pc.atmo.planet_radius) < 0.0) {
+            let rx = length(x);
+            sun_e = sun_top * atmoTransmittance(rx, dot(x / rx, sun));
+            // A short march towards it (base shape only).
+            var tau = 0.0;
+            for (uint j = 0u; j < ln; j++) {
+                let xs = x + sun * ((float(j) + 0.5) * light_dt);
+                let hfs = cloudHeightFraction(xs);
+                if (hfs < 0.0 || hfs > 1.0) {
+                    break;
+                }
+                tau += cloudDensity(xs, hfs, false) * light_dt;
+            }
+            tau *= a.cloud_extinction;
+            // Multi-octave scattering approximation (Frostbite): attenuated, wider octaves.
+            float oa = 1.0, ob = 1.0, oc = 1.0;
+            for (uint k = 0u; k < 3u; k++) {
+                let ph = lerp(cloudHG(cos_theta, a.cloud_forward_g * oc),
+                              cloudHG(cos_theta, a.cloud_back_g * oc), 0.5);
+                sun_l += oa * exp(-tau * ob) * ph;
+                oa *= 0.5;
+                ob *= 0.5;
+                oc *= 0.5;
+            }
+            // The orders past those: isotropic and slow to fade with depth. Without them a
+            // thick deck reflects a tenth of what a real one does and reads grey in sunlight.
+            sun_l += CLOUD_MS_WEIGHT / (4.0 * ATM_PI) * exp(-tau * 0.125);
         }
         // Powder: the multiple-scatter brightening at cloud edges facing the sun.
         let powder = 1.0 - 0.5 * exp(-dens * a.cloud_extinction * 60.0);

@@ -32,7 +32,7 @@ use crate::{
     sky::{EnvironmentSkies, Sun},
 };
 
-// LUT and table sizes; must match atmosphere.glsl / atmosphere_rt.slang.
+// LUT and table sizes; must match atmosphere.slang / atmosphere_rt.slang.
 const T_W: u32 = 256;
 const T_H: u32 = 64;
 const MS_N: u32 = 32;

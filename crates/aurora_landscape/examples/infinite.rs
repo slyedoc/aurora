@@ -1,6 +1,8 @@
 //! An infinite landscape: a generator layer under a streaming window of pages that follows
-//! the camera. Rules paint rock on steep ground and snow up high, grass grows on the rest.
-//! Every page that slides into the window evaluates on the GPU; nothing is stored.
+//! the camera, with six LOD rings around it (each twice the texel size of the one inside),
+//! so the ground reaches some 30 km under the atmosphere's sky. Rules paint rock on steep
+//! ground and snow up high, grass grows on the rest. Every page that slides into a window
+//! evaluates on the GPU; nothing is stored.
 //!
 //! ```text
 //! cargo run -r -p aurora_landscape --example infinite
@@ -17,8 +19,11 @@ use bevy::{
 };
 use bevy_aurora::{
     AuroraDefaultPlugins,
+    atmosphere::Atmosphere,
+    environment::MainPhysicsEnvironmentEntity,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
+    sky::{Fog, Sky},
     util::ScreenshotExt,
 };
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
@@ -103,6 +108,7 @@ fn grass_tuft(bend: f32) -> AuroraMesh {
 
 fn setup(
     mut commands: Commands,
+    main: Res<MainPhysicsEnvironmentEntity>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<AuroraMaterial>>,
     mut meshes: ResMut<Assets<AuroraMesh>>,
@@ -123,7 +129,8 @@ fn setup(
         .spawn((
             Name::new("Infinite"),
             Landscape {
-                stream_radius: 6,
+                stream_radius: 3,
+                lod_rings: 6,
                 ..default()
             },
             LandscapePalette(palette),
@@ -199,14 +206,35 @@ fn setup(
         },
     ));
 
+    // The atmosphere is the sky and the haze; the environment's own fog would fade the far
+    // rings to nothing. An Earth-sized planet under the world, for a real horizon.
+    commands.entity(main.0).insert((
+        Sky::Atmosphere,
+        Fog {
+            density: 0.0,
+            ..default()
+        },
+    ));
+    commands.insert_resource(Atmosphere {
+        planet_center: Vec3::new(0.0, -6_371_000.0, 0.0),
+        planet_radius: 6_371_000.0,
+        ..default()
+    });
+
     commands.spawn((
         Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection {
+            near: 0.1,
+            far: 1.0e6,
+            ..default()
+        }),
         FreeCamera {
-            run_speed: 200.0,
+            run_speed: 600.0,
             ..default()
         },
         LandscapeViewer,
-        Transform::from_xyz(0.0, 260.0, 0.0).looking_at(Vec3::new(300.0, 120.0, 300.0), Vec3::Y),
+        // Looking out over the rings, toward the horizon.
+        Transform::from_xyz(0.0, 600.0, 0.0).looking_to(Vec3::new(1.0, -0.12, 1.0), Vec3::Y),
     ));
     commands.spawn((
         DirectionalLight {
@@ -217,11 +245,11 @@ fn setup(
     ));
 }
 
-/// Once, when the first pages are in: 40 m above the ground under the camera.
+/// Once, when the first pages are in: 300 m above the ground under the camera.
 fn place_camera(
     mut placed: Local<bool>,
     mut camera: Single<&mut Transform, With<LandscapeViewer>>,
-    landscape: Single<(&LandscapePages, &GlobalTransform)>,
+    landscape: Single<(&LandscapePages, &GlobalTransform), Without<LandscapeRing>>,
 ) {
     let (pages, at) = *landscape;
     if *placed || !pages.is_complete() {
@@ -229,5 +257,6 @@ fn place_camera(
     }
     *placed = true;
     let local = camera.translation - at.translation();
-    camera.translation.y = at.translation().y + pages.height_at(local.xz()) + 40.0;
+    camera.translation.y = at.translation().y + pages.height_at(local.xz()) + 300.0;
 }
+

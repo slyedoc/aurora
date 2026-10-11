@@ -112,6 +112,9 @@ pub struct LandscapePages {
     min: IVec2,
     count: IVec2,
     texel: f32,
+    /// Whether evaluated pages are copied to the CPU mirrors (an LOD ring's are never read
+    /// there, so it has none).
+    mirrored: bool,
     /// Pages waiting for evaluation (heights and then materials).
     pub(crate) dirty: HashSet<IVec2>,
     /// Pages whose materials alone wait.
@@ -377,9 +380,17 @@ impl LandscapePages {
 pub fn allocate_pages(
     mut commands: Commands,
     rd: Res<RenderDevice>,
-    mut landscapes: Query<(Entity, &Landscape, Option<&mut LandscapePages>), Changed<Landscape>>,
+    mut landscapes: Query<
+        (
+            Entity,
+            &Landscape,
+            Option<&mut LandscapePages>,
+            Has<crate::ring::LandscapeRing>,
+        ),
+        Changed<Landscape>,
+    >,
 ) {
-    for (entity, landscape, pages) in &mut landscapes {
+    for (entity, landscape, pages, ring) in &mut landscapes {
         let count = landscape.page_count();
         if let Some(mut pages) = pages {
             if pages.count == count && pages.texel == landscape.texel_size {
@@ -412,6 +423,8 @@ pub fn allocate_pages(
             continue;
         }
         let len = count.x as u64 * count.y as u64 * PAGE_LEN as u64;
+        let mirrored = !ring;
+        let mirror_len = if mirrored { len } else { 1 };
         let buffer: Buffer<f32> = rd.create_device_buffer(
             len,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -419,7 +432,7 @@ pub fn allocate_pages(
                 | vk::BufferUsageFlags::TRANSFER_DST,
         );
         let mut mirror: Buffer<f32> = rd.create_buffer(
-            len,
+            mirror_len,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             MemoryLocation::GpuToCpu,
         );
@@ -431,7 +444,7 @@ pub fn allocate_pages(
                 | vk::BufferUsageFlags::TRANSFER_DST,
         );
         let mut material_mirror: Buffer<[u32; 2]> = rd.create_buffer(
-            len,
+            mirror_len,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             MemoryLocation::GpuToCpu,
         );
@@ -446,6 +459,7 @@ pub fn allocate_pages(
             min: landscape.pages_min,
             count,
             texel: landscape.texel_size,
+            mirrored,
             dirty: HashSet::default(),
             dirty_materials: HashSet::default(),
             complete: false,
@@ -677,7 +691,9 @@ pub fn evaluate_pages(
         &mut LandscapePages,
         Option<&Children>,
         Option<&LandscapeBake>,
+        Option<&crate::ring::LandscapeRing>,
     )>,
+    parent_children: Query<&Children, Without<crate::ring::LandscapeRing>>,
     live: Res<LandscapeLive>,
     server: Res<AssetServer>,
     height_layers: HeightLayers,
@@ -694,12 +710,20 @@ pub fn evaluate_pages(
     ) else {
         return;
     };
-    for (entity, landscape, mut pages, children, bake) in &mut landscapes {
-        let children: Vec<Entity> = children.into_iter().flatten().copied().collect();
+    for (entity, landscape, mut pages, children, bake, ring) in &mut landscapes {
+        // A ring evaluates its parent's stacks, less the edits (texel-indexed at the finest
+        // level).
+        let children: Vec<Entity> = match ring {
+            Some(ring) => parent_children
+                .get(ring.of)
+                .map(|c| c.iter().collect())
+                .unwrap_or_default(),
+            None => children.into_iter().flatten().copied().collect(),
+        };
         let order: Vec<Entity> = children
             .iter()
             .copied()
-            .filter(|c| height_layers.contains(*c))
+            .filter(|c| height_layers.contains(*c) && !(ring.is_some() && sculpts.contains(*c)))
             .collect();
         if order != pages.order {
             pages.dirty_all();
@@ -708,7 +732,7 @@ pub fn evaluate_pages(
         let material_order: Vec<Entity> = children
             .iter()
             .copied()
-            .filter(|c| material_layers.contains(*c))
+            .filter(|c| material_layers.contains(*c) && !(ring.is_some() && paints.contains(*c)))
             .collect();
         if material_order != pages.material_order {
             pages.dirty_all_materials();
@@ -831,6 +855,7 @@ pub fn evaluate_pages(
                         );
                     }
                 }
+                if pages.mirrored {
                 memory_barrier(
                     &rd,
                     cmd,
@@ -866,6 +891,7 @@ pub fn evaluate_pages(
                     vk::PipelineStageFlags2::HOST,
                     vk::AccessFlags2::HOST_READ,
                 );
+                }
             }
 
             // Materials: rules read the heights just written.
@@ -916,6 +942,9 @@ pub fn evaluate_pages(
                         None,
                     );
                 }
+            }
+            if !pages.mirrored {
+                return;
             }
             memory_barrier(
                 &rd,

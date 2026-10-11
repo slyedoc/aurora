@@ -4,7 +4,11 @@
 //! neighbour are stitched. A tile whose pages re-evaluate refills in place: the old mesh
 //! stays until the new one is built.
 
-use bevy::{ecs::lifecycle::Remove, platform::collections::HashMap, prelude::*};
+use bevy::{
+    ecs::lifecycle::Remove,
+    platform::collections::{HashMap, HashSet},
+    prelude::*,
+};
 use bevy_aurora::{
     compute::ComputeModules,
     material::AuroraMaterial3d,
@@ -56,6 +60,10 @@ pub struct TileParams {
     face: u32,
     radius: f32,
     origin_y: f32,
+    /// Edges (-z, +z, -x, +x as bits 0..3) whose skirt drops `skirt_depth`: the ones on a
+    /// boundary between LOD levels, where neighbouring tiles sample different pools.
+    skirt_edges: u32,
+    pad: u32,
 }
 
 #[derive(Component, Clone, Debug)]
@@ -66,6 +74,8 @@ pub struct LandscapeTile {
     pub cell: IVec2,
     /// Per edge (-z, +z, -x, +x): the coarser neighbour's step in this tile's vertex steps.
     pub edge_steps: [u8; 4],
+    /// Edges with a skirt (see `TileParams::skirt_edges`).
+    pub skirt_edges: u8,
     /// Landscape-local xz.
     pub rect: Rect,
     params: TileParams,
@@ -95,12 +105,59 @@ pub(crate) fn viewer_position(
 /// roots leave with their page (a streaming window slid) or all at once (a new pool).
 pub fn spawn_roots(
     mut commands: Commands,
-    mut landscapes: Query<(Entity, &LandscapePages, Option<&mut LandscapeRoots>)>,
+    mut landscapes: Query<(
+        Entity,
+        &LandscapePages,
+        Option<&mut LandscapeRoots>,
+        Option<&crate::ring::LandscapeRing>,
+    )>,
 ) {
-    for (entity, pages, roots) in &mut landscapes {
+    // A ring's page inside its hole gives way only once the ground is up under all four of its
+    // pages at the level inside: rooted there, or (where that level has its own hole) covered
+    // in turn by the levels further in. Built finest first.
+    let rooted: HashMap<Entity, HashSet<IVec2>> = landscapes
+        .iter()
+        .filter_map(|(entity, _, roots, _)| roots.map(|r| (entity, r.roots.keys().copied().collect())))
+        .collect();
+    let mut levels: Vec<(Entity, Entity, u8)> = landscapes
+        .iter()
+        .map(|(entity, _, _, ring)| match ring {
+            Some(ring) => (entity, ring.of, ring.level),
+            None => (entity, entity, 0),
+        })
+        .collect();
+    levels.sort_by_key(|&(_, _, level)| level);
+    let mut ground: HashMap<(Entity, u8), HashSet<IVec2>> = HashMap::default();
+    for (entity, parent, level) in levels {
+        let mut pages = rooted.get(&entity).cloned().unwrap_or_default();
+        if level > 0
+            && let Some(inner) = ground.get(&(parent, level - 1))
+        {
+            let quads: HashSet<IVec2> = inner
+                .iter()
+                .map(|c| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)))
+                .collect();
+            pages.extend(quads.into_iter().filter(|q| {
+                [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
+                    .iter()
+                    .all(|d| inner.contains(&(*q * 2 + *d)))
+            }));
+        }
+        ground.insert((parent, level), pages);
+    }
+    for (entity, pages, roots, ring) in &mut landscapes {
         if !pages.is_complete() {
             continue;
         }
+        let inner = ring.and_then(|ring| Some((*ring, ground.get(&(ring.of, ring.level - 1))?)));
+        let covered = |page: IVec2| {
+            inner.is_some_and(|(ring, inner)| {
+                ring.in_hole(page)
+                    && [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
+                        .iter()
+                        .all(|d| inner.contains(&(page * 2 + *d)))
+            })
+        };
         let pool = pages.pool().heights;
         let Some(mut roots) = roots else {
             commands.entity(entity).insert(LandscapeRoots {
@@ -120,11 +177,15 @@ pub fn spawn_roots(
             .roots
             .keys()
             .copied()
-            .filter(|p| !pages.in_window(*p))
+            .filter(|p| !pages.in_window(*p) || covered(*p))
             .collect();
         let missing: Vec<IVec2> = pages
             .window()
-            .filter(|p| !roots.roots.contains_key(p) && !pages.dirty.contains(p))
+            .filter(|p| {
+                // Inside the hole too while the level inside has no roots there: the coarse
+                // ground stands in until the finer one is up.
+                !roots.roots.contains_key(p) && !pages.dirty.contains(p) && !covered(*p)
+            })
             .collect();
         if gone.is_empty() && missing.is_empty() {
             continue;
@@ -186,6 +247,7 @@ pub fn update_quadtrees(
     viewers: Query<&GlobalTransform, With<LandscapeViewer>>,
     cameras: Query<(&GlobalTransform, &Camera), With<Camera3d>>,
     landscapes: Query<(&Landscape, &LandscapePages, &GlobalTransform)>,
+    rings: Query<&crate::ring::LandscapeRing>,
     mut roots: Query<(&LandscapeRoot, &mut QuadTree)>,
     prepared: Res<VulkanAssets<ProceduralMesh>>,
     meshes: Query<&ProceduralMesh3d>,
@@ -199,8 +261,15 @@ pub fn update_quadtrees(
         };
         let mut local = viewer - transform.translation();
         if landscape.sphere.is_none() {
-            // Height above the ground, not above y = 0.
-            local.y = (local.y - pages.height_at(local.xz())).max(0.0);
+            // Height above the ground, not above y = 0: read on the finest level, the one with
+            // a CPU mirror (a ring has none, and the viewer stands over its hole).
+            let ground = match rings.get(root.landscape) {
+                Ok(ring) => landscapes.get(ring.of).map(|(_, p, _)| p),
+                Err(_) => Ok(pages),
+            };
+            if let Ok(ground) = ground {
+                local.y = (local.y - ground.height_at(local.xz())).max(0.0);
+            }
         }
         let size = landscape.page_size();
         let origin = root.page.as_vec2() * size;
@@ -249,6 +318,26 @@ fn edge_steps(level: u8, cell: IVec2, trees: &HashMap<IVec2, &QuadTree>) -> [u8;
     })
 }
 
+/// The edges (-z, +z, -x, +x as bits) across which this landscape has no page: where the
+/// tile meets another LOD level, whose tiles sample a different pool.
+fn boundary_edges(level: u8, cell: IVec2, trees: &HashMap<IVec2, &QuadTree>) -> u8 {
+    let n = 1i32 << level;
+    [
+        IVec2::new(cell.x, cell.y - 1),
+        IVec2::new(cell.x, cell.y + 1),
+        IVec2::new(cell.x - 1, cell.y),
+        IVec2::new(cell.x + 1, cell.y),
+    ]
+    .iter()
+    .enumerate()
+    .filter(|(_, nc)| !trees.contains_key(&IVec2::new(nc.x.div_euclid(n), nc.y.div_euclid(n))))
+    .fold(0u8, |bits, (i, _)| bits | (1 << i))
+}
+
+/// How far a level-boundary skirt drops, in the landscape's texels: past the gap a coarser
+/// level's interpolation leaves against a finer one.
+const SKIRT_TEXELS: f32 = 16.0;
+
 fn tile_mesh(
     kernels: &LandscapeKernels,
     topologies: &mut PatchTopologies,
@@ -272,7 +361,12 @@ pub fn spawn_tiles(
     kernels: Res<LandscapeKernels>,
     engine_kernels: Res<ProceduralKernels>,
     modules: Res<ComputeModules>,
-    landscapes: Query<(&Landscape, &LandscapePages, Option<&AuroraMaterial3d>)>,
+    landscapes: Query<(
+        &Landscape,
+        &LandscapePages,
+        Option<&AuroraMaterial3d>,
+        Has<crate::ring::LandscapeRing>,
+    )>,
     mut roots: Query<(Entity, &LandscapeRoot, &mut QuadTree)>,
     tiles: Query<&LandscapeTile>,
 ) {
@@ -283,6 +377,7 @@ pub fn spawn_tiles(
         root: Entity,
         leaf: NodeId,
         steps: [u8; 4],
+        skirts: u8,
         respawn: bool,
     }
     let mut todo: Vec<Todo> = Vec::new();
@@ -296,21 +391,37 @@ pub fn spawn_tiles(
         }
         for (entity, root, tree) in roots.iter() {
             let trees = &trees[&root.landscape];
+            // Only landscapes with LOD levels meet another level at their window's edge.
+            let ringed = landscapes
+                .get(root.landscape)
+                .is_ok_and(|(l, _, _, ring)| ring || l.lod_rings > 0);
             for leaf in tree.leaf_node_ids() {
                 let node = &tree.nodes[leaf.0 as usize];
                 let n = 1i32 << node.depth;
                 let (uv_min, _) = node.uv_bounds();
                 let cell = root.page * n + (uv_min * n as f32).round().as_ivec2();
                 let steps = edge_steps(node.depth, cell, trees);
+                let skirts = if ringed {
+                    boundary_edges(node.depth, cell, trees)
+                } else {
+                    0
+                };
                 let respawn = match node.patch_entity {
                     None => false,
-                    Some(e) if tiles.get(e).is_ok_and(|t| t.edge_steps != steps) => true,
+                    Some(e)
+                        if tiles
+                            .get(e)
+                            .is_ok_and(|t| t.edge_steps != steps || t.skirt_edges != skirts) =>
+                    {
+                        true
+                    }
                     Some(_) => continue,
                 };
                 todo.push(Todo {
                     root: entity,
                     leaf,
                     steps,
+                    skirts,
                     respawn,
                 });
             }
@@ -325,7 +436,7 @@ pub fn spawn_tiles(
         let Ok((_, root, mut tree)) = roots.get_mut(item.root) else {
             continue;
         };
-        let Ok((landscape, pages, material)) = landscapes.get(root.landscape) else {
+        let Ok((landscape, pages, material, _)) = landscapes.get(root.landscape) else {
             continue;
         };
         if item.respawn {
@@ -361,11 +472,17 @@ pub fn spawn_tiles(
             } else {
                 origin.y
             },
-            skirt_depth: 0.0,
+            skirt_depth: if item.skirts != 0 {
+                SKIRT_TEXELS * landscape.texel_size
+            } else {
+                0.0
+            },
             edge_steps: u32::from_le_bytes(item.steps),
             face: landscape.sphere.map_or(0, |f| f.face as u32),
             radius: landscape.sphere.map_or(0.0, |f| f.radius),
             origin_y: at.y,
+            skirt_edges: item.skirts as u32,
+            pad: 0,
         };
         let mesh = procedural.add(tile_mesh(&kernels, &mut topologies, &params));
         let entity = commands
@@ -381,6 +498,7 @@ pub fn spawn_tiles(
                     level: depth,
                     cell,
                     edge_steps: item.steps,
+                    skirt_edges: item.skirts,
                     rect: Rect::from_center_size(origin, Vec2::splat(tile_size)),
                     params,
                 },

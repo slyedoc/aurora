@@ -371,7 +371,7 @@ layout (buffer_reference, scalar, buffer_reference_align = 4) readonly restrict 
   float input_exposure;
 };
 
-// ---- Atmosphere + clouds (src/atmosphere.rs, atmosphere.glsl) ---------------------------
+// ---- Atmosphere + clouds (src/atmosphere.rs, atmosphere_rt.slang) -----------------------
 
 // A W x H table of vec4 (the atmosphere LUTs), written by the atmo_*.comp kernels.
 layout (buffer_reference, scalar, buffer_reference_align = 16) buffer LutData {

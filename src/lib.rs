@@ -186,7 +186,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         // Rasterizes the `bevy_ui` node tree. It belongs here rather than behind
         // `DevUIPlugin`, which is where it used to live: the dev panel is a debug tool, but
         // any app with a UI needs the renderer, and reaching it through a debug plugin
-        // meant an app that did not want the F2 panel silently had no UI at all -- not even
+        // meant an app that did not want the F3 panel silently had no UI at all -- not even
         // `Assets<Font>`, since this is what pulls `TextPlugin` in.
         group = group.add(crate::ui_render::UiRenderPlugin);
         group = group.add(crate::camera_target::CameraTargetPlugin);

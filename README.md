@@ -109,7 +109,7 @@ Troubleshooting:
   ```
 
 - *Double vision / eye strain*: the frame rate is below the headset's refresh rate. Use
-  `--release`, and cycle the DLSS mode towards Performance with `F3`.
+  `--release`, and cycle the DLSS mode towards Performance with `F5`.
 
 ## Examples
 
@@ -131,7 +131,7 @@ logical pixels from its top-left, the same space a child's `left`/`top` lives in
 Every example has the dev panel (`DevUIPlugin`): fps and the exposure probe over
 `bevy_feathers_inspector` cards for `RenderSettings` and the camera's `AuroraLens`,
 `AuroraExposure` and `AuroraDlss`. An environment's fog and sky level are `Fog` and
-`SkyBrightness` on its entity. `F2` toggles the panel, `Space` toggles accumulation.
+`SkyBrightness` on its entity. `F3` toggles the panel, `Space` toggles accumulation.
 
 This rendering backend integrates seamlessly with Bevy, as a result, the code needed to run a simple scene is extremely simple:
 

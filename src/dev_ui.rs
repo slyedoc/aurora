@@ -2,7 +2,7 @@
 //! feathers inspectors for [`RenderSettings`] and the first camera's lens, exposure and DLSS
 //! mode. It holds no state of its own; an editor edits the same resource and components.
 //!
-//! Keys: `F2` toggles this panel.
+//! Keys: `F3` toggles this panel.
 
 use std::any::TypeId;
 
@@ -29,7 +29,7 @@ use crate::{
     ui_render::UiRenderPlugin,
 };
 
-/// The panel root; `F2` flips its `Display`. Public so apps can hang their own sections
+/// The panel root; `F3` flips its `Display`. Public so apps can hang their own sections
 /// under it (a `Node` child + `BuildComponentInspector` / `BuildResourceInspector`).
 #[derive(Component, Default, Clone)]
 pub struct DevUIPanel;
@@ -146,7 +146,7 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                @caption("aurora  (F2: panel)")
+                @caption("aurora  (F3: panel)")
                 --
                 @caption("fps: -") DevUIStats
                 --
@@ -184,7 +184,7 @@ fn toggle_panel(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut panels: Query<&mut Node, With<DevUIPanel>>,
 ) {
-    if keyboard.just_pressed(KeyCode::F2) {
+    if keyboard.just_pressed(KeyCode::F3) {
         for mut node in &mut panels {
             node.display = if node.display == Display::None {
                 Display::Flex

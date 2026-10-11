@@ -29,6 +29,10 @@ struct TilePush {
     uint face;
     float radius;
     float origin_y;
+    // Edges (-z, +z, -x, +x as bits 0..3) whose skirt drops `skirt_depth`: the ones on a
+    // boundary between LOD levels (aurora_landscape ring.rs).
+    uint skirt_edges;
+    uint pad;
 };
 [[vk::push_constant]] TilePush push;
 
@@ -100,6 +104,7 @@ void tile_fill(uint3 gid: SV_DispatchThreadID) {
     int li;
     int lj;
     var skirt = false;
+    var skirt_edge = 0u;
     var centre = false;
     if (i < res * res) {
         gx = i % res;
@@ -118,6 +123,7 @@ void tile_fill(uint3 gid: SV_DispatchThreadID) {
         let k = i - centres;
         let t = k % res;
         skirt = true;
+        skirt_edge = k / res;
         switch (k / res) {
             case 0: gx = t; gy = 0; break;
             case 1: gx = t; gy = res - 1; break;
@@ -145,7 +151,7 @@ void tile_fill(uint3 gid: SV_DispatchThreadID) {
     if (dot(normal, up) < 0.0) {
         normal = -normal;
     }
-    if (skirt) {
+    if (skirt && ((push.skirt_edges >> skirt_edge) & 1u) != 0u) {
         pos -= up * push.skirt_depth;
     }
 
