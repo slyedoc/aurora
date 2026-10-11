@@ -91,17 +91,23 @@ fn default_view(
     }
 }
 
-/// F4 cycles the view on every 3D camera.
+/// F4 steps one view, shown on every 3D camera alike (an editor's viewport, previews and the
+/// game camera all switch together, once per press).
 fn cycle_view(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut cameras: Query<&mut AuroraDebugView, With<Camera3d>>,
 ) {
-    if keyboard.just_pressed(KeyCode::F4) {
-        for mut view in &mut cameras {
-            *view = view.next();
-            log::info!("debug view: {:?}", *view);
-        }
+    if !keyboard.just_pressed(KeyCode::F4) {
+        return;
     }
+    let Some(current) = cameras.iter().copied().max_by_key(|view| view.shader_index()) else {
+        return;
+    };
+    let next = current.next();
+    for mut view in &mut cameras {
+        *view = next;
+    }
+    log::info!("debug view: {next:?}");
 }
 
 pub struct DebugViewPlugin;
