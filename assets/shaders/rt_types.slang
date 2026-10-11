@@ -73,6 +73,11 @@ public struct EnvironmentGpu {
     public float sun_clip;
     // Fog: the camera ray's march steps (0 = it scatters at random like a bounce).
     public uint fog_steps;
+    // Fog light grid (src/fog_grid.rs): how far it reaches (0 = off) and the frames it averages.
+    public float fog_grid_distance;
+    public float fog_grid_history;
+    public uint pad_grid0;
+    public uint pad_grid1;
     public float4 color;
     public float4 zenith;
     public float4 horizon;
@@ -202,6 +207,12 @@ public struct UniformData {
     public uint fog_volume_count;
     // Seconds since startup (wrapped), for the volumes' drifting noise.
     public float time;
+    // Fog light grid (src/fog_grid.rs): last frame's and this frame's cells (0 = off), the
+    // cell count, and 1 when last frame's is not this view's history.
+    public float4* fog_grid_prev;
+    public float4* fog_grid_cur;
+    public uint fog_grid_cells;
+    public uint fog_grid_fresh;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

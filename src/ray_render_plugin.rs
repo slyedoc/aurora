@@ -108,6 +108,12 @@ pub struct UniformData {
     fog_volume_count: u32,
     /// Seconds since startup, for the fog volumes' drifting noise.
     time: f32,
+    /// Fog light grid (src/fog_grid.rs): last frame's and this frame's cells (0 = off), the
+    /// cell count, and 1 when last frame's is not this view's history.
+    fog_grid_prev: u64,
+    fog_grid_cur: u64,
+    fog_grid_cells: u32,
+    fog_grid_fresh: u32,
 }
 
 #[repr(C)]
@@ -417,6 +423,7 @@ fn render_frame(
         ResMut<AtmosphereState>,
         ResMut<crate::picking::Picker>,
         Res<crate::fog_volume::FogVolumeTable>,
+        ResMut<crate::fog_grid::FogGridState>,
     ),
     camera: Query<
         (
@@ -474,6 +481,7 @@ fn render_frame(
         mut atmo,
         mut picker,
         fog_volumes,
+        mut fog_grid,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
@@ -767,6 +775,17 @@ fn render_frame(
         .copy_from_slice(&envs);
     // Update each view's uniform buffer
     for view in &views {
+        let environment = skies.view_environment(view.camera_mask as u8);
+        let fog = skies.environments[environment as usize].fog;
+        let grid = fog_grid.ensure(
+            &render_device,
+            view.trace_extent,
+            *frame_counter,
+            view.slot,
+            fog.grid_distance > 0.0
+                && fog.steps > 0
+                && (fog.density > 0.0 || fog_volumes.count() > 0),
+        );
         let data = UniformData {
             inverse_view: view.inverse_view,
             inverse_projection: view.projection.inverse(),
@@ -779,7 +798,7 @@ fn render_frame(
                 .map(|(_, y)| y)
                 .unwrap_or(0xFFFFFFFF),
             aperture: view.lens.aperture,
-            environment: skies.view_environment(view.camera_mask as u8) as u32,
+            environment: environment as u32,
             view: view.view_matrix.to_cols_array(),
             view_proj: view.view_proj.to_cols_array(),
             prev_view_proj: view.last_view_proj.to_cols_array(),
@@ -827,6 +846,10 @@ fn render_frame(
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
             time: time.elapsed_secs_wrapped(),
+            fog_grid_prev: grid.prev,
+            fog_grid_cur: grid.cur,
+            fog_grid_cells: grid.cells,
+            fog_grid_fresh: grid.fresh as u32,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -1058,6 +1081,7 @@ fn render_frame(
                         *frame_counter,
                         view.slot,
                     );
+                    fog_grid.record_clear(&render_device, cmd_buffer, view.slot);
                     let push_constants = RaytracingPushConstants {
                         uniform_buffer: frame.uniform_buffers[view.slot].address,
                         material_buffer: tlas.material_address(),
@@ -1801,5 +1825,7 @@ mod tests {
         assert_eq!(offset_of!(U, brush_color), 456);
         assert_eq!(offset_of!(U, fog_volumes), 472);
         assert_eq!(offset_of!(U, time), 484);
+        assert_eq!(offset_of!(U, fog_grid_prev), 488);
+        assert_eq!(offset_of!(U, fog_grid_cells), 504);
     }
 }

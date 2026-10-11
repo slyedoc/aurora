@@ -169,7 +169,10 @@ static const float FOG_ALBEDO = 0.95;
 
 // Henyey-Greenstein phase function, per steradian.
 float fogPhase(EnvironmentGpu env, float cos_theta) {
-    let g = env.fog_scatter;
+    return fogPhaseG(env.fog_scatter, cos_theta);
+}
+
+float fogPhaseG(float g, float cos_theta) {
     let denom = 1.0 + g * g - 2.0 * g * cos_theta;
     return (1.0 - g * g) / (4.0 * PI * denom * sqrt(denom));
 }
@@ -255,29 +258,7 @@ void fogMarch(EnvironmentGpu env, uint ray_env, uint ray_mask, float tmax, float
             continue;
         }
         let step_t = exp(-sigma * dt);
-        var Ls = float3(0.0);
-        // The HDR sky's sun is two discs (core, halo) on one direction: one shadow ray serves
-        // every disc that shares it.
-        var visible = false;
-        var l = float3(0.0);
-        for (uint si = 0u; si < env.sun_count; si++) {
-            let sun = env.suns[si];
-            if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
-                l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
-                payload.t = -1.0;
-                trace(FLAGS_SHADOW, ray_mask, x, 0.0, l, tmax, payload);
-                visible = payload.t == 0.0;
-            }
-            if (!visible) {
-                continue;
-            }
-            var radiance = sun.radiance.rgb;
-            if (env.mode == 3u && si == 0u) {
-                radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
-            }
-            let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-            Ls += radiance * solid_angle * fogPhase(env, dot(d, l));
-        }
+        var Ls = fogSunLight(env, ray_mask, tmax, x, d, payload);
         if (i == sky_step) {
             // Phase-sampled, so the phase over its pdf is 1; one step in n carries it.
             let w = sampleFogScatterDirection(env, d);
@@ -294,6 +275,34 @@ void fogMarch(EnvironmentGpu env, uint ray_env, uint ray_mask, float tmax, float
     acc += mask * L;
     mask *= T;
     payload = vertex;
+}
+
+// The suns' light at fog point `x`, as the fog scatters it along `d`. The HDR sky's sun is
+// two discs (core, halo) on one direction: one shadow ray serves every disc that shares it.
+float3 fogSunLight(EnvironmentGpu env, uint ray_mask, float tmax, float3 x, float3 d,
+                   inout HitPayload payload) {
+    var Ls = float3(0.0);
+    var visible = false;
+    var l = float3(0.0);
+    for (uint si = 0u; si < env.sun_count; si++) {
+        let sun = env.suns[si];
+        if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
+            l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
+            payload.t = -1.0;
+            trace(FLAGS_SHADOW, ray_mask, x, 0.0, l, tmax, payload);
+            visible = payload.t == 0.0;
+        }
+        if (!visible) {
+            continue;
+        }
+        var radiance = sun.radiance.rgb;
+        if (env.mode == 3u && si == 0u) {
+            radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
+        }
+        let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
+        Ls += radiance * solid_angle * fogPhase(env, dot(d, l));
+    }
+    return Ls;
 }
 
 // Extracts either the first two or second two bytes from the uint
@@ -488,6 +497,10 @@ uint lightsFindInstance(uint e) {
 // (base, coat, less what is transmitted), and behind a thin translucent one the light coming
 // through it. Zero where it takes none (and wherever the geometric normal disagrees).
 float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+    // n = 0: a point in the fog, `ns.x` its Henyey-Greenstein g.
+    if (all(n == float3(0.0))) {
+        return float3(fogPhaseG(ns.x, dot(-v, dir)));
+    }
     let NoL = dot(n, dir);
     let above = NoL > 0.0 && dot(dir, ns) > 0.0;
     let through = lob.transmission > 0.0 && NoL < 0.0 && dot(dir, ns) < 0.0;
@@ -816,6 +829,200 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
     return false;
 }
 
+// ---- Fog light grid (src/fog_grid.rs) ------------------------------------------------------
+
+// Must match src/fog_grid.rs.
+static const uint FOG_GRID_TILE = 8u;
+static const uint FOG_GRID_SLICES = 64u;
+// Most steps the camera ray takes through the grid (lookups, so many more than `fog_steps`).
+static const uint FOG_GRID_STEPS = 24u;
+
+uint2 fogGridSize(uint2 launch) {
+    return max(launch / FOG_GRID_TILE, uint2(1u));
+}
+
+// A world point's cell coordinate in LAST frame's grid (cell centres at +0.5): screen uv
+// up, slices quadratic in view depth out to `dist`.
+float3 fogGridCoord(float3 x, uint2 size, float dist) {
+    let clip = mat4MulVec(pc.uniforms.prev_view_proj, float4(x, 1.0));
+    let w = max(clip.w, 1.0e-4);
+    let uv = clip.xy / w * 0.5 + 0.5;
+    return float3(uv * float2(size), sqrt(saturate(w / dist)) * float(FOG_GRID_SLICES));
+}
+
+// Last frame's grid at a cell coordinate, trilinear; clamped to the grid's edges.
+float4 fogGridSample(uint2 size, float3 g) {
+    let p = g - 0.5;
+    let b = int3(floor(p));
+    let f = p - float3(b);
+    let hi = int3(int(size.x) - 1, int(size.y) - 1, int(FOG_GRID_SLICES) - 1);
+    var r = float4(0.0);
+    for (uint k = 0u; k < 8u; k++) {
+        let o = int3(int(k & 1u), int((k >> 1u) & 1u), int(k >> 2u));
+        let q = clamp(b + o, int3(0), hi);
+        let w = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) * (o.z == 1 ? f.z : 1.0 - f.z);
+        r += w * pc.uniforms.fog_grid_prev[(uint(q.z) * size.y + uint(q.y)) * size.x + uint(q.x)];
+    }
+    return r;
+}
+
+// A cell's world point: (uv, slice) in [0, 1), unjittered at the centre.
+float3 fogGridPoint(float2 uv, float s, float dist) {
+    let target = mat4MulVec(pc.uniforms.inverse_projection, float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
+    let view = target / max(-target.z, 1.0e-6);
+    return mat4MulVec(pc.uniforms.inverse_view, float4(view * (dist * s * s), 1.0)).xyz;
+}
+
+// One light-table sample at fog point `x`, as the fog scatters it along `d`: RIS over
+// `light_candidates` from the power CDF, one shadow ray for the survivor, clamped.
+float3 fogTableLight(EnvironmentGpu env, uint ray_mask, float3 x, float3 d, float radiance_clamp,
+                     inout HitPayload payload) {
+    if (pc.uniforms.light_entries == 0u) {
+        return float3(0.0);
+    }
+    DisneyMaterial mat = {};
+    Lobes lob = {};
+    let M = max(1u, pc.uniforms.light_candidates);
+    var wsum = 0.0;
+    var sel_val = float3(0.0);
+    var sel_phat = 0.0;
+    var ldir = float3(0.0);
+    var ldist = 0.0;
+    for (uint c = 0u; c < M; c++) {
+        float p_pick;
+        let e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
+        let su = randf();
+        let sv = randf();
+        float p_area, pdf_solid, cdist;
+        float3 cdir;
+        let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv, x, float3(0.0),
+                                  float3(env.fog_scatter, 0.0, 0.0), -d, mat, lob, ray_mask,
+                                  p_area, pdf_solid, cdir, cdist);
+        let phat = luma(val);
+        if (phat <= 0.0 || p_area <= 0.0) {
+            continue;
+        }
+        let wi = phat / p_area;
+        wsum += wi;
+        if (randf() * wsum < wi) {
+            sel_val = val;
+            sel_phat = phat;
+            ldir = cdir;
+            ldist = cdist;
+        }
+    }
+    if (wsum <= 0.0 || sel_phat <= 0.0) {
+        return float3(0.0);
+    }
+    payload.t = -1.0;
+    trace(FLAGS_SHADOW, ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4), payload);
+    if (payload.t != 0.0) {
+        return float3(0.0);
+    }
+    var L = sel_val * (wsum / (float(M) * sel_phat));
+    if (radiance_clamp > 0.0) {
+        L *= min(1.0, radiance_clamp / max(luma(L), 1.0e-6));
+    }
+    return L;
+}
+
+// This pixel's grid cell, if it has one: a random point in it lit by the suns, one
+// phase-sampled sky ray and the light table, blended into last frame's value at the cell's
+// reprojected centre.
+void fogGridUpdate(uint2 launch_id, uint2 launch_size, float tmax, float radiance_clamp,
+                   inout HitPayload payload) {
+    if (pc.uniforms.fog_grid_cells == 0u) {
+        return;
+    }
+    let size = fogGridSize(launch_size);
+    let cells = size.x * size.y * FOG_GRID_SLICES;
+    let i = launch_id.y * launch_size.x + launch_id.x;
+    if (i >= cells || cells > pc.uniforms.fog_grid_cells) {
+        return;
+    }
+    let ray_env = pc.uniforms.environment;
+    let ray_mask = pc.uniforms.camera_mask;
+    let env = pc.uniforms.environments[ray_env];
+    let dist = env.fog_grid_distance;
+    let cell = float3(float(i % size.x), float((i / size.x) % size.y), float(i / (size.x * size.y)));
+    let grid = float3(float2(size), float(FOG_GRID_SLICES));
+    let r = float3(randf(), randf(), randf());
+    let x = fogGridPoint((cell.xy + r.xy) / grid.xy, (cell.z + r.z) / grid.z, dist);
+    let cam = mat4MulVec(pc.uniforms.inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    let centre = fogGridPoint((cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
+    let d = normalize(centre - cam);
+
+    var L = fogSunLight(env, ray_mask, tmax, x, d, payload);
+    let w = sampleFogScatterDirection(env, d);
+    payload.t = -1.0;
+    payload.miss_flags = ray_env << 1;
+    trace(FLAGS_SHADOW, ray_mask, x, 0.0, w, tmax, payload);
+    if (payload.t == 0.0) {
+        L += payload.emission;
+    }
+    L += fogTableLight(env, ray_mask, x, d, radiance_clamp, payload);
+    if (any(isnan(L)) || any(isinf(L))) {
+        L = float3(0.0);
+    }
+
+    // Off last frame's grid (past its far slice moving forward, its edges turning) the
+    // nearest edge cell is still the best guess: kept at a quarter of its weight rather than
+    // dropped, which left those cells one raw sample every frame.
+    var prev = float4(0.0);
+    if (pc.uniforms.fog_grid_fresh == 0u) {
+        let g = fogGridCoord(centre, size, dist);
+        prev = fogGridSample(size, g);
+        if (any(g < float3(0.0)) || any(g > grid)) {
+            prev.w = min(prev.w, env.fog_grid_history * 0.25);
+        }
+    }
+    if (any(isnan(prev)) || any(isinf(prev)) || prev.w < 0.0) {
+        prev = float4(0.0);
+    }
+    // Firefly clamp against the cell's own average: a sky ray through a canopy gap or a lone
+    // sunlit sample in shade moves it by a bounded step instead of a flash.
+    if (prev.w >= 4.0) {
+        let cap = 4.0 * max(luma(prev.rgb), 1.0e-3);
+        L *= min(1.0, cap / max(luma(L), 1.0e-6));
+    }
+    let n = min(prev.w + 1.0, env.fog_grid_history);
+    pc.uniforms.fog_grid_cur[i] = float4(lerp(prev.rgb, L, 1.0 / n), n);
+}
+
+// The camera ray through the fog like fogMarch, lit from last frame's grid instead of
+// shadow rays: the in-scatter goes into `acc`, the transmittance into `mask`.
+void fogMarchGrid(EnvironmentGpu env, float3 o, float3 d, float seg, bool base,
+                  inout float3 mask, inout float3 acc) {
+    let depth = fogMajorant(env, o, d, seg, base) * seg;
+    if (depth <= 1.0e-6) {
+        return;
+    }
+    let size = fogGridSize(DispatchRaysDimensions().xy);
+    let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, FOG_GRID_STEPS);
+    let jitter = randf();
+    var T = 1.0;
+    var prev = 0.0;
+    var L = float3(0.0);
+    for (uint i = 0u; i < n; i++) {
+        let f = float(i + 1u) / float(n);
+        let t_end = seg * f * f;
+        let fs = (float(i) + jitter) / float(n);
+        let x = o + d * (seg * fs * fs);
+        let dt = t_end - prev;
+        prev = t_end;
+        let sigma = fogDensityAt(env, x, base);
+        if (sigma <= 0.0) {
+            continue;
+        }
+        let step_t = exp(-sigma * dt);
+        let Ls = fogGridSample(size, fogGridCoord(x, size, env.fog_grid_distance)).rgb;
+        L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
+        T *= step_t;
+    }
+    acc += mask * L;
+    mask *= T;
+}
+
 [shader("raygeneration")]
 void main() {
     let launch_id = DispatchRaysIndex().xy;
@@ -873,6 +1080,8 @@ void main() {
     var meter_albedo = 1.0;
     var meter_skip = false;
 
+    fogGridUpdate(launch_id, launch_size, tmax, radiance_clamp, payload);
+
     for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
         let offsetR = sqrt(randf());
         let offsetA = randf() * 2.0 * PI;
@@ -897,6 +1106,8 @@ void main() {
         // Still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
         var camera_segment = true;
+        // Still in the view's own frustum (no portal yet): the fog grid lights only that.
+        var in_view = true;
         // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
         // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
         // once the path ends.
@@ -963,6 +1174,7 @@ void main() {
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
+                    in_view = false;
                     continue;
                 }
             }
@@ -1098,7 +1310,10 @@ void main() {
                 // The camera ray marches its fog (the shafts, without the noise of one random
                 // scatter); a ray to the sky marches only as far as the volumes reach.
                 let seg = payload.t > 0.0 ? payload.t : fogVolumesReach(origin, direction);
-                if (seg > 0.0) {
+                if (seg > 0.0 && in_view && pc.uniforms.fog_grid_cells > 0u
+                    && pc.uniforms.fog_grid_fresh == 0u) {
+                    fogMarchGrid(env, origin, direction, seg, payload.t > 0.0, mask, acc);
+                } else if (seg > 0.0) {
                     fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
                              payload.t > 0.0, mask, acc, payload);
                 }

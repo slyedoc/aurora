@@ -71,11 +71,19 @@ pub struct Fog {
     /// ...and thins by 1/e every `falloff` metres above it (0 = the same density everywhere).
     #[reflect(@0.0..=500.0_f32)]
     pub falloff: f32,
-    /// Steps the camera ray marches through the fog (and any [`FogVolume`](crate::fog_volume::FogVolume)s), each with a
-    /// shadow ray per sun: the light shafts. 0 = the camera ray scatters at random, like a
-    /// bounce (noisier, cheaper).
+    /// Steps the camera ray marches through the fog (and any [`FogVolume`](crate::fog_volume::FogVolume)s) when
+    /// it is not lit from the grid, each with a shadow ray per sun: the light shafts. 0 = the
+    /// camera ray scatters at random, like a bounce (noisier, cheaper).
     #[reflect(@0..=32_u32)]
     pub steps: u32,
+    /// The camera ray's fog is lit from a cached grid out to this far (metres; beyond it, the
+    /// farthest slice's light): shafts at an eighth of the resolution, for lookups instead of
+    /// a shadow ray per step, and the light table's lamps light the fog too. 0 = off.
+    #[reflect(@0.0..=2000.0_f32)]
+    pub grid_distance: f32,
+    /// Frames the grid averages: more is smoother, fewer follows moving shadows sooner.
+    #[reflect(@1.0..=128.0_f32)]
+    pub grid_history: f32,
 }
 
 impl Default for Fog {
@@ -86,6 +94,8 @@ impl Default for Fog {
             height: 0.0,
             falloff: 0.0,
             steps: 6,
+            grid_distance: 150.0,
+            grid_history: 32.0,
         }
     }
 }
@@ -356,6 +366,10 @@ pub struct EnvironmentGpu {
     pub sun_clip: f32,
     /// [`Fog::steps`].
     pub fog_steps: u32,
+    /// [`Fog::grid_distance`] (0 = off), [`Fog::grid_history`].
+    pub fog_grid_distance: f32,
+    pub fog_grid_history: f32,
+    pub pad_grid: [u32; 2],
     /// Flat: the radiance. HDR: the scale. Atmosphere: the space image's scale (0 = none).
     pub color: [f32; 4],
     pub zenith: [f32; 4],
@@ -418,6 +432,9 @@ impl EnvironmentGpu {
             fog_falloff: fog.falloff.max(0.0),
             sun_clip,
             fog_steps: fog.steps,
+            fog_grid_distance: fog.grid_distance.max(0.0),
+            fog_grid_history: fog.grid_history.max(1.0),
+            pad_grid: [0; 2],
             color: color.to_array(),
             zenith: environment
                 .gradient

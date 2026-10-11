@@ -28,6 +28,7 @@ pub mod debug_view;
 pub mod dev_ui;
 pub mod dlss;
 pub mod environment;
+pub mod fog_grid;
 pub mod fog_volume;
 pub mod frame_sync;
 pub mod gizmo_render;
@@ -177,6 +178,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::terrain::TerrainPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
+        group = group.add(crate::fog_grid::FogGridPlugin);
         group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
         group = group.add(crate::atmosphere::AtmospherePlugin);
