@@ -100,10 +100,15 @@ public float3 offsetRay(float3 p, float3 n) {
         asfloat(asint(p.x) + (p.x < 0.0 ? -of_i.x : of_i.x)),
         asfloat(asint(p.y) + (p.y < 0.0 ? -of_i.y : of_i.y)),
         asfloat(asint(p.z) + (p.z < 0.0 ? -of_i.z : of_i.z)));
-    return float3(
+    let per_axis = float3(
         abs(p.x) < ORIGIN ? p.x + FLOAT_SCALE * n.x : p_i.x,
         abs(p.y) < ORIGIN ? p.y + FLOAT_SCALE * n.y : p_i.y,
         abs(p.z) < ORIGIN ? p.z + FLOAT_SCALE * n.z : p_i.z);
+    // The hit point's error scales with its LARGEST coordinate, not each one's own: ground at
+    // y ~ 0 a hundred metres out got a y push of ~1e-6 m against ~1e-5 m of error, and its
+    // shadow rays hit the ground they left (acne moire wherever |y| is small).
+    let largest = max(max(abs(p.x), abs(p.y)), abs(p.z));
+    return per_axis + n * (largest * (1.0 / 524288.0));
 }
 
 // `offsetRay` off the surface with normal `n`, to the side direction `d` leaves through.
