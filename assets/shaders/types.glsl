@@ -54,7 +54,7 @@ struct EnvironmentGpu {
   float fog_height;
   float fog_falloff;
   float sun_clip;
-  uint pad0;
+  uint fog_steps;
   vec4 color;
   vec4 zenith;
   vec4 horizon;

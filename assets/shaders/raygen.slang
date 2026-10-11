@@ -53,18 +53,103 @@ float fogDensity(EnvironmentGpu env, float y) {
     return env.fog_density * exp(-max(0.0, y - env.fog_height) / env.fog_falloff);
 }
 
+// The environment's own fog at a point (uniform or height fog).
+float fogBaseDensity(EnvironmentGpu env, float3 x) {
+    return env.fog_falloff > 0.0 ? fogDensity(env, x.y) : env.fog_density;
+}
+
+// ---- fog volumes (src/fog_volume.rs) ------------------------------------------------------
+
+float fogHash(float3 p) {
+    var p3 = frac(p * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float fogValueNoise(float3 p) {
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = lerp(lerp(fogHash(i), fogHash(i + float3(1.0, 0.0, 0.0)), u.x),
+                 lerp(fogHash(i + float3(0.0, 1.0, 0.0)), fogHash(i + float3(1.0, 1.0, 0.0)), u.x), u.y);
+    let b = lerp(lerp(fogHash(i + float3(0.0, 0.0, 1.0)), fogHash(i + float3(1.0, 0.0, 1.0)), u.x),
+                 lerp(fogHash(i + float3(0.0, 1.0, 1.0)), fogHash(i + float3(1.0, 1.0, 1.0)), u.x), u.y);
+    return lerp(a, b, u.z);
+}
+
+float3 fogVolumeLocal(FogVolumeGpu v, float4 p) {
+    return float3(dot(v.row0, p), dot(v.row1, p), dot(v.row2, p));
+}
+
+// A volume's density at a world point: full inside, fading over `edge` toward the surface,
+// carved by drifting noise. Never above `density` (the majorant relies on it).
+float fogVolumeDensity(FogVolumeGpu v, float3 x) {
+    let p = fogVolumeLocal(v, float4(x, 1.0));
+    let r = v.shape == 0u ? max(abs(p.x), max(abs(p.y), abs(p.z))) : length(p);
+    if (r >= 1.0) {
+        return 0.0;
+    }
+    var d = v.density * (v.edge > 0.0 ? smoothstep(1.0, 1.0 - v.edge, r) : 1.0);
+    if (v.noise_strength > 0.0) {
+        let q = (x - float3(v.wind_x, v.wind_y, v.wind_z) * pc.uniforms.time) / v.noise_scale;
+        let n = 0.65 * fogValueNoise(q) + 0.35 * fogValueNoise(q * 2.03 + 17.0);
+        d *= lerp(1.0, smoothstep(0.3, 0.7, n), v.noise_strength);
+    }
+    return d;
+}
+
+// Where a ray crosses a volume's bounds, clipped to [0, t_max]; false if it misses them.
+bool fogVolumeSpan(FogVolumeGpu v, float3 o, float3 d, float t_max, out float t0, out float t1) {
+    let lo = fogVolumeLocal(v, float4(o, 1.0));
+    let ld = fogVolumeLocal(v, float4(d, 0.0));
+    let inv = 1.0 / select(abs(ld) < 1.0e-12, float3(1.0e-12), ld);
+    let a = (float3(-1.0) - lo) * inv;
+    let b = (float3(1.0) - lo) * inv;
+    let n = min(a, b);
+    let f = max(a, b);
+    t0 = max(max(n.x, n.y), max(n.z, 0.0));
+    t1 = min(min(f.x, f.y), min(f.z, t_max));
+    return t1 > t0;
+}
+
+// All the fog at a point: the environment's (`base`) and every volume's.
+float fogDensityAt(EnvironmentGpu env, float3 x, bool base) {
+    var d = base ? fogBaseDensity(env, x) : 0.0;
+    for (uint i = 0u; i < pc.uniforms.fog_volume_count; i++) {
+        d += fogVolumeDensity(pc.uniforms.fog_volumes[i], x);
+    }
+    return d;
+}
+
+// The farthest any volume reaches along a ray (0 = it crosses none): how far a camera ray
+// that reaches the sky marches.
+float fogVolumesReach(float3 o, float3 d) {
+    var reach = 0.0;
+    for (uint i = 0u; i < pc.uniforms.fog_volume_count; i++) {
+        float t0, t1;
+        if (fogVolumeSpan(pc.uniforms.fog_volumes[i], o, d, 1.0e5, t0, t1)) {
+            reach = max(reach, t1);
+        }
+    }
+    return reach;
+}
+
 // Whether the ray scatters in the fog before `t_max` (0 = it reached the sky: no fog), and
-// where. Uniform fog draws one exponential distance; height fog delta-tracks against the
-// density at the segment's lowest point (the majorant), accepting a tentative collision with
-// probability density / majorant.
+// where. Uniform fog alone draws one exponential distance; otherwise delta tracking against
+// a majorant (the height fog at the segment's lowest point plus every volume it crosses),
+// accepting a tentative collision with probability density / majorant.
 bool sampleFogScatter(EnvironmentGpu env, float3 o, float3 d, float t_max, out float t) {
-    if (env.fog_falloff <= 0.0) {
+    let volumes = pc.uniforms.fog_volume_count > 0u;
+    if (env.fog_falloff <= 0.0 && !volumes) {
         t = sampleDistanceInFog(env);
         return t < t_max;
     }
     t = 0.0;
-    let majorant = fogDensity(env, min(o.y, o.y + d.y * t_max));
-    if (t_max <= 0.0 || majorant <= 1.0e-9) {
+    if (t_max <= 0.0) {
+        return false;
+    }
+    let majorant = fogMajorant(env, o, d, t_max, true);
+    if (majorant <= 1.0e-9) {
         return false;
     }
     for (int i = 0; i < 64; i++) {
@@ -72,7 +157,7 @@ bool sampleFogScatter(EnvironmentGpu env, float3 o, float3 d, float t_max, out f
         if (t >= t_max) {
             return false;
         }
-        if (randf() * majorant < fogDensity(env, o.y + d.y * t)) {
+        if (randf() * majorant < fogDensityAt(env, o + d * t, true)) {
             return true;
         }
     }
@@ -116,6 +201,99 @@ float3 sampleFogScatterDirection(EnvironmentGpu env, float3 incoming) {
 
     let ret = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
     return mul(ret, orthonormalBasis(incoming));
+}
+
+// Optical depth per march step: a segment through faint fog takes fewer steps (down to one),
+// thick fog all of `fog_steps`. Neighbouring pixels see about the same depth, so they agree
+// on the count and their shadow rays stay coherent.
+static const float FOG_STEP_DEPTH = 0.05;
+
+// The densest the fog can be along a segment: the height fog at its lowest point (or the
+// uniform fog) when `base`, plus every volume it crosses.
+float fogMajorant(EnvironmentGpu env, float3 o, float3 d, float t_max, bool base) {
+    var majorant = 0.0;
+    if (base) {
+        majorant = env.fog_falloff > 0.0 ? fogDensity(env, min(o.y, o.y + d.y * t_max)) : env.fog_density;
+    }
+    for (uint i = 0u; i < pc.uniforms.fog_volume_count; i++) {
+        float t0, t1;
+        if (fogVolumeSpan(pc.uniforms.fog_volumes[i], o, d, t_max, t0, t1)) {
+            majorant += pc.uniforms.fog_volumes[i].density;
+        }
+    }
+    return majorant;
+}
+
+// The camera ray through the fog: `env.fog_steps` jittered steps over its first `seg` metres
+// (closer together near the camera), each lit by the suns through a shadow ray -- the shafts
+// -- and one step, picked at random, by the sky in a phase-sampled direction. Adds the
+// in-scatter to `acc` and leaves the transmittance in `mask`; `base` takes the environment's
+// own fog in too (not on a ray to the sky, which the old scatter never fogged either). The
+// payload comes back as it went in.
+void fogMarch(EnvironmentGpu env, uint ray_env, uint ray_mask, float tmax, float3 o, float3 d,
+              float seg, bool base, inout float3 mask, inout float3 acc, inout HitPayload payload) {
+    let depth = fogMajorant(env, o, d, seg, base) * seg;
+    if (depth <= 1.0e-6) {
+        return;
+    }
+    let vertex = payload;
+    let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, env.fog_steps);
+    let jitter = randf();
+    let sky_step = min(uint(randf() * float(n)), n - 1u);
+    var T = 1.0;
+    var prev = 0.0;
+    var L = float3(0.0);
+    for (uint i = 0u; i < n; i++) {
+        let f = float(i + 1u) / float(n);
+        let t_end = seg * f * f;
+        let fs = (float(i) + jitter) / float(n);
+        let x = o + d * (seg * fs * fs);
+        let dt = t_end - prev;
+        prev = t_end;
+        let sigma = fogDensityAt(env, x, base);
+        if (sigma <= 0.0) {
+            continue;
+        }
+        let step_t = exp(-sigma * dt);
+        var Ls = float3(0.0);
+        // The HDR sky's sun is two discs (core, halo) on one direction: one shadow ray serves
+        // every disc that shares it.
+        var visible = false;
+        var l = float3(0.0);
+        for (uint si = 0u; si < env.sun_count; si++) {
+            let sun = env.suns[si];
+            if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
+                l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
+                payload.t = -1.0;
+                trace(FLAGS_SHADOW, ray_mask, x, 0.0, l, tmax, payload);
+                visible = payload.t == 0.0;
+            }
+            if (!visible) {
+                continue;
+            }
+            var radiance = sun.radiance.rgb;
+            if (env.mode == 3u && si == 0u) {
+                radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
+            }
+            let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
+            Ls += radiance * solid_angle * fogPhase(env, dot(d, l));
+        }
+        if (i == sky_step) {
+            // Phase-sampled, so the phase over its pdf is 1; one step in n carries it.
+            let w = sampleFogScatterDirection(env, d);
+            payload.t = -1.0;
+            payload.miss_flags = ray_env << 1;
+            trace(FLAGS_SHADOW, ray_mask, x, 0.0, w, tmax, payload);
+            if (payload.t == 0.0) {
+                Ls += payload.emission * float(n);
+            }
+        }
+        L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
+        T *= step_t;
+    }
+    acc += mask * L;
+    mask *= T;
+    payload = vertex;
 }
 
 // Extracts either the first two or second two bytes from the uint
@@ -915,12 +1093,22 @@ void main() {
             // deferring to the generic emitter check)
             float fogDistance;
             let env = pc.uniforms.environments[ray_env];
-            if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
+            let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
+            if (camera_segment && env.fog_steps > 0u && fog_any) {
+                // The camera ray marches its fog (the shafts, without the noise of one random
+                // scatter); a ray to the sky marches only as far as the volumes reach.
+                let seg = payload.t > 0.0 ? payload.t : fogVolumesReach(origin, direction);
+                if (seg > 0.0) {
+                    fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
+                             payload.t > 0.0, mask, acc, payload);
+                }
+            } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
                 surf_n = float3(0.0);
                 // Uniform fog keeps its old ad-hoc loss; height fog is delta-tracked, so the
                 // collision's weight is just the medium's single-scattering albedo.
-                mask *= env.fog_falloff > 0.0 ? FOG_ALBEDO : calcFogTransmittance(fogDistance);
+                mask *= env.fog_falloff > 0.0 || pc.uniforms.fog_volume_count > 0u
+                    ? FOG_ALBEDO : calcFogTransmittance(fogDistance);
                 // The sun straight into the scatter point, through the phase function: the
                 // shafts of light through gaps (a scattered ray would rarely find its disc).
                 {

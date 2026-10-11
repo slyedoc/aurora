@@ -41,6 +41,20 @@ public struct EnvironmentSun {
 // colour (color), 1 = HDR (tex, color = scale, importance = its sampling table or null),
 // 2 = gradient (zenith/horizon/ground), 3 = atmosphere (tex = the space image, color = its
 // scale, 0 = none).
+// One fog volume (src/fog_volume.rs `GpuFogVolume`): world to unit-local rows, then its
+// parameters. Shape 0 = box, 1 = ellipsoid.
+public struct FogVolumeGpu {
+    public float4 row0;
+    public float4 row1;
+    public float4 row2;
+    public float density;
+    public float edge;
+    public float noise_scale;
+    public float noise_strength;
+    public float wind_x, wind_y, wind_z;
+    public uint shape;
+};
+
 public struct EnvironmentGpu {
     public uint mode;
     public uint tex;
@@ -57,7 +71,8 @@ public struct EnvironmentGpu {
     // HDR sky with its sun taken out (sky_importance.rs HdrSun): the texel luminance it is
     // clipped to inside a sun's cone; 0 = nothing taken out.
     public float sun_clip;
-    public uint pad0;
+    // Fog: the camera ray's march steps (0 = it scatters at random like a bounce).
+    public uint fog_steps;
     public float4 color;
     public float4 zenith;
     public float4 horizon;
@@ -181,6 +196,12 @@ public struct UniformData {
     public float brush_radius;
     public uint brush_active;
     public float brush_color_r, brush_color_g, brush_color_b;
+    public uint pad_fog;
+    // Fog volumes (src/fog_volume.rs): the table + entry count (0 = none).
+    public FogVolumeGpu* fog_volumes;
+    public uint fog_volume_count;
+    // Seconds since startup (wrapped), for the volumes' drifting noise.
+    public float time;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

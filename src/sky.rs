@@ -71,6 +71,11 @@ pub struct Fog {
     /// ...and thins by 1/e every `falloff` metres above it (0 = the same density everywhere).
     #[reflect(@0.0..=500.0_f32)]
     pub falloff: f32,
+    /// Steps the camera ray marches through the fog (and any [`FogVolume`](crate::fog_volume::FogVolume)s), each with a
+    /// shadow ray per sun: the light shafts. 0 = the camera ray scatters at random, like a
+    /// bounce (noisier, cheaper).
+    #[reflect(@0..=32_u32)]
+    pub steps: u32,
 }
 
 impl Default for Fog {
@@ -80,6 +85,7 @@ impl Default for Fog {
             scatter: 0.9,
             height: 0.0,
             falloff: 0.0,
+            steps: 6,
         }
     }
 }
@@ -347,7 +353,8 @@ pub struct EnvironmentGpu {
     /// HDR sky with its sun taken out ([`HdrSun`]): the texel luminance the sky is clipped to
     /// inside a sun's cone (the sun is one of `suns`). 0 = nothing taken out.
     pub sun_clip: f32,
-    pub pad: u32,
+    /// [`Fog::steps`].
+    pub fog_steps: u32,
     /// Flat: the radiance. HDR: the scale. Atmosphere: the space image's scale (0 = none).
     pub color: [f32; 4],
     pub zenith: [f32; 4],
@@ -409,7 +416,7 @@ impl EnvironmentGpu {
             fog_height: fog.height,
             fog_falloff: fog.falloff.max(0.0),
             sun_clip,
-            pad: 0,
+            fog_steps: fog.steps,
             color: color.to_array(),
             zenith: environment
                 .gradient

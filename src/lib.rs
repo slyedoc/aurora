@@ -28,6 +28,7 @@ pub mod debug_view;
 pub mod dev_ui;
 pub mod dlss;
 pub mod environment;
+pub mod fog_volume;
 pub mod frame_sync;
 pub mod gizmo_render;
 pub mod gpu_transform;
@@ -94,6 +95,7 @@ pub mod prelude {
         dev_ui::{DevUIPanel, DevUIPlugin},
         dlss::{AuroraDlss, RrPreset},
         environment::{AuroraPrimaryHidden, InEnvironment, RenderEnvironments, RenderLayerApp},
+        fog_volume::{FogShape, FogVolume},
         material::{AuroraMaterial, AuroraMaterial3d},
         mesh::{AuroraMesh, AuroraMesh3d},
         picking::{RayCaster, RayHit, RayHits},
@@ -142,6 +144,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(bevy::animation::AnimationPlugin);
         group = group.add(bevy::world_serialization::WorldSerializationPlugin);
         group = group.add(crate::portal::PortalPlugin);
+        group = group.add(crate::fog_volume::FogVolumePlugin);
         group = group.add(bevy::winit::WinitPlugin::default());
         group = group.add(bevy::audio::AudioPlugin::default());
 

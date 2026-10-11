@@ -102,6 +102,12 @@ pub struct UniformData {
     brush_radius: f32,
     brush_active: u32,
     brush_color: [f32; 3],
+    pad_fog: u32,
+    /// Fog volume table (src/fog_volume.rs): buffer address + entry count (0 = none).
+    fog_volumes: u64,
+    fog_volume_count: u32,
+    /// Seconds since startup, for the fog volumes' drifting noise.
+    time: f32,
 }
 
 #[repr(C)]
@@ -410,6 +416,7 @@ fn render_frame(
         ResMut<crate::terrain::Terrains>,
         ResMut<AtmosphereState>,
         ResMut<crate::picking::Picker>,
+        Res<crate::fog_volume::FogVolumeTable>,
     ),
     camera: Query<
         (
@@ -466,6 +473,7 @@ fn render_frame(
         mut terrains,
         mut atmo,
         mut picker,
+        fog_volumes,
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
@@ -809,6 +817,10 @@ fn render_frame(
             brush_radius: terrain_cursor.radius,
             brush_active: terrain_cursor.active as u32,
             brush_color: terrain_cursor.color.to_vec3().to_array(),
+            pad_fog: 0,
+            fog_volumes: fog_volumes.address(),
+            fog_volume_count: fog_volumes.count(),
+            time: time.elapsed_secs_wrapped(),
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -1781,5 +1793,7 @@ mod tests {
         assert_eq!(offset_of!(U, environment_bits), 424);
         assert_eq!(offset_of!(U, environments), 432);
         assert_eq!(offset_of!(U, brush_color), 456);
+        assert_eq!(offset_of!(U, fog_volumes), 472);
+        assert_eq!(offset_of!(U, time), 484);
     }
 }
