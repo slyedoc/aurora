@@ -92,27 +92,33 @@ fn resolve_skin_joints(
             commands.entity(entity).remove::<SkinJointsByName>();
             continue;
         }
-        let mut root = entity;
-        while let Ok(parent) = parents.get(root) {
-            root = parent.parent();
-        }
-        let mut by_name_map: HashMap<&str, Entity> = HashMap::new();
-        let mut stack = vec![root];
-        while let Some(e) = stack.pop() {
-            if let Ok(name) = names.get(e) {
-                by_name_map.entry(name.as_str()).or_insert(e);
+        // The nearest ancestor whose subtree names every joint is this part's own prefab: two
+        // instances of one rig under a shared root must not borrow each other's bones.
+        let mut scope = entity;
+        let joints = loop {
+            let mut by_name_map: HashMap<&str, Entity> = HashMap::new();
+            let mut stack = vec![scope];
+            while let Some(e) = stack.pop() {
+                if let Ok(name) = names.get(e) {
+                    by_name_map.entry(name.as_str()).or_insert(e);
+                }
+                if let Ok(c) = children.get(e) {
+                    stack.extend(c.iter());
+                }
             }
-            if let Ok(c) = children.get(e) {
-                stack.extend(c.iter());
+            let found = by_name
+                .0
+                .iter()
+                .map(|n| by_name_map.get(n.as_str()).copied())
+                .collect::<Option<Vec<Entity>>>();
+            match (found, parents.get(scope)) {
+                (Some(joints), _) => break Some(joints),
+                (None, Ok(parent)) => scope = parent.parent(),
+                (None, Err(_)) => break None,
             }
-        }
-        let Some(joints) = by_name
-            .0
-            .iter()
-            .map(|n| by_name_map.get(n.as_str()).copied())
-            .collect::<Option<Vec<Entity>>>()
-        else {
-            // The prefab is still streaming in; retry next frame.
+        };
+        // The prefab is still streaming in; retry next frame.
+        let Some(joints) = joints else {
             continue;
         };
         let armature = parents.get(joints[0]).ok().map(|p| p.parent());
