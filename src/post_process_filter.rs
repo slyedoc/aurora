@@ -51,12 +51,12 @@ impl VulkanAsset for PostProcessFilter {
         param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
         let Some(vertex_shader) = param.get(&self.vertex_shader) else {
-            log::warn!("Vertex shader not ready yet");
+            log::debug!("Vertex shader not ready yet");
             return None;
         };
 
         let Some(fragment_shader) = param.get(&self.fragment_shader) else {
-            log::warn!("Fragment shader not ready yet");
+            log::debug!("Fragment shader not ready yet");
             return None;
         };
 

@@ -499,7 +499,7 @@ impl Skins {
         }
         let Some(module) = modules.get(&self.module) else {
             if !self.warned_module {
-                log::info!("skinning.slang not compiled yet; skinned meshes wait");
+                log::debug!("skinning.slang not compiled yet; skinned meshes wait");
                 self.warned_module = true;
             }
             return false;

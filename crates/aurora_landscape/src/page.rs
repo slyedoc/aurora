@@ -992,7 +992,7 @@ pub fn evaluate_pages(
         );
         if pages.dirty.is_empty() && !pages.complete {
             pages.complete = true;
-            log::info!(
+            log::debug!(
                 "landscape: {} pages evaluated in {:.1} ms",
                 batch.len(),
                 started.elapsed().as_secs_f64() * 1000.0

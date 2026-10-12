@@ -340,14 +340,14 @@ fn prepare_sky_importance(
                 table.buffer = buffer;
                 table.sun = sun;
                 match sun {
-                    Some(sun) => log::info!(
+                    Some(sun) => log::debug!(
                         "sky importance: environment {bit}'s table built ({ENV_W}x{ENV_H}); sun \
                          taken out at {:.3} ({:.2} deg radius, halo {:.2} deg)",
                         sun.direction,
                         sun.core.cos_radius.acos().to_degrees(),
                         sun.halo.map_or(0.0, |h| h.cos_radius.acos().to_degrees())
                     ),
-                    None => log::info!(
+                    None => log::debug!(
                         "sky importance: environment {bit}'s table built ({ENV_W}x{ENV_H}); no sun"
                     ),
                 }

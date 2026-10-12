@@ -289,7 +289,7 @@ impl AtmosphereState {
         ] {
             unsafe { rd.device.cmd_fill_buffer(cmd, handle, 0, vk::WHOLE_SIZE, 0) };
         }
-        log::info!(
+        log::debug!(
             "atmosphere: LUTs {}x{} + {}x{} + 2x{}x{}, cloud noise {}^3 + {}^3 ({} MB)",
             T_W,
             T_H,

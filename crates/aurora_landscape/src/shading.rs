@@ -280,12 +280,23 @@ pub fn on_shading_removed(
     }
 }
 
-pub fn release_shading(mut shadings: Query<&mut LandscapeShading>, rd: Res<RenderDevice>) {
+pub fn release_shading(
+    mut shadings: Query<&mut LandscapeShading>,
+    class: Option<ResMut<LandscapeClass>>,
+    rd: Res<RenderDevice>,
+) {
     for mut shading in &mut shadings {
         if shading.palette.handle != vk::Buffer::null() {
             rd.destroyer.destroy_buffer(shading.palette.handle);
             shading.palette = Buffer::default();
         }
+    }
+    // The class's shared row table.
+    if let Some(mut class) = class
+        && class.rows.handle != vk::Buffer::null()
+    {
+        rd.destroyer.destroy_buffer(class.rows.handle);
+        class.rows = Buffer::default();
     }
 }
 

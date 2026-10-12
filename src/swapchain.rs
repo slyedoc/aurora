@@ -264,7 +264,7 @@ impl Swapchain {
                 ) {
                     Ok((index, _)) => break index,
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                        log::info!("swapchain: out of date at acquire, recreating");
+                        log::debug!("swapchain: out of date at acquire, recreating");
                         self.on_resize(window);
                     }
                     Err(e) => panic!("acquire_next_image failed: {e:?}"),
@@ -305,7 +305,7 @@ impl Swapchain {
             static PRESENTED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !PRESENTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::info!("first frame presented");
+                log::debug!("first frame presented");
             }
             // Tracy's frame boundary (bevy_render's mark, which this renderer replaces).
             #[cfg(feature = "trace_tracy")]
@@ -345,7 +345,7 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        log::info!("Dropping Swapchain");
+        log::debug!("Dropping Swapchain");
         unsafe {
             {
                 let queue = self.device.queue.lock().unwrap();

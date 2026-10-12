@@ -87,7 +87,7 @@ impl SharcState {
                     | vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
             );
-            log::info!(
+            log::debug!(
                 "sharc: {} entries ({} MB)",
                 SHARC_ENTRIES,
                 SHARC_ENTRIES as u64 * ENTRY_BYTES / (1024 * 1024)

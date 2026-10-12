@@ -160,7 +160,7 @@ impl SphereBLAS {
             };
         }
 
-        log::info!("Created sphere BLAS");
+        log::debug!("Created sphere BLAS");
 
         Self {
             acceleration_structure,

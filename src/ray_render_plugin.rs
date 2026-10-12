@@ -279,7 +279,7 @@ pub fn shutdown_renderer(world: &mut World) {
     if !world.contains_resource::<RenderDevice>() {
         return;
     }
-    log::info!("Shutting down the renderer");
+    log::debug!("Shutting down the renderer");
     {
         let render_device = world.resource::<RenderDevice>();
         let queue = render_device.queue.lock().unwrap();

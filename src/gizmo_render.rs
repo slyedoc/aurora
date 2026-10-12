@@ -124,11 +124,11 @@ impl VulkanAsset for GizmoPipeline {
     ) -> Option<Self::ExtractedAsset> {
         let shaders: &Assets<crate::shader::Shader> = &**param;
         let Some(vertex_shader) = shaders.get(&self.vertex_shader) else {
-            log::warn!("gizmo vertex shader not ready yet");
+            log::debug!("gizmo vertex shader not ready yet");
             return None;
         };
         let Some(fragment_shader) = shaders.get(&self.fragment_shader) else {
-            log::warn!("gizmo fragment shader not ready yet");
+            log::debug!("gizmo fragment shader not ready yet");
             return None;
         };
         Some((vertex_shader.clone(), fragment_shader.clone()))

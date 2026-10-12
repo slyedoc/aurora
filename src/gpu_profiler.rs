@@ -111,7 +111,7 @@ impl GpuProfiler {
                 .iter()
                 .map(|(name, ms)| format!("{name} {ms:.2}"))
                 .collect();
-            info!("gpu ms: {}", line.join(", "));
+            debug!("gpu ms: {}", line.join(", "));
         }
     }
 

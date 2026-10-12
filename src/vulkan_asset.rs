@@ -282,7 +282,7 @@ fn on_shutdown_asset<A: VulkanAsset>(world: &mut World) {
                 finished += 1;
             }
             if finished > 0 {
-                log::info!("VulkanAsset: waited for {finished} in-flight build(s) at shutdown");
+                log::debug!("VulkanAsset: waited for {finished} in-flight build(s) at shutdown");
             }
         }
         for (_, prep) in assets.0.drain() {

@@ -277,7 +277,7 @@ pub fn run_bakes(
                 record_dispatch(&rd, cmd, module, "write_delta", &push, len, None);
             }
         });
-        log::info!(
+        log::debug!(
             "landscape: eroded {}x{} cells x {} steps in {:.0} ms",
             n.x,
             n.y,

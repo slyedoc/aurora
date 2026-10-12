@@ -211,11 +211,11 @@ impl VulkanAsset for UiPipeline {
     ) -> Option<Self::ExtractedAsset> {
         let shaders: &Assets<crate::shader::Shader> = &**param;
         let Some(vertex_shader) = shaders.get(&self.vertex_shader) else {
-            log::warn!("UI vertex shader not ready yet");
+            log::debug!("UI vertex shader not ready yet");
             return None;
         };
         let Some(fragment_shader) = shaders.get(&self.fragment_shader) else {
-            log::warn!("UI fragment shader not ready yet");
+            log::debug!("UI fragment shader not ready yet");
             return None;
         };
         Some((vertex_shader.clone(), fragment_shader.clone()))
@@ -1809,7 +1809,7 @@ fn build_vertices(
                     static WARNED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        log::warn!(
+                        log::debug!(
                             "ui: quad dropped, no VulkanAssets<Image> entry for {id:?} (first occurrence only)"
                         );
                     }
@@ -2129,7 +2129,7 @@ pub fn prepare_ui_surfaces(
                 },
             ),
         );
-        log::info!("ui: surface target {:?} ({}x{})", asset, size.x, size.y);
+        log::debug!("ui: surface target {:?} ({}x{})", asset, size.x, size.y);
     }
 }
 

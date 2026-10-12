@@ -182,7 +182,7 @@ impl DlssRenderer {
             )
         };
         if r != RESULT_SUCCESS {
-            log::info!(
+            log::warn!(
                 "dlss: NVSDK_NGX_VULKAN_Init_with_ProjectID -> {} -- running without DLSS",
                 ngx::result_name(r)
             );
@@ -191,7 +191,7 @@ impl DlssRenderer {
         let mut params: *mut NgxParameter = std::ptr::null_mut();
         let r = unsafe { NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut params) };
         if r != RESULT_SUCCESS || params.is_null() {
-            log::info!(
+            log::warn!(
                 "dlss: NVSDK_NGX_VULKAN_GetCapabilityParameters -> {}",
                 ngx::result_name(r)
             );
@@ -200,7 +200,7 @@ impl DlssRenderer {
         }
         let rr_available = get_i(params, P_SUPERSAMPLING_DENOISING_AVAILABLE).unwrap_or(0) != 0;
         let init_result = get_i(params, P_SUPERSAMPLING_FEATURE_INIT_RESULT).unwrap_or(0);
-        log::info!(
+        log::debug!(
             "dlss: RayReconstruction available = {rr_available}, \
              SuperSampling.FeatureInitResult = {}, min driver {}.{}",
             ngx::result_name(init_result as u32),

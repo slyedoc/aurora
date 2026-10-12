@@ -482,7 +482,7 @@ impl GpuTransforms {
         }
         let Some(module) = modules.get(&self.module) else {
             if !self.warned_module {
-                log::info!("transform.slang not compiled yet; instances wait");
+                log::debug!("transform.slang not compiled yet; instances wait");
                 self.warned_module = true;
             }
             // Keep the deltas: the CPU mirror already holds them, and the first build after

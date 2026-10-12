@@ -156,32 +156,32 @@ impl VulkanAsset for RaytracingPipeline {
         let shaders: &Assets<crate::shader::Shader> = &**shaders;
 
         let Some(raygen_shader) = shaders.get(&self.raygen_shader) else {
-            log::warn!("Raygen shader not ready yet");
+            log::debug!("Raygen shader not ready yet");
             return None;
         };
 
         let Some(miss_shader) = shaders.get(&self.miss_shader) else {
-            log::warn!("Miss shader not ready yet");
+            log::debug!("Miss shader not ready yet");
             return None;
         };
 
         let Some(hit_shader) = shaders.get(&self.hit_shader) else {
-            log::warn!("Hit shader not ready yet");
+            log::debug!("Hit shader not ready yet");
             return None;
         };
 
         let Some(any_hit_shader) = shaders.get(&self.any_hit_shader) else {
-            log::warn!("Any-hit shader not ready yet");
+            log::debug!("Any-hit shader not ready yet");
             return None;
         };
 
         let Some(sphere_intersection_shader) = shaders.get(&self.sphere_intersection_shader) else {
-            log::warn!("Sphere intersection shader not ready yet");
+            log::debug!("Sphere intersection shader not ready yet");
             return None;
         };
 
         let Some(sphere_hit_shader) = shaders.get(&self.sphere_hit_shader) else {
-            log::warn!("Sphere hit shader not ready yet");
+            log::debug!("Sphere hit shader not ready yet");
             return None;
         };
 
@@ -191,7 +191,7 @@ impl VulkanAsset for RaytracingPipeline {
         let mut surface_groups = Vec::with_capacity(registry.groups().len());
         for group in registry.groups() {
             let Some(closest_hit) = shaders.get(&group.closest_hit) else {
-                log::warn!("surface group {:?}: closest-hit not ready yet", group.label);
+                log::debug!("surface group {:?}: closest-hit not ready yet", group.label);
                 WAITING_ON_GROUP.store(true, std::sync::atomic::Ordering::Relaxed);
                 return None;
             };
@@ -199,7 +199,7 @@ impl VulkanAsset for RaytracingPipeline {
                 Some(handle) => match shaders.get(handle) {
                     Some(shader) => Some(shader.clone()),
                     None => {
-                        log::warn!("surface group {:?}: any-hit not ready yet", group.label);
+                        log::debug!("surface group {:?}: any-hit not ready yet", group.label);
                         WAITING_ON_GROUP.store(true, std::sync::atomic::Ordering::Relaxed);
                         return None;
                     }

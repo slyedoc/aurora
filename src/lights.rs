@@ -248,7 +248,7 @@ impl LightManager {
         }
         let Some(module) = modules.get(&self.module) else {
             if !self.warned_module {
-                log::info!("lights.slang not compiled yet; light table waits");
+                log::debug!("lights.slang not compiled yet; light table waits");
                 self.warned_module = true;
             }
             return;

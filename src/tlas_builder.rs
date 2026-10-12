@@ -590,7 +590,7 @@ impl TLAS {
         }
         let Some(module) = modules.get(&self.module) else {
             if !self.warned_module {
-                log::info!("instances.slang not compiled yet; TLAS waits");
+                log::debug!("instances.slang not compiled yet; TLAS waits");
                 self.warned_module = true;
             }
             return;

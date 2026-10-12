@@ -433,7 +433,7 @@ impl RenderDevice {
 
 impl Drop for RenderDeviceData {
     fn drop(&mut self) {
-        log::info!("Dropping RenderDevice");
+        log::debug!("Dropping RenderDevice");
         unsafe {
             let destroyer = ManuallyDrop::take(&mut self.destroyer);
             drop(destroyer);
@@ -487,10 +487,10 @@ unsafe fn create_instance(
             ));
         }
 
-        println!("Validation layers:");
-        for layer_name in layer_names.iter() {
-            println!("  - {}", layer_name.to_str().unwrap());
-        }
+        log::debug!(
+            "vulkan: validation layers: {:?}",
+            layer_names.iter().map(|l| l.to_string_lossy()).collect::<Vec<_>>()
+        );
 
         let layers_names_raw: Vec<*const c_char> = layer_names
             .iter()
@@ -515,10 +515,13 @@ unsafe fn create_instance(
             }
         }
 
-        println!("Instance extensions:");
-        for extension_name in instance_extensions.iter() {
-            println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
-        }
+        log::debug!(
+            "vulkan: instance extensions: {:?}",
+            instance_extensions
+                .iter()
+                .map(|e| CStr::from_ptr(*e).to_string_lossy())
+                .collect::<Vec<_>>()
+        );
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(app_name)
@@ -677,21 +680,25 @@ unsafe fn pick_physical_device(
                 .expect("XR physical device has no graphics queue")
                 as u32;
             let info = instance.get_physical_device_properties(physical_device);
-            println!(
-                "Running on device (OpenXR): {}",
-                CStr::from_ptr(info.device_name.as_ptr()).to_str().unwrap()
+            log::info!(
+                "vulkan: {} (OpenXR)",
+                CStr::from_ptr(info.device_name.as_ptr()).to_string_lossy()
             );
             return (physical_device, queue_family_idx);
         }
         let all_devices = instance.enumerate_physical_devices().unwrap();
-        println!("Available devices:");
-        for device in all_devices.iter() {
-            let info = instance.get_physical_device_properties(*device);
-            println!(
-                "  - {}",
-                CStr::from_ptr(info.device_name.as_ptr()).to_str().unwrap()
-            );
-        }
+        log::debug!(
+            "vulkan: devices: {:?}",
+            all_devices
+                .iter()
+                .map(|d| {
+                    let info = instance.get_physical_device_properties(*d);
+                    CStr::from_ptr(info.device_name.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        );
 
         let (physical_device, queue_family_idx) = instance
             .enumerate_physical_devices()
@@ -719,11 +726,9 @@ unsafe fn pick_physical_device(
             .expect("Not a single device found!");
 
         let device_properties = instance.get_physical_device_properties(physical_device);
-        println!(
-            "Running on device: {}",
-            CStr::from_ptr(device_properties.device_name.as_ptr())
-                .to_str()
-                .unwrap()
+        log::info!(
+            "vulkan: {}",
+            CStr::from_ptr(device_properties.device_name.as_ptr()).to_string_lossy()
         );
         (physical_device, queue_family_idx)
     }
@@ -772,7 +777,7 @@ unsafe fn create_logical_device(
                 .iter()
                 .any(|p| CStr::from_ptr(*p) == ext.as_c_str());
             if !known {
-                println!(
+                log::warn!(
                     "dlss: device lacks {} -- DLSS will be unavailable",
                     ext.to_string_lossy()
                 );
@@ -788,7 +793,7 @@ unsafe fn create_logical_device(
         if micromaps {
             device_extensions.push(opacity_micromap::NAME.as_ptr());
         } else {
-            println!(
+            log::warn!(
                 "device lacks VK_EXT_opacity_micromap -- alpha cutouts stay on the any-hit path"
             );
         }
@@ -805,10 +810,13 @@ unsafe fn create_logical_device(
             device_extensions.push(vk::NV_DEVICE_DIAGNOSTICS_CONFIG_NAME.as_ptr());
         }
 
-        println!("Device extensions:");
-        for extension_name in device_extensions.iter() {
-            println!("  - {}", CStr::from_ptr(*extension_name).to_str().unwrap());
-        }
+        log::debug!(
+            "vulkan: device extensions: {:?}",
+            device_extensions
+                .iter()
+                .map(|e| CStr::from_ptr(*e).to_string_lossy())
+                .collect::<Vec<_>>()
+        );
 
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_idx)
@@ -1155,7 +1163,7 @@ impl VkDestroyer {
 
 impl Drop for VkDestroyer {
     fn drop(&mut self) {
-        log::info!("Dropping connection to destroy thread");
+        log::debug!("Dropping connection to destroy thread");
         let sender = self.sender.take().unwrap();
         drop(sender);
         self.thread.take().unwrap().join().unwrap();
@@ -1232,7 +1240,7 @@ fn spawn_destroy_thread(
                 }
             }
         }
-        log::info!("Destroy thread finished");
+        log::debug!("Destroy thread finished");
     });
 
     ManuallyDrop::new(VkDestroyer {
