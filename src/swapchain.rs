@@ -302,6 +302,11 @@ impl Swapchain {
                 .device
                 .ext_swapchain
                 .queue_present(queue, &present_info);
+            static PRESENTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !PRESENTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::info!("first frame presented");
+            }
             // Tracy's frame boundary (bevy_render's mark, which this renderer replaces).
             #[cfg(feature = "trace_tracy")]
             bevy::log::event!(

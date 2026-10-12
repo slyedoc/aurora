@@ -123,7 +123,7 @@ impl VulkanAsset for ComputeModule {
         let handles = unsafe {
             render_device
                 .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &infos, None)
+                .create_compute_pipelines(render_device.pipeline_cache, &infos, None)
                 .unwrap_or_else(|(_, e)| {
                     panic!("compute pipelines for {} failed: {e:?}", shader.path)
                 })

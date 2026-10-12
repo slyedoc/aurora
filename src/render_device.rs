@@ -103,6 +103,9 @@ pub struct RenderDeviceData {
     pub command_buffers: [vk::CommandBuffer; 2],
     pub descriptor_pool: Mutex<vk::DescriptorPool>,
     pub linear_sampler: vk::Sampler,
+    /// Every pipeline compiles through this; seeded from and saved to disk
+    /// ([`RenderDevice::save_pipeline_cache`]) so a relaunch skips the driver's compile.
+    pub pipeline_cache: vk::PipelineCache,
     pub destroyer: ManuallyDrop<VkDestroyer>,
     pub allocator_state: Arc<Mutex<ManuallyDrop<AllocatorState>>>,
     /// The validation messenger (debug / `dev` builds): destroyed right before the instance.
@@ -170,6 +173,7 @@ impl RenderDevice {
             let (bindless_descriptor_set, bindless_descriptor_set_layout) =
                 create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
             let linear_sampler = create_linear_sampler(device.clone());
+            let pipeline_cache = create_pipeline_cache(&device);
 
             let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
                 allocator: Arc::new(Mutex::new(
@@ -211,12 +215,35 @@ impl RenderDevice {
                 command_buffers,
                 descriptor_pool,
                 linear_sampler,
+                pipeline_cache,
                 destroyer,
                 debug_messenger,
                 allocator_state,
             }));
 
             ret
+        }
+    }
+
+    /// Writes the pipeline cache to disk; called after a pipeline compiles, not at exit, so a
+    /// crashing teardown still keeps it.
+    pub fn save_pipeline_cache(&self) {
+        let Some(path) = pipeline_cache_path() else {
+            return;
+        };
+        let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(data) => data,
+            Err(err) => {
+                log::warn!("pipeline cache: read back failed: {err:?}");
+                return;
+            }
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let partial = path.with_extension(format!("{}.part", std::process::id()));
+        if std::fs::write(&partial, &data).is_ok() && std::fs::rename(&partial, &path).is_ok() {
+            log::debug!("pipeline cache: saved {} KiB", data.len() / 1024);
         }
     }
 
@@ -415,6 +442,7 @@ impl Drop for RenderDeviceData {
             self.destroy_descriptor_set_layout(self.bindless_descriptor_set_layout, None);
 
             self.destroy_sampler(self.linear_sampler, None);
+            self.destroy_pipeline_cache(self.pipeline_cache, None);
             {
                 let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
                 self.destroy_command_pool(*transfer_command_pool, None);
@@ -1196,4 +1224,22 @@ fn spawn_destroy_thread(
         sender: Some(sender),
         thread: Some(thread),
     })
+}
+
+fn pipeline_cache_path() -> Option<std::path::PathBuf> {
+    crate::shader::cache_dir().map(|dir| dir.join("pipelines.bin"))
+}
+
+/// The pipeline cache, seeded from the last run's; the driver checks the blob's header (vendor,
+/// device, driver UUID) and starts empty when it doesn't match.
+fn create_pipeline_cache(device: &ash::Device) -> vk::PipelineCache {
+    let data = pipeline_cache_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .unwrap_or_default();
+    let info = vk::PipelineCacheCreateInfo::default().initial_data(&data);
+    unsafe { device.create_pipeline_cache(&info, None) }
+        .or_else(|_| unsafe {
+            device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        })
+        .expect("create pipeline cache")
 }

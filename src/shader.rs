@@ -57,15 +57,20 @@ impl AssetLoader for ShaderLoader {
                     .display()
                     .to_string(),
             };
-            let spirv = compile_slang(&source_path)?;
+            let imports = slang_imports(std::path::Path::new(&source_path));
+            let spirv = compile_slang_cached(&source_path, &imports)?;
             // Every module it imports, read through the loader: bevy then reloads this shader
             // when any of them changes.
-            for import in slang_imports(std::path::Path::new(&source_path)) {
+            for import in imports {
                 if let Some(asset) = slang_asset_path(&import) {
                     let _ = load_context.read_asset_bytes(asset).await;
                 }
             }
-            let path = load_context.path().path().to_string_lossy().replace('\\', "/");
+            let path = load_context
+                .path()
+                .path()
+                .to_string_lossy()
+                .replace('\\', "/");
             log::debug!("Loaded shader: {path}");
             Ok(Shader {
                 path,
@@ -82,7 +87,10 @@ fn slang_search_dirs(importer: &std::path::Path) -> Vec<std::path::PathBuf> {
     if let Some(dir) = importer.parent() {
         dirs.push(dir.to_path_buf());
     }
-    dirs.push(std::path::PathBuf::from(format!("{}/shaders", crate::assets::AURORA_ASSET_DIR)));
+    dirs.push(std::path::PathBuf::from(format!(
+        "{}/shaders",
+        crate::assets::AURORA_ASSET_DIR
+    )));
     dirs.push(bevy::asset::io::file::FileAssetReader::get_base_path().join("assets/shaders"));
     dirs
 }
@@ -98,7 +106,9 @@ fn slang_imports(source: &std::path::Path) -> Vec<std::path::PathBuf> {
         for line in text.lines() {
             let line = line.trim_start();
             let line = line.strip_prefix("__exported ").unwrap_or(line);
-            let Some(module) = line.strip_prefix("import ").and_then(|m| m.split(';').next())
+            let Some(module) = line
+                .strip_prefix("import ")
+                .and_then(|m| m.split(';').next())
             else {
                 continue;
             };
@@ -131,15 +141,84 @@ fn slang_asset_path(file: &std::path::Path) -> Option<bevy::asset::AssetPath<'st
     Some(bevy::asset::AssetPath::from(rel.to_path_buf()).into_owned())
 }
 
+/// [`compile_slang`] through an on-disk cache keyed by the slangc binary, the source and every
+/// module it imports, so an unchanged shader skips slangc on the next launch.
+fn compile_slang_cached(
+    source_path: &str,
+    imports: &[std::path::PathBuf],
+) -> Result<Vec<u8>, ShaderLoaderError> {
+    let Some(dir) = cache_dir().map(|dir| dir.join("slang")) else {
+        return compile_slang(source_path);
+    };
+    let mut hasher = blake3::Hasher::new();
+    let slangc = slangc_path();
+    hasher.update(slangc.as_os_str().as_encoded_bytes());
+    if let Ok(meta) = std::fs::metadata(&slangc) {
+        hasher.update(&meta.len().to_le_bytes());
+        if let Ok(modified) = meta.modified() {
+            hasher.update(format!("{modified:?}").as_bytes());
+        }
+    }
+    hasher.update(SLANGC_ARGS.join(" ").as_bytes());
+    for file in std::iter::once(std::path::Path::new(source_path))
+        .chain(imports.iter().map(|p| p.as_path()))
+    {
+        hasher.update(file.as_os_str().as_encoded_bytes());
+        hasher.update(&std::fs::read(file)?);
+    }
+    let cached = dir.join(format!("{}.spv", hasher.finalize().to_hex()));
+    if let Ok(spirv) = std::fs::read(&cached) {
+        log::debug!("slang cache hit: {source_path}");
+        return Ok(spirv);
+    }
+    let spirv = compile_slang(source_path)?;
+    let _ = std::fs::create_dir_all(&dir);
+    let partial = cached.with_extension(format!("{}.part", std::process::id()));
+    if std::fs::write(&partial, &spirv).is_ok() {
+        let _ = std::fs::rename(&partial, &cached);
+    }
+    Ok(spirv)
+}
+
+/// `$XDG_CACHE_HOME/aurora`, else `~/.cache/aurora`: compiled shaders and the pipeline cache.
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache"))
+        })?;
+    Some(base.join("aurora"))
+}
+
+/// The Vulkan SDK's `slangc` (`$VULKAN_SDK/bin`), else the one on `PATH`.
+fn slangc_path() -> std::path::PathBuf {
+    let sdk = std::env::var_os("VULKAN_SDK")
+        .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"));
+    let path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|dir| dir.join("slangc"));
+    sdk.into_iter()
+        .chain(path)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("slangc"))
+}
+
+const SLANGC_ARGS: &[&str] = &[
+    "-target",
+    "spirv",
+    "-profile",
+    "spirv_1_6",
+    "-O2",
+    "-fvk-use-entrypoint-name",
+];
+
 /// Compiles a `.slang` module to SPIR-V with the Vulkan SDK's `slangc` (`$VULKAN_SDK/bin`, else
 /// `PATH`). Every `[shader("...")]` entry point in the file lands in the one module under its
 /// own name, so a file with several entries is one asset and one compile. Modules reference
 /// buffers through raw pointers (`SPV_KHR_physical_storage_buffer`).
 pub fn compile_slang(source_path: &str) -> Result<Vec<u8>, ShaderLoaderError> {
-    let slangc = std::env::var_os("VULKAN_SDK")
-        .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("slangc"));
+    let slangc = slangc_path();
     // slangc has no stdout mode; round-trip through a per-process temp file.
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let out_dir = std::env::temp_dir().join("aurora-slang");
@@ -151,8 +230,7 @@ pub fn compile_slang(source_path: &str) -> Result<Vec<u8>, ShaderLoaderError> {
     ));
     let output = std::process::Command::new(&slangc)
         .arg(source_path)
-        .args(["-target", "spirv", "-profile", "spirv_1_6", "-O2"])
-        .arg("-fvk-use-entrypoint-name")
+        .args(SLANGC_ARGS)
         // Engine modules (`import procedural;`) resolve from any asset source, and the app's
         // own shader root so its modules import across directories (`import planet.noise;`).
         .arg("-I")

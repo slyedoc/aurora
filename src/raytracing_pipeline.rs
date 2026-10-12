@@ -384,7 +384,7 @@ impl VulkanAsset for RaytracingPipeline {
                 .ext_rtx_pipeline
                 .create_ray_tracing_pipelines(
                     vk::DeferredOperationKHR::null(),
-                    vk::PipelineCache::null(),
+                    render_device.pipeline_cache,
                     std::slice::from_ref(&pipeline_info),
                     None,
                 )
@@ -436,6 +436,7 @@ impl VulkanAsset for RaytracingPipeline {
             .collect();
 
         log::debug!("Raytracing pipeline compiled in {:?}", start.elapsed());
+        render_device.save_pipeline_cache();
 
         CompiledRaytracingPipeline {
             pipeline,

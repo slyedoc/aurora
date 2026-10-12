@@ -114,7 +114,8 @@ impl FogGridState {
         view.clear = false;
         unsafe {
             for b in &view.buffers {
-                rd.device.cmd_fill_buffer(cmd, b.handle, 0, vk::WHOLE_SIZE, 0);
+                rd.device
+                    .cmd_fill_buffer(cmd, b.handle, 0, vk::WHOLE_SIZE, 0);
             }
         }
         memory_barrier(

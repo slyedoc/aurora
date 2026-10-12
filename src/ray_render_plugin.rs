@@ -475,8 +475,7 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
 
-    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds) =
-        dev_ui_stuff;
+    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds) = dev_ui_stuff;
     let settings = settings
         .map(|settings| settings.clone())
         .unwrap_or_default();
@@ -986,6 +985,11 @@ fn render_frame(
             if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
                 && sbt.data.address != 0
             {
+                static TRACED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("first frame traced");
+                }
                 render_device.cmd_bind_pipeline(
                     cmd_buffer,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1786,7 +1790,10 @@ mod tests {
     #[test]
     fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
         assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 94 * 4);
-        assert_eq!(core::mem::offset_of!(super::UniformData, emissive_boost), 103 * 4);
+        assert_eq!(
+            core::mem::offset_of!(super::UniformData, emissive_boost),
+            103 * 4
+        );
     }
 
     /// `rt_types.slang` mirrors `UniformData` with scalars only; its offsets are these.

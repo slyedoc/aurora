@@ -12,6 +12,4 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "std",
     "bevy_asset",
     "bevy_image",
-    # Material files are `.bsn` asset values (`bevy::bsn_asset::BsnValueLoader`).
-    "bsn_asset",
 ] }

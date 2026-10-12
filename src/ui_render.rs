@@ -303,7 +303,7 @@ impl VulkanAsset for UiPipeline {
 
         let pipeline = unsafe {
             render_device.create_graphics_pipelines(
-                vk::PipelineCache::null(),
+                render_device.pipeline_cache,
                 &[pipeline_info],
                 None,
             )

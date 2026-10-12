@@ -18,7 +18,6 @@
 //! The GPU side -- the record the hit shaders read, bindless texture resolution -- is
 //! `bevy_aurora::material`, which re-exports this crate.
 
-use bevy::bsn_asset::BsnAssetAppExt;
 use bevy::{asset::AssetApp, ecs::template::FromTemplate, prelude::*};
 
 /// Which side of a surface is culled.
@@ -208,9 +207,7 @@ impl Plugin for AuroraMaterialTypesPlugin {
             .register_type::<ParallaxMappingMethod>()
             .register_type::<AuroraMaterial3d>()
             .register_type::<AuroraMaterial3dTemplate>()
-            .register_asset_reflect::<AuroraMaterial>()
-            // `materials/slate.bsn`: a `#name` and the material, as the editor writes it.
-            .register_bsn_asset::<AuroraMaterial>();
+            .register_asset_reflect::<AuroraMaterial>();
         app.world_mut()
             .resource_mut::<Assets<AuroraMaterial>>()
             .insert(

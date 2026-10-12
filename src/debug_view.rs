@@ -100,7 +100,11 @@ fn cycle_view(
     if !keyboard.just_pressed(KeyCode::F4) {
         return;
     }
-    let Some(current) = cameras.iter().copied().max_by_key(|view| view.shader_index()) else {
+    let Some(current) = cameras
+        .iter()
+        .copied()
+        .max_by_key(|view| view.shader_index())
+    else {
         return;
     };
     let next = current.next();
