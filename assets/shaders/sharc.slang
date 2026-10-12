@@ -6,18 +6,25 @@
 // average (weighted by sample counts), clears the accumulators, and evicts entries that
 // have not been touched for a while.
 
-// Must match `SharcEntry` in src/sharc.rs. 32 bytes; resolved values are packed f16 pairs
-// (shaderFloat16 is enabled at device creation).
+// Must match `SharcEntry` in rt_types.slang (56 bytes, ENTRY_BYTES in src/sharc.rs).
 struct SharcEntry {
     uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
     uint frame;    // Last frame the entry was deposited into or queried.
-    uint acc_r;    // Fixed-point (1 nit) radiance accumulated this frame.
-    uint acc_g;
-    uint acc_b;
+    // Radiance accumulated this frame, fixed point at SHARC_UNIT (1/65536 nit): 64-bit so a
+    // moonlit voxel keeps its precision and a sunlit one cannot overflow.
+    uint64_t acc_r;
+    uint64_t acc_g;
+    uint64_t acc_b;
     uint acc_n;    // Samples accumulated this frame.
-    uint res_rg;   // Resolved radiance, 2xf16 (r, g).
-    uint res_bc;   // Resolved radiance b + confidence (samples folded in), 2xf16.
+    float conf;    // Samples folded into the resolved value.
+    float res_r;   // Resolved outgoing radiance (nits).
+    float res_g;
+    float res_b;
+    uint pad;
 };
+
+// Fixed-point unit of the accumulators, in nits.
+static const float SHARC_UNIT = 1.0 / 65536.0;
 
 struct SharcResolveParams {
     SharcEntry* entries;
@@ -40,23 +47,28 @@ void sharc_resolve(uint3 gid: SV_DispatchThreadID) {
     if (e.tag == 0) {
         return;
     }
-    // Untouched for ~10 seconds: evict.
-    if (p.frame - e.frame > 600) {
+    // Untouched for 3000 frames (15 s at 200 fps): evict. Shorter, at high frame rates whole
+    // regions dropped out and relearned in waves the image pulsed with.
+    if (p.frame - e.frame > 3000) {
         p.entries[i] = SharcEntry();
         return;
     }
     if (e.acc_n == 0) {
         return;
     }
-    let fresh = float3(float(e.acc_r), float(e.acc_g), float(e.acc_b)) / float(e.acc_n);
-    let old = float3(f16tof32(e.res_rg & 0xFFFF), f16tof32(e.res_rg >> 16), f16tof32(e.res_bc & 0xFFFF));
-    let conf = f16tof32(e.res_bc >> 16);
-    // Count-weighted blend, floored so the cache keeps tracking lighting changes.
+    let fresh = float3(float(e.acc_r), float(e.acc_g), float(e.acc_b)) * (SHARC_UNIT / float(e.acc_n));
+    let old = float3(e.res_r, e.res_g, e.res_b);
+    let conf = e.conf;
+    // Count-weighted blend, floored so the cache keeps tracking lighting changes (2 %: a
+    // voxel's per-frame noise stays under Ray Reconstruction's notice, a change lands in a
+    // fraction of a second).
     let conf_new = min(conf + float(e.acc_n), 1024.0);
-    let w = max(float(e.acc_n) / conf_new, 0.05);
+    let w = max(float(e.acc_n) / conf_new, 0.02);
     let resolved = lerp(old, fresh, conf <= 0.0 ? 1.0 : w);
-    p.entries[i].res_rg = f32tof16(resolved.x) | (f32tof16(resolved.y) << 16);
-    p.entries[i].res_bc = f32tof16(resolved.z) | (f32tof16(conf_new) << 16);
+    p.entries[i].res_r = resolved.x;
+    p.entries[i].res_g = resolved.y;
+    p.entries[i].res_b = resolved.z;
+    p.entries[i].conf = conf_new;
     p.entries[i].acc_r = 0;
     p.entries[i].acc_g = 0;
     p.entries[i].acc_b = 0;

@@ -276,12 +276,17 @@ public struct LightInstance {
 public struct SharcEntry {
     public uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
     public uint frame;    // Last frame the entry was deposited into or queried.
-    public uint acc_r;    // Fixed-point (1 nit) radiance accumulated this frame.
-    public uint acc_g;
-    public uint acc_b;
+    // Radiance accumulated this frame, fixed point at SHARC_UNIT (1/65536 nit): 64-bit so a
+    // moonlit voxel keeps its precision and a sunlit one cannot overflow.
+    public uint64_t acc_r;
+    public uint64_t acc_g;
+    public uint64_t acc_b;
     public uint acc_n;    // Samples accumulated this frame.
-    public uint res_rg;   // Resolved radiance, 2xf16 (r, g).
-    public uint res_bc;   // Resolved radiance b + confidence (samples folded in), 2xf16.
+    public float conf;    // Samples folded into the resolved value.
+    public float res_r;   // Resolved outgoing radiance (nits).
+    public float res_g;
+    public float res_b;
+    public uint pad;
 };
 
 // One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.

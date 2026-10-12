@@ -876,6 +876,10 @@ unsafe fn create_logical_device(
         let mut features_float16 =
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
 
+        // 64-bit atomic adds: the radiance cache accumulates in fine fixed point (sharc.rs).
+        let mut features_atomic64 = vk::PhysicalDeviceShaderAtomicInt64Features::default()
+            .shader_buffer_int64_atomics(true);
+
         let mut features_micromap =
             vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true);
 
@@ -913,7 +917,8 @@ unsafe fn create_logical_device(
             .push_next(&mut features_reorder)
             .push_next(&mut features_host_query_reset)
             .push_next(&mut features_scalar_block)
-            .push_next(&mut features_float16);
+            .push_next(&mut features_float16)
+            .push_next(&mut features_atomic64);
         let device_info = if micromaps {
             device_info.push_next(&mut features_micromap)
         } else {

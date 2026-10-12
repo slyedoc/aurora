@@ -3,12 +3,13 @@
 //! A fixed-size hash table of voxel entries (voxel size scales with distance to the camera,
 //! keyed by position + level + dominant face normal). The raygen deposits each traced path's
 //! outgoing radiance at its diffuse vertices (delta accumulation over the sample's running
-//! radiance) and, from bounce 2 on, terminates paths into entries that have converged. The
-//! `sharc_resolve` kernel folds each frame's accumulation into a per-entry moving average
-//! and evicts entries that have not been touched for a while.
+//! radiance, 64-bit fixed point so dim light keeps its precision) and, from the first indirect
+//! hit on, terminates paths into entries that have converged -- unless the hit is closer than
+//! a voxel, or the path is one of the share kept to train the cache. The `sharc_resolve`
+//! kernel folds each frame's accumulation into a per-entry moving average and evicts entries
+//! that have not been touched for a while.
 //!
-//! The cache is biased by construction, so it turns off while accumulating (Space keeps the
-//! reference estimator) and the panel's `sharc` toggle A/Bs it live.
+//! Biased by construction; the panel's `sharc` toggle A/Bs it live.
 
 use ash::vk;
 use bevy::prelude::*;
@@ -24,8 +25,8 @@ use crate::{
 
 /// Must match SHARC_ENTRIES in raygen.slang.
 const SHARC_ENTRIES: u32 = 1 << 20;
-/// Must match SharcEntry in sharc.slang.
-const ENTRY_BYTES: u64 = 32;
+/// Must match SharcEntry in sharc.slang / rt_types.slang.
+const ENTRY_BYTES: u64 = 56;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

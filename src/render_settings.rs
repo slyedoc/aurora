@@ -78,7 +78,9 @@ pub struct RenderSettings {
     pub light_grid_cell: f32,
     #[reflect(@1.0..=64.0_f32)]
     pub light_grid_samples: u32,
-    /// Radiance cache: paths terminate into converged voxels from bounce 2 on. Biased.
+    /// Radiance cache: indirect paths end in converged voxels from the first bounce on (a few
+    /// train it to the end). Biased, but at 1 spp it keeps the light Ray Reconstruction would
+    /// throw away as fireflies (the abbey 25 % dark without it).
     pub sharc: bool,
     /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
     #[reflect(@0.05..=2.0_f32)]
@@ -118,7 +120,7 @@ impl Default for RenderSettings {
             restir_boiling: 0.0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
-            sharc: false,
+            sharc: true,
             sharc_voxel: 0.25,
             omm: true,
             rr_preset: RrPreset::current(),

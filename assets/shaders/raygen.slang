@@ -439,12 +439,23 @@ LightCtx lightCtx() {
 
 // Must match SHARC_ENTRIES in src/sharc.rs.
 static const uint SHARC_ENTRIES = 1u << 20;
+// The share of paths that never query the cache (they train it).
+static const float SHARC_TRAIN = 0.125;
+
+// The voxel size at a point: `sharc_voxel` near the camera, doubling per distance octave
+// past 8 m.
+float sharcLevel(float3 pos, float3 cam) {
+    return floor(log2(max(max(length(pos - cam), 1.0e-3) / 8.0, 1.0)));
+}
+
+float sharcVoxelSize(float3 pos, float3 cam) {
+    return max(pc.uniforms.sharc_voxel, 1.0e-3) * exp2(sharcLevel(pos, cam));
+}
 
 // Voxel key: position quantized at a distance-scaled size, level, dominant face normal.
 uint4 sharcKey(float3 pos, float3 n, float3 cam) {
-    let d = max(length(pos - cam), 1.0e-3);
-    let level = floor(log2(max(d / 8.0, 1.0)));
-    let s = max(pc.uniforms.sharc_voxel, 1.0e-3) * exp2(level);
+    let level = sharcLevel(pos, cam);
+    let s = sharcVoxelSize(pos, cam);
     let c = int3(floor(pos / s));
     var axis = abs(n.x) > abs(n.y) ? (abs(n.x) > abs(n.z) ? 0u : 2u)
                                    : (abs(n.y) > abs(n.z) ? 1u : 2u);
@@ -487,18 +498,17 @@ uint sharcSlot(float3 pos, float3 n, float3 cam) {
 
 // The resolved radiance, if the entry has folded in enough samples to be trusted.
 bool sharcQuery(uint slot, out float3 radiance) {
-    let rg = unpackHalf2(pc.sharc[slot].res_rg);
-    let bc = unpackHalf2(pc.sharc[slot].res_bc);
-    radiance = float3(rg, bc.x);
-    return bc.y >= 8.0;
+    radiance = float3(pc.sharc[slot].res_r, pc.sharc[slot].res_g, pc.sharc[slot].res_b);
+    return pc.sharc[slot].conf >= 16.0;
 }
 
-// One path sample of the voxel's outgoing radiance (nits, fixed point at 1 nit).
+// One path sample of the voxel's outgoing radiance (nits; fixed point at 1/65536 nit, so a
+// moonlit voxel is not rounded to black).
 void sharcDeposit(uint slot, float3 radiance) {
-    let r = clamp(radiance, float3(0.0), float3(1.0e6));
-    InterlockedAdd(pc.sharc[slot].acc_r, uint(r.r));
-    InterlockedAdd(pc.sharc[slot].acc_g, uint(r.g));
-    InterlockedAdd(pc.sharc[slot].acc_b, uint(r.b));
+    let r = clamp(radiance, float3(0.0), float3(1.0e6)) * 65536.0;
+    InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(r.r));
+    InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(r.g));
+    InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(r.b));
     InterlockedAdd(pc.sharc[slot].acc_n, 1u);
     pc.sharc[slot].frame = pc.uniforms.frame;
 }
@@ -994,6 +1004,9 @@ void main() {
         float3 sh_mask[4];
         float3 sh_acc[4];
         var sh_n = 0u;
+        // One path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
+        // cache learns from (answered paths only pass on what it already knows).
+        let sharc_train = SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN;
         // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
         var guides_written = false;
@@ -1395,15 +1408,16 @@ void main() {
 
             let disney_mat = disneyMaterial(payload.color.rgb, metallic, roughness);
 
-            // Radiance cache: diffuse-ish vertices past the primary hit take part. From bounce
-            // 2 on, a converged voxel ends the path with its cached outgoing radiance; every
-            // participating vertex is also recorded as an update target, so the cache keeps
-            // learning from the paths that do get traced (including ones that end in a query).
+            // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
+            // indirect hit on, a converged voxel ends the path with its cached outgoing
+            // radiance -- unless the hit is closer than a voxel (the cache would leak light
+            // into contact shadows) or the path is a training one. Every participating vertex
+            // of a traced path is an update target.
             if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
                 && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
                 let slot = sharcSlot(origin, world_normal, initial_origin);
                 if (slot != 0xFFFFFFFFu) {
-                    if (bounce_idx >= 2) {
+                    if (!sharc_train && payload.t > sharcVoxelSize(origin, initial_origin)) {
                         float3 cached;
                         if (sharcQuery(slot, cached)) {
                             acc += mask * cached;
