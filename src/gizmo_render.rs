@@ -23,13 +23,17 @@
 
 use ash::vk;
 use bevy::{
-    camera::visibility::{InheritedVisibility, RenderLayers},
+    camera::{
+        primitives::{Aabb, Frustum},
+        visibility::{InheritedVisibility, RenderLayers},
+    },
     color::LinearRgba,
     ecs::system::{SystemParam, lifetimeless::SRes},
     gizmos::{
         GizmoAsset, GizmoHandles, GizmoMeshSystems, config::GizmoConfigStore,
         gizmos::GizmoBufferView, retained::Gizmo,
     },
+    platform::collections::HashMap,
     prelude::*,
 };
 
@@ -339,6 +343,7 @@ pub struct GizmoBatch {
 /// A line drawn for an entity (`GizmoBuffer::set_owner`) shows where its owner does: in the
 /// owner's world and layers, and not while the owner is hidden or gone. An unowned line takes
 /// its group's `render_layers`, or its retained entity's world.
+#[allow(clippy::too_many_arguments)]
 fn extract_gizmo_lines(
     mut frame: ResMut<GizmoLineFrame>,
     handles: Option<Res<GizmoHandles>>,
@@ -350,12 +355,23 @@ fn extract_gizmo_lines(
         Option<&InEnvironment>,
         Option<&InheritedVisibility>,
     )>,
+    cameras: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    xr: Option<Res<crate::xr::XrState>>,
+    mut bounds: Local<HashMap<AssetId<GizmoAsset>, Option<Aabb>>>,
+    mut changed: MessageReader<AssetEvent<GizmoAsset>>,
 ) {
     frame.vertices.clear();
     frame.batches.clear();
+    for event in changed.read() {
+        if let AssetEvent::Modified { id } | AssetEvent::Removed { id } = event {
+            bounds.remove(id);
+        }
+    }
     let (Some(handles), Some(assets)) = (handles, assets) else {
         return;
     };
+    let frusta = view_frusta(&cameras, &windows, xr.is_some());
     let owner_mask = |owner: Entity| -> Option<u8> {
         let (layers, world, visibility) = owners.get(owner).ok()?;
         if visibility.is_some_and(|v| !v.get()) {
@@ -388,10 +404,21 @@ fn extract_gizmo_lines(
     }
 
     // Retained `Gizmo` components: the entity owns whatever its asset does not give an owner.
+    // One whose bounds miss every view is left out before its lines are touched.
     for (entity, gizmo, transform) in &retained {
         let Some(asset) = assets.get(&gizmo.handle) else {
             continue;
         };
+        if let Some(frusta) = &frusta
+            && let Some(aabb) = bounds
+                .entry(gizmo.handle.id())
+                .or_insert_with(|| buffer_bounds(asset.buffer().buffer()))
+            && !frusta
+                .iter()
+                .any(|f| f.intersects_obb(aabb, &transform.affine(), true, false))
+        {
+            continue;
+        }
         append_buffer(
             &mut frame,
             asset.buffer().buffer(),
@@ -401,6 +428,50 @@ fn extract_gizmo_lines(
             &|owner| owner_mask(owner.unwrap_or(entity)),
         );
     }
+}
+
+/// Every 3D camera's frustum, for pruning retained gizmos; `None` (draw everything) in a
+/// headset, whose eyes are not the camera's own projection, or with a camera that is not a
+/// perspective one.
+fn view_frusta(
+    cameras: &Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+    windows: &Query<&Window, With<bevy::window::PrimaryWindow>>,
+    xr: bool,
+) -> Option<Vec<Frustum>> {
+    if xr {
+        return None;
+    }
+    let aspect = windows
+        .iter()
+        .next()
+        .map_or(1.0, |w| w.width().max(1.0) / w.height().max(1.0));
+    cameras
+        .iter()
+        .map(|(transform, projection)| {
+            let Projection::Perspective(p) = projection else {
+                return None;
+            };
+            // The tracer's own projection (ray_render_plugin), infinite and reverse-z.
+            let clip_from_view =
+                bevy::math::proj::perspective_infinite_reverse(p.fov, aspect, p.near);
+            let clip_from_world = clip_from_view * transform.to_matrix().inverse();
+            Some(Frustum(bevy::shape::ViewFrustum::from_clip_from_world(
+                &clip_from_world,
+            )))
+        })
+        .collect()
+}
+
+/// A gizmo asset's local bounds over all its line points; `None` when it has none.
+fn buffer_bounds(buffer: GizmoBufferView<'_>) -> Option<Aabb> {
+    let mut points = buffer
+        .list_positions
+        .iter()
+        .chain(buffer.strip_positions.iter())
+        .filter(|p| p.is_finite());
+    let first = *points.next()?;
+    let (min, max) = points.fold((first, first), |(min, max), p| (min.min(*p), max.max(*p)));
+    Some(Aabb::from_min_max(min, max))
 }
 
 /// Add `count` vertices from `first` drawn by views sharing `mask`, extending the last batch when

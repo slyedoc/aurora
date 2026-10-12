@@ -117,6 +117,17 @@ fn inspect_camera(
     ] {
         let section = commands.spawn((section_node(), ChildOf(*host))).id();
         sections.push(section);
+        // The camera's cards start closed; the settings above are what the panel is for.
+        commands.queue(move |world: &mut World| {
+            world.resource_mut::<InspectorCollapsed>().set(
+                &InspectorRoot::Component {
+                    entity: camera,
+                    type_id,
+                },
+                "",
+                true,
+            );
+        });
         commands.queue(BuildComponentInspector {
             target: camera,
             type_id,
@@ -132,10 +143,13 @@ pub const DEV_UI_Z: i32 = 1_000;
 fn spawn_panel(world: &mut World) {
     let panel = world
         .spawn_scene(bsn! {
+            // Starts closed; F3 opens it.
             Node {
+                display: Display::None,
                 position_type: PositionType::Absolute,
                 left: px(16),
-                top: px(16),
+                // Below the app's fps readout in the top-left corner.
+                top: px(44),
                 width: px(340),
                 padding: UiRect::all(px(10)),
                 flex_direction: FlexDirection::Column,
@@ -151,27 +165,18 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                @caption("centre: -") DevUIProbe
-                --
                 Node {
                     flex_direction: FlexDirection::Column,
                     align_self: AlignSelf::Stretch,
                 }
                 DevUIInspectorHost
+                --
+                @caption("centre: -") DevUIProbe
             ]
         })
         .expect("dev panel spawns")
         .id();
     world.flush();
-
-    // The card starts collapsed (expanding is one click; the panel stays compact).
-    world.resource_mut::<InspectorCollapsed>().set(
-        &InspectorRoot::Resource {
-            type_id: TypeId::of::<RenderSettings>(),
-        },
-        "",
-        true,
-    );
 
     let host = world
         .query_filtered::<Entity, With<DevUIInspectorHost>>()
