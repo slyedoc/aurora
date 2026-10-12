@@ -71,6 +71,12 @@ struct KernelParams {
     float4* sun_out;    // the environment table's sun radiance (rgb; a kept)
     float altitude;     // the viewer above the ground (metres)
     uint pad2;
+    // The moonlit sky: the moon's direction and illuminance above the air (lux, rgb; 0 = none).
+    float moon_dir_x, moon_dir_y, moon_dir_z;
+    float moon_r, moon_g, moon_b;
+    // The night sky's floor (airglow): radiance above the horizon (nits, rgb).
+    float airglow_r, airglow_g, airglow_b;
+    uint pad3;
 };
 [[vk::push_constant]] KernelParams kp;
 
@@ -484,6 +490,18 @@ void sky_render(uint3 gid: SV_DispatchThreadID) {
     let d = skyUvToDir(uv);
     float3 L, T, ms;
     integrate(viewerPos(), d, sunDirection(), 40, true, true, sunIlluminance(), true, L, T, ms);
+    // The moon lights the air like the sun, far dimmer: the night's blue sky.
+    let moon_e = float3(kp.moon_r, kp.moon_g, kp.moon_b);
+    if (any(moon_e > float3(0.0))) {
+        float3 Lm, Tm, msm;
+        let moon = normalize(float3(kp.moon_dir_x, kp.moon_dir_y, kp.moon_dir_z));
+        integrate(viewerPos(), d, moon, 24, true, true, moon_e, true, Lm, Tm, msm);
+        L += Lm;
+    }
+    // Airglow: a floor under the night sky above the horizon, the ground below it lit by it.
+    let glow = float3(kp.airglow_r, kp.airglow_g, kp.airglow_b);
+    let up = smoothstep(-0.04, 0.04, d.y);
+    L += glow * (up + (1.0 - up) * groundAlbedo());
     kp.sky[idx] = float4(max(L, float3(0.0)), 1.0);
 }
 

@@ -247,6 +247,10 @@ pub(crate) struct KernelParams {
     pub sun_out: u64,
     pub altitude: f32,
     pub pad2: u32,
+    pub moon_dir: [f32; 3],
+    pub moon_lux: [f32; 3],
+    pub airglow: [f32; 3],
+    pub pad3: u32,
 }
 
 #[derive(Resource)]

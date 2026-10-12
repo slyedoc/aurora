@@ -5,6 +5,7 @@ import rt_types;
 import rand;
 import disney;
 import atmosphere_rt;
+import light_eval;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
 // primary hit of sample 0.
@@ -210,10 +211,7 @@ float fogPhase(EnvironmentGpu* env, float cos_theta) {
     return fogPhaseG(env.fog_scatter, cos_theta);
 }
 
-float fogPhaseG(float g, float cos_theta) {
-    let denom = 1.0 + g * g - 2.0 * g * cos_theta;
-    return (1.0 - g * g) / (4.0 * PI * denom * sqrt(denom));
-}
+
 
 float calcFogTransmittance(float distance) {
     return exp(-g_extinction * distance);
@@ -374,60 +372,21 @@ float2 bnoiseBest(uint sampleIdx) {
     return TwoBnoiseSamples(byteIndex);
 }
 
-float3 vertexPosition(float* verts, uint i) {
-    let b = i * 8u;
-    return float3(verts[b], verts[b + 1u], verts[b + 2u]);
-}
 
-// The world-space corners of triangle `tri` of light instance `li`, through the live
-// TLAS instance row (3x4 row-major, as in prev_instances); `g` gets the geometry index.
-void lightTriangleWorld(LightInstance li, uint tri, out uint g, out float3 w0, out float3 w1, out float3 w2) {
-    g = 0u;
-    for (uint k = 1u; k < li.geom_count; k++) {
-        if (li.geom_to_triangle[k] <= tri) {
-            g = k;
-        } else {
-            break;
-        }
-    }
-    let idx = li.geom_to_index[g] + (tri - li.geom_to_triangle[g]) * 3u;
-    let p0 = vertexPosition(li.vertices, li.indices[idx + 0u]);
-    let p1 = vertexPosition(li.vertices, li.indices[idx + 1u]);
-    let p2 = vertexPosition(li.vertices, li.indices[idx + 2u]);
-    let base = li.slot * 4u;
-    let r0 = pc.cur_instances[base + 0u];
-    let r1 = pc.cur_instances[base + 1u];
-    let r2 = pc.cur_instances[base + 2u];
-    w0 = float3(dot(r0, float4(p0, 1.0)), dot(r1, float4(p0, 1.0)), dot(r2, float4(p0, 1.0)));
-    w1 = float3(dot(r0, float4(p1, 1.0)), dot(r1, float4(p1, 1.0)), dot(r2, float4(p1, 1.0)));
-    w2 = float3(dot(r0, float4(p2, 1.0)), dot(r1, float4(p2, 1.0)), dot(r2, float4(p2, 1.0)));
-}
 
-// Solid-angle pdf of the light table picking direction onto triangle `tri` of `li` at
-// distance `t` along `dir` (for MIS against BRDF sampling). 0 when degenerate.
-float lightTrianglePdf(LightInstance li, uint tri, float p_pick, float t, float3 dir) {
-    uint g;
-    float3 w0, w1, w2;
-    lightTriangleWorld(li, tri, g, w0, w1, w2);
-    let lng = cross(w1 - w0, w2 - w0);
-    let area2 = length(lng);
-    if (area2 <= 0.0) {
-        return 0.0;
-    }
-    let cos_l = abs(dot(lng / area2, dir));
-    if (cos_l <= 1.0e-4) {
-        return 0.0;
-    }
-    return p_pick * t * t / (cos_l * 0.5 * area2);
-}
 
-// The pick probability of light-table entry `e` from the power CDF.
-float lightsEntryPick(uint e) {
-    var below = 0.0;
-    if (e > 0u) {
-        below = pc.lights.cdf[e - 1u];
-    }
-    return (pc.lights.cdf[e] - below) / pc.lights.total_power;
+
+
+
+
+
+// The light table as light_eval.slang reaches it.
+LightCtx lightCtx() {
+    LightCtx ctx;
+    ctx.lights = pc.lights;
+    ctx.instances = pc.cur_instances;
+    ctx.emissive_boost = pc.uniforms.emissive_boost;
+    return ctx;
 }
 
 // ---- Radiance cache (SHaRC-style; see src/sharc.rs) ---------------------------------------
@@ -498,230 +457,17 @@ void sharcDeposit(uint slot, float3 radiance) {
     pc.sharc[slot].frame = pc.uniforms.frame;
 }
 
-// Entry from the power CDF at cumulative value x, and its pick probability.
-uint lightsPickEntry(float x, out float p_pick) {
-    uint lo = 0u, hi = pc.lights.entry_count - 1u;
-    while (lo < hi) {
-        let mid = (lo + hi) / 2u;
-        if (pc.lights.cdf[mid] < x) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    p_pick = lightsEntryPick(lo);
-    return lo;
-}
 
-// The light instance owning entry e; 0 for analytic entries (which have no instance --
-// lightSampleEval never reads it for them).
-uint lightsFindInstance(uint e) {
-    return pc.lights.entry_to_linst[e];
-}
 
-// A surface's response to light from `dir`, cosine included: the whole layered BSDF in front
-// (base, coat, less what is transmitted), and behind a thin translucent one the light coming
-// through it. Zero where it takes none (and wherever the geometric normal disagrees).
-float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
-    // n = 0: a point in the fog, `ns.x` its Henyey-Greenstein g.
-    if (all(n == float3(0.0))) {
-        return float3(fogPhaseG(ns.x, dot(-v, dir)));
-    }
-    let NoL = dot(n, dir);
-    let above = NoL > 0.0 && dot(dir, ns) > 0.0;
-    let through = lob.transmission > 0.0 && NoL < 0.0 && dot(dir, ns) < 0.0;
-    if (!above && !through) {
-        return float3(0.0);
-    }
-    return evalLayered(v, n, dir, mat, lob, true) * abs(NoL);
-}
 
-// Unshadowed contribution of analytic light `e` (same contract as lightSampleEval below).
-// A radius-0 point or spot is a delta: `p_area` is just the pick probability and
-// `pdf_solid` a huge sentinel, so the MIS weight against BRDF sampling goes to 1. Points,
-// spots and rects have no geometry -- a BRDF ray never finds them, so nothing takes the
-// complementary weight. A sphere emitter (kind 3) does: see sphereEmitterPdf.
-float3 analyticSampleEval(uint e, float p_pick, float su, float sv,
-                          float3 sp, float3 n, float3 ns, float3 v,
-                          DisneyMaterial mat, Lobes lob,
-                          out float p_area, out float pdf_solid, out float3 dir, out float dist) {
-    p_area = 0.0;
-    pdf_solid = 0.0;
-    dir = float3(0.0);
-    dist = 0.0;
-    let al = pc.lights.analytics[e];
-    let al_position = float3(al.position_x, al.position_y, al.position_z);
-    let al_direction = float3(al.direction_x, al.direction_y, al.direction_z);
-    let al_emission = float3(al.emission_r, al.emission_g, al.emission_b);
-    if (al.kind == 2u) {
-        // Rect: uniform point on the rectangle, evaluated exactly like a triangle entry.
-        let al_tangent = float3(al.tangent_x, al.tangent_y, al.tangent_z);
-        let bitangent = cross(al_direction, al_tangent);
-        let point = al_position
-            + al_tangent * ((su * 2.0 - 1.0) * al.half_extents_x)
-            + bitangent * ((sv * 2.0 - 1.0) * al.half_extents_y);
-        let to_light = point - sp;
-        dist = length(to_light);
-        if (dist <= 1.0e-4) {
-            return float3(0.0);
-        }
-        dir = to_light / dist;
-        var cos_l = dot(al_direction, -dir);
-        if ((al.flags & 1u) != 0u) {
-            cos_l = abs(cos_l);
-        }
-        let surf = thinSurface(v, n, ns, dir, mat, lob);
-        if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
-            return float3(0.0);
-        }
-        let area = 4.0 * al.half_extents_x * al.half_extents_y;
-        if (area <= 0.0) {
-            return float3(0.0);
-        }
-        p_area = p_pick / area;
-        pdf_solid = p_area * dist * dist / cos_l;
-        return surf * al_emission * (cos_l / (dist * dist));
-    }
-    // Point / spot / sphere emitter. With a radius the light is a Lambertian sphere of that
-    // size: a point or spot (bevy's `radius`) has no geometry and spreads its intensity over
-    // the projected disc, L = I / (pi r^2), so the total is unchanged and the shadows go
-    // soft; a sphere emitter (kind 3) IS an emissive `Sphere` in the scene and carries its
-    // radiance directly. Radius 0 is the delta at the position.
-    let to_centre = al_position - sp;
-    let centre_dist = length(to_centre);
-    if (centre_dist <= 1.0e-4) {
-        return float3(0.0);
-    }
-    let centre_dir = to_centre / centre_dist;
-    var atten = 1.0;
-    if (al.kind == 1u) {
-        // Bevy's spot falloff: smooth between the inner and outer cone (about the centre).
-        let cos_a = dot(al_direction, -centre_dir);
-        if (cos_a <= al.cos_outer) {
-            return float3(0.0);
-        }
-        atten = smoothstep(al.cos_outer, max(al.cos_inner, al.cos_outer + 1.0e-4), cos_a);
-    }
-    if (al.radius <= 1.0e-4 || centre_dist <= al.radius) {
-        // Inside a sphere emitter every direction sees it: BRDF hits carry it at full weight.
-        if (al.kind == 3u) {
-            return float3(0.0);
-        }
-        dist = centre_dist;
-        dir = centre_dir;
-        let surf = thinSurface(v, n, ns, dir, mat, lob);
-        if (all(surf == float3(0.0))) {
-            return float3(0.0);
-        }
-        p_area = p_pick;
-        pdf_solid = 1.0e16;
-        return surf * al_emission * (atten / (dist * dist));
-    }
-    // Uniform over the CONE the sphere subtends from here: every sample lands on the visible
-    // cap, where uniform-area sampling threw the far half away and piled variance onto
-    // whatever stood close to the light.
-    let sin2_max = (al.radius * al.radius) / (centre_dist * centre_dist);
-    let cos_max = sqrt(max(0.0, 1.0 - sin2_max));
-    let one_minus_cos_max = sin2_max / (1.0 + cos_max);  // no cancellation far away
-    let cos_t = 1.0 - su * one_minus_cos_max;
-    let sin2_t = max(0.0, 1.0 - cos_t * cos_t);
-    let phi = 2.0 * PI * sv;
-    dir = normalize(mul(float3(sqrt(sin2_t) * cos(phi), sqrt(sin2_t) * sin(phi), cos_t),
-                        orthonormalBasis(centre_dir)));
-    let surface_dist = centre_dist * cos_t
-        - sqrt(max(0.0, al.radius * al.radius - centre_dist * centre_dist * sin2_t));
-    if (surface_dist <= 1.0e-4) {
-        return float3(0.0);
-    }
-    let surf = thinSurface(v, n, ns, dir, mat, lob);
-    if (all(surf == float3(0.0))) {
-        return float3(0.0);
-    }
-    let sn = (sp + dir * surface_dist - al_position) / al.radius;
-    let cos_l = max(dot(sn, -dir), 1.0e-4);
-    pdf_solid = p_pick / (2.0 * PI * one_minus_cos_max);
-    p_area = pdf_solid * cos_l / (surface_dist * surface_dist);
-    // The shadow ray stops short of the surface: a sphere emitter's own geometry is there.
-    dist = surface_dist * 0.9995;
-    let radiance = al.kind == 3u ? al_emission : al_emission / (PI * al.radius * al.radius);
-    return surf * radiance * (atten * cos_l / (surface_dist * surface_dist));
-}
 
-// Solid-angle pdf with which next-event estimation at `from` would have sampled sphere
-// emitter `e` (analyticSampleEval's cone); 0 inside it. The MIS partner of a BRDF ray that
-// hit the sphere.
-float sphereEmitterPdf(uint e, float3 from) {
-    let al = pc.lights.analytics[e];
-    let to_centre = float3(al.position_x, al.position_y, al.position_z) - from;
-    let d2 = dot(to_centre, to_centre);
-    let r2 = al.radius * al.radius;
-    if (d2 <= r2 || r2 <= 0.0) {
-        return 0.0;
-    }
-    let p_pick = lightsEntryPick(e);
-    let sin2_max = r2 / d2;
-    return p_pick * (1.0 + sqrt(1.0 - sin2_max)) / (2.0 * PI * sin2_max);
-}
 
-// Unshadowed contribution of the point (su, sv) on light-table entry `e`, in AREA measure:
-// f * NoL * Le * cos_l / d^2, evaluated at shading point `sp` (normal n, geometric normal
-// ns, view v). Outputs the area pdf (p_pick / live area), the matching solid-angle pdf and
-// the shadow-ray direction / distance; returns 0 on any rejection -- including a light in
-// another world than `ray_mask`'s (the shadow ray could not see its geometry, so it would
-// otherwise light through).
-float3 lightSampleEval(uint e, uint li_idx, float p_pick, float su, float sv,
-                       float3 sp, float3 n, float3 ns, float3 v,
-                       DisneyMaterial mat, Lobes lob, uint ray_mask,
-                       out float p_area, out float pdf_solid, out float3 dir, out float dist) {
-    if (e < pc.lights.analytic_count) {
-        if (((pc.lights.analytics[e].flags >> 8) & ray_mask & 0xFFu) == 0u) {
-            p_area = 0.0;
-            pdf_solid = 0.0;
-            dir = float3(0.0);
-            dist = 0.0;
-            return float3(0.0);
-        }
-        return analyticSampleEval(e, p_pick, su, sv, sp, n, ns, v, mat, lob,
-                                  p_area, pdf_solid, dir, dist)
-            * pc.uniforms.emissive_boost;
-    }
-    p_area = 0.0;
-    pdf_solid = 0.0;
-    dir = float3(0.0);
-    dist = 0.0;
-    let li = pc.lights.linsts[li_idx];
-    // The emitter's world: its instance row's mask (packed above the custom index).
-    if (((asuint(pc.cur_instances[li.slot * 4u + 3u].x) >> 24) & ray_mask & 0xFFu) == 0u) {
-        return float3(0.0);
-    }
-    uint g;
-    float3 w0, w1, w2;
-    lightTriangleWorld(li, e - li.entry_base, g, w0, w1, w2);
-    let lng = cross(w1 - w0, w2 - w0);
-    let area2 = length(lng);
-    if (area2 <= 0.0) {
-        return float3(0.0);
-    }
-    let r = sqrt(max(su, 1.0e-6));
-    let point = w0 * (1.0 - r) + w1 * (r * (1.0 - sv)) + w2 * (r * sv);
-    let to_light = point - sp;
-    dist = length(to_light);
-    if (dist <= 1.0e-4) {
-        return float3(0.0);
-    }
-    dir = to_light / dist;
-    let cos_l = abs(dot(lng / area2, dir));
-    let surf = thinSurface(v, n, ns, dir, mat, lob);
-    if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
-        return float3(0.0);
-    }
-    p_area = p_pick / (0.5 * area2);
-    pdf_solid = p_area * dist * dist / cos_l;
-    let emission = float3(li.geom_emission[g * 3u + 0u],
-                          li.geom_emission[g * 3u + 1u],
-                          li.geom_emission[g * 3u + 2u]);
-    return surf * emission * (pc.uniforms.emissive_boost * cos_l / (dist * dist));
-}
+
+
+
+
+
+
 
 // The shading normal bent the least amount into the viewer's hemisphere: n' = n + v * (eps - n.v)
 // leaves n untouched when it already faces v and otherwise gives n'.v = eps (before the
@@ -914,13 +660,13 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, flo
     var ldist = 0.0;
     for (uint c = 0u; c < M; c++) {
         float p_pick;
-        let e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
+        let e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
         let su = randf();
         let sv = randf();
         float p_area, pdf_solid, cdist;
         float3 cdir;
-        let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv, x, float3(0.0),
-                                  float3(env.fog_scatter, 0.0, 0.0), -d, mat, lob, ray_mask,
+        let val = lightSampleEval(lightCtx(), e, lightsFindInstance(lightCtx(), e), p_pick, su, sv, x, float3(0.0),
+                                  float3(env.fog_scatter, 0.0, 0.0), -d, mat, lob, ray_mask, false,
                                   p_area, pdf_solid, cdir, cdist);
         let phat = luma(val);
         if (phat <= 0.0 || p_area <= 0.0) {
@@ -1045,6 +791,41 @@ void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
     }
     acc += mask * L;
     mask *= T;
+}
+
+// ReSTIR DI's shading (src/restir.rs), after its compute passes: the pixel's final reservoir
+// gets one shadow ray; visible, its contribution goes into the noisy colour (pre-exposed like
+// the main pass's). An occluded winner is NOT zeroed for reuse: carried forward, the zero
+// counted shadow twice (history, then this ray) and the result came out ~15 % dark.
+[shader("raygeneration")]
+void restir_shade() {
+    let launch_id = DispatchRaysIndex().xy;
+    let launch_size = DispatchRaysDimensions().xy;
+    let idx = launch_id.y * launch_size.x + launch_id.x;
+    let s = pc.restir_surfaces[idx];
+    if (s.frame != pc.uniforms.frame) {
+        return;
+    }
+    var r = pc.reservoirs_cur[idx];
+    if (r.y == 0xFFFFFFFFu || r.W <= 0.0) {
+        return;
+    }
+    float p_area_cdf, p_cdf, dist;
+    float3 dir;
+    let val = restirTarget(lightCtx(), s, r.y, r.uv_pk, p_area_cdf, p_cdf, dir, dist);
+    if (restirLuma(val) <= 0.0) {
+        return;
+    }
+    let ns = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
+    if (!traceVisible(s.ray_mask, leaveSurface(s.position, ns, dir), 0.0, dir,
+                      dist * (1.0 - 1.0e-4))) {
+        return;
+    }
+    let px = int2(launch_id);
+    let add = s.throughput * val * (r.W / float(max(pc.uniforms.samples, 1u)))
+        * pc.ae.input_exposure;
+    let prior = dlss_color[px].rgb;
+    dlss_color[px] = float4(clamp(prior + add, float3(0.0), float3(65504.0)), 1.0);
 }
 
 [shader("raygeneration")]
@@ -1381,7 +1162,7 @@ void main() {
                     let linst_idx = pc.lights.slot_to_linst[payload.slot];
                     if (linst_idx != 0xFFFFFFFFu && (linst_idx & LIGHT_SLOT_ANALYTIC) != 0u) {
                         // A sphere emitter: `origin` is still the vertex the ray left.
-                        let pdf_light = sphereEmitterPdf(linst_idx & ~LIGHT_SLOT_ANALYTIC, origin);
+                        let pdf_light = sphereEmitterPdf(lightCtx(), linst_idx & ~LIGHT_SLOT_ANALYTIC, origin);
                         if (pdf_light > 0.0) {
                             contribution *= prev_pdf / (prev_pdf + pdf_light);
                         }
@@ -1389,9 +1170,9 @@ void main() {
                         let li = pc.lights.linsts[linst_idx];
                         if (payload.prim_tri < li.tri_count) {
                             let e = li.entry_base + payload.prim_tri;
-                            let p_pick = lightsEntryPick(e);
+                            let p_pick = lightsEntryPick(lightCtx(), e);
                             if (p_pick > 0.0) {
-                                let pdf_light = lightTrianglePdf(li, payload.prim_tri, p_pick, payload.t, direction);
+                                let pdf_light = lightTrianglePdf(lightCtx(), li, payload.prim_tri, p_pick, payload.t, direction);
                                 if (pdf_light > 0.0) {
                                     contribution *= prev_pdf / (prev_pdf + pdf_light);
                                 }
@@ -1546,127 +1327,34 @@ void main() {
                 }
             }
 
-            // Direct light from the emissive-triangle table. At the primary vertex of sample 0
-            // this is ReSTIR DI (RIS over the CDF candidates, temporal reservoir reuse across
-            // the reprojected pixel, one visibility ray whose occlusion also clears the stored
-            // weight); everywhere else it is one CDF sample with an MIS-weighted shadow ray.
+            // Direct light from the emissive-triangle table. At the primary vertex of sample 0,
+            // with ReSTIR DI on, its passes do it (light grid, initial + temporal and spatial
+            // reuse, one shadow ray: src/restir.rs); everywhere else it is RIS over CDF
+            // candidates with an MIS-weighted shadow ray.
             // Positions and areas are read live, so stale CDF weights change variance, never
             // the answer.
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
                 if (RESTIR_ON && bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
-                    var r_y = 0u;
-                    var r_uv = 0u;
-                    var r_wsum = 0.0;
-                    var r_M = 0.0;
-                    var r_phat = 0.0;
-                    var r_val = float3(0.0);
-                    var r_dir = float3(0.0);
-                    var r_dist = 0.0;
-                    // Initial candidates.
-                    for (uint c = 0u; c < pc.uniforms.restir_candidates; c++) {
-                        float p_pick;
-                        let e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
-                        let su = randf();
-                        let sv = randf();
-                        float p_area, pdf_solid, cdist;
-                        float3 cdir;
-                        var val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
-                                                  origin, world_normal, surface_normal,
-                                                  -direction, disney_mat, lob, ray_mask,
-                                                  p_area, pdf_solid, cdir, cdist);
-                        r_M += 1.0;
-                        // The MIS weight against BRDF sampling rides in the target, as in the
-                        // RIS path below: a BRDF-sampled bounce that reaches this emitter is
-                        // weighted against the CDF pdf, so without it the light counts twice
-                        // (brighter, and the bounce's share is speckle noise).
-                        if (pdf_solid > 0.0) {
-                            val *= pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
-                        }
-                        let phat = luma(val);
-                        if (phat > 0.0 && p_area > 0.0) {
-                            let wi = phat / p_area;
-                            r_wsum += wi;
-                            if (randf() * r_wsum < wi) {
-                                r_y = e;
-                                r_uv = packHalf2(float2(su, sv));
-                                r_phat = phat;
-                                r_val = val;
-                                r_dir = cdir;
-                                r_dist = cdist;
-                            }
-                        }
-                    }
-                    // Temporal reuse: last frame's reservoir at the reprojected pixel, revalidated
-                    // and re-evaluated at this frame's shading point.
-                    let prev_clip = mat4MulVec(pc.uniforms.prev_view_proj, float4(payload.prev_world_pos, 1.0));
-                    if (prev_clip.w > 1.0e-4) {
-                        let uv01 = (prev_clip.xy / prev_clip.w) * 0.5 + 0.5;
-                        // Inverse of the forward mapping (pixel_center = (x, H - 1 - y) + subpixel):
-                        // H - uv * H = y + 0.5 for row y's centre, so truncation lands on y. Off by
-                        // a row either way, every fetch reads a neighbour and the reservoir pattern
-                        // scrolls one row per frame (down with -1, up with the +1 this once had).
-                        let ppx = int2(int(uv01.x * float(launch_size.x)),
-                                       int(float(launch_size.y) - uv01.y * float(launch_size.y)));
-                        if (ppx.x >= 0 && ppx.y >= 0
-                            && ppx.x < int(launch_size.x) && ppx.y < int(launch_size.y)) {
-                            let prev = pc.reservoirs_prev[ppx.y * int(launch_size.x) + ppx.x];
-                            if (prev.frame + 1u == pc.uniforms.frame
-                                && prev.epoch == pc.uniforms.light_epoch
-                                && prev.M > 0.0 && prev.W > 0.0
-                                && abs(prev.depth - prev_clip.w) < 0.1 * prev_clip.w
-                                && dot(oct_to_float32x3(unpackHalf2(prev.normal_pk)), world_normal) > 0.9) {
-                                let suv = unpackHalf2(prev.uv_pk);
-                                float p_area_ign, pdf_solid, cdist;
-                                float3 cdir;
-                                // Its real pick probability, for the same MIS weight as a fresh
-                                // candidate's.
-                                var val = lightSampleEval(prev.y, lightsFindInstance(prev.y),
-                                                          lightsEntryPick(prev.y), suv.x, suv.y,
-                                                          origin, world_normal, surface_normal,
-                                                          -direction, disney_mat, lob, ray_mask,
-                                                          p_area_ign, pdf_solid, cdir, cdist);
-                                if (pdf_solid > 0.0) {
-                                    val *= pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
-                                }
-                                let phat = luma(val);
-                                let Mprev = min(prev.M, pc.uniforms.restir_m_clamp);
-                                if (phat > 0.0) {
-                                    let wi = phat * prev.W * Mprev;
-                                    r_wsum += wi;
-                                    if (randf() * r_wsum < wi) {
-                                        r_y = prev.y;
-                                        r_uv = prev.uv_pk;
-                                        r_phat = phat;
-                                        r_val = val;
-                                        r_dir = cdir;
-                                        r_dist = cdist;
-                                    }
-                                }
-                                r_M += Mprev;
-                            }
-                        }
-                    }
-                    // Resolve: contribution weight, one visibility ray, shade.
-                    var r_W = (r_phat > 0.0 && r_M > 0.0) ? r_wsum / (r_M * r_phat) : 0.0;
-                    if (r_W > 0.0) {
-                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, r_dir), tmin, r_dir, r_dist * (1.0 - 1.0e-4))) {
-                            acc += mask * r_val * r_W;
-                        } else {
-                            // Visibility reuse: an occluded winner is forgotten, not dragged along.
-                            r_W = 0.0;
-                        }
-                    }
-                    Reservoir cur;
-                    cur.y = r_y;
-                    cur.uv_pk = r_uv;
-                    cur.W = r_W;
-                    cur.M = min(r_M, pc.uniforms.restir_m_clamp);
-                    cur.epoch = pc.uniforms.light_epoch;
-                    cur.normal_pk = packHalf2(float32x3_to_oct(world_normal));
-                    let cur_clip = mat4MulVec(pc.uniforms.view_proj, float4(origin, 1.0));
-                    cur.depth = cur_clip.w;
-                    cur.frame = pc.uniforms.frame;
-                    pc.reservoirs_cur[px.y * int(launch_size.x) + px.x] = cur;
+                    // ReSTIR DI lights this vertex from the table in its own passes (restir.slang,
+                    // then `restir_shade` below): hand it the surface.
+                    RestirSurface rs;
+                    rs.position = origin;
+                    rs.frame = pc.uniforms.frame;
+                    rs.prev_position = payload.prev_world_pos;
+                    rs.depth = mat4MulVec(pc.uniforms.view_proj, float4(origin, 1.0)).w;
+                    rs.albedo = disney_mat.albedo;
+                    rs.metallic = disney_mat.metallic;
+                    rs.throughput = mask;
+                    rs.roughness = disney_mat.roughness;
+                    rs.normal_oct = packHalf2(float32x3_to_oct(world_normal));
+                    rs.geo_normal_oct = packHalf2(float32x3_to_oct(surface_normal));
+                    rs.view_oct = packHalf2(float32x3_to_oct(-direction));
+                    rs.ray_mask = ray_mask;
+                    rs.transmission = lob.transmission;
+                    rs.clearcoat = lob.clearcoat;
+                    rs.coat_alpha = lob.coat_alpha;
+                    rs.pad = 0.0;
+                    pc.restir_surfaces[px.y * int(launch_size.x) + px.x] = rs;
                 } else {
                     // Resampled importance sampling, no reuse: M candidates from the power CDF, each
                     // weighted by its MIS-weighted unshadowed contribution at THIS point over its
@@ -1685,14 +1373,14 @@ void main() {
                     var ldist = 0.0;
                     for (uint c = 0u; c < M; c++) {
                         float p_pick;
-                        let e = lightsPickEntry(randf() * pc.lights.total_power, p_pick);
+                        let e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
                         let su = randf();
                         let sv = randf();
                         float p_area, pdf_solid, cdist;
                         float3 cdir;
-                        let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
+                        let val = lightSampleEval(lightCtx(), e, lightsFindInstance(lightCtx(), e), p_pick, su, sv,
                                                   origin, world_normal, surface_normal, -direction,
-                                                  disney_mat, lob, ray_mask, p_area, pdf_solid, cdir,
+                                                  disney_mat, lob, ray_mask, false, p_area, pdf_solid, cdir,
                                                   cdist);
                         if (luma(val) <= 0.0 || p_area <= 0.0) {
                             continue;

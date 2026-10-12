@@ -67,6 +67,33 @@ impl AirKey {
 #[derive(Clone, Copy, PartialEq)]
 struct SunKey(Vec3, f32, f32);
 
+/// The night's part of the image: the moon's direction and illuminance (rgb lux), the airglow
+/// floor (rgb nits).
+#[derive(Clone, Copy, PartialEq, Default)]
+struct NightKey {
+    moon_dir: [f32; 3],
+    moon_lux: [f32; 3],
+    airglow: [f32; 3],
+}
+
+impl NightKey {
+    /// The moon is the environment's second sun, while it is up (zero's `DayMoon`).
+    fn of(environment: &crate::sky::EnvironmentSky) -> Self {
+        let air = &environment.air;
+        let glow = air.airglow.to_linear().to_vec3();
+        let luma = (0.2126 * glow.x + 0.7152 * glow.y + 0.0722 * glow.z).max(1.0e-6);
+        let mut key = NightKey {
+            airglow: (glow * (air.airglow_nits / luma)).to_array(),
+            ..default()
+        };
+        if let Some(moon) = environment.suns.get(1) {
+            key.moon_dir = moon.direction.to_array();
+            key.moon_lux = (moon.radiance * moon.solid_angle()).to_array();
+        }
+        key
+    }
+}
+
 /// One generated environment's tables and image.
 #[derive(Default)]
 struct Slot {
@@ -80,6 +107,7 @@ struct Slot {
     tex: u32,
     air: Option<AirKey>,
     sun: Option<SunKey>,
+    night: Option<NightKey>,
 }
 
 impl Slot {
@@ -231,9 +259,11 @@ fn prepare_sky_gen(
             });
         let air_key = AirKey::of(air);
         let rebuild_air = slot.air != Some(air_key);
-        let rerender = rebuild_air || slot.sun != Some(sun);
+        let night = NightKey::of(environment);
+        let rerender = rebuild_air || slot.sun != Some(sun) || slot.night != Some(night);
         slot.air = Some(air_key);
         slot.sun = Some(sun);
+        slot.night = Some(night);
 
         let gpu = atmosphere(slot, air, sun);
         let base = KernelParams {
@@ -242,6 +272,9 @@ fn prepare_sky_gen(
             table: slot.table.address,
             rows: slot.rows.address,
             altitude: air.altitude,
+            moon_dir: night.moon_dir,
+            moon_lux: night.moon_lux,
+            airglow: night.airglow,
             ..default()
         };
         // The environment table's first sun, which the CPU writes this frame.

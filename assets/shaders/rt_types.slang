@@ -283,6 +283,30 @@ public struct SharcEntry {
 };
 
 // One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.
+// The primary vertex as ReSTIR DI sees it (src/restir.rs), written by the raygen at sample 0's
+// first shaded surface; `frame` marks it live (a pixel that hit nothing keeps an old one).
+// Normals and the view are octahedral 2xf16. 96 bytes.
+public struct RestirSurface {
+    public float3 position;
+    public uint frame;
+    // Where the surface was last frame (object motion), and its view depth (clip w).
+    public float3 prev_position;
+    public float depth;
+    public float3 albedo;
+    public float metallic;
+    // The path weight reaching this vertex (alpha pass-through, glass in front).
+    public float3 throughput;
+    public float roughness;
+    public uint normal_oct;
+    public uint geo_normal_oct;
+    public uint view_oct;
+    public uint ray_mask;
+    public float transmission;
+    public float clearcoat;
+    public float coat_alpha;
+    public float pad;
+};
+
 public struct Reservoir {
     // Winning light-table entry and its (su, sv) triangle sample, packed as 2xf16.
     public uint y;
@@ -402,7 +426,8 @@ public struct PushConstants {
     // 64 bluenoise slices of 128x128 byte pairs.
     public uint* bluenoise;
     public float* focus;
-    public uint pad0, pad1;
+    // ReSTIR DI's primary surfaces (one per traced pixel; restir.rs).
+    public RestirSurface* restir_surfaces;
     // Last frame's VkAccelerationStructureInstanceKHR array: 4 float4 per instance, rows
     // 0..2 are the 3x4 transform (row-major).
     public float4* prev_instances;

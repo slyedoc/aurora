@@ -135,6 +135,13 @@ fn the_generated_sky_is_blue_at_noon_red_at_sunset_and_dark_at_night() {
     let brightest = night.iter().map(|t| luma(t.truncate())).fold(0.0, f32::max);
     println!("night: brightest {brightest}");
     assert!(brightest < 1.0, "a dark night: {brightest}");
+    // The airglow floor: the night zenith at `SkyAir::airglow_nits` (the sun adds nothing).
+    let zenith = luma(texel(&night, Vec3::Y));
+    let floor = SkyAir::default().airglow_nits;
+    assert!(
+        (zenith / floor - 1.0).abs() < 0.1,
+        "night zenith {zenith} vs airglow {floor}"
+    );
 
     bevy_aurora::ray_render_plugin::shutdown_renderer(app.world_mut());
 }

@@ -171,6 +171,12 @@ pub struct SkyAir {
     /// The sun's illuminance above the air (lux).
     #[reflect(@0.0..=200000.0_f32)]
     pub sun_illuminance: f32,
+    /// The night sky's floor (airglow, scattered starlight): its colour and radiance above the
+    /// horizon in nits. A game night is far brighter than the real ~1e-4: this is the fill
+    /// that lets open ground read at night while covered places stay dark.
+    pub airglow: Color,
+    #[reflect(@0.0..=5.0_f32)]
+    pub airglow_nits: f32,
     /// An equirectangular star map behind the sky, faded in as the sun sets (from 6 to 18
     /// degrees below the horizon), texel x `star_nits`.
     pub stars: Option<Handle<Image>>,
@@ -193,6 +199,8 @@ impl Default for SkyAir {
             ground_albedo: Color::linear_rgb(0.3, 0.28, 0.25),
             altitude: 50.0,
             sun_illuminance: 120_000.0,
+            airglow: Color::linear_rgb(0.30, 0.42, 1.0),
+            airglow_nits: 0.05,
             stars: None,
             star_nits: 1.0,
             star_rotation: Quat::IDENTITY,

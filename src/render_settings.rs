@@ -43,14 +43,29 @@ pub struct RenderSettings {
     /// primary vertex for surfaces up to this roughness. 0 = no guide rays.
     #[reflect(@0.0..=1.0_f32)]
     pub spec_hit_roughness: f32,
-    /// ReSTIR DI at the primary vertex (initial candidates + temporal reuse).
+    /// ReSTIR DI for the light table at the primary vertex: candidates from a world light grid,
+    /// temporal and spatial reuse, one shadow ray (restir.rs).
     pub restir: bool,
-    /// Initial light candidates per pixel.
+    /// Initial light candidates per pixel (from its grid cell).
     #[reflect(@1.0..=32.0_f32)]
     pub restir_candidates: u32,
-    /// Temporal history cap, in multiples of the candidate count.
-    #[reflect(@0.0..=64.0_f32)]
+    /// Temporal history cap, in frames: short keeps Ray Reconstruction's input decorrelated.
+    #[reflect(@1.0..=64.0_f32)]
     pub restir_history: f32,
+    /// Neighbours merged by the spatial pass (0 = no spatial reuse) and their disc (pixels).
+    #[reflect(@0.0..=16.0_f32)]
+    pub restir_spatial_samples: u32,
+    #[reflect(@1.0..=64.0_f32)]
+    pub restir_spatial_radius: f32,
+    /// Boiling filter: a reservoir more than 1/this times its neighbourhood's is dropped
+    /// (0 = off).
+    #[reflect(@0.0..=1.0_f32)]
+    pub restir_boiling: f32,
+    /// The light grid's cell size (m) and samples per cell.
+    #[reflect(@0.5..=32.0_f32)]
+    pub light_grid_cell: f32,
+    #[reflect(@1.0..=64.0_f32)]
+    pub light_grid_samples: u32,
     /// Radiance cache: paths terminate into converged voxels from bounce 2 on. Biased.
     pub sharc: bool,
     /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
@@ -78,7 +93,12 @@ impl Default for RenderSettings {
             spec_hit_roughness: 0.6,
             restir: false,
             restir_candidates: 8,
-            restir_history: 20.0,
+            restir_history: 8.0,
+            restir_spatial_samples: 5,
+            restir_spatial_radius: 30.0,
+            restir_boiling: 0.0,
+            light_grid_cell: 4.0,
+            light_grid_samples: 16,
             sharc: false,
             sharc_voxel: 0.25,
             omm: true,

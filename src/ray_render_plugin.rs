@@ -1154,25 +1154,44 @@ fn render_frame(
                         &[],
                     );
 
-                    let (reservoirs_prev, reservoirs_cur) = restir.ensure(
-                        &render_device,
-                        cmd_buffer,
-                        view.trace_extent,
-                        *frame_counter,
-                        view.slot,
-                    );
+                    // ReSTIR DI's buffers and this frame's parameters (none while it is off).
+                    let restir_on = settings.restir
+                        && settings.light_nee
+                        && lights.active_entries > 0
+                        && view.plan.is_some();
+                    let restir_addresses = if restir_on {
+                        restir.prepare(
+                            &render_device,
+                            cmd_buffer,
+                            &crate::restir::RestirInput {
+                                extent: view.trace_extent,
+                                frame: *frame_counter,
+                                slot: view.slot,
+                                prev_view_proj: view.last_view_proj,
+                                camera: view.inverse_view.w_axis.truncate(),
+                                epoch: lights.epoch,
+                                lights: lights.header_address(),
+                                instances: tlas.instances_address(),
+                                light_entries: lights.active_entries,
+                                settings: &settings,
+                            },
+                        )
+                    } else {
+                        restir.release(&render_device, view.slot);
+                        crate::restir::RestirAddresses::default()
+                    };
                     fog_grid.record_clear(&render_device, cmd_buffer, view.slot);
                     let push_constants = RaytracingPushConstants {
                         uniform_buffer: frame.uniform_buffers[view.slot].address,
                         material_buffer: tlas.material_address(),
                         bluenoise_buffer2: bluenoise_buffer.0.address,
                         focus_buffer: frame.focus_data.address,
-                        padding: [0; 2],
+                        restir_surfaces: restir_addresses.surfaces,
                         prev_instances: tlas.prev_instances_address(),
                         lights: lights.header_address(),
                         instances: tlas.instances_address(),
-                        reservoirs_prev,
-                        reservoirs_cur,
+                        reservoirs_prev: restir_addresses.prev,
+                        reservoirs_cur: restir_addresses.final_,
                         sharc: sharc.address(),
                         lum_buffer: view.ae.0,
                         auto_exposure: view.ae.1,
@@ -1229,6 +1248,45 @@ fn render_frame(
                             1,
                         );
                         prof.end(&render_device, cmd_buffer, scope);
+                        // ReSTIR DI: its compute passes over the surfaces the trace just wrote,
+                        // then one shadow ray per pixel into the colour (restir.rs).
+                        if restir_on
+                            && restir.record_passes(
+                                &render_device,
+                                cmd_buffer,
+                                &modules,
+                                view.slot,
+                                &mut prof,
+                            )
+                        {
+                            render_device.cmd_push_constants(
+                                cmd_buffer,
+                                rtx_pipeline.pipeline_layout,
+                                vk::ShaderStageFlags::ALL,
+                                0,
+                                bytemuck::cast_slice(&[push_constants]),
+                            );
+                            let scope = prof.begin(&render_device, cmd_buffer, "restir shade");
+                            render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                cmd_buffer,
+                                &sbt.restir_shade_region,
+                                &sbt.miss_region,
+                                &sbt.hit_region,
+                                &vk::StridedDeviceAddressRegionKHR::default(),
+                                plan.render.width,
+                                plan.render.height,
+                                1,
+                            );
+                            prof.end(&render_device, cmd_buffer, scope);
+                            crate::compute::memory_barrier(
+                                &render_device,
+                                cmd_buffer,
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                vk::AccessFlags2::SHADER_WRITE,
+                                vk::PipelineStageFlags2::ALL_COMMANDS,
+                                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                            );
+                        }
                         let scope = prof.begin(&render_device, cmd_buffer, "dlss");
                         renderer.record_evaluate(
                             &render_device,
