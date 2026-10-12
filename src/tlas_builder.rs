@@ -1112,7 +1112,8 @@ pub fn prepare_instances(
         let record = InstanceRecord {
             slot,
             custom_and_mask: (custom_index & 0x00FF_FFFF) | ((source.mask as u32) << 24),
-            sbt_and_flags: (hit_offset & 0x00FF_FFFF) | (flags << 24),
+            // Two SBT records per hit offset (sbt.rs): shading at 2n, shadow at 2n + 1.
+            sbt_and_flags: ((2 * hit_offset) & 0x00FF_FFFF) | (flags << 24),
             node: source.node,
             blas,
             pad: 0,
@@ -1141,7 +1142,7 @@ pub fn prepare_instances(
                 match meshes.get_by_id(*pose) {
                     Some(b) => resolved.push(BlockPose {
                         blas: b.acceleration_structure.address,
-                        sbt_and_flags: (offset & 0x00FF_FFFF) | (flags << 24),
+                        sbt_and_flags: ((2 * offset) & 0x00FF_FFFF) | (flags << 24),
                         pad: 0,
                     }),
                     None => complete = false,

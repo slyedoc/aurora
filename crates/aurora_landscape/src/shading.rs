@@ -127,11 +127,10 @@ pub fn register_class(
         closest_hit: server.load(aurora_asset("shaders/landscape/hit.slang")),
         any_hit: None,
     });
-    let rows: Buffer<LandscapeRow> =
-        rd.create_host_buffer(
-            ROWS,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        );
+    let rows: Buffer<LandscapeRow> = rd.create_host_buffer(
+        ROWS,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+    );
     data.set(class, rows.address);
     commands.insert_resource(LandscapeClass {
         class,

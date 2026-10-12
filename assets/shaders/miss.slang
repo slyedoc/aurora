@@ -111,3 +111,9 @@ void main(inout HitPayload payload) {
     }
     payload.emission = sky * env.sky_brightness;
 }
+
+// Shadow rays (miss index 1): they only ask whether the sky is reached.
+[shader("miss")]
+void shadow_miss(inout ShadowPayload payload) {
+    payload.visible = 1u;
+}

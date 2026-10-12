@@ -29,6 +29,12 @@ public struct HitPayload {
     public uint lobes;
 };
 
+// Shadow rays: whether the ray reached the sky (the shadow miss shader sets it). One word, so
+// a visibility test carries none of the shading payload.
+public struct ShadowPayload {
+    public uint visible;
+};
+
 public uint packLobes(float transmission, float clearcoat, float clearcoat_roughness) {
     return uint(saturate(transmission) * 255.0 + 0.5)
         | (uint(saturate(clearcoat) * 255.0 + 0.5) << 8)

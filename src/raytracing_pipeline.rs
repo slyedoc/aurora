@@ -88,6 +88,12 @@ pub struct CompiledRaytracingPipeline {
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
+    /// Miss index 1: shadow rays.
+    pub shadow_miss_handle: RTGroupHandle,
+    /// Shadow twins of the hit groups (record offset 1): the opaque triangles' alpha test,
+    /// and no shaders at all for the surface classes.
+    pub shadow_hit_handle: RTGroupHandle,
+    pub shadow_empty_handle: RTGroupHandle,
     /// The built-in opaque triangle group: [`SurfaceClass::OPAQUE`], and
     /// `surface_handles[0]`.
     pub hit_handle: RTGroupHandle,
@@ -330,6 +336,7 @@ impl VulkanAsset for RaytracingPipeline {
 
         // Stage indices 0..=5 are fixed and the group table below names them literally;
         // each registered surface group appends its own stages after them.
+        let any_hit_shader_spirv = any_hit_shader.spirv.unwrap();
         let mut shader_stages = vec![
             render_device
                 .load_shader(
@@ -357,10 +364,7 @@ impl VulkanAsset for RaytracingPipeline {
                 vk::ShaderStageFlags::CLOSEST_HIT_KHR,
                 c"closesthit",
             ),
-            render_device.load_shader(
-                &any_hit_shader.spirv.unwrap(),
-                vk::ShaderStageFlags::ANY_HIT_KHR,
-            ),
+            render_device.load_shader(&any_hit_shader_spirv, vk::ShaderStageFlags::ANY_HIT_KHR),
         ];
 
         let shader_group = [
@@ -451,6 +455,50 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
+        // The shadow rays' miss shader (miss index 1, miss.slang `shadow_miss`), last.
+        let shadow_miss_group = shader_group.len();
+        let shadow_miss_stage = shader_stages.len() as u32;
+        shader_stages.push(render_device.load_shader_entry(
+            miss_shader.spirv.as_ref().unwrap(),
+            vk::ShaderStageFlags::MISS_KHR,
+            c"shadow_miss",
+        ));
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(shadow_miss_stage)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
+        // Shadow hit groups (record offset 1, sbt.rs): the opaque triangles' alpha test under the
+        // shadow payload, and an empty group for the classes, which have no any-hit.
+        let shadow_hit_group = shader_group.len();
+        let shadow_any_hit_stage = shader_stages.len() as u32;
+        shader_stages.push(render_device.load_shader_entry(
+            &any_hit_shader_spirv,
+            vk::ShaderStageFlags::ANY_HIT_KHR,
+            c"shadow_any_hit",
+        ));
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                .general_shader(vk::SHADER_UNUSED_KHR)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(shadow_any_hit_stage)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+        let shadow_empty_group = shader_group.len();
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                .general_shader(vk::SHADER_UNUSED_KHR)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
         // Pipelines that trace structures referencing opacity micromaps must say so.
         let flags = if render_device.ext_micromap.is_some() {
             vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT
@@ -520,6 +568,9 @@ impl VulkanAsset for RaytracingPipeline {
             .chain(handles[OPAQUE_GROUP + 2..fog_grid_group].iter().copied())
             .collect();
         let fog_grid_handle = handles[fog_grid_group];
+        let shadow_miss_handle = handles[shadow_miss_group];
+        let shadow_hit_handle = handles[shadow_hit_group];
+        let shadow_empty_handle = handles[shadow_empty_group];
 
         log::debug!("Raytracing pipeline compiled in {:?}", start.elapsed());
         render_device.save_pipeline_cache();
@@ -532,6 +583,9 @@ impl VulkanAsset for RaytracingPipeline {
             raygen_handle,
             fog_grid_handle,
             miss_handle,
+            shadow_miss_handle,
+            shadow_hit_handle,
+            shadow_empty_handle,
             hit_handle,
             sphere_hit_handle,
             surface_handles,

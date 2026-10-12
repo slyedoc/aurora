@@ -50,6 +50,20 @@ void trace(uint flags, uint mask, float3 origin, float tmin, float3 direction, f
     TraceRay(topLevelAS, flags, mask, 0, 0, 0, ray, payload);
 }
 
+// A shadow ray: true when nothing opaque lies between (the shadow miss shader, miss index 1,
+// ran; hits use each record's shadow twin, sbt.rs). Its one-word payload keeps the shading payload out of every visibility test.
+bool traceVisible(uint mask, float3 origin, float tmin, float3 direction, float tmax) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.TMin = tmin;
+    ray.Direction = direction;
+    ray.TMax = tmax;
+    ShadowPayload shadow = { 0u };
+    // Hit record offset 1: every geometry's shadow twin (its any-hit takes this payload).
+    TraceRay(topLevelAS, FLAGS_SHADOW, mask, 1, 0, 1, ray, shadow);
+    return shadow.visible != 0u;
+}
+
 // trace() through Shader Execution Reordering: the hit is found first, the warp regrouped by
 // what it hit, and only then shaded, so neighbouring lanes shade the same material instead of
 // diverging across the scene (Northshire: 12.2 -> 10.9 ms; a record-index hint measured the
@@ -312,9 +326,7 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
         let sun = env.suns[si];
         if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
             l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
-            payload.t = -1.0;
-            trace(FLAGS_SHADOW, ray_mask, x, 0.0, l, tmax, payload);
-            visible = payload.t == 0.0;
+            visible = traceVisible(ray_mask, x, 0.0, l, tmax);
         }
         if (!visible) {
             continue;
@@ -926,9 +938,7 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, flo
     if (wsum <= 0.0 || sel_phat <= 0.0) {
         return float3(0.0);
     }
-    payload.t = -1.0;
-    trace(FLAGS_SHADOW, ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4), payload);
-    if (payload.t != 0.0) {
+    if (!traceVisible(ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4))) {
         return float3(0.0);
     }
     var L = sel_val * (wsum / (float(M) * sel_phat));
@@ -1348,9 +1358,7 @@ void main() {
                         if (ATMOSPHERE_ON && env.mode == 3u && si == 0u) {
                             sun_radiance *= atmoSunTransmittanceAt(origin);
                         }
-                        payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, origin, 0.0, l, tmax, payload);
-                        if (payload.t == 0.0) {
+                        if (traceVisible(ray_mask, origin, 0.0, l, tmax)) {
                             let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                             acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle;
                         }
@@ -1562,11 +1570,18 @@ void main() {
                         let sv = randf();
                         float p_area, pdf_solid, cdist;
                         float3 cdir;
-                        let val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
+                        var val = lightSampleEval(e, lightsFindInstance(e), p_pick, su, sv,
                                                   origin, world_normal, surface_normal,
                                                   -direction, disney_mat, lob, ray_mask,
                                                   p_area, pdf_solid, cdir, cdist);
                         r_M += 1.0;
+                        // The MIS weight against BRDF sampling rides in the target, as in the
+                        // RIS path below: a BRDF-sampled bounce that reaches this emitter is
+                        // weighted against the CDF pdf, so without it the light counts twice
+                        // (brighter, and the bounce's share is speckle noise).
+                        if (pdf_solid > 0.0) {
+                            val *= pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
+                        }
                         let phat = luma(val);
                         if (phat > 0.0 && p_area > 0.0) {
                             let wi = phat / p_area;
@@ -1586,12 +1601,12 @@ void main() {
                     let prev_clip = mat4MulVec(pc.uniforms.prev_view_proj, float4(payload.prev_world_pos, 1.0));
                     if (prev_clip.w > 1.0e-4) {
                         let uv01 = (prev_clip.xy / prev_clip.w) * 0.5 + 0.5;
-                        // Inverse of the forward mapping (pixel_center = (x, H - y) + subpixel): the
-                        // flipped y needs +1 so truncation lands in (y, y+1) like x's (x, x+1) --
-                        // without it every fetch reads the row above and the reservoir pattern
-                        // scrolls down the screen one row per frame.
+                        // Inverse of the forward mapping (pixel_center = (x, H - 1 - y) + subpixel):
+                        // H - uv * H = y + 0.5 for row y's centre, so truncation lands on y. Off by
+                        // a row either way, every fetch reads a neighbour and the reservoir pattern
+                        // scrolls one row per frame (down with -1, up with the +1 this once had).
                         let ppx = int2(int(uv01.x * float(launch_size.x)),
-                                       int(float(launch_size.y) + 1.0 - uv01.y * float(launch_size.y)));
+                                       int(float(launch_size.y) - uv01.y * float(launch_size.y)));
                         if (ppx.x >= 0 && ppx.y >= 0
                             && ppx.x < int(launch_size.x) && ppx.y < int(launch_size.y)) {
                             let prev = pc.reservoirs_prev[ppx.y * int(launch_size.x) + ppx.x];
@@ -1601,13 +1616,18 @@ void main() {
                                 && abs(prev.depth - prev_clip.w) < 0.1 * prev_clip.w
                                 && dot(oct_to_float32x3(unpackHalf2(prev.normal_pk)), world_normal) > 0.9) {
                                 let suv = unpackHalf2(prev.uv_pk);
-                                float p_area_ign, pdf_solid_ign, cdist;
+                                float p_area_ign, pdf_solid, cdist;
                                 float3 cdir;
-                                let val = lightSampleEval(prev.y, lightsFindInstance(prev.y), 1.0,
-                                                          suv.x, suv.y, origin, world_normal,
-                                                          surface_normal, -direction, disney_mat,
-                                                          lob, ray_mask, p_area_ign, pdf_solid_ign, cdir,
-                                                          cdist);
+                                // Its real pick probability, for the same MIS weight as a fresh
+                                // candidate's.
+                                var val = lightSampleEval(prev.y, lightsFindInstance(prev.y),
+                                                          lightsEntryPick(prev.y), suv.x, suv.y,
+                                                          origin, world_normal, surface_normal,
+                                                          -direction, disney_mat, lob, ray_mask,
+                                                          p_area_ign, pdf_solid, cdir, cdist);
+                                if (pdf_solid > 0.0) {
+                                    val *= pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
+                                }
                                 let phat = luma(val);
                                 let Mprev = min(prev.M, pc.uniforms.restir_m_clamp);
                                 if (phat > 0.0) {
@@ -1629,9 +1649,7 @@ void main() {
                     // Resolve: contribution weight, one visibility ray, shade.
                     var r_W = (r_phat > 0.0 && r_M > 0.0) ? r_wsum / (r_M * r_phat) : 0.0;
                     if (r_W > 0.0) {
-                        payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, r_dir), tmin, r_dir, r_dist * (1.0 - 1.0e-4), payload);
-                        if (payload.t == 0.0) {
+                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, r_dir), tmin, r_dir, r_dist * (1.0 - 1.0e-4))) {
                             acc += mask * r_val * r_W;
                         } else {
                             // Visibility reuse: an occluded winner is forgotten, not dragged along.
@@ -1692,9 +1710,7 @@ void main() {
                         }
                     }
                     if (wsum > 0.0 && sel_phat > 0.0) {
-                        payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, ldir), tmin, ldir, ldist * (1.0 - 1.0e-4), payload);
-                        if (payload.t == 0.0) {
+                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, ldir), tmin, ldir, ldist * (1.0 - 1.0e-4))) {
                             var contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
                             if (bounce_idx > 0 && radiance_clamp > 0.0) {
                                 contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
@@ -1723,9 +1739,7 @@ void main() {
                     let f = evalLayered(-direction, world_normal, l, disney_mat, lob, true);
                     if (any(f > float3(0.0))) {
                         let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
-                        payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax, payload);
-                        if (payload.t == 0.0) {
+                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
                             acc += mask * f * abs(NoL) * L * (w / pdf_env);
                         }
                     }
@@ -1763,9 +1777,7 @@ void main() {
                         // Shadow ray: any accepted hit terminates without running a closest-hit
                         // shader, so the payload's t only becomes 0 when the miss shader ran. Not
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
-                        payload.t = -1.0;
-                        trace(FLAGS_SHADOW, ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax, payload);
-                        if (payload.t == 0.0) {
+                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
                             let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                             acc += mask * f * abs(NoL) * sun_radiance * solid_angle;
                         }

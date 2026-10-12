@@ -2,7 +2,7 @@ use crate::{
     mesh::AuroraMesh,
     procedural_mesh::ProceduralMesh,
     ray_render_plugin::{RenderConfig, RenderSet, TeardownSchedule, on_shutdown},
-    raytracing_pipeline::{RTGroupHandle, RaytracingPipeline},
+    raytracing_pipeline::{CompiledRaytracingPipeline, RTGroupHandle, RaytracingPipeline},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     skinning::{Skins, prepare_skins},
@@ -68,6 +68,31 @@ pub struct SBT {
     pub data: Buffer<u8>,
 }
 
+/// A hit offset's two records: `record` at 2n and its shadow twin at 2n + 1 -- the same
+/// geometry, under the opaque group's alpha test (or no shaders for a surface class, which has
+/// no any-hit).
+unsafe fn write_hit_pair(
+    dst: *mut u8,
+    stride: u64,
+    offset: u32,
+    pipeline: &CompiledRaytracingPipeline,
+    record: SBTRegionHitTriangle,
+) {
+    let shadow = SBTRegionHitTriangle {
+        handle: if record.handle == pipeline.hit_handle {
+            pipeline.shadow_hit_handle
+        } else {
+            pipeline.shadow_empty_handle
+        },
+        ..record
+    };
+    unsafe {
+        let at = dst.add(2 * offset as usize * stride as usize);
+        (at as *mut SBTRegionHitTriangle).write(record);
+        (at.add(stride as usize) as *mut SBTRegionHitTriangle).write(shadow);
+    }
+}
+
 fn update_sbt(
     render_device: Res<RenderDevice>,
     mut sbt: ResMut<SBT>,
@@ -103,7 +128,8 @@ fn update_sbt(
 
     sbt.miss_region.stride =
         vk_utils::aligned_size(handle_size_aligned, aligments.shader_group_base_alignment);
-    sbt.miss_region.size = sbt.miss_region.stride;
+    // Two records: the sky (index 0) and the shadow rays' (index 1).
+    sbt.miss_region.size = sbt.miss_region.stride * 2;
 
     sbt.hit_region.stride = vk_utils::aligned_size(
         std::mem::size_of::<SBTRegionHitTriangle>().max(std::mem::size_of::<SBTRegionHitSphere>())
@@ -112,7 +138,9 @@ fn update_sbt(
     );
 
     // Hit offsets are stable per mesh asset (0 is the sphere group), so size by their count.
-    sbt.hit_region.size = sbt.hit_region.stride * tlas.hit_offset_count().max(1) as u64;
+    // Each offset owns two records: its shading group at 2n, its shadow twin at 2n + 1 (shadow
+    // rays trace with record offset 1; the TLAS stores 2n as the instance's offset).
+    sbt.hit_region.size = sbt.hit_region.stride * 2 * tlas.hit_offset_count().max(1) as u64;
 
     let total_size = sbt.raygen_region.size
         + sbt.fog_grid_region.size
@@ -160,12 +188,22 @@ fn update_sbt(
             (dst as *mut SBTRegionMiss).write(SBTRegionMiss {
                 handle: rtx_pipeline.miss_handle,
             });
+            (dst.add(sbt.miss_region.stride as usize) as *mut SBTRegionMiss).write(SBTRegionMiss {
+                handle: rtx_pipeline.shadow_miss_handle,
+            });
             dst = dst.add(sbt.miss_region.size as usize);
 
             // hit regions (come after the miss region)
+            // Spheres: their intersection shader carries no payload, so the shadow twin is the
+            // same group.
             (dst as *mut SBTRegionHitSphere).write(SBTRegionHitSphere {
                 handle: rtx_pipeline.sphere_hit_handle,
             });
+            (dst.add(sbt.hit_region.stride as usize) as *mut SBTRegionHitSphere).write(
+                SBTRegionHitSphere {
+                    handle: rtx_pipeline.sphere_hit_handle,
+                },
+            );
 
             for (mesh_id, mesh) in meshes.iter() {
                 let mesh = match mesh {
@@ -177,9 +215,12 @@ fn update_sbt(
                     .get(&mesh_id.untyped())
                     .map_or(&[][..], Vec::as_slice)
                 {
-                    (dst.add(*offset as usize * sbt.hit_region.stride as usize)
-                        as *mut SBTRegionHitTriangle)
-                        .write(SBTRegionHitTriangle {
+                    write_hit_pair(
+                        dst,
+                        sbt.hit_region.stride,
+                        *offset,
+                        rtx_pipeline,
+                        SBTRegionHitTriangle {
                             handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
                             vertex_buffer: mesh.vertex_buffer.address,
                             triangle_buffer: mesh.triangle_buffer.address,
@@ -189,7 +230,8 @@ fn update_sbt(
                             prev_vertex_buffer: 0,
                             flags: 0,
                             surface_data: surface_data.get(SurfaceClass(*class)),
-                        });
+                        },
+                    );
                 }
             }
 
@@ -203,9 +245,12 @@ fn update_sbt(
                     .get(&mesh_id.untyped())
                     .map_or(&[][..], Vec::as_slice)
                 {
-                    (dst.add(*offset as usize * sbt.hit_region.stride as usize)
-                        as *mut SBTRegionHitTriangle)
-                        .write(SBTRegionHitTriangle {
+                    write_hit_pair(
+                        dst,
+                        sbt.hit_region.stride,
+                        *offset,
+                        rtx_pipeline,
+                        SBTRegionHitTriangle {
                             handle: rtx_pipeline.surface_handle(SurfaceClass(*class)),
                             vertex_buffer: mesh.vertex_buffer.address,
                             triangle_buffer: mesh.triangle_buffer.address,
@@ -215,15 +260,19 @@ fn update_sbt(
                             prev_vertex_buffer: 0,
                             flags: 0,
                             surface_data: surface_data.get(SurfaceClass(*class)),
-                        });
+                        },
+                    );
                 }
             }
 
             // Skinned instances: their own deformed streams, plus last frame's positions.
             for record in skins.hit_records() {
-                (dst.add(record.hit_offset as usize * sbt.hit_region.stride as usize)
-                    as *mut SBTRegionHitTriangle)
-                    .write(SBTRegionHitTriangle {
+                write_hit_pair(
+                    dst,
+                    sbt.hit_region.stride,
+                    record.hit_offset,
+                    rtx_pipeline,
+                    SBTRegionHitTriangle {
                         handle: rtx_pipeline.hit_handle,
                         vertex_buffer: record.vertex_buffer,
                         triangle_buffer: record.triangle_buffer,
@@ -233,7 +282,8 @@ fn update_sbt(
                         prev_vertex_buffer: record.prev_vertex_buffer,
                         flags: 1,
                         surface_data: 0,
-                    });
+                    },
+                );
             }
         }
     }

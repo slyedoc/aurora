@@ -16,8 +16,11 @@ use bevy_aurora::{
 fn texel(sky: &[Vec4], d: Vec3) -> Vec3 {
     let d = d.normalize();
     let phi = d.x.atan2(d.z);
-    let mut u = (if phi > 0.0 { phi } else { phi + std::f32::consts::TAU })
-        / std::f32::consts::TAU
+    let mut u = (if phi > 0.0 {
+        phi
+    } else {
+        phi + std::f32::consts::TAU
+    }) / std::f32::consts::TAU
         - 0.5;
     if u < 0.0 {
         u += 1.0;
@@ -40,9 +43,7 @@ fn sun_at(elevation: f32) -> Transform {
 }
 
 fn render(app: &mut App, environment: Entity, sun: Entity, elevation: f32) -> Vec<Vec4> {
-    app.world_mut()
-        .entity_mut(sun)
-        .insert(sun_at(elevation));
+    app.world_mut().entity_mut(sun).insert(sun_at(elevation));
     // Until the kernels are compiled and have run, then a few more frames.
     let start = std::time::Instant::now();
     let bit = loop {
@@ -57,7 +58,10 @@ fn render(app: &mut App, environment: Entity, sun: Entity, elevation: f32) -> Ve
         {
             break bit;
         }
-        assert!(start.elapsed().as_secs() < 30, "the generated sky was never built");
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "the generated sky was never built"
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
     for _ in 0..4 {
@@ -118,8 +122,14 @@ fn the_generated_sky_is_blue_at_noon_red_at_sunset_and_dark_at_night() {
     let under_sun = texel(&sunset, Vec3::new(1.0, 0.03, 0.0));
     let zenith = texel(&sunset, Vec3::Y);
     println!("sunset: under the sun {under_sun}, zenith {zenith}");
-    assert!(under_sun.x > under_sun.z, "a red horizon under the sun: {under_sun}");
-    assert!(luma(zenith) < luma(texel(&noon, Vec3::Y)), "dimmer than noon");
+    assert!(
+        under_sun.x > under_sun.z,
+        "a red horizon under the sun: {under_sun}"
+    );
+    assert!(
+        luma(zenith) < luma(texel(&noon, Vec3::Y)),
+        "dimmer than noon"
+    );
 
     let night = render(&mut app, environment, sun, -20.0);
     let brightest = night.iter().map(|t| luma(t.truncate())).fold(0.0, f32::max);
