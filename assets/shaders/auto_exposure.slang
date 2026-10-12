@@ -9,6 +9,8 @@
 
 // Fixed thread count for `ae_histogram`: 256 groups of 64, each thread striding the buffer.
 static const uint AE_HISTOGRAM_THREADS = 16384;
+// Neighbouring pixels (along a row) averaged into one meter reading.
+static const uint AE_STRIP = 16;
 
 // Must match AeGpu in src/auto_exposure.rs (and AeData in rt_types.slang).
 struct AeState {
@@ -55,17 +57,35 @@ void ae_histogram(uint3 gid: SV_DispatchThreadID, uint li: SV_GroupIndex) {
     shared_bins[li] = 0;
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint i = gid.x; i < p.pixel_count; i += AE_HISTOGRAM_THREADS) {
-        let lum = p.lum[2 * i];
-        if (lum < 0.0) {
+    // Binned per strip of AE_STRIP neighbouring pixels (their linear mean, counted once per
+    // metered pixel), not per pixel: at one path per pixel many meters are exactly 0 (an
+    // occluded shadow ray, a bounce that found nothing) and the log histogram read that noise
+    // as darkness -- by up to seven stops once the fog lifted those zeros off the floor.
+    let strips = (p.pixel_count + AE_STRIP - 1) / AE_STRIP;
+    for (uint b = gid.x; b < strips; b += AE_HISTOGRAM_THREADS) {
+        var sum = 0.0;
+        var n = 0u;
+        for (uint k = 0u; k < AE_STRIP; k++) {
+            let i = b * AE_STRIP + k;
+            if (i >= p.pixel_count) {
+                break;
+            }
+            let lum = p.lum[2 * i];
+            if (lum >= 0.0 && lum < 1.0e30) {
+                sum += lum;
+                n += 1u;
+            }
+        }
+        if (n == 0u) {
             continue;
         }
+        let lum = sum / float(n);
         uint bin = 0;
         if (lum >= exp2(p.min_log_lum)) {
             let t = saturate((log2(lum) - p.min_log_lum) * p.inv_log_lum_range);
             bin = uint(t * 62.0 + 1.0);
         }
-        InterlockedAdd(shared_bins[bin], 1);
+        InterlockedAdd(shared_bins[bin], n);
     }
 
     GroupMemoryBarrierWithGroupSync();

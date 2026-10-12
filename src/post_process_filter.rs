@@ -16,7 +16,11 @@ pub struct PostProcessPushConstants {
     pub debug_view: u32,
     /// 1: write physical radiance (no exposure or tonemap) for a scene-radiance target.
     pub scene_radiance: u32,
-    pub _pad: u32,
+    /// 1: composite the camera ray's fog (slot 8) over the resolved image.
+    pub fog: u32,
+    /// `RenderSettings::local_tonemap`.
+    pub local_tonemap: f32,
+    pub _pad: f32,
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
@@ -69,12 +73,12 @@ impl VulkanAsset for PostProcessFilter {
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
 
-        // 8 sampled images: the DLSS output plus the guide buffers for the debug views
-        // (quad.slang's `test[8]`).
+        // 9 sampled images: the DLSS output, the guide buffers for the debug views and the
+        // camera ray's fog (quad.slang's `test[9]`).
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .binding(0)
-            .descriptor_count(8)
+            .descriptor_count(9)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
 
         let descriptor_layout_info =

@@ -16,6 +16,9 @@ import light_eval;
 [[vk::binding(4, 0)]] [[vk::image_format("r32f")]] RWTexture2D<float4> guide_spec_hit;
 [[vk::binding(5, 0)]] [[vk::image_format("rg16f")]] RWTexture2D<float4> guide_motion;
 [[vk::binding(6, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> dlss_color;
+// The camera ray's fog, kept out of Ray Reconstruction: rgb the in-scattered light (pre-exposed
+// like the colour), a the transmittance; the composite lays it over RR's output.
+[[vk::binding(7, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> guide_fog;
 [[vk::binding(100, 0)]] RaytracingAccelerationStructure topLevelAS;
 [[vk::binding(200, 1)]] Sampler2D textures[];
 
@@ -646,8 +649,8 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
 
 // ---- Fog light grid (src/fog_grid.rs) ------------------------------------------------------
 
-// Most steps the camera ray takes through the grid (lookups, so many more than `fog_steps`).
-static const uint FOG_GRID_STEPS = 24u;
+// Most slices the camera ray steps through the grid (lookups, so many more than `fog_steps`).
+static const uint FOG_GRID_STEPS = 32u;
 
 // The grid's cells across, down and deep (src/fog_grid.rs).
 uint3 fogGridSize() {
@@ -677,6 +680,16 @@ float4 fogGridSample(float4* grid, uint3 size, float3 g) {
         r += w * grid[(uint(q.z) * size.y + uint(q.y)) * size.x + uint(q.x)];
     }
     return r;
+}
+
+// The grid across two cells (four reads half a cell apart in x and y): each cell's own noise
+// (its light is a few random shadow rays) shared with its neighbours. Composited after Ray
+// Reconstruction, the camera's fog no longer has it to hide a mottle at the cell size.
+float4 fogGridSampleSoft(float4* grid, uint3 size, float3 g) {
+    return 0.25 * (fogGridSample(grid, size, g + float3(-0.5, -0.5, 0.0))
+                 + fogGridSample(grid, size, g + float3(0.5, -0.5, 0.0))
+                 + fogGridSample(grid, size, g + float3(-0.5, 0.5, 0.0))
+                 + fogGridSample(grid, size, g + float3(0.5, 0.5, 0.0)));
 }
 
 // A cell's world point: (uv, slice) in [0, 1) of the grid's own view, unjittered at the centre.
@@ -802,33 +815,46 @@ void fog_grid() {
 }
 
 // The camera ray through the fog like fogMarch, lit from last frame's grid instead of
-// shadow rays: the in-scatter goes into `acc`, the transmittance into `mask`.
+// shadow rays: the in-scatter goes into `acc`, the transmittance into `mask`. One lookup per
+// grid slice the ray crosses (slices are quadratic in depth, so are the steps), at fixed
+// positions: the fog is composited after Ray Reconstruction, which no longer averages a dither
+// away, and stepping by optical depth gave thin daylight haze ONE step -- a single lookup half
+// way down the ray, so a ray ending at a sunward tree sampled only its shadow (black cut-outs)
+// and one past it a flat veil. Past the grid the far slice lights the rest in one step.
 void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
                   inout float3 mask, inout float3 acc) {
-    let depth = fogMajorant(env, o, d, seg, base) * seg;
-    if (depth <= 1.0e-6) {
+    if (fogMajorant(env, o, d, seg, base) * seg <= 1.0e-6) {
         return;
     }
     let size = fogGridSize();
-    let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, FOG_GRID_STEPS);
-    let jitter = randf();
+    let dist = env.fog_grid_distance;
+    let inside = min(seg, dist);
+    let n = clamp(uint(ceil(sqrt(inside / dist) * float(size.z))), 1u, FOG_GRID_STEPS);
     var T = 1.0;
     var prev = 0.0;
     var L = float3(0.0);
-    for (uint i = 0u; i < n; i++) {
-        let f = float(i + 1u) / float(n);
-        let t_end = seg * f * f;
-        let fs = (float(i) + jitter) / float(n);
-        let x = o + d * (seg * fs * fs);
+    for (uint i = 0u; i <= n; i++) {
+        var t_end = seg;
+        var t_mid = 0.5 * (prev + seg);
+        if (i < n) {
+            let f = float(i + 1u) / float(n);
+            let fm = (float(i) + 0.5) / float(n);
+            t_end = inside * f * f;
+            t_mid = inside * fm * fm;
+        }
         let dt = t_end - prev;
         prev = t_end;
+        if (dt <= 0.0) {
+            continue;
+        }
+        let x = o + d * t_mid;
         let sigma = fogDensityAt(env, x, base);
         if (sigma <= 0.0) {
             continue;
         }
         let step_t = exp(-sigma * dt);
-        let Ls = fogGridSample(pc.uniforms.fog_grid_cur, size,
-                               fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, env.fog_grid_distance)).rgb;
+        let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
+                                   fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, dist)).rgb;
         L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
         T *= step_t;
     }
@@ -914,6 +940,9 @@ void main() {
     }
 
     var acc = float3(0.0);
+    // Sample 0's camera-ray fog for the composite (`guide_fog`); none: nothing over the colour.
+    var fog_out = float3(0.0);
+    var fog_out_t = 1.0;
     let SAMPLES = pc.uniforms.samples;
     let MAX_BOUNCES = pc.uniforms.max_bounces;
     // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
@@ -968,6 +997,11 @@ void main() {
         // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
         var guides_written = false;
+        // The camera ray's fog (sample 0 of a 1-spp frame): kept out of Ray Reconstruction's
+        // colour, its light and transmittance go to `guide_fog` for the composite.
+        let fog_aside = sample_idx == 0u && SAMPLES == 1u;
+        var fog_light = float3(0.0);
+        var fog_t = 1.0;
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
         // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
@@ -1160,12 +1194,23 @@ void main() {
                 // The camera ray marches its fog (the shafts, without the noise of one random
                 // scatter); a ray to the sky marches only as far as the volumes reach.
                 let seg = payload.t > 0.0 ? payload.t : fogVolumesReach(origin, direction);
+                var fog_mask = mask;
+                var fog_acc = float3(0.0);
                 if (seg > 0.0 && in_view && pc.uniforms.fog_grid_cells > 0u
                     && pc.uniforms.fog_grid_fresh == 0u) {
-                    fogMarchGrid(env, origin, direction, seg, payload.t > 0.0, mask, acc);
+                    fogMarchGrid(env, origin, direction, seg, payload.t > 0.0, fog_mask, fog_acc);
                 } else if (seg > 0.0) {
                     fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
-                             payload.t > 0.0, mask, acc, payload);
+                             payload.t > 0.0, fog_mask, fog_acc, payload);
+                }
+                if (fog_aside) {
+                    // The surface behind reaches RR unveiled; the composite applies both.
+                    let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
+                    fog_light += fog_t * fog_acc;
+                    fog_t *= seg_t;
+                } else {
+                    mask = fog_mask;
+                    acc += fog_acc;
                 }
             } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
@@ -1630,6 +1675,11 @@ void main() {
             }
         }
 
+        if (fog_aside) {
+            fog_out = fog_light;
+            fog_out_t = fog_t;
+        }
+
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
         // darkness is learned too).
@@ -1651,9 +1701,14 @@ void main() {
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =
     // skipped) and the raw nits for the panel readout.
-    let lum_nits = dot(float3(0.2125, 0.7154, 0.0721), mean);
+    // Meter what is seen: the surface through the fog plus the fog (composited after Ray
+    // Reconstruction; metered without it, the exposure ignored the veil and it blew out).
+    let lum_nits = dot(float3(0.2125, 0.7154, 0.0721), mean * fog_out_t + fog_out);
     let lum_at = 2u * (uint(px.y) * launch_size.x + uint(px.x));
-    pc.lum[lum_at] = meter_skip ? -1.0 : lum_nits / max(meter_albedo, 0.04);
+    // The incident meter: the surface's light over its albedo, the fog's as is (it reflects
+    // nothing; it is light in the air).
+    let fog_nits = dot(float3(0.2125, 0.7154, 0.0721), fog_out);
+    pc.lum[lum_at] = meter_skip ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
     pc.lum[lum_at + 1u] = lum_nits;
     // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
     // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
@@ -1662,4 +1717,6 @@ void main() {
     // Finite and inside f16 range.
     let radiance = clamp(mean * pc.ae.input_exposure, float3(0.0), float3(65504.0));
     dlss_color[px] = float4(radiance, 1.0);
+    guide_fog[px] = float4(clamp(fog_out * pc.ae.input_exposure, float3(0.0), float3(65504.0)),
+                           fog_out_t);
 }

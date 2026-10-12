@@ -5,7 +5,8 @@
 //! `AuroraMaterial3d`, becomes one aurora `InstanceBlock`: a slot per cell of a square window
 //! around the viewer. The kernel writes each slot's transform (or a zero one where nothing
 //! grows) straight into the TLAS instance array; nothing is read back. With `poses`, it also
-//! picks each plant's wind pose every frame by swapping BLAS pointers among the baked poses.
+//! leans each plant with the wind every frame: the baked pose under its lean (a BLAS pointer
+//! swap) plus a shear for the rest of the way, so the sway is continuous at any frame rate.
 
 use ash::vk;
 use bevy::{ecs::lifecycle::Remove, prelude::*};
@@ -53,10 +54,13 @@ pub struct ScatterSpecies {
     pub max_slope: f32,
     /// Metres the base sits below the ground.
     pub sink: f32,
-    /// Wind poses the plant cycles through (empty = rigid).
+    /// Wind poses at evenly spaced lean amounts, least first (empty = rigid).
     pub poses: Vec<Handle<AuroraMesh>>,
     /// Gust cycles per second.
     pub wind_speed: f32,
+    /// The shear (x per y, plant space) standing in for one pose step: the lean between two
+    /// poses. 0 = the pose steps alone.
+    pub wind_shear: f32,
     pub seed: u32,
     /// Multiplies every `grows_on` factor: thins (or fills) the species without moving it.
     pub density: f32,
@@ -75,6 +79,7 @@ impl Default for ScatterSpecies {
             sink: 0.05,
             poses: Vec::new(),
             wind_speed: 0.35,
+            wind_shear: 0.0,
             seed: 1,
             density: 1.0,
         }
@@ -122,6 +127,8 @@ struct ScatterPush {
 struct SpeciesTables {
     factors: [f32; PALETTE_MAX],
     poses: [BlockPose; POSES_MAX],
+    wind_shear: f32,
+    _pad: [f32; 3],
 }
 
 /// A species' GPU tables and what its block last held.
@@ -240,6 +247,7 @@ pub fn scatter_species(
             tables.factors[id as usize] = (f * spec.density).clamp(0.0, 1.0);
         }
         tables.poses[..poses.len()].copy_from_slice(poses);
+        tables.wind_shear = spec.wind_shear;
         state.last = Some((cell0, generation));
         let push = ScatterPush {
             instances: tlas.instances_address(),

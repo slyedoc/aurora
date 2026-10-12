@@ -42,7 +42,7 @@ static DEV_SNIPPET: AtomicBool = AtomicBool::new(false);
 
 /// `NVSDK_NGX_RayReconstruction_Hint_Render_Preset` value; set by [`DlssPlugin`], read at
 /// feature creation. Same pattern as [`DEV_SNIPPET`].
-static RR_PRESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static RR_PRESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(5);
 
 /// The dev panel's jitter amplitude, as f32 bits (1 = the full +-0.5 traced pixel). The same
 /// scaled offset goes to the raygen and to NGX, so they always agree. Smaller covers less of
@@ -62,11 +62,12 @@ pub fn set_jitter_scale(scale: f32) {
 #[reflect(Default, Clone, PartialEq)]
 pub enum RrPreset {
     /// NVIDIA's pick, may move with OTA updates (currently resolves to D).
-    #[default]
     Default,
     /// The default transformer model (`diamond_wallaby`).
     D,
-    /// The latest transformer model (`truthful_shrimp`); required for the DoF guide.
+    /// The latest transformer model (`truthful_shrimp`); required for the DoF guide. Ours: far
+    /// less boiling than D on correlated input (ReSTIR reuse, Russian roulette).
+    #[default]
     E,
 }
 
@@ -188,6 +189,8 @@ pub struct GuideViews {
     pub spec_hit: vk::ImageView,
     pub motion: vk::ImageView,
     pub color: vk::ImageView,
+    /// The camera ray's fog (composited after Ray Reconstruction).
+    pub fog: vk::ImageView,
 }
 
 pub(crate) fn halton(mut index: u32, base: u32) -> f32 {
@@ -485,7 +488,7 @@ fn teardown(mut state: ResMut<DlssState>) {
 /// (a short hitch) so that rebuild never overlaps in-flight work.
 #[derive(Default)]
 pub struct DlssPlugin {
-    /// Which RR model to create the feature with; `Default` unless experimenting.
+    /// Which RR model to create the feature with (E, the latest transformer, by default).
     pub preset: RrPreset,
 }
 

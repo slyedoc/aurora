@@ -271,7 +271,7 @@ impl VulkanAsset for RaytracingPipeline {
             .data(bytemuck::cast_slice(&spec_data));
 
         // 0..=6: the DLSS guide images (normal+roughness, diffuse, specular, depth,
-        // specular hit distance, motion, colour); 100: the TLAS.
+        // specular hit distance, motion, colour); 7: the camera ray's fog; 100: the TLAS.
         let storage = |binding: u32| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
@@ -287,6 +287,7 @@ impl VulkanAsset for RaytracingPipeline {
             storage(4),
             storage(5),
             storage(6),
+            storage(7),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(100)
                 .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)

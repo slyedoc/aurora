@@ -108,7 +108,7 @@ pub mod prelude {
         sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyAir, SkyBrightness},
         sky_importance::SkyImportance,
         ui_panel::{InspectorPanel3d, UiPanel3d},
-        util::{ScreenshotExt, TimeoutAppExt},
+        util::{ScreenshotExt, TimeoutAppExt, VideoExt, VideoRecorder},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }

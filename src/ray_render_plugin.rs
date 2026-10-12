@@ -226,7 +226,8 @@ impl Plugin for RayRenderPlugin {
         app.insert_resource(sphere_blas);
         app.init_resource::<Frame>();
         app.init_resource::<RenderConfig>();
-        app.init_resource::<ScreenshotRequests>();
+        app.init_resource::<ScreenshotRequests>()
+            .init_resource::<crate::util::video::VideoRecorder>();
 
         let mut teardown = Schedule::new(TeardownSchedule);
         teardown.add_systems(on_shutdown);
@@ -469,6 +470,7 @@ fn render_frame(
         // Rides along here because a system's parameter list stops at 16.
         Res<crate::camera_target::CameraTargets>,
         ResMut<crate::gpu_profiler::GpuProfiler>,
+        ResMut<crate::util::video::VideoRecorder>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -500,10 +502,12 @@ fn render_frame(
         mut fog_grid,
         mut frame_commands,
     ) = gpu;
-    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut prof) = dlss_stuff;
+    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut prof, mut video) =
+        dlss_stuff;
 
     let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
         dev_ui_stuff;
+    let local_tonemap = settings.as_ref().map_or(0.0, |s| s.local_tonemap);
     let settings = settings
         .map(|settings| settings.clone())
         .unwrap_or_default();
@@ -1124,6 +1128,7 @@ fn render_frame(
                                 g.spec_hit,
                                 g.motion,
                                 g.color,
+                                g.fog,
                             ]
                             .into_iter()
                             .map(|view| {
@@ -1371,7 +1376,9 @@ fn render_frame(
                             display_exposure: views[eye].exposure.display_exposure(),
                             debug_view,
                             scene_radiance: 0,
-                            _pad: 0,
+                            fog: 0,
+                            local_tonemap,
+                            _pad: 0.0,
                         },
                     );
                 }
@@ -1454,7 +1461,9 @@ fn render_frame(
                             display_exposure: view.exposure.display_exposure(),
                             debug_view: view.debug_view,
                             scene_radiance: 0,
-                            _pad: 0,
+                            fog: 0,
+                            local_tonemap,
+                            _pad: 0.0,
                         },
                     );
                 }
@@ -1492,9 +1501,7 @@ fn render_frame(
 
         // The window, when there is one: the flat render or the XR spectator (left eye,
         // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
-        let capture = if let Some((swapchain_image, swapchain_view, window_size, window_format)) =
-            presenting
-        {
+        if let Some((swapchain_image, swapchain_view, window_size, window_format)) = presenting {
             // The window: the flat render, or the XR spectator (left eye, aspect-fit).
             vk_utils::transition_image_layout(
                 &render_device,
@@ -1610,7 +1617,9 @@ fn render_frame(
                             display_exposure: view.exposure.display_exposure(),
                             debug_view: view.debug_view,
                             scene_radiance: 0,
-                            _pad: 0,
+                            fog: 0,
+                            local_tonemap,
+                            _pad: 0.0,
                         },
                     );
                 }
@@ -1674,16 +1683,33 @@ fn render_frame(
             // swapchain extent -- under XR `output_extent` is the eye extent, and sizing the
             // copy with it reads out of the swapchain image's bounds (F12 crashed XR runs).
             let capture_extent = window_size;
-            let capture = screenshots.take_next().map(|path| {
-                let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
-                let buffer: Buffer<u8> =
-                    render_device.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST);
+            // Last frame's captures have landed (its fence passed): off to their encoder thread.
+            screenshots.collect(&render_device);
+            // A recording copies its frames out the same way (util/video.rs).
+            let copy_out = screenshots.has_pending() || video.wants_frame();
+            if copy_out {
                 vk_utils::transition_image_layout(
                     &render_device,
                     cmd_buffer,
                     frame.swapchain_image,
                     vk::ImageLayout::ATTACHMENT_OPTIMAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+                video.record(
+                    &render_device,
+                    cmd_buffer,
+                    frame.swapchain_image,
+                    capture_extent,
+                    window_format,
+                );
+            }
+            if let Some(path) = screenshots.take_next() {
+                let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
+                // Read back on the CPU: host-cached memory, not the upload kind.
+                let buffer: Buffer<u8> = render_device.create_buffer(
+                    size,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
                 );
                 // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
                 let region = vk::BufferImageCopy::default()
@@ -1704,25 +1730,22 @@ fn render_frame(
                     buffer.handle,
                     std::slice::from_ref(&region),
                 );
-                (path, buffer)
-            });
+                screenshots.in_flight(path, buffer, capture_extent, window_format);
+            }
 
             // Make swapchain available for present
             vk_utils::transition_image_layout(
                 &render_device,
                 cmd_buffer,
                 frame.swapchain_image,
-                if capture.is_some() {
+                if copy_out {
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL
                 } else {
                     vk::ImageLayout::ATTACHMENT_OPTIMAL
                 },
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
-            capture.map(|(path, buffer)| (path, buffer, window_size, window_format))
-        } else {
-            None
-        };
+        }
 
         prof.end(&render_device, cmd_buffer, present_scope);
         prof.end(&render_device, cmd_buffer, frame_scope);
@@ -1767,26 +1790,6 @@ fn render_frame(
             let _queue = render_device.queue.lock().unwrap();
             let _ = render_device.device.device_wait_idle();
         }
-
-        if let Some((path, mut buffer, capture_extent, capture_format)) = capture {
-            // Debug tool: one hitch per capture beats plumbing a fence through the frame.
-            {
-                let _queue = render_device.queue.lock().unwrap();
-                let _ = render_device.device.device_wait_idle();
-            }
-            let mut view = render_device.map_buffer(&mut buffer);
-            let wrote = crate::util::screenshot::save_png(
-                view.as_slice_mut(),
-                capture_format,
-                capture_extent,
-                &path,
-            );
-            drop(view);
-            if wrote {
-                screenshots.record_written(path, capture_extent);
-            }
-            render_device.destroyer.destroy_buffer(buffer.handle);
-        }
     }
 }
 
@@ -1809,6 +1812,7 @@ unsafe fn record_post_draw(
     };
     let push_constants = crate::post_process_filter::PostProcessPushConstants {
         scene_radiance: (kind == TargetKind::SceneRadiance) as u32,
+        fog: guides.is_some() as u32,
         ..*push_constants
     };
     unsafe {
@@ -1829,7 +1833,7 @@ unsafe fn record_post_draw(
             .image_layout(vk::ImageLayout::GENERAL)
             .image_view(source_view)
             .sampler(render_device.linear_sampler);
-        let mut image_infos = [output_info; 8];
+        let mut image_infos = [output_info; 9];
         if let Some(g) = guides {
             for (slot, view) in [
                 (1, g.color),
@@ -1839,6 +1843,7 @@ unsafe fn record_post_draw(
                 (5, g.depth),
                 (6, g.spec_hit),
                 (7, g.motion),
+                (8, g.fog),
             ] {
                 image_infos[slot] = vk::DescriptorImageInfo::default()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)

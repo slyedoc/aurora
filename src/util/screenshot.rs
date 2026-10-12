@@ -1,13 +1,18 @@
 //! Keyboard-triggered swapchain captures, plus `AUTO_SCREENSHOT_MS` for headless runs.
 //!
 //! `App::add_screenshot(KeyCode::F12)` queues a capture; the render loop copies the next
-//! presented frame into a host buffer and writes `./target/tmp/screenshot-<ms>.png`.
+//! presented frame into a host buffer, picks it up a frame later (its fence passed, so nothing
+//! waits on the GPU) and writes `./target/tmp/screenshot-<ms>.png` on a thread of its own.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ash::vk;
 use bevy::prelude::*;
+
+use crate::render_buffer::{Buffer, BufferProvider};
+use crate::render_device::RenderDevice;
 
 /// Pending captures, drained one per frame by the render loop, and the ones already on
 /// disk. A capture lands several frames after it is asked for, so a caller that has to
@@ -15,7 +20,17 @@ use bevy::prelude::*;
 #[derive(Resource, Default)]
 pub struct ScreenshotRequests {
     pending: Vec<PathBuf>,
-    written: Vec<Capture>,
+    /// Copies recorded into this frame, read back the next.
+    in_flight: Vec<InFlight>,
+    /// Filled by the PNG threads.
+    written: Arc<Mutex<Vec<Capture>>>,
+}
+
+struct InFlight {
+    path: PathBuf,
+    buffer: Buffer<u8>,
+    extent: vk::Extent2D,
+    format: vk::Format,
 }
 
 /// A capture that reached disk, with the size it was written at.
@@ -33,19 +48,50 @@ impl ScreenshotRequests {
 
     /// Every capture written since the last call.
     pub fn take_written(&mut self) -> Vec<Capture> {
-        std::mem::take(&mut self.written)
+        std::mem::take(&mut *self.written.lock().unwrap())
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     pub(crate) fn take_next(&mut self) -> Option<PathBuf> {
         (!self.pending.is_empty()).then(|| self.pending.remove(0))
     }
 
-    pub(crate) fn record_written(&mut self, path: PathBuf, extent: vk::Extent2D) {
-        self.written.push(Capture {
+    /// This frame's copy of a capture into `buffer`, for [`collect`](Self::collect) next frame.
+    pub(crate) fn in_flight(
+        &mut self,
+        path: PathBuf,
+        buffer: Buffer<u8>,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) {
+        self.in_flight.push(InFlight {
             path,
-            width: extent.width,
-            height: extent.height,
+            buffer,
+            extent,
+            format,
         });
+    }
+
+    /// Last frame's copies, landed by now: their pixels go to a PNG thread each.
+    pub(crate) fn collect(&mut self, rd: &RenderDevice) {
+        for mut capture in self.in_flight.drain(..) {
+            let mut pixels = rd.map_buffer(&mut capture.buffer).as_slice_mut().to_vec();
+            rd.destroyer.destroy_buffer(capture.buffer.handle);
+            let written = self.written.clone();
+            let (path, extent, format) = (capture.path, capture.extent, capture.format);
+            std::thread::spawn(move || {
+                if save_png(&mut pixels, format, extent, &path) {
+                    written.lock().unwrap().push(Capture {
+                        path,
+                        width: extent.width,
+                        height: extent.height,
+                    });
+                }
+            });
+        }
     }
 }
 

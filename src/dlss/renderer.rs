@@ -82,6 +82,9 @@ struct DlssView {
     depth: DlssImage,
     spec_hit: DlssImage,
     motion: DlssImage,
+    /// The camera ray's fog (rgb in-scattered light, pre-exposed; a its transmittance): kept
+    /// out of Ray Reconstruction's input and composited over its output (quad.slang).
+    fog: DlssImage,
     /// 1x1 R32F holding 1.0: without it NGX auto-exposes and the image re-normalises over
     /// seconds.
     exposure: DlssImage,
@@ -94,7 +97,7 @@ struct DlssView {
 
 impl DlssView {
     /// What the raygen writes (see the set-0 bindings in `raygen.slang`).
-    fn guides(&self) -> [&DlssImage; 7] {
+    fn guides(&self) -> [&DlssImage; 8] {
         [
             &self.normal_roughness,
             &self.diffuse,
@@ -103,6 +106,7 @@ impl DlssView {
             &self.spec_hit,
             &self.motion,
             &self.color,
+            &self.fog,
         ]
     }
 }
@@ -316,6 +320,7 @@ impl DlssRenderer {
         let depth = DlssImage::new(rd, F_DEPTH, render, true);
         let spec_hit = DlssImage::new(rd, F_DEPTH, render, true);
         let motion = DlssImage::new(rd, F_MOTION, render, true);
+        let fog = DlssImage::new(rd, F_COLOR, render, true);
         let exposure = DlssImage::new(rd, F_DEPTH, one, false);
         let output_image = DlssImage::new(rd, F_COLOR, output, true);
 
@@ -351,6 +356,7 @@ impl DlssRenderer {
                     &depth,
                     &spec_hit,
                     &motion,
+                    &fog,
                     &exposure,
                     &output_image,
                 ] {
@@ -383,6 +389,7 @@ impl DlssRenderer {
             depth,
             spec_hit,
             motion,
+            fog,
             exposure,
             output_image,
             first_evaluate: true,
@@ -421,6 +428,7 @@ impl DlssRenderer {
             spec_hit: v.spec_hit.view,
             motion: v.motion.view,
             color: v.color.view,
+            fog: v.fog.view,
         })
     }
 

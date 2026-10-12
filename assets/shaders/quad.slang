@@ -14,6 +14,8 @@ struct AeData {
 
 // `UniformData`'s vignette, as a float index; pinned by a test in ray_render_plugin.rs.
 static const uint UNIFORM_VIGNETTE_FLOAT = 90;
+// `UniformData`'s DLSS jitter (x, y; render pixels), as a float index.
+static const uint UNIFORM_JITTER_FLOAT = 84;
 
 // `PostProcessPushConstants` in post_process_filter.rs.
 struct QuadPush {
@@ -26,14 +28,19 @@ struct QuadPush {
     uint debug_view;
     // 1: a scene-radiance target (half float) -- physical radiance, no exposure or tonemap.
     uint scene_radiance;
-    uint pad;
+    // 1: slot 8 holds the camera ray's fog (rgb light pre-exposed like the colour, a its
+    // transmittance), composited here over Ray Reconstruction's output.
+    uint fog;
+    // Local tone mapping strength (RenderSettings::local_tonemap); 0 = off.
+    float local_tonemap;
+    float pad;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
 // 0: the DLSS output; 1..=7 the guide images (colour, normals+roughness, diffuse, specular,
-// depth, specular hit distance, motion) for the debug views. Slots the renderer cannot fill
-// yet alias the output.
-[[vk::binding(0, 0)]] Sampler2D test[8];
+// depth, specular hit distance, motion) for the debug views; 8 the camera ray's fog. Slots the
+// renderer cannot fill yet alias the output.
+[[vk::binding(0, 0)]] Sampler2D test[9];
 
 struct VertexOut {
     float4 position : SV_Position;
@@ -72,6 +79,39 @@ float3 nitsFalseColor(float nits) {
     let f = frac(t);
     let edge = smoothstep(0.0, 0.035, f) * smoothstep(0.0, 0.035, 1.0 - f);
     return c * (0.4 + 0.6 * edge);
+}
+
+// Local tone mapping: the log-average luminance of the surroundings (two rings of wide taps
+// on the resolved colour, ~3 % and ~9 % of the height out) against the whole frame's (a 4x4
+// grid) sets a gain that moves the region `strength` of the way toward the frame's average,
+// clamped to two stops either way. Low frequency only, so texture stays; shade under a canopy
+// lifts, sunlit ground comes down, and a frame dark all over (night) keeps its exposure.
+float3 localGain(float2 uv, float scale, float strength) {
+    uint w, h;
+    test[0].GetDimensions(w, h);
+    let aspect = float(h) / float(w);
+    var sum = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+    var n = 1.0;
+    for (int ring = 1; ring <= 2; ring++) {
+        let r = ring == 1 ? 0.03 : 0.09;
+        for (int k = 0; k < 8; k++) {
+            let a = (float(k) + (ring == 1 ? 0.0 : 0.5)) * 0.7853982;
+            let o = float2(cos(a) * aspect, sin(a)) * r;
+            let c = test[0].SampleLevel(uv + o, 0.0).rgb * scale;
+            sum += log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+            n += 1.0;
+        }
+    }
+    let key = sum / n;
+    var frame = 0.0;
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            let c = test[0].SampleLevel((float2(float(x), float(y)) + 0.5) / 4.0, 0.0).rgb * scale;
+            frame += log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+        }
+    }
+    let stops = clamp((frame / 16.0 - key) * strength, -2.0, 2.0);
+    return float3(exp2(stops));
 }
 
 float3 acesFilm(float3 x) {
@@ -132,12 +172,46 @@ float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
     // or a fixed one -- where it cannot disturb RR's history. Tonemap to display-linear; the
     // sRGB attachment applies the transfer function on store.
     let input = max(push.ae.input_exposure, 1.0e-12);
-    let src = test[view].Sample(uv).rgb;
+    var src = test[view].Sample(uv).rgb;
+    // The camera ray's fog over it (none without the guides), kept apart so local tone
+    // mapping lifts the surfaces behind the veil and not the veil.
+    var veil = float3(0.0);
+    var through = 1.0;
+    // The fog in front of the surface, which Ray Reconstruction never saw: divided by a
+    // surface's albedo there, a white veil bled colour halos around dark coloured surfaces.
+    if (push.fog != 0u && view == 0u) {
+        // Nine bilinear taps 1.5 texels apart (~5x5 render texels): the fog grid's cell noise
+        // smoothed out, which Ray Reconstruction used to do. Fog has no fine detail to lose.
+        uint fw, fh;
+        test[8].GetDimensions(fw, fh);
+        let size = float2(float(fw), float(fh));
+        let texel = 1.5 / size;
+        // The fog was traced through this frame's sub-pixel jitter (render texel t holds the
+        // scene at t + 0.5 + jitter) and Ray Reconstruction is not there to undo it: shift
+        // back, or every fog edge shimmers by a fraction of a pixel each frame.
+        let jitter = float2(push.uniforms[UNIFORM_JITTER_FLOAT], push.uniforms[UNIFORM_JITTER_FLOAT + 1]);
+        let fog_uv = uv - jitter / size;
+        var f = float4(0.0);
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                let w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+                f += test[8].Sample(fog_uv + float2(float(x), float(y)) * texel) * w;
+            }
+        }
+        f /= 16.0;
+        veil = f.rgb;
+        through = f.a;
+    }
     if (push.scene_radiance != 0u) {
-        return float4(src / input, 1.0);
+        return float4((src * through + veil) / input, 1.0);
     }
     let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
-    var color = clamp(acesFilm(src * (look / input)), float3(0.0), float3(1.0));
+    var surface = src * through;
+    if (push.local_tonemap > 0.0 && view == 0u) {
+        surface *= localGain(uv, look / input, push.local_tonemap);
+    }
+    let exposed = (surface + veil) * (look / input);
+    var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT]);
     return float4(color, 1.0);
 }

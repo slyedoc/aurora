@@ -101,9 +101,9 @@ impl Default for Fog {
             height: 0.0,
             falloff: 0.0,
             steps: 6,
-            grid_distance: 80.0,
-            grid_tile: 16,
-            grid_slices: 32,
+            grid_distance: 150.0,
+            grid_tile: 8,
+            grid_slices: 64,
             grid_history: 32.0,
         }
     }

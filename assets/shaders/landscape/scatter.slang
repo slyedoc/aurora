@@ -3,8 +3,9 @@
 // window moves. The spot is kept by the material weights there (times the species' factor per
 // palette id) and the slope, dropped onto the heights, and written straight into the
 // species' TLAS instance block; a dropped spot gets a zero transform (traces nothing). With
-// poses, each instance also picks its wind pose from a gust wave travelling across the field:
-// a BLAS pointer and hit record swap, no geometry rebuilt. With an interaction field, each
+// poses, each instance leans with a gust wave travelling across the field: the baked pose under
+// its lean (a BLAS pointer and hit record swap, no geometry rebuilt) plus a shear the rest of
+// the way, so the sway is continuous at any frame rate and has motion vectors. With an interaction field, each
 // instance also shears away from whatever walked through its spot (interaction.slang).
 import pages;
 import materials;
@@ -31,6 +32,9 @@ struct Pose {
 struct SpeciesTables {
     float factors[256];
     Pose poses[64];
+    // The shear (x per y, plant space) standing in for one pose step.
+    float wind_shear;
+    float pad[3];
 };
 
 // `ScatterPush` in scatter.rs (the whole 128-byte block).
@@ -158,9 +162,16 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     push.instances[slot].t2 = float4(-sn, lean.y * tall, c, at.z);
 
     if (pose_count > 0) {
-        // A gust front sweeping +x, slightly skewed, with a little per-plant lag.
+        // A gust front sweeping +x, slightly skewed, with a little per-plant lag; the lean
+        // swings over the poses' range (least to most) and back.
         let wave = push.wave - (xz.x * 0.045 + xz.y * 0.02) + unit(h) * 0.15;
-        let k = uint(floor(frac(wave) * float(pose_count))) % pose_count;
+        let s = (0.5 + 0.5 * sin(wave * 6.2831853)) * float(pose_count - 1);
+        let k = min(uint(s), max(pose_count, 2u) - 2u);
+        let rest = pose_count > 1u ? s - float(k) : 0.0;
+        // The rest of the way as a shear in plant space (x += g y): rotated by the yaw.
+        let g = rest * push.tables.wind_shear;
+        push.instances[slot].t0.y += c * g;
+        push.instances[slot].t2.y -= sn * g;
         let pose = push.tables.poses[k];
         push.instances[slot].blas = pose.blas;
         push.instances[slot].sbt_and_flags = pose.sbt_and_flags;

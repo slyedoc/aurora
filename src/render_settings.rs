@@ -90,6 +90,11 @@ pub struct RenderSettings {
     /// Sub-pixel camera jitter: 1 = the full +-0.5 traced pixel, 0 = pixel centres.
     #[reflect(@0.0..=1.0_f32)]
     pub jitter_scale: f32,
+    /// Local tone mapping: how far each region's exposure moves from its surroundings' average
+    /// toward the whole frame's (0 = one exposure for the frame). Lifts deep shade and holds
+    /// back sunlit ground in one view; a frame dark all over keeps its exposure.
+    #[reflect(@0.0..=1.0_f32)]
+    pub local_tonemap: f32,
 }
 
 impl Default for RenderSettings {
@@ -118,6 +123,7 @@ impl Default for RenderSettings {
             omm: true,
             rr_preset: RrPreset::current(),
             jitter_scale: 1.0,
+            local_tonemap: 0.4,
         }
     }
 }

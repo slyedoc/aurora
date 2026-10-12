@@ -62,12 +62,12 @@ pub enum AuroraExposure {
     Environment,
 }
 
-/// The environment's fixed exposure: a consistent look that never changes with what the camera
-/// points at, set by how brightly the environment is lit. `Auto` is opt-in, for scenes that move
-/// between very different light levels.
+/// Auto around a fixed daylight anchor: interiors, shade and night are lifted part of the way
+/// by what the camera sees, without anyone authoring them, and a room looks the same at any
+/// hour.
 impl Default for AuroraExposure {
     fn default() -> Self {
-        Self::Environment
+        Self::Auto(AutoExposureSettings::default())
     }
 }
 
@@ -101,10 +101,16 @@ impl AuroraExposure {
         Self::Fixed(FixedExposure { ev })
     }
 
-    /// `World` as the fixed exposure of an environment at `world_ev100`; anything else unchanged.
+    /// `World` as the fixed exposure of an environment at `world_ev100`; `Auto` anchored there
+    /// when it asks to be; anything else unchanged.
     pub fn resolve(&self, world_ev100: f32) -> Self {
         match self {
             Self::Environment => Self::fixed(ev_from_ev100(world_ev100)),
+            Self::Auto(settings) if settings.reference_from_environment => {
+                let mut settings = settings.clone();
+                settings.reference_ev = ev_from_ev100(world_ev100);
+                Self::Auto(settings)
+            }
             other => other.clone(),
         }
     }
@@ -165,9 +171,13 @@ pub struct AutoExposureSettings {
     /// Artist EV offset on the mid-gray target.
     #[reflect(@-8.0..=8.0_f32)]
     pub compensation: f32,
-    /// The look adapts around this exposure...
+    /// The look adapts around this exposure (replaced by the environment's when
+    /// `reference_from_environment`)...
     #[reflect(@-30.0..=0.0_f32)]
     pub reference_ev: f32,
+    /// ...anchored on the camera's environment exposure (sky.rs `EnvironmentSky::ev100`: a
+    /// day/night curve keeps working, and auto lifts interiors part of the way from there).
+    pub reference_from_environment: bool,
     /// ...by this fraction of the way to the metering: 1 = full auto (every scene lands at
     /// the same brightness), 0 = locked at `reference_ev`. In between, dim scenes stay
     /// dimmer than bright ones.
@@ -184,19 +194,26 @@ impl Default for AutoExposureSettings {
         Self {
             min_ev: -30.0,
             max_ev: 0.0,
-            filter_low: 0.10,
-            filter_high: 0.90,
-            // Snappy: a full interior<->exterior swing (~7 EV) settles in under a second,
-            // with the exponential tail keeping the last stops smooth. Slow these towards
-            // eye-adaptation (3.0 / 1.0) for a cinematic feel.
-            speed_brighten: 10.0,
-            speed_darken: 8.0,
+            // Deep shade and the sun's disc / bright sky out of the meter: neither should
+            // drag the picture.
+            filter_low: 0.30,
+            filter_high: 0.95,
+            // Eye-like: into darkness slowly, into light faster; the exponential tail keeps
+            // the last stops smooth.
+            speed_brighten: 1.5,
+            speed_darken: 3.0,
             exponential_transition_distance: 1.5,
-            // Metering targets photographic mid-gray; ACES reads a couple of stops under
-            // that as "well exposed" rather than washed out.
-            compensation: -2.0,
+            // Metering targets photographic mid-gray; under ACES (quad.slang) a little over two
+            // stops below that reads as "well exposed" rather than washed out.
+            compensation: -2.5,
+            // A fixed daylight anchor, not the environment's day/night curve: a sealed room is
+            // metered the same at noon and at midnight, so it looks the same (anchored on the
+            // curve, the abbey was shown ~4.5 stops apart).
             reference_ev: -13.0,
-            adaptation: 0.8,
+            reference_from_environment: false,
+            // 70 % of the way to the metering: a room ~9 stops under daylight reads dim and
+            // indoor (~2.7 under mid-gray), moonlit ground stays darker still.
+            adaptation: 0.7,
             input_speed: 4.0,
         }
     }
