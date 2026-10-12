@@ -207,7 +207,8 @@ public struct UniformData {
     public uint primary_hidden;
     // The mask bits that are environments; a portal ray takes the exit's from these.
     public uint environment_bits;
-    public uint pad_environments;
+    // Russian roulette from this bounce on (0 = off).
+    public uint roulette_from;
     // Every environment's sky, suns and fog, by environment bit.
     public EnvironmentGpu* environments;
     // Fog volumes (src/fog_volume.rs): the table + entry count (0 = none).
@@ -229,7 +230,8 @@ public struct UniformData {
     public float fog_grid_view_proj[16];
     public float fog_grid_prev_view_proj[16];
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
-    public uint pad_grid;
+    // One shadow ray per vertex from this bounce on.
+    public uint one_shadow_ray_from;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

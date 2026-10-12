@@ -17,12 +17,13 @@ pub struct RenderSettings {
     /// trace time.
     #[reflect(@1.0..=4.0_f32)]
     pub samples: u32,
-    /// Maximum path length. With the firefly clamp a short path is all the denoiser needs.
+    /// Maximum path length (Russian roulette ends most paths well before it).
     #[reflect(@1.0..=64.0_f32)]
     pub max_bounces: u32,
     /// Firefly suppression: indirect contributions are clamped to this many times the
-    /// metered mid-gray luminance (0 = off). Biases bright indirect paths down; kills the
-    /// speckle Ray Reconstruction would otherwise smear.
+    /// metered mid-gray luminance (0 = off, the default). Biased: it clipped Russian roulette's
+    /// boosted survivors and took over half the light under the canopy; Ray Reconstruction
+    /// copes without it.
     #[reflect(@0.0..=64.0_f32)]
     pub firefly_clamp: f32,
     /// Uniform multiplier on every light's emission, emissive surfaces and analytic lights
@@ -43,6 +44,17 @@ pub struct RenderSettings {
     /// primary vertex for surfaces up to this roughness. 0 = no guide rays.
     #[reflect(@0.0..=1.0_f32)]
     pub spec_hit_roughness: f32,
+    /// Russian roulette: from this bounce on, a path continues with probability its throughput
+    /// (its brightest channel, at least 5 %) and survivors are boosted to match, so dim paths end
+    /// early instead of running to `max_bounces`. Unbiased; 0 = off.
+    #[reflect(@0.0..=8.0_f32)]
+    pub roulette_from: u32,
+    /// From this bounce on, a vertex traces ONE shadow ray: the suns, the sky and the light table
+    /// each propose their unshadowed contribution, one is picked by brightness and scaled by 1 /
+    /// its pick probability (unbiased). Below it, every strategy traces its own. Past
+    /// `max_bounces` = off.
+    #[reflect(@0.0..=8.0_f32)]
+    pub one_shadow_ray_from: u32,
     /// ReSTIR DI for the light table at the primary vertex: candidates from a world light grid,
     /// temporal and spatial reuse, one shadow ray (restir.rs).
     pub restir: bool,
@@ -85,12 +97,14 @@ impl Default for RenderSettings {
         Self {
             samples: 1,
             max_bounces: 4,
-            firefly_clamp: 8.0,
+            firefly_clamp: 0.0,
             emissive_boost: 1.0,
             light_nee: true,
             light_candidates: 4,
             texture_lod_bias: -1.0,
             spec_hit_roughness: 0.6,
+            roulette_from: 1,
+            one_shadow_ray_from: 0,
             restir: false,
             restir_candidates: 8,
             restir_history: 8.0,

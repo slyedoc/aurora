@@ -92,7 +92,8 @@ pub struct UniformData {
     primary_hidden: u32,
     /// The mask bits that are environments; a portal ray takes the exit's from these.
     environment_bits: u32,
-    pad: u32,
+    /// Russian roulette from this bounce on (0 = off; `RenderSettings::roulette_from`).
+    roulette_from: u32,
     /// Every environment's sky, suns and fog (sky.rs `EnvironmentGpu`, 8 entries by bit): a
     /// ray reads the entry of the environment it is in.
     environments: u64,
@@ -115,7 +116,8 @@ pub struct UniformData {
     fog_grid_view_proj: [f32; 16],
     fog_grid_prev_view_proj: [f32; 16],
     fog_grid_size: [u32; 3],
-    pad_grid: u32,
+    /// One shadow ray per vertex from this bounce on (`RenderSettings::one_shadow_ray_from`).
+    one_shadow_ray_from: u32,
 }
 
 #[repr(C)]
@@ -892,7 +894,7 @@ fn render_frame(
             camera_mask: view.camera_mask,
             primary_hidden: view.primary_hidden,
             environment_bits: skies.environment_bits as u32,
-            pad: 0,
+            roulette_from: settings.roulette_from,
             environments: frame.environments.address,
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
@@ -906,7 +908,7 @@ fn render_frame(
             fog_grid_view_proj: grid.view_proj.to_cols_array(),
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
-            pad_grid: 0,
+            one_shadow_ray_from: settings.one_shadow_ray_from,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);

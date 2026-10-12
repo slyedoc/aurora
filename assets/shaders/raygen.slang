@@ -65,6 +65,49 @@ bool traceVisible(uint mask, float3 origin, float tmin, float3 direction, float 
     return shadow.visible != 0u;
 }
 
+// One shadow ray for several light strategies at a vertex: each proposes its finished,
+// unshadowed contribution; one is kept with probability proportional to the square root of its
+// brightness and, visible, adds that contribution / its pick probability (unbiased; one ray
+// instead of one per strategy). The root tempers a dominant light: in shade the sun's unshadowed
+// value would otherwise win nearly every pick, its ray blocked, and the sky's fill go unsampled.
+struct ShadowPick {
+    float wsum;
+    float w;
+    float3 contribution;
+    float3 origin;
+    float tmin;
+    float3 direction;
+    float tmax;
+
+    [mutating]
+    void propose(float3 c, float3 o, float t0, float3 d, float t1) {
+        let wc = sqrt(luma(c));
+        if (!(wc > 0.0)) {
+            return;
+        }
+        wsum += wc;
+        if (randf() * wsum < wc) {
+            w = wc;
+            contribution = c;
+            origin = o;
+            tmin = t0;
+            direction = d;
+            tmax = t1;
+        }
+    }
+
+    // The kept proposal's shadow ray; its contribution over its pick probability when visible.
+    float3 resolve(uint mask) {
+        if (wsum <= 0.0) {
+            return float3(0.0);
+        }
+        if (!traceVisible(mask, origin, tmin, direction, tmax)) {
+            return float3(0.0);
+        }
+        return contribution * (wsum / w);
+    }
+};
+
 // trace() through Shader Execution Reordering: the hit is found first, the warp regrouped by
 // what it hit, and only then shaded, so neighbouring lanes shade the same material instead of
 // diverging across the scene (Northshire: 12.2 -> 10.9 ms; a record-index hint measured the
@@ -893,6 +936,10 @@ void main() {
         var origin = mat4MulVec(pc.uniforms.inverse_view, float4(offset, 0, 1)).xyz;
         var direction = normalize(focalPoint - origin);
         var mask = float3(1.0);
+        // Russian roulette's boost so far (1 / the survival odds): the firefly clamp allows for
+        // it, or it would clip back exactly the energy that keeps roulette unbiased (the canopy's
+        // indirect light came out at less than half).
+        var rr_boost = 1.0;
         // The camera ray and pure-specular continuations may see the sun disc directly; after a
         // BRDF-sampled bounce the sun comes from next-event estimation only.
         var want_sun = true;
@@ -1188,7 +1235,7 @@ void main() {
                 // Firefly suppression: an indirect path that reaches an emitter far brighter than the
                 // sky would take hundreds of frames to average out; clamp its luminance instead.
                 if (bounce_idx > 0 && radiance_clamp > 0.0) {
-                    contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
+                    contribution *= min(1.0, radiance_clamp * rr_boost / max(luma(contribution), 1.0e-6));
                 }
                 acc += contribution;
                 break;
@@ -1333,6 +1380,9 @@ void main() {
             // candidates with an MIS-weighted shadow ray.
             // Positions and areas are read live, so stale CDF weights change variance, never
             // the answer.
+            // From `one_shadow_ray_from` on the strategies below share one shadow ray.
+            let one_ray = bounce_idx >= pc.uniforms.one_shadow_ray_from;
+            ShadowPick pick = {};
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
                 if (RESTIR_ON && bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
                     // ReSTIR DI lights this vertex from the table in its own passes (restir.slang,
@@ -1398,11 +1448,14 @@ void main() {
                         }
                     }
                     if (wsum > 0.0 && sel_phat > 0.0) {
-                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, ldir), tmin, ldir, ldist * (1.0 - 1.0e-4))) {
-                            var contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
-                            if (bounce_idx > 0 && radiance_clamp > 0.0) {
-                                contribution *= min(1.0, radiance_clamp / max(luma(contribution), 1.0e-6));
-                            }
+                        var contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
+                        if (bounce_idx > 0 && radiance_clamp > 0.0) {
+                            contribution *= min(1.0, radiance_clamp * rr_boost / max(luma(contribution), 1.0e-6));
+                        }
+                        let o = leaveSurface(origin, surface_normal, ldir);
+                        if (one_ray) {
+                            pick.propose(contribution, o, tmin, ldir, ldist * (1.0 - 1.0e-4));
+                        } else if (traceVisible(ray_mask, o, tmin, ldir, ldist * (1.0 - 1.0e-4))) {
                             acc += contribution;
                         }
                     }
@@ -1427,8 +1480,12 @@ void main() {
                     let f = evalLayered(-direction, world_normal, l, disney_mat, lob, true);
                     if (any(f > float3(0.0))) {
                         let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
-                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
-                            acc += mask * f * abs(NoL) * L * (w / pdf_env);
+                        let c = mask * f * abs(NoL) * L * (w / pdf_env);
+                        let o = leaveSurface(origin, surface_normal, l);
+                        if (one_ray) {
+                            pick.propose(c, o, tmin, l, tmax);
+                        } else if (traceVisible(ray_mask, o, tmin, l, tmax)) {
+                            acc += c;
                         }
                     }
                 }
@@ -1465,12 +1522,19 @@ void main() {
                         // Shadow ray: any accepted hit terminates without running a closest-hit
                         // shader, so the payload's t only becomes 0 when the miss shader ran. Not
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
-                        if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
-                            let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                            acc += mask * f * abs(NoL) * sun_radiance * solid_angle;
+                        let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
+                        let c = mask * f * abs(NoL) * sun_radiance * solid_angle;
+                        let o = leaveSurface(origin, surface_normal, l);
+                        if (one_ray) {
+                            pick.propose(c, o, tmin, l, tmax);
+                        } else if (traceVisible(ray_mask, o, tmin, l, tmax)) {
+                            acc += c;
                         }
                     }
                 }
+            }
+            if (one_ray) {
+                acc += pick.resolve(ray_mask);
             }
 
             // Thin layers before the base: through the surface with probability `transmission`
@@ -1553,6 +1617,17 @@ void main() {
             mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
+            // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
+            // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
+            // carried; the indirect bounces were most of the trace.
+            if (pc.uniforms.roulette_from > 0u && bounce_idx + 1u >= pc.uniforms.roulette_from) {
+                let q = clamp(max(mask.r, max(mask.g, mask.b)), 0.25, 1.0);
+                if (randf() >= q) {
+                    break;
+                }
+                mask /= q;
+                rr_boost /= q;
+            }
         }
 
         // The path ended: everything gathered after each cache vertex, divided by its mask
