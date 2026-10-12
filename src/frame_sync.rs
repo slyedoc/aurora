@@ -33,8 +33,10 @@ impl FrameSync {
         self.in_flight_fences[self.frame_count % FRAMES_IN_FLIGHT]
     }
 
-    /// Wait for the previous frame and rearm its fence.
-    pub unsafe fn wait(&mut self) {
+    /// Wait for the previous frame, leaving its fence signalled: before the CPU rewrites
+    /// host-visible buffers the previous frame may still be reading (a frame that then returns
+    /// without submitting must not leave the fence unsignalled).
+    pub unsafe fn wait_previous(&self) {
         unsafe {
             let _wait = info_span!("frame_fence_wait").entered();
             self.device
@@ -44,6 +46,13 @@ impl FrameSync {
                     crate::aftermath::note_device_lost(e);
                     panic!("frame fence wait failed: {e:?}");
                 });
+        }
+    }
+
+    /// Wait for the previous frame and rearm its fence.
+    pub unsafe fn wait(&mut self) {
+        unsafe {
+            self.wait_previous();
             self.device
                 .reset_fences(std::slice::from_ref(&self.fence()))
                 .unwrap();

@@ -135,6 +135,81 @@ pub enum Sky {
     /// [`crate::atmosphere::CloudLayer`]), lit by the environment's first sun. One environment at a time:
     /// the atmosphere's lookup tables are global.
     Atmosphere,
+    /// Rendered on the GPU from the environment's [`SkyAir`] and its brightest sun
+    /// (src/sky_gen.rs), whenever either changes; shaded like [`Sky::Hdr`]. The sun's
+    /// `DirectionalLight` gives only its direction (and `SunDisk` its size): its colour and
+    /// brightness come from the air it shines through, [`SkyAir::sun_illuminance`] above it.
+    Generated,
+}
+
+/// The air a [`Sky::Generated`] is rendered through: Earth's by default. On an environment
+/// entity. Coefficients per megametre (1e-6 / m), heights in metres.
+#[derive(Component, Reflect, Clone, Debug, PartialEq)]
+#[reflect(Component, Default)]
+pub struct SkyAir {
+    /// Molecular scattering at sea level: what makes the sky blue.
+    pub rayleigh_scatter: Vec3,
+    #[reflect(@100.0..=50000.0_f32)]
+    pub rayleigh_height: f32,
+    /// Aerosol scattering: the haze knob (4 clear, 20+ hazy).
+    #[reflect(@0.0..=100.0_f32)]
+    pub mie_scatter: f32,
+    #[reflect(@0.0..=100.0_f32)]
+    pub mie_absorb: f32,
+    #[reflect(@10.0..=20000.0_f32)]
+    pub mie_height: f32,
+    /// The aerosols' forward scattering: the glow around the sun.
+    #[reflect(@0.0..=0.99_f32)]
+    pub mie_g: f32,
+    /// Ozone absorption at its peak: twilight's blue.
+    pub ozone_absorb: Vec3,
+    /// What the ground bounces back into the sky.
+    pub ground_albedo: Color,
+    /// How high the viewer stands above the ground.
+    #[reflect(@0.0..=20000.0_f32)]
+    pub altitude: f32,
+    /// The sun's illuminance above the air (lux).
+    #[reflect(@0.0..=200000.0_f32)]
+    pub sun_illuminance: f32,
+    /// An equirectangular star map behind the sky, faded in as the sun sets (from 6 to 18
+    /// degrees below the horizon), texel x `star_nits`.
+    pub stars: Option<Handle<Image>>,
+    #[reflect(@0.0..=100.0_f32)]
+    pub star_nits: f32,
+    /// Turns the star map: a world direction's place on it.
+    pub star_rotation: Quat,
+}
+
+impl Default for SkyAir {
+    fn default() -> Self {
+        Self {
+            rayleigh_scatter: Vec3::new(5.802, 13.558, 33.1),
+            rayleigh_height: 8_000.0,
+            mie_scatter: 3.996,
+            mie_absorb: 4.4,
+            mie_height: 1_200.0,
+            mie_g: 0.8,
+            ozone_absorb: Vec3::new(0.65, 1.881, 0.085),
+            ground_albedo: Color::linear_rgb(0.3, 0.28, 0.25),
+            altitude: 50.0,
+            sun_illuminance: 120_000.0,
+            stars: None,
+            star_nits: 1.0,
+            star_rotation: Quat::IDENTITY,
+        }
+    }
+}
+
+impl SkyAir {
+    /// How bright the stars are with the sun `elevation` radians up (none: night).
+    pub fn star_fade(elevation: Option<f32>) -> f32 {
+        let Some(elevation) = elevation else {
+            return 1.0;
+        };
+        let t = ((-6.0f32).to_radians() - elevation) / 12.0f32.to_radians();
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
 }
 
 /// The colours of [`Sky::Gradient`]; radiances in nits. On an environment entity.
@@ -227,6 +302,7 @@ pub struct EnvironmentSky {
     pub ev100: f32,
     pub fog: Fog,
     pub sky_brightness: f32,
+    pub air: SkyAir,
 }
 
 impl Default for EnvironmentSky {
@@ -238,6 +314,7 @@ impl Default for EnvironmentSky {
             ev100: DEFAULT_EV100,
             fog: Fog::default(),
             sky_brightness: 1.0,
+            air: SkyAir::default(),
         }
     }
 }
@@ -274,6 +351,7 @@ fn gather_skies(
         Option<&EnvironmentExposure>,
         Option<&Fog>,
         Option<&SkyBrightness>,
+        Option<&SkyAir>,
     )>,
     suns: Query<(
         &DirectionalLight,
@@ -291,10 +369,10 @@ fn gather_skies(
     let mut atmosphere = None;
     let mut exposures = [None; 8];
     for bit in 0..8u8 {
-        let (sky, gradient, exposure, fog, brightness) = worlds
+        let (sky, gradient, exposure, fog, brightness, air) = worlds
             .environment(bit)
             .and_then(|world| skies.get(world).ok())
-            .unwrap_or((None, None, None, None, None));
+            .unwrap_or((None, None, None, None, None, None));
         exposures[bit as usize] = exposure.map(|e| e.ev100);
         let mut sky = sky.cloned().unwrap_or_default();
         if matches!(sky, Sky::Atmosphere) {
@@ -312,6 +390,10 @@ fn gather_skies(
         entry.gradient = gradient.cloned().unwrap_or_default();
         entry.fog = fog.copied().unwrap_or_default();
         entry.sky_brightness = brightness.copied().unwrap_or_default().0;
+        match air {
+            Some(air) => entry.air.clone_from(air),
+            None => entry.air = SkyAir::default(),
+        }
         entry.suns.clear();
     }
     out.atmosphere = atmosphere;
@@ -331,6 +413,13 @@ fn gather_skies(
                 brightest[bit] = brightest[bit].max(light.illuminance);
             }
         }
+    }
+    // Brightest first: the sun a generated sky or the atmosphere is lit by.
+    for environment in &mut out.environments {
+        environment.suns.sort_by(|a, b| {
+            let power = |s: &Sun| luma(s.radiance) * s.solid_angle();
+            power(b).total_cmp(&power(a))
+        });
     }
     for bit in 0..8 {
         out.environments[bit].ev100 = exposures[bit].unwrap_or(if brightest[bit] > 0.0 {
@@ -381,6 +470,12 @@ pub struct EnvironmentGpu {
     pub fog_grid_history: f32,
     pub fog_grid_tile: u32,
     pub fog_grid_slices: u32,
+    /// [`SkyAir`]'s stars: world-to-map rotation, the map's bindless index, nits (faded; 0 =
+    /// none).
+    pub stars_rotation: [f32; 4],
+    pub stars_tex: u32,
+    pub stars_nits: f32,
+    pub stars_pad: [u32; 2],
     /// Flat: the radiance. HDR: the scale. Atmosphere: the space image's scale (0 = none).
     pub color: [f32; 4],
     pub zenith: [f32; 4],
@@ -392,17 +487,19 @@ pub struct EnvironmentGpu {
 impl EnvironmentGpu {
     /// `tex` and `space` are the renderer's: the HDR's (or space image's) bindless index,
     /// and the space image's scale; `importance` the HDR sky's sampling table, and `hdr_sun` the
-    /// sun taken out of it.
+    /// sun taken out of it; `stars` the generated sky's star map (bindless, None until loaded).
     pub fn new(
         environment: &EnvironmentSky,
         tex: u32,
         space: Vec4,
         importance: u64,
         hdr_sun: Option<&HdrSun>,
+        stars: Option<u32>,
     ) -> Self {
         let (mode, color) = match &environment.sky {
             Sky::Color { radiance } => (0, radiance.extend(0.0)),
             Sky::Hdr { scale, .. } => (1, Vec4::splat(*scale)),
+            Sky::Generated => (1, Vec4::ONE),
             Sky::Gradient => (2, Vec4::ZERO),
             Sky::Atmosphere => (3, space),
         };
@@ -431,6 +528,19 @@ impl EnvironmentGpu {
             sun_clip = sun.clip;
         }
         let fog = environment.fog;
+        let (stars_tex, stars_nits) = match (&environment.sky, stars) {
+            (Sky::Generated, Some(tex)) => (
+                tex,
+                environment.air.star_nits
+                    * SkyAir::star_fade(
+                        environment
+                            .suns
+                            .first()
+                            .map(|s| s.direction.y.clamp(-1.0, 1.0).asin()),
+                    ),
+            ),
+            _ => (0, 0.0),
+        };
         Self {
             mode,
             tex,
@@ -447,6 +557,10 @@ impl EnvironmentGpu {
             fog_grid_history: fog.grid_history.max(1.0),
             fog_grid_tile: fog.grid_tile.max(1),
             fog_grid_slices: fog.grid_slices.max(1),
+            stars_rotation: environment.air.star_rotation.to_array(),
+            stars_tex,
+            stars_nits,
+            stars_pad: [0; 2],
             color: color.to_array(),
             zenith: environment
                 .gradient
@@ -486,6 +600,7 @@ impl Plugin for SkyPlugin {
             .register_type::<EnvironmentExposure>()
             .register_type::<Fog>()
             .register_type::<SkyBrightness>()
+            .register_type::<SkyAir>()
             .register_type::<DirectionalLight>()
             .register_type::<SunDisk>()
             .init_resource::<EnvironmentSkies>()

@@ -79,6 +79,14 @@ public struct EnvironmentGpu {
     public float fog_grid_history;
     public uint fog_grid_tile;
     public uint fog_grid_slices;
+    // Stars behind a generated sky (src/sky.rs SkyAir): the rotation from a world direction
+    // into the star map (quaternion), the map's bindless index and its radiance scale (nits,
+    // already faded by the sun; 0 = none).
+    public float4 stars_rotation;
+    public uint stars_tex;
+    public float stars_nits;
+    public uint stars_pad0;
+    public uint stars_pad1;
     public float4 color;
     public float4 zenith;
     public float4 horizon;

@@ -489,7 +489,10 @@ unsafe fn create_instance(
 
         log::debug!(
             "vulkan: validation layers: {:?}",
-            layer_names.iter().map(|l| l.to_string_lossy()).collect::<Vec<_>>()
+            layer_names
+                .iter()
+                .map(|l| l.to_string_lossy())
+                .collect::<Vec<_>>()
         );
 
         let layers_names_raw: Vec<*const c_char> = layer_names

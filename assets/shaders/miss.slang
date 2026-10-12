@@ -42,7 +42,19 @@ float3 hdrSky(float3 d, EnvironmentGpu env) {
     if (env.importance == nullptr) {
         texel = min(texel, float3(300.0));
     }
-    return env.color.rgb * texel;
+    return env.color.rgb * texel + stars(d, env);
+}
+
+// The star map behind a generated sky, turned with the night and dimmed into the horizon's
+// haze.
+float3 stars(float3 d, EnvironmentGpu env) {
+    if (env.stars_nits <= 0.0) {
+        return float3(0.0);
+    }
+    let q = env.stars_rotation;
+    let s = d + 2.0 * cross(q.xyz, cross(q.xyz, d) + q.w * d);
+    let haze = smoothstep(-0.02, 0.2, d.y);
+    return sampleSky(env.stars_tex, env_dir_to_uv(s)) * env.stars_nits * haze;
 }
 
 // Zenith / horizon gradient above, horizon / ground below (all nits), with a small aureole

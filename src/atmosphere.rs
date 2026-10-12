@@ -188,59 +188,65 @@ impl Default for CloudLayer {
 /// Must match `AtmosphereParams` in rt_types.slang (scalar layout: the 8-byte pointers first,
 /// then 4-byte fields with no padding).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct AtmosphereGpu {
-    transmittance: u64,
-    multiscatter: u64,
-    skyview_rad: u64,
-    skyview_trn: u64,
-    noise: u64,
-    noise_detail: u64,
-    planet_center: [f32; 3],
-    planet_radius: f32,
-    atmosphere_height: f32,
-    rayleigh_h: f32,
-    mie_h: f32,
-    ozone_center: f32,
-    ozone_width: f32,
-    rayleigh_scatter: [f32; 3],
-    mie_scatter: [f32; 3],
-    mie_absorb: [f32; 3],
-    ozone_absorb: [f32; 3],
-    mie_g: f32,
-    ground_albedo: [f32; 3],
-    sun_direction: [f32; 3],
-    sun_radiance: [f32; 3],
-    sun_cos_radius: f32,
-    camera_pos: [f32; 3],
-    clouds: u32,
-    cloud_shadows: u32,
-    cloud_steps: u32,
-    cloud_light_steps: u32,
-    cloud_bottom: f32,
-    cloud_top: f32,
-    cloud_coverage: f32,
-    cloud_coverage_scale: f32,
-    cloud_density: f32,
-    cloud_extinction: f32,
-    cloud_detail: f32,
-    cloud_scale: f32,
-    cloud_detail_scale: f32,
-    cloud_wind: [f32; 3],
-    cloud_light_dist: f32,
-    cloud_max_dist: f32,
-    cloud_ambient: f32,
-    cloud_forward_g: f32,
-    cloud_back_g: f32,
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+pub(crate) struct AtmosphereGpu {
+    pub(crate) transmittance: u64,
+    pub(crate) multiscatter: u64,
+    pub(crate) skyview_rad: u64,
+    pub(crate) skyview_trn: u64,
+    pub(crate) noise: u64,
+    pub(crate) noise_detail: u64,
+    pub(crate) planet_center: [f32; 3],
+    pub(crate) planet_radius: f32,
+    pub(crate) atmosphere_height: f32,
+    pub(crate) rayleigh_h: f32,
+    pub(crate) mie_h: f32,
+    pub(crate) ozone_center: f32,
+    pub(crate) ozone_width: f32,
+    pub(crate) rayleigh_scatter: [f32; 3],
+    pub(crate) mie_scatter: [f32; 3],
+    pub(crate) mie_absorb: [f32; 3],
+    pub(crate) ozone_absorb: [f32; 3],
+    pub(crate) mie_g: f32,
+    pub(crate) ground_albedo: [f32; 3],
+    pub(crate) sun_direction: [f32; 3],
+    pub(crate) sun_radiance: [f32; 3],
+    pub(crate) sun_cos_radius: f32,
+    pub(crate) camera_pos: [f32; 3],
+    pub(crate) clouds: u32,
+    pub(crate) cloud_shadows: u32,
+    pub(crate) cloud_steps: u32,
+    pub(crate) cloud_light_steps: u32,
+    pub(crate) cloud_bottom: f32,
+    pub(crate) cloud_top: f32,
+    pub(crate) cloud_coverage: f32,
+    pub(crate) cloud_coverage_scale: f32,
+    pub(crate) cloud_density: f32,
+    pub(crate) cloud_extinction: f32,
+    pub(crate) cloud_detail: f32,
+    pub(crate) cloud_scale: f32,
+    pub(crate) cloud_detail_scale: f32,
+    pub(crate) cloud_wind: [f32; 3],
+    pub(crate) cloud_light_dist: f32,
+    pub(crate) cloud_max_dist: f32,
+    pub(crate) cloud_ambient: f32,
+    pub(crate) cloud_forward_g: f32,
+    pub(crate) cloud_back_g: f32,
 }
 
-/// Push constants of every atmosphere kernel.
+/// Push constants of every atmosphere kernel; the generated sky's (sky_gen.rs) use the rest.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct KernelParams {
-    atmo: u64,
-    base: u32,
-    pad: u32,
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+pub(crate) struct KernelParams {
+    pub atmo: u64,
+    pub base: u32,
+    pub pad: u32,
+    pub sky: u64,
+    pub table: u64,
+    pub rows: u64,
+    pub sun_out: u64,
+    pub altitude: f32,
+    pub pad2: u32,
 }
 
 #[derive(Resource)]
@@ -398,8 +404,7 @@ impl AtmosphereState {
         };
         let params = KernelParams {
             atmo: self.params.address,
-            base: 0,
-            pad: 0,
+            ..default()
         };
         let base = Some(std::mem::offset_of!(KernelParams, base));
         let compute_barrier = |rd: &RenderDevice| {

@@ -64,6 +64,13 @@ struct KernelParams {
     AtmosphereParams* atmo;
     uint base;
     uint pad;
+    // The generated sky's kernels only (src/sky_gen.rs).
+    float4* sky;        // SKY_W x SKY_H radiance, the sky image's texels
+    float* table;       // its importance table: cdf[N + 1], then pdf[N]
+    float* rows;        // per-row totals [SKY_H], row offsets [SKY_H], the total
+    float4* sun_out;    // the environment table's sun radiance (rgb; a kept)
+    float altitude;     // the viewer above the ground (metres)
+    uint pad2;
 };
 [[vk::push_constant]] KernelParams kp;
 
@@ -255,8 +262,10 @@ void skyViewUvToParams(float2 uv, float r, out float view_cos_zenith, out float 
 // the in-scattered radiance, `T` the transmittance, `MS` the integrated scattering (the MS
 // kernel's f_ms). `use_ms` adds the multiple-scattering LUT term; `mie_phase` = false is
 // the isotropic variant the MS kernel wants; `sun_e` the sun illuminance.
+// `dense_near` packs the steps towards `p` (quadratic), for long grazing paths whose air
+// is all near the start.
 void integrate(float3 p, float3 d, float3 sun, uint steps, bool use_ms, bool mie_phase,
-               float3 sun_e, out float3 L, out float3 T, out float3 MS) {
+               float3 sun_e, bool dense_near, out float3 L, out float3 T, out float3 MS) {
     L = float3(0.0);
     T = float3(1.0);
     MS = float3(0.0);
@@ -292,7 +301,8 @@ void integrate(float3 p, float3 d, float3 sun, uint steps, bool use_ms, bool mie
 
     var t = 0.0;
     for (uint i = 0; i < steps; i++) {
-        let t_new = (float(i) + 0.3) / float(steps) * t_max;
+        let f = (float(i) + 0.3) / float(steps);
+        let t_new = (dense_near ? f * f : f) * t_max;
         let dt = t_new - t;
         t = t_new;
         let x = p + d * t;
@@ -397,7 +407,7 @@ void atmo_multiscatter(uint3 gid: SV_DispatchThreadID) {
             let phi = acos(1.0 - 2.0 * (float(j) + 0.5) / float(SQRT_SAMPLES));
             let d = float3(cos(theta) * sin(phi), cos(phi), sin(theta) * sin(phi));
             float3 L, T, ms;
-            integrate(p, d, sun, 20, false, false, float3(1.0), L, T, ms);
+            integrate(p, d, sun, 20, false, false, float3(1.0), false, L, T, ms);
             sum_L += L;
             sum_ms += ms;
         }
@@ -435,9 +445,130 @@ void atmo_skyview(uint3 gid: SV_DispatchThreadID) {
     let d = float3(vsz * lvc, vcz, vsz * sqrt(max(0.0, 1.0 - lvc * lvc)));
 
     float3 L, T, ms;
-    integrate(p, d, sun, 32, true, true, sunIlluminance(), L, T, ms);
+    integrate(p, d, sun, 32, true, true, sunIlluminance(), false, L, T, ms);
     kp.atmo.skyview_rad[idx] = float4(L, 1.0);
     kp.atmo.skyview_trn[idx] = float4(T, 1.0);
+}
+
+// ---- generated sky (src/sky_gen.rs) ----------------------------------------------------
+//
+// `sky_render` integrates the sky from the viewer's altitude for every texel of an
+// equirectangular image (rt_types.slang `env_uv_to_dir`), the sun left out: the renderer
+// draws it as an analytic sun. `sky_rows` / `sky_offsets` / `sky_normalize` turn the image
+// into the importance table the raygen samples (sky_importance.rs's layout), and
+// `sun_tint` writes the sun's radiance through the air into the environment table.
+
+static const uint SKY_W = 512;
+static const uint SKY_H = 256;
+
+// rt_types.slang `env_uv_to_dir`.
+float3 skyUvToDir(float2 uv) {
+    let phi = (uv.x + 0.5) * 2.0 * PI;
+    let theta = uv.y * PI;
+    let st = sin(theta);
+    return float3(st * sin(phi), cos(theta), st * cos(phi));
+}
+
+float3 viewerPos() {
+    return float3(0.0, kp.atmo.planet_radius + max(kp.altitude, 0.5), 0.0);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_render(uint3 gid: SV_DispatchThreadID) {
+    let idx = gid.x + kp.base;
+    if (idx >= SKY_W * SKY_H) {
+        return;
+    }
+    let uv = (float2(idx % SKY_W, idx / SKY_W) + 0.5) / float2(float(SKY_W), float(SKY_H));
+    let d = skyUvToDir(uv);
+    float3 L, T, ms;
+    integrate(viewerPos(), d, sunDirection(), 40, true, true, sunIlluminance(), true, L, T, ms);
+    kp.sky[idx] = float4(max(L, float3(0.0)), 1.0);
+}
+
+float skyWeight(uint idx) {
+    let c = kp.sky[idx].rgb;
+    var l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    l = isfinite(l) ? max(l, 0.0) : 0.0;
+    let sin_theta = sin((float(idx / SKY_W) + 0.5) / float(SKY_H) * PI);
+    // A floor keeps every direction reachable (unbiased even where the sky is black).
+    return (l + 1.0e-4) * sin_theta;
+}
+
+// One thread per row: the row's running weight (unnormalised) into the cdf, its total to rows.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_rows(uint3 gid: SV_DispatchThreadID) {
+    let y = gid.x;
+    if (y >= SKY_H) {
+        return;
+    }
+    var run = 0.0;
+    for (uint x = 0u; x < SKY_W; x++) {
+        let idx = y * SKY_W + x;
+        run += skyWeight(idx);
+        kp.table[1u + idx] = run;
+    }
+    kp.rows[y] = run;
+}
+
+// One thread: each row's offset (the rows before it) and the grand total.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_offsets(uint3 gid: SV_DispatchThreadID) {
+    if (gid.x != 0u) {
+        return;
+    }
+    var before = 0.0;
+    for (uint y = 0u; y < SKY_H; y++) {
+        kp.rows[SKY_H + y] = before;
+        before += kp.rows[y];
+    }
+    kp.rows[2u * SKY_H] = before;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_normalize(uint3 gid: SV_DispatchThreadID) {
+    let idx = gid.x + kp.base;
+    let n = SKY_W * SKY_H;
+    if (idx >= n) {
+        return;
+    }
+    let y = idx / SKY_W;
+    let inv_total = 1.0 / max(kp.rows[2u * SKY_H], 1.0e-30);
+    kp.table[1u + idx] = idx == n - 1u ? 1.0 : (kp.rows[SKY_H + y] + kp.table[1u + idx]) * inv_total;
+    if (idx == 0u) {
+        kp.table[0] = 0.0;
+    }
+    // Texel solid angle: (2 pi / W)(pi / H) sin theta.
+    let sin_theta = sin((float(y) + 0.5) / float(SKY_H) * PI);
+    let texel = 2.0 * PI * PI / float(n);
+    kp.table[n + 1u + idx] = skyWeight(idx) * inv_total / (texel * max(sin_theta, 1.0e-4));
+}
+
+// The sun's disc radiance where the viewer stands: the top of the air's, through it, and
+// only the part of the disc above the horizon.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sun_tint(uint3 gid: SV_DispatchThreadID) {
+    if (gid.x != 0u) {
+        return;
+    }
+    let p = viewerPos();
+    let r = p.y;
+    let sun = sunDirection();
+    let Rg = kp.atmo.planet_radius;
+    let horizon = -acos(clamp(Rg / r, -1.0, 1.0));
+    let radius = acos(clamp(kp.atmo.sun_cos_radius, -1.0, 1.0));
+    let elevation = asin(clamp(sun.y, -1.0, 1.0));
+    let visible = smoothstep(-radius, radius, elevation - horizon);
+    // Through the air just above the horizon while the disc sets.
+    let mu = sin(max(elevation, horizon + radius));
+    let T = transmittance(r, mu);
+    let prev = kp.sun_out[0];
+    kp.sun_out[0] = float4(sunRadiance() * T * visible, prev.a);
 }
 
 // ---- cloud noise -------------------------------------------------------------------------

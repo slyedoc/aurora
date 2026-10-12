@@ -55,7 +55,10 @@ pub struct FogGridFrame {
 /// around all of theirs. One view is its own grid view.
 pub fn grid_view(views: &[(Mat4, Mat4)]) -> (Mat4, Mat4) {
     if views.len() <= 1 {
-        return views.first().copied().unwrap_or((Mat4::IDENTITY, Mat4::IDENTITY));
+        return views
+            .first()
+            .copied()
+            .unwrap_or((Mat4::IDENTITY, Mat4::IDENTITY));
     }
     let centre = views.iter().map(|(v, _)| v.w_axis.truncate()).sum::<Vec3>() / views.len() as f32;
     let (_, rotation, _) = views[0].0.to_scale_rotation_translation();
@@ -64,7 +67,12 @@ pub fn grid_view(views: &[(Mat4, Mat4)]) -> (Mat4, Mat4) {
     let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
     for (view, projection) in views {
         let unproject = projection.inverse();
-        for corner in [Vec2::new(-1.0, -1.0), Vec2::new(1.0, -1.0), Vec2::new(-1.0, 1.0), Vec2::ONE] {
+        for corner in [
+            Vec2::new(-1.0, -1.0),
+            Vec2::new(1.0, -1.0),
+            Vec2::new(-1.0, 1.0),
+            Vec2::ONE,
+        ] {
             let p = unproject * corner.extend(1.0).extend(1.0);
             let d = to_grid.transform_vector3(view.transform_vector3(p.truncate() / p.w));
             let tan = d.truncate().xy() / (-d.z).max(1.0e-6);
@@ -77,7 +85,12 @@ pub fn grid_view(views: &[(Mat4, Mat4)]) -> (Mat4, Mat4) {
     let projection = Mat4::from_cols(
         Vec4::new(2.0 / (hi.x - lo.x), 0.0, 0.0, 0.0),
         Vec4::new(0.0, 2.0 / (hi.y - lo.y), 0.0, 0.0),
-        Vec4::new((hi.x + lo.x) / (hi.x - lo.x), (hi.y + lo.y) / (hi.y - lo.y), 0.0, -1.0),
+        Vec4::new(
+            (hi.x + lo.x) / (hi.x - lo.x),
+            (hi.y + lo.y) / (hi.y - lo.y),
+            0.0,
+            -1.0,
+        ),
         Vec4::new(0.0, 0.0, near, 0.0),
     );
     (inverse_view, projection)

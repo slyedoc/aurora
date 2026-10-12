@@ -175,14 +175,24 @@ pub struct TeardownSchedule;
 
 /// The frame's stages, chained in [`Last`] after the simulation. One world: the systems in
 /// [`RenderSet::Extract`] read the ECS directly (transform deltas, instance changes, UI quads,
-/// asset events), [`RenderSet::Prepare`] consumes the asset worker's results, and
-/// [`RenderSet::Render`] waits for the previous frame, records, and submits.
+/// asset events), [`RenderSet::Fence`] waits for the previous frame's GPU work,
+/// [`RenderSet::Prepare`] consumes the asset worker's results, and [`RenderSet::Render`]
+/// records and submits. Host-visible buffers the GPU reads (the SBT, the environment table,
+/// the uniforms, light and fog tables) are rewritten in place, so nothing may write one before
+/// the fence: Extract only gathers.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderSet {
     Shutdown,
     Extract,
+    Fence,
     Prepare,
     Render,
+}
+
+/// The previous frame's GPU work is done from here on (its fence stays signalled; Render
+/// rearms it before submitting).
+fn wait_previous_frame(sync: Res<crate::frame_sync::FrameSync>) {
+    unsafe { sync.wait_previous() };
 }
 
 pub struct RayRenderPlugin;
@@ -225,6 +235,7 @@ impl Plugin for RayRenderPlugin {
             (
                 RenderSet::Shutdown,
                 RenderSet::Extract.run_if(render_device_exists),
+                RenderSet::Fence.run_if(render_device_exists),
                 RenderSet::Prepare.run_if(render_device_exists),
                 RenderSet::Render.run_if(render_device_exists),
             )
@@ -237,6 +248,7 @@ impl Plugin for RayRenderPlugin {
             (
                 shutdown.in_set(RenderSet::Shutdown),
                 update_render_window.in_set(RenderSet::Extract),
+                wait_previous_frame.in_set(RenderSet::Fence),
                 render_frame.in_set(RenderSet::Render),
             ),
         );
@@ -400,6 +412,7 @@ fn render_frame(
         crate::gizmo_render::GizmoDrawParams,
         Res<Atmosphere>,
         Res<CloudLayer>,
+        Res<crate::sky_gen::SkyGen>,
     ),
     mut frame: ResMut<Frame>,
     render_config: Res<RenderConfig>,
@@ -487,7 +500,8 @@ fn render_frame(
     ) = gpu;
     let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut prof) = dlss_stuff;
 
-    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds) = dev_ui_stuff;
+    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
+        dev_ui_stuff;
     let settings = settings
         .map(|settings| settings.clone())
         .unwrap_or_default();
@@ -752,9 +766,16 @@ fn render_frame(
         .iter()
         .enumerate()
         .map(|(bit, environment)| {
-            let importance_address = importance.address(bit);
+            let mut importance_address = importance.address(bit);
             let (tex, space) = match &environment.sky {
                 Sky::Hdr { image, .. } => (texture_index(image), Vec4::ZERO),
+                Sky::Generated => match sky_gen.sky(bit) {
+                    Some((tex, table)) => {
+                        importance_address = table;
+                        (tex, Vec4::ZERO)
+                    }
+                    None => (WHITE_TEXTURE_IDX, Vec4::ZERO),
+                },
                 // The space image behind the air (colour = its scale; 0 = none).
                 Sky::Atmosphere => match &atmosphere.space {
                     Some(image) => (texture_index(image), Vec4::splat(atmosphere.space_scale)),
@@ -768,6 +789,12 @@ fn render_frame(
                 space,
                 importance_address,
                 importance.sun(bit),
+                environment
+                    .air
+                    .stars
+                    .as_ref()
+                    .and_then(|stars| textures.get(stars))
+                    .map(|t| render_device.register_bindless_texture(t)),
             )
         })
         .collect();

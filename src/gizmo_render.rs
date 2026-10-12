@@ -718,6 +718,8 @@ impl Plugin for GizmoRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<GizmoPipeline>();
         app.init_vulkan_asset::<GizmoPipeline>();
+        // Read by the retained-gizmo bounds cache; an app without GizmoPlugin never sends it.
+        app.add_message::<AssetEvent<GizmoAsset>>();
         app.add_systems(Update, propagate_modified);
 
         let asset_server = app.world().get_resource::<AssetServer>().unwrap();

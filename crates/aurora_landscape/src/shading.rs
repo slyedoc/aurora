@@ -8,6 +8,7 @@ use ash::vk;
 use bevy::{ecs::lifecycle::Remove, prelude::*};
 use bevy_aurora::{
     assets::aurora_asset,
+    compute::FrameCommands,
     material::{AuroraMaterial, AuroraMaterial3d},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -127,7 +128,10 @@ pub fn register_class(
         any_hit: None,
     });
     let rows: Buffer<LandscapeRow> =
-        rd.create_host_buffer(ROWS, vk::BufferUsageFlags::STORAGE_BUFFER);
+        rd.create_host_buffer(
+            ROWS,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
     data.set(class, rows.address);
     commands.insert_resource(LandscapeClass {
         class,
@@ -141,6 +145,7 @@ pub fn register_class(
 #[allow(clippy::type_complexity)]
 pub fn sync_shading(
     mut commands: Commands,
+    mut frame_commands: ResMut<FrameCommands>,
     rd: Res<RenderDevice>,
     mut class: ResMut<LandscapeClass>,
     mut data: ResMut<SurfaceGroupData>,
@@ -181,7 +186,7 @@ pub fn sync_shading(
                     mirror,
                     palette: rd.create_host_buffer(
                         PALETTE_MAX as u64,
-                        vk::BufferUsageFlags::STORAGE_BUFFER,
+                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     ),
                     written: None,
                 });
@@ -229,10 +234,20 @@ pub fn sync_shading(
         {
             continue;
         }
-        let at = shading.row as usize;
-        rd.map_buffer(&mut shading.palette).as_slice_mut()[..gpu_palette.len()]
-            .copy_from_slice(&gpu_palette);
-        rd.map_buffer(&mut class.rows).as_slice_mut()[at] = row;
+        // In the frame's command buffer, not through the mapping: the previous frame's hits may
+        // still be reading these (this runs before the frame fence).
+        let palette_buffer = shading.palette.handle;
+        let rows_buffer = class.rows.handle;
+        let row_offset = shading.row as u64 * size_of::<LandscapeRow>() as u64;
+        let palette_bytes = bytemuck::cast_slice::<PaletteGpu, u8>(&gpu_palette).to_vec();
+        frame_commands.push(move |rd, _, cmd| unsafe {
+            if !palette_bytes.is_empty() {
+                rd.device
+                    .cmd_update_buffer(cmd, palette_buffer, 0, &palette_bytes);
+            }
+            rd.device
+                .cmd_update_buffer(cmd, rows_buffer, row_offset, bytemuck::bytes_of(&row));
+        });
         shading.written = Some((row, gpu_palette));
     }
 }

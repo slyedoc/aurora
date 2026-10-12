@@ -244,9 +244,18 @@ impl VulkanAsset for RaytracingPipeline {
             features.atmosphere as u32,
         ];
         let spec_entries = [
-            vk::SpecializationMapEntry::default().constant_id(0).offset(0).size(4),
-            vk::SpecializationMapEntry::default().constant_id(1).offset(4).size(4),
-            vk::SpecializationMapEntry::default().constant_id(2).offset(8).size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(2)
+                .offset(8)
+                .size(4),
         ];
         let spec = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
@@ -329,7 +338,10 @@ impl VulkanAsset for RaytracingPipeline {
                 )
                 .specialization_info(&spec),
             render_device
-                .load_shader(miss_shader.spirv.as_ref().unwrap(), vk::ShaderStageFlags::MISS_KHR)
+                .load_shader(
+                    miss_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::MISS_KHR,
+                )
                 .specialization_info(&spec),
             render_device.load_shader(
                 &hit_shader.spirv.unwrap(),

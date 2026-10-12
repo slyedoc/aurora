@@ -57,6 +57,7 @@ pub mod shader;
 pub mod sharc;
 pub mod skinning;
 pub mod sky;
+pub mod sky_gen;
 pub mod sky_importance;
 pub mod sphere;
 pub mod surface_group;
@@ -104,7 +105,7 @@ pub mod prelude {
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         render_settings::{AuroraLens, RenderSettings},
         skinning::{SkinJointsByName, Wind, WindSway},
-        sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyBrightness},
+        sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyAir, SkyBrightness},
         sky_importance::SkyImportance,
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt},
@@ -182,6 +183,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
         group = group.add(crate::atmosphere::AtmospherePlugin);
+        group = group.add(crate::sky_gen::SkyGenPlugin);
         group = group.add(crate::debug_view::DebugViewPlugin);
         group = group.add(crate::surface_group::SurfaceGroupPlugin);
         group = group.add(crate::render_shaders::RenderShadersPlugin);
