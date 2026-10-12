@@ -73,11 +73,12 @@ public struct EnvironmentGpu {
     public float sun_clip;
     // Fog: the camera ray's march steps (0 = it scatters at random like a bounce).
     public uint fog_steps;
-    // Fog light grid (src/fog_grid.rs): how far it reaches (0 = off) and the frames it averages.
+    // Fog light grid (src/fog_grid.rs): how far it reaches (0 = off), the frames it averages,
+    // trace pixels per cell across and depth slices.
     public float fog_grid_distance;
     public float fog_grid_history;
-    public uint pad_grid0;
-    public uint pad_grid1;
+    public uint fog_grid_tile;
+    public uint fog_grid_slices;
     public float4 color;
     public float4 zenith;
     public float4 horizon;
@@ -207,11 +208,20 @@ public struct UniformData {
     // Seconds since startup (wrapped), for the volumes' drifting noise.
     public float time;
     // Fog light grid (src/fog_grid.rs): last frame's and this frame's cells (0 = off), the
-    // cell count, and 1 when last frame's is not this view's history.
+    // cell count, and 1 when last frame's is not this grid's history.
     public float4* fog_grid_prev;
     public float4* fog_grid_cur;
     public uint fog_grid_cells;
     public uint fog_grid_fresh;
+    // The grid's own view (a headset's eyes share one): where its cells are, this frame's
+    // view-projection (the camera ray looks the grid up), last frame's (the update's history),
+    // and its cells across, down and deep.
+    public float fog_grid_inverse_view[16];
+    public float fog_grid_inverse_projection[16];
+    public float fog_grid_view_proj[16];
+    public float fog_grid_prev_view_proj[16];
+    public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
+    public uint pad_grid;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -315,6 +325,8 @@ public struct LightsHeader {
     public LightInstance* linsts;
     public uint* slot_to_linst;
     public AnalyticLight* analytics;
+    // Per entry, its light instance (0 for analytic entries).
+    public uint* entry_to_linst;
 };
 
 // Exposure state from the metering (auto_exposure.slang). The raygen applies

@@ -210,6 +210,13 @@ const SLANGC_ARGS: &[&str] = &[
     "-profile",
     "spirv_1_6",
     "-O2",
+    // Full debug info with the source embedded, for Nsight's shader profiler (the driver
+    // drops it when it compiles the pipeline).
+    "-g3",
+    // HitObject / ReorderThread lower to the NV flavour of SER (only modules that use it
+    // declare it).
+    "-capability",
+    "spvShaderInvocationReorderNV",
     "-fvk-use-entrypoint-name",
 ];
 

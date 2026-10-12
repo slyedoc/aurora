@@ -1,6 +1,6 @@
-//! The dev panel, for apps without an editor: fps and the centre-screen exposure probe over
-//! feathers inspectors for [`RenderSettings`] and the first camera's lens, exposure and DLSS
-//! mode. It holds no state of its own; an editor edits the same resource and components.
+//! The dev panel, for apps without an editor: the centre-screen exposure probe over feathers
+//! inspectors for [`RenderSettings`] and the first camera's lens, exposure and DLSS mode. It
+//! holds no state of its own; an editor edits the same resource and components.
 //!
 //! Keys: `F3` toggles this panel.
 
@@ -34,18 +34,15 @@ use crate::{
 #[derive(Component, Default, Clone)]
 pub struct DevUIPanel;
 
-/// The live stats line (fps).
-#[derive(Component, Default, Clone)]
-struct DevUIStats;
-
-/// The exposure/luminance readout. Its OWN line on purpose: the panel is a fixed 340 px
-/// and text wider than that relayouts every frame, which reads as the whole panel
-/// flickering. Both lines are padded to a stable width for the same reason -- a readout
-/// that changes length as the number changes digits is the same bug, just intermittent.
+/// The exposure/luminance readout, kept inside the panel's fixed 340 px: text wider than that
+/// relayouts every frame, which reads as the whole panel flickering. It is padded to a stable
+/// width for the same reason -- a readout that changes length as the number changes digits is
+/// the same bug, just intermittent.
 #[derive(Component, Default, Clone)]
 struct DevUIProbe;
 
-/// The node the resource inspector is built under.
+/// The node the inspectors are built under, each in a section of its own (an inspector owns
+/// its whole panel: building one into a shared node clears the others).
 #[derive(Component, Default, Clone)]
 struct DevUIInspectorHost;
 
@@ -71,7 +68,7 @@ impl Plugin for DevUIPlugin {
         }
 
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(Update, (toggle_panel, update_stats, inspect_camera));
+        app.add_systems(Update, (toggle_panel, update_probe, inspect_camera));
     }
 }
 
@@ -88,6 +85,7 @@ fn inspect_camera(
     >,
     host: Single<Entity, With<DevUIInspectorHost>>,
     mut shown: Local<Option<Entity>>,
+    mut sections: Local<Vec<Entity>>,
     mut commands: Commands,
 ) {
     let Some((camera, lens, exposure, dlss)) = cameras.iter().next() else {
@@ -97,6 +95,11 @@ fn inspect_camera(
         return;
     }
     *shown = Some(camera);
+    for section in sections.drain(..) {
+        if let Ok(mut section) = commands.get_entity(section) {
+            section.despawn();
+        }
+    }
     let mut entity = commands.entity(camera);
     if !lens {
         entity.insert(AuroraLens::default());
@@ -112,10 +115,12 @@ fn inspect_camera(
         TypeId::of::<AuroraExposure>(),
         TypeId::of::<AuroraDlss>(),
     ] {
+        let section = commands.spawn((section_node(), ChildOf(*host))).id();
+        sections.push(section);
         commands.queue(BuildComponentInspector {
             target: camera,
             type_id,
-            panel: *host,
+            panel: section,
         });
     }
 }
@@ -146,10 +151,6 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
-                @caption("aurora  (F3: panel)")
-                --
-                @caption("fps: -") DevUIStats
-                --
                 @caption("centre: -") DevUIProbe
                 --
                 Node {
@@ -177,7 +178,17 @@ fn spawn_panel(world: &mut World) {
         .iter(world)
         .find(|_| true)
         .unwrap_or(panel);
-    build_resource_inspector(world, TypeId::of::<RenderSettings>(), host);
+    let section = world.spawn((section_node(), ChildOf(host))).id();
+    build_resource_inspector(world, TypeId::of::<RenderSettings>(), section);
+}
+
+/// One inspector's own node in the host's column.
+fn section_node() -> Node {
+    Node {
+        flex_direction: FlexDirection::Column,
+        align_self: AlignSelf::Stretch,
+        ..default()
+    }
 }
 
 fn toggle_panel(
@@ -195,8 +206,7 @@ fn toggle_panel(
     }
 }
 
-fn update_stats(
-    time: Res<Time>,
+fn update_probe(
     ae: Option<Res<crate::auto_exposure::AutoExposureState>>,
     cameras: Query<
         (
@@ -207,14 +217,8 @@ fn update_stats(
         With<Camera3d>,
     >,
     skies: Option<Res<crate::sky::EnvironmentSkies>>,
-    mut stats: Query<&mut Text, (With<DevUIStats>, Without<DevUIProbe>)>,
-    mut probe: Query<&mut Text, (With<DevUIProbe>, Without<DevUIStats>)>,
-    mut fps_avg: Local<f32>,
+    mut probe: Query<&mut Text, With<DevUIProbe>>,
 ) {
-    let dt = time.delta_secs();
-    if dt > 0.0 {
-        *fps_avg = 0.95 * *fps_avg + 0.05 * (1.0 / dt);
-    }
     // Centre-screen luminance in NITS and the EV100 in force. Physical and
     // exposure-independent, so an emitter authored too dim and a look keyed to something
     // bright stop being the same symptom.
@@ -233,9 +237,6 @@ fn update_stats(
             ),
             AuroraExposure::Auto(_) => (f32::NAN, 'A'),
         });
-    for mut text in &mut stats {
-        text.0 = format!("fps: {:>6.1}", *fps_avg);
-    }
     // Both halves padded to a FIXED width, and the whole line kept inside the panel's
     // 340 px: a line that grows as the numbers change digits relayouts the panel every
     // frame, which reads as a flicker.

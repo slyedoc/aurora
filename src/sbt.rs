@@ -61,6 +61,8 @@ pub struct SBTAligments {
 #[derive(Default, Resource)]
 pub struct SBT {
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
+    /// The fog grid update's raygen record, right after the main one (fog_grid.rs).
+    pub fog_grid_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
     pub data: Buffer<u8>,
@@ -96,6 +98,8 @@ fn update_sbt(
     sbt.raygen_region.stride =
         vk_utils::aligned_size(handle_size_aligned, aligments.shader_group_base_alignment);
     sbt.raygen_region.size = sbt.raygen_region.stride;
+    sbt.fog_grid_region.stride = sbt.raygen_region.stride;
+    sbt.fog_grid_region.size = sbt.raygen_region.stride;
 
     sbt.miss_region.stride =
         vk_utils::aligned_size(handle_size_aligned, aligments.shader_group_base_alignment);
@@ -110,7 +114,10 @@ fn update_sbt(
     // Hit offsets are stable per mesh asset (0 is the sphere group), so size by their count.
     sbt.hit_region.size = sbt.hit_region.stride * tlas.hit_offset_count().max(1) as u64;
 
-    let total_size = sbt.raygen_region.size + sbt.miss_region.size + sbt.hit_region.size;
+    let total_size = sbt.raygen_region.size
+        + sbt.fog_grid_region.size
+        + sbt.miss_region.size
+        + sbt.hit_region.size;
 
     // recreate the buffer if the size has changed
     if sbt.data.nr_elements != total_size {
@@ -144,6 +151,10 @@ fn update_sbt(
                 handle: rtx_pipeline.raygen_handle,
             });
             dst = dst.add(sbt.raygen_region.size as usize);
+            (dst as *mut SBTRegionRaygen).write(SBTRegionRaygen {
+                handle: rtx_pipeline.fog_grid_handle,
+            });
+            dst = dst.add(sbt.fog_grid_region.size as usize);
 
             // miss region (also only a hanlde, comes after the raygen region)
             (dst as *mut SBTRegionMiss).write(SBTRegionMiss {
@@ -228,9 +239,10 @@ fn update_sbt(
     }
 
     sbt.raygen_region.device_address = sbt.data.address;
-    sbt.miss_region.device_address = sbt.data.address + sbt.raygen_region.size;
-    sbt.hit_region.device_address =
-        sbt.data.address + sbt.raygen_region.size + sbt.miss_region.size;
+    sbt.fog_grid_region.device_address = sbt.data.address + sbt.raygen_region.size;
+    sbt.miss_region.device_address =
+        sbt.fog_grid_region.device_address + sbt.fog_grid_region.size;
+    sbt.hit_region.device_address = sbt.miss_region.device_address + sbt.miss_region.size;
 }
 
 fn cleanup_sbt(sbt: Res<SBT>, render_device: Res<RenderDevice>) {

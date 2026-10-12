@@ -8,6 +8,10 @@ import atmosphere_rt;
 
 static const float PI = 3.14159265359;
 
+// Some environment's sky is the atmosphere (raytracing_pipeline.rs `PipelineFeatures`; same id
+// as raygen.slang's): off, the atmosphere's code is gone from the shader.
+[vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
+
 float3 sampleSky(uint tex, float2 uv) {
     return textures[NonUniformResourceIndex(tex)].SampleLevel(uv, 0.0).rgb;
 }
@@ -84,7 +88,7 @@ void main(inout HitPayload payload) {
         break;
     // The atmosphere draws its own (first) sun through the air.
     case 3u:
-        sky = atmosphereSky(d, want_sun, env.tex, env.color.rgb);
+        sky = ATMOSPHERE_ON ? atmosphereSky(d, want_sun, env.tex, env.color.rgb) : env.color.rgb;
         break;
     default:
         sky = env.color.rgb;

@@ -63,7 +63,7 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in lights.slang. 56 bytes.
+/// Must match `LightsHeader` in lights.slang and rt_types.slang. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -79,6 +79,8 @@ struct LightsHeaderGpu {
     linsts: u64,
     slot_to_linst: u64,
     analytics: u64,
+    /// Per entry, its light instance (0 for analytic entries): the sampler's direct lookup.
+    entry_to_linst: u64,
 }
 
 /// `slot_map` values with this bit are a sphere emitter's analytic entry rather than a light
@@ -150,6 +152,7 @@ pub struct LightManager {
     linsts: Buffer<LightInstGpu>,
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
+    entry_to_linst: Buffer<u32>,
     emissions: Buffer<f32>,
     analytics: Buffer<AnalyticLightGpu>,
     /// The analytic lights as last extracted (entry order); re-uploaded when they move.
@@ -185,6 +188,7 @@ impl LightManager {
             linsts: Buffer::default(),
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
+            entry_to_linst: Buffer::default(),
             emissions: Buffer::default(),
             analytics: Buffer::default(),
             analytic_cache: Vec::new(),
@@ -211,6 +215,7 @@ impl LightManager {
             self.linsts.handle,
             self.slot_map.handle,
             self.cdf.handle,
+            self.entry_to_linst.handle,
             self.emissions.handle,
             self.analytics.handle,
         ] {
@@ -220,6 +225,7 @@ impl LightManager {
         self.linsts = Buffer::default();
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
+        self.entry_to_linst = Buffer::default();
         self.emissions = Buffer::default();
         self.analytics = Buffer::default();
     }
@@ -551,6 +557,12 @@ fn prepare_lights(
     lights.linsts = render_device.create_device_buffer(linsts.len().max(1) as u64, storage);
     lights.slot_map = render_device.create_device_buffer(slot_map.len() as u64, storage);
     lights.cdf = render_device.create_device_buffer(entry_base as u64, storage);
+    let mut entry_to_linst = vec![0u32; entry_base as usize];
+    for (i, li) in linsts.iter().enumerate() {
+        let first = li.entry_base as usize;
+        entry_to_linst[first..first + li.tri_count as usize].fill(i as u32);
+    }
+    lights.entry_to_linst = render_device.create_device_buffer(entry_base as u64, storage);
     lights.header = render_device.create_device_buffer(1, storage);
     lights.emissions = render_device.create_device_buffer(emissions.len().max(1) as u64, storage);
     lights.analytics =
@@ -571,12 +583,14 @@ fn prepare_lights(
         linsts: lights.linsts.address,
         slot_to_linst: lights.slot_map.address,
         analytics: lights.analytics.address,
+        entry_to_linst: lights.entry_to_linst.address,
     };
     render_device.run_transfer_commands(|cmd| {
         if !linsts.is_empty() {
             upload_slice(&render_device, cmd, &linsts, &lights.linsts);
         }
         upload_slice(&render_device, cmd, &slot_map, &lights.slot_map);
+        upload_slice(&render_device, cmd, &entry_to_linst, &lights.entry_to_linst);
         upload_slice(&render_device, cmd, &[header], &lights.header);
         if !emissions.is_empty() {
             upload_slice(&render_device, cmd, &emissions, &lights.emissions);

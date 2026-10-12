@@ -69,11 +69,11 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             samples: 1,
-            max_bounces: 32,
+            max_bounces: 4,
             firefly_clamp: 8.0,
             emissive_boost: 1.0,
             light_nee: true,
-            light_candidates: 8,
+            light_candidates: 4,
             texture_lod_bias: -1.0,
             spec_hit_roughness: 0.6,
             restir: false,

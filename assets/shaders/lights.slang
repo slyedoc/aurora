@@ -42,6 +42,7 @@ struct LightsHeader {
     uint64_t linsts;
     uint64_t slot_to_linst;
     uint64_t analytics;
+    uint64_t entry_to_linst;
 };
 
 // Must match AnalyticLightGpu in lights.rs. 80 bytes; the

@@ -31,6 +31,31 @@ pub struct ExtractedRaytracingPipeline {
     sphere_hit: Shader,
     /// `(label, closest_hit, any_hit)` per registered class, in class order.
     surface_groups: Vec<(String, Shader, Option<Shader>)>,
+    features: PipelineFeatures,
+}
+
+/// [`RenderSettings`](crate::render_settings::RenderSettings) features the pipeline is built
+/// with or without (raygen.slang's specialization constants): one that is off costs nothing,
+/// registers included. Changing one rebuilds the pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PipelineFeatures {
+    pub sharc: bool,
+    pub restir: bool,
+    /// Some environment's sky is the atmosphere.
+    pub atmosphere: bool,
+}
+
+impl PipelineFeatures {
+    fn of(
+        settings: Option<&crate::render_settings::RenderSettings>,
+        skies: Option<&crate::sky::EnvironmentSkies>,
+    ) -> Self {
+        Self {
+            sharc: settings.is_some_and(|s| s.sharc),
+            restir: settings.is_some_and(|s| s.restir),
+            atmosphere: skies.is_some_and(|s| s.atmosphere.is_some()),
+        }
+    }
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
@@ -60,6 +85,8 @@ pub struct CompiledRaytracingPipeline {
     /// command buffer must not be rewritten.
     pub descriptor_sets: [vk::DescriptorSet; 2 * crate::MAX_VIEWS],
     pub raygen_handle: RTGroupHandle,
+    /// The fog grid update's raygen (fog_grid.rs).
+    pub fog_grid_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
     /// The built-in opaque triangle group: [`SurfaceClass::OPAQUE`], and
     /// `surface_handles[0]`.
@@ -115,6 +142,8 @@ impl VulkanAsset for RaytracingPipeline {
     type ExtractParam = (
         SRes<Assets<crate::shader::Shader>>,
         SRes<SurfaceGroupRegistry>,
+        Option<SRes<crate::render_settings::RenderSettings>>,
+        Option<SRes<crate::sky::EnvironmentSkies>>,
     );
     type PreparedAsset = CompiledRaytracingPipeline;
 
@@ -122,7 +151,8 @@ impl VulkanAsset for RaytracingPipeline {
         &self,
         param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
     ) -> Option<Self::ExtractedAsset> {
-        let (shaders, registry) = param;
+        let (shaders, registry, settings, skies) = param;
+        let features = PipelineFeatures::of(settings.as_deref(), skies.as_deref());
         let shaders: &Assets<crate::shader::Shader> = &**shaders;
 
         let Some(raygen_shader) = shaders.get(&self.raygen_shader) else {
@@ -187,6 +217,7 @@ impl VulkanAsset for RaytracingPipeline {
             sphere_intersection: sphere_intersection_shader.clone(),
             sphere_hit: sphere_hit_shader.clone(),
             surface_groups,
+            features,
         })
     }
 
@@ -203,7 +234,23 @@ impl VulkanAsset for RaytracingPipeline {
             sphere_intersection: sphere_intersection_shader,
             sphere_hit: sphere_hit_shader,
             surface_groups,
+            features,
         } = asset;
+        // raygen.slang's `constant_id`s (VkBool32 each): 0 SHARC_ON, 1 RESTIR_ON, 2 ATMOSPHERE_ON
+        // (miss.slang's too).
+        let spec_data = [
+            features.sharc as u32,
+            features.restir as u32,
+            features.atmosphere as u32,
+        ];
+        let spec_entries = [
+            vk::SpecializationMapEntry::default().constant_id(0).offset(0).size(4),
+            vk::SpecializationMapEntry::default().constant_id(1).offset(4).size(4),
+            vk::SpecializationMapEntry::default().constant_id(2).offset(8).size(4),
+        ];
+        let spec = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(bytemuck::cast_slice(&spec_data));
 
         // 0..=6: the DLSS guide images (normal+roughness, diffuse, specular, depth,
         // specular hit distance, motion, colour); 100: the TLAS.
@@ -275,11 +322,15 @@ impl VulkanAsset for RaytracingPipeline {
         // Stage indices 0..=5 are fixed and the group table below names them literally;
         // each registered surface group appends its own stages after them.
         let mut shader_stages = vec![
-            render_device.load_shader(
-                &raygen_shader.spirv.unwrap(),
-                vk::ShaderStageFlags::RAYGEN_KHR,
-            ),
-            render_device.load_shader(&miss_shader.spirv.unwrap(), vk::ShaderStageFlags::MISS_KHR),
+            render_device
+                .load_shader(
+                    raygen_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                )
+                .specialization_info(&spec),
+            render_device
+                .load_shader(miss_shader.spirv.as_ref().unwrap(), vk::ShaderStageFlags::MISS_KHR)
+                .specialization_info(&spec),
             render_device.load_shader(
                 &hit_shader.spirv.unwrap(),
                 vk::ShaderStageFlags::CLOSEST_HIT_KHR,
@@ -366,6 +417,28 @@ impl VulkanAsset for RaytracingPipeline {
             log::debug!("surface group {label:?} -> class {}", index + 1);
         }
 
+        // The fog grid's raygen (raygen.slang `fog_grid`), after the classes: the surface
+        // handle table stops before it.
+        let fog_grid_group = shader_group.len();
+        let fog_grid_stage = shader_stages.len() as u32;
+        shader_stages.push(
+            render_device
+                .load_shader_entry(
+                    raygen_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                    c"fog_grid",
+                )
+                .specialization_info(&spec),
+        );
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(fog_grid_stage)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
         // Pipelines that trace structures referencing opacity micromaps must say so.
         let flags = if render_device.ext_micromap.is_some() {
             vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT
@@ -432,8 +505,9 @@ impl VulkanAsset for RaytracingPipeline {
         // Class order: the opaque group, then the registered ones. `surface_handles[0]`
         // and `hit_handle` are deliberately the same handle.
         let surface_handles: Vec<RTGroupHandle> = std::iter::once(hit_handle)
-            .chain(handles[OPAQUE_GROUP + 2..].iter().copied())
+            .chain(handles[OPAQUE_GROUP + 2..fog_grid_group].iter().copied())
             .collect();
+        let fog_grid_handle = handles[fog_grid_group];
 
         log::debug!("Raytracing pipeline compiled in {:?}", start.elapsed());
         render_device.save_pipeline_cache();
@@ -444,6 +518,7 @@ impl VulkanAsset for RaytracingPipeline {
             descriptor_set_layout,
             descriptor_sets,
             raygen_handle,
+            fog_grid_handle,
             miss_handle,
             hit_handle,
             sphere_hit_handle,
@@ -464,6 +539,23 @@ impl VulkanAsset for RaytracingPipeline {
         render_device
             .destroyer
             .destroy_pipeline(prepared_asset.pipeline);
+    }
+}
+
+/// Rebuilds the pipeline when a [`PipelineFeatures`] setting changes.
+fn rebuild_on_features(
+    settings: Option<Res<crate::render_settings::RenderSettings>>,
+    skies: Option<Res<crate::sky::EnvironmentSkies>>,
+    pipelines: Res<Assets<RaytracingPipeline>>,
+    mut events: MessageWriter<AssetEvent<RaytracingPipeline>>,
+    mut built: bevy::ecs::system::Local<Option<PipelineFeatures>>,
+) {
+    let features = PipelineFeatures::of(settings.as_deref(), skies.as_deref());
+    if built.replace(features).is_some_and(|was| was != features) {
+        log::info!("rt pipeline: rebuilding for {features:?}");
+        for (id, _) in pipelines.iter() {
+            events.write(AssetEvent::Modified { id });
+        }
     }
 }
 
@@ -525,6 +617,6 @@ impl Plugin for RaytracingPipelinePlugin {
     fn build(&self, app: &mut bevy::prelude::App) {
         app.init_asset::<RaytracingPipeline>();
         app.init_vulkan_asset::<RaytracingPipeline>();
-        app.add_systems(Update, propagate_modified);
+        app.add_systems(Update, (propagate_modified, rebuild_on_features));
     }
 }

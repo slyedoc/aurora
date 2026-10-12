@@ -817,6 +817,7 @@ dependencies = [
  "avian3d",
  "bevy",
  "bevy_animation_graph",
+ "blake3",
  "bytemuck",
  "crossbeam",
  "glam 0.33.12",
@@ -830,6 +831,7 @@ dependencies = [
  "raw-window-handle",
  "rayon",
  "thiserror 1.0.69",
+ "tracy-client",
  "wgpu-types",
 ]
 

@@ -10,7 +10,7 @@
 use ash::vk;
 use bevy::{ecs::lifecycle::Remove, prelude::*};
 use bevy_aurora::{
-    compute::{ComputeModules, compute_to_compute_barrier, record_dispatch},
+    compute::{ComputeModules, FrameCommands, memory_barrier, record_dispatch},
     mesh::AuroraMesh,
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -167,7 +167,10 @@ pub fn size_blocks(
         }
         if !has_state {
             commands.entity(entity).insert(ScatterState {
-                tables: rd.create_host_buffer(1, vk::BufferUsageFlags::STORAGE_BUFFER),
+                tables: rd.create_device_buffer(
+                    1,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                ),
                 last: None,
             });
         }
@@ -178,7 +181,6 @@ pub fn size_blocks(
 /// moved, the landscape re-evaluated, the species changed or the instance array was rebuilt.
 #[allow(clippy::too_many_arguments)]
 pub fn scatter_species(
-    rd: Res<RenderDevice>,
     kernels: Res<LandscapeKernels>,
     modules: Res<ComputeModules>,
     mut tlas: ResMut<TLAS>,
@@ -188,6 +190,7 @@ pub fn scatter_species(
     landscapes: Query<(&Landscape, Ref<LandscapePages>, &GlobalTransform)>,
     parents: Query<&ChildOf>,
     field: Res<InteractionField>,
+    mut frame: ResMut<FrameCommands>,
     mut species: Query<(
         Ref<ScatterSpecies>,
         &ChildOf,
@@ -195,16 +198,16 @@ pub fn scatter_species(
         &mut ScatterState,
     )>,
 ) {
-    let Some(module) = modules.get(&kernels.scatter) else {
+    if modules.get(&kernels.scatter).is_none() {
         return;
-    };
+    }
     let Some(viewer) = viewer_position(&viewers, &cameras) else {
         return;
     };
     let generation = tlas.generation();
     // A disturbed field re-grows every frame, so plants spring back as it decays.
     let field = field.address(time.elapsed_secs_f64());
-    let mut jobs: Vec<ScatterPush> = Vec::new();
+    let mut jobs: Vec<(vk::Buffer, SpeciesTables, ScatterPush)> = Vec::new();
     for (spec, child_of, slots, mut state) in &mut species {
         let Some((landscape, pages, transform)) = std::iter::once(child_of.parent())
             .chain(parents.iter_ancestors(child_of.parent()))
@@ -237,9 +240,8 @@ pub fn scatter_species(
             tables.factors[id as usize] = (f * spec.density).clamp(0.0, 1.0);
         }
         tables.poses[..poses.len()].copy_from_slice(poses);
-        rd.map_buffer(&mut state.tables).copy_from_slice(&[tables]);
         state.last = Some((cell0, generation));
-        jobs.push(ScatterPush {
+        let push = ScatterPush {
             instances: tlas.instances_address(),
             materials: pages.materials_address(),
             tables: state.tables.address,
@@ -262,24 +264,35 @@ pub fn scatter_species(
             wave: (time.elapsed_secs_f64() * spec.wind_speed as f64).fract() as f32,
             inner_radius: spec.inner_radius,
             fade: spec.fade,
-        });
+        };
+        jobs.push((state.tables.handle, tables, push));
     }
     if jobs.is_empty() {
         return;
     }
-    rd.run_transfer_commands(|cmd| {
-        for job in &jobs {
-            record_dispatch(
-                &rd,
-                cmd,
-                module,
-                "scatter",
-                job,
-                job.width * job.width,
-                None,
-            );
+    // Recorded into the frame's command buffer, ahead of the TLAS build that reads the rows.
+    let kernel = kernels.scatter.clone();
+    frame.push(move |rd, modules, cmd| {
+        let Some(module) = modules.get(&kernel) else {
+            return;
+        };
+        for (buffer, tables, _) in &jobs {
+            unsafe {
+                rd.device
+                    .cmd_update_buffer(cmd, *buffer, 0, bytemuck::bytes_of(tables));
+            }
         }
-        compute_to_compute_barrier(&rd, cmd);
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
+        for (_, _, job) in &jobs {
+            record_dispatch(rd, cmd, module, "scatter", job, job.width * job.width, None);
+        }
     });
     tlas.request_rebuild();
 }

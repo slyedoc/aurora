@@ -292,6 +292,50 @@ fn propagate_modified(
     }
 }
 
+/// Work recorded into the frame's own command buffer, at its start: a system with a small
+/// per-frame dispatch queues it here instead of a blocking `run_transfer_commands`, which
+/// stalls the CPU on the GPU every frame. Captured data must be by value (it runs in `Last`).
+pub type FrameCommand =
+    Box<dyn FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer) + Send + Sync>;
+
+/// This frame's [`FrameCommand`]s, drained by the renderer (followed by one barrier to
+/// everything after).
+#[derive(Resource, Default)]
+pub struct FrameCommands(Vec<FrameCommand>);
+
+impl FrameCommands {
+    pub fn push(
+        &mut self,
+        f: impl FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer) + Send + Sync + 'static,
+    ) {
+        self.0.push(Box::new(f));
+    }
+
+    /// Records every queued command into `cmd_buffer`, then makes their writes visible to
+    /// the rest of the frame.
+    pub fn record(
+        &mut self,
+        render_device: &RenderDevice,
+        modules: &ComputeModules,
+        cmd_buffer: vk::CommandBuffer,
+    ) {
+        if self.0.is_empty() {
+            return;
+        }
+        for command in self.0.drain(..) {
+            command(render_device, modules, cmd_buffer);
+        }
+        memory_barrier(
+            render_device,
+            cmd_buffer,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
+    }
+}
+
 /// Loaded compute modules, by name: `render_app.world().resource::<VulkanAssets<ComputeModule>>()`.
 pub type ComputeModules = VulkanAssets<ComputeModule>;
 
@@ -300,6 +344,7 @@ pub struct ComputePlugin;
 impl Plugin for ComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<ComputeModule>();
+        app.init_resource::<FrameCommands>();
         app.init_vulkan_asset::<ComputeModule>();
         app.add_systems(Update, propagate_modified);
     }

@@ -22,7 +22,7 @@ dlss-dev = []
 # the window a spectator view. `--features bevy_aurora/xr`.
 xr = []
 # Tracy: bevy's spans plus a frame mark per present. `--features bevy_aurora/trace_tracy`.
-trace_tracy = ["bevy/trace_tracy"]
+trace_tracy = ["bevy/trace_tracy", "dep:tracy-client"]
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
@@ -34,6 +34,8 @@ opt-level = 3
 
 [dependencies]
 blake3 = "1"
+# GPU pass times as Tracy plots (gpu_profiler.rs, `trace_tracy`); the version bevy uses.
+tracy-client = { version = "0.19", optional = true }
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
 # No default features: this crate is its own renderer, in one world (no render sub-app, no

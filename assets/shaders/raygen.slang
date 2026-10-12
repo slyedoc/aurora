@@ -19,6 +19,14 @@ import atmosphere_rt;
 [[vk::binding(200, 1)]] Sampler2D textures[];
 
 static const bool ENABLE_BLUENOISE = true;
+
+// Features fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
+// `RenderSettings`): off, their code is gone from the shader, registers and all. Their
+// uniforms still switch them per frame within a build that has them.
+[vk::constant_id(0)] const bool SHARC_ON = false;
+[vk::constant_id(1)] const bool RESTIR_ON = false;
+// Some environment's sky is the atmosphere (sky.rs `EnvironmentSkies::atmosphere`).
+[vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
 // Paths per pixel and their maximum length come from the uniforms (`pc.uniforms.samples`
 // / `max_bounces`); the DLSS path runs 1 spp with a short cap.
 
@@ -42,19 +50,35 @@ void trace(uint flags, uint mask, float3 origin, float tmin, float3 direction, f
     TraceRay(topLevelAS, flags, mask, 0, 0, 0, ray, payload);
 }
 
+// trace() through Shader Execution Reordering: the hit is found first, the warp regrouped by
+// what it hit, and only then shaded, so neighbouring lanes shade the same material instead of
+// diverging across the scene (Northshire: 12.2 -> 10.9 ms; a record-index hint measured the
+// same as the driver's own key).
+void traceReordered(uint flags, uint mask, float3 origin, float tmin, float3 direction, float tmax,
+                    inout HitPayload payload) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.TMin = tmin;
+    ray.Direction = direction;
+    ray.TMax = tmax;
+    HitObject hit = HitObject::TraceRay(topLevelAS, flags, mask, 0, 0, 0, ray, payload);
+    ReorderThread(hit);
+    HitObject::Invoke(topLevelAS, hit, payload);
+}
+
 // The fog of the environment a ray is in (src/sky.rs `Fog`).
-float sampleDistanceInFog(EnvironmentGpu env) {
+float sampleDistanceInFog(EnvironmentGpu* env) {
     return -log(randf()) / env.fog_density;
 }
 
 // Fog extinction at a height: `fog_density` at and below `fog_height`, thinning by 1/e every
 // `fog_falloff` metres above it.
-float fogDensity(EnvironmentGpu env, float y) {
+float fogDensity(EnvironmentGpu* env, float y) {
     return env.fog_density * exp(-max(0.0, y - env.fog_height) / env.fog_falloff);
 }
 
 // The environment's own fog at a point (uniform or height fog).
-float fogBaseDensity(EnvironmentGpu env, float3 x) {
+float fogBaseDensity(EnvironmentGpu* env, float3 x) {
     return env.fog_falloff > 0.0 ? fogDensity(env, x.y) : env.fog_density;
 }
 
@@ -113,7 +137,7 @@ bool fogVolumeSpan(FogVolumeGpu v, float3 o, float3 d, float t_max, out float t0
 }
 
 // All the fog at a point: the environment's (`base`) and every volume's.
-float fogDensityAt(EnvironmentGpu env, float3 x, bool base) {
+float fogDensityAt(EnvironmentGpu* env, float3 x, bool base) {
     var d = base ? fogBaseDensity(env, x) : 0.0;
     for (uint i = 0u; i < pc.uniforms.fog_volume_count; i++) {
         d += fogVolumeDensity(pc.uniforms.fog_volumes[i], x);
@@ -138,7 +162,7 @@ float fogVolumesReach(float3 o, float3 d) {
 // where. Uniform fog alone draws one exponential distance; otherwise delta tracking against
 // a majorant (the height fog at the segment's lowest point plus every volume it crosses),
 // accepting a tentative collision with probability density / majorant.
-bool sampleFogScatter(EnvironmentGpu env, float3 o, float3 d, float t_max, out float t) {
+bool sampleFogScatter(EnvironmentGpu* env, float3 o, float3 d, float t_max, out float t) {
     let volumes = pc.uniforms.fog_volume_count > 0u;
     if (env.fog_falloff <= 0.0 && !volumes) {
         t = sampleDistanceInFog(env);
@@ -168,7 +192,7 @@ bool sampleFogScatter(EnvironmentGpu env, float3 o, float3 d, float t_max, out f
 static const float FOG_ALBEDO = 0.95;
 
 // Henyey-Greenstein phase function, per steradian.
-float fogPhase(EnvironmentGpu env, float cos_theta) {
+float fogPhase(EnvironmentGpu* env, float cos_theta) {
     return fogPhaseG(env.fog_scatter, cos_theta);
 }
 
@@ -181,7 +205,7 @@ float calcFogTransmittance(float distance) {
     return exp(-g_extinction * distance);
 }
 
-float3 sampleFogScatterDirection(EnvironmentGpu env, float3 incoming) {
+float3 sampleFogScatterDirection(EnvironmentGpu* env, float3 incoming) {
     // Henyey-Greenstein phase function sampling
     // g is the asymmetry parameter (-1 <= g <= 1)
     // g > 0 means forward scattering
@@ -213,7 +237,7 @@ static const float FOG_STEP_DEPTH = 0.05;
 
 // The densest the fog can be along a segment: the height fog at its lowest point (or the
 // uniform fog) when `base`, plus every volume it crosses.
-float fogMajorant(EnvironmentGpu env, float3 o, float3 d, float t_max, bool base) {
+float fogMajorant(EnvironmentGpu* env, float3 o, float3 d, float t_max, bool base) {
     var majorant = 0.0;
     if (base) {
         majorant = env.fog_falloff > 0.0 ? fogDensity(env, min(o.y, o.y + d.y * t_max)) : env.fog_density;
@@ -233,7 +257,7 @@ float fogMajorant(EnvironmentGpu env, float3 o, float3 d, float t_max, bool base
 // in-scatter to `acc` and leaves the transmittance in `mask`; `base` takes the environment's
 // own fog in too (not on a ray to the sky, which the old scatter never fogged either). The
 // payload comes back as it went in.
-void fogMarch(EnvironmentGpu env, uint ray_env, uint ray_mask, float tmax, float3 o, float3 d,
+void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, float3 o, float3 d,
               float seg, bool base, inout float3 mask, inout float3 acc, inout HitPayload payload) {
     let depth = fogMajorant(env, o, d, seg, base) * seg;
     if (depth <= 1.0e-6) {
@@ -279,7 +303,7 @@ void fogMarch(EnvironmentGpu env, uint ray_env, uint ray_mask, float tmax, float
 
 // The suns' light at fog point `x`, as the fog scatters it along `d`. The HDR sky's sun is
 // two discs (core, halo) on one direction: one shadow ray serves every disc that shares it.
-float3 fogSunLight(EnvironmentGpu env, uint ray_mask, float tmax, float3 x, float3 d,
+float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, float3 d,
                    inout HitPayload payload) {
     var Ls = float3(0.0);
     var visible = false;
@@ -296,6 +320,8 @@ float3 fogSunLight(EnvironmentGpu env, uint ray_mask, float tmax, float3 x, floa
             continue;
         }
         var radiance = sun.radiance.rgb;
+        // Not behind ATMOSPHERE_ON like the other atmosphere sites: folding this one away hung
+        // the GPU (Xid 109, driver 595, 2026-10-11).
         if (env.mode == 3u && si == 0u) {
             radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
         }
@@ -475,22 +501,10 @@ uint lightsPickEntry(float x, out float p_pick) {
     return lo;
 }
 
-// The light instance owning entry e (greatest entry_base <= e); 0 for analytic entries
-// (which have no instance -- lightSampleEval never reads it for them).
+// The light instance owning entry e; 0 for analytic entries (which have no instance --
+// lightSampleEval never reads it for them).
 uint lightsFindInstance(uint e) {
-    if (e < pc.lights.analytic_count || pc.lights.linst_count == 0u) {
-        return 0u;
-    }
-    uint lo = 0u, hi = pc.lights.linst_count - 1u;
-    while (lo < hi) {
-        let mid = (lo + hi + 1u) / 2u;
-        if (pc.lights.linsts[mid].entry_base <= e) {
-            lo = mid;
-        } else {
-            hi = mid - 1u;
-        }
-    }
-    return lo;
+    return pc.lights.entry_to_linst[e];
 }
 
 // A surface's response to light from `dir`, cosine included: the whole layered BSDF in front
@@ -727,12 +741,12 @@ float3 envBRDFApprox2(float3 f0, float alpha, float NoV) {
 // ---- HDR sky importance sampling (src/sky_importance.rs) ----------------------------------
 
 // Whether the environment's HDR sky has a sampling table (no table: BRDF sampling only).
-bool skySampled(EnvironmentGpu env) {
+bool skySampled(EnvironmentGpu* env) {
     return env.importance != nullptr;
 }
 
 // Solid-angle pdf of the sky sampler picking direction `d`.
-float skyPdf(EnvironmentGpu env, float3 d) {
+float skyPdf(EnvironmentGpu* env, float3 d) {
     let uv = env_dir_to_uv(d);
     let w = SKY_IMPORTANCE_W;
     let h = SKY_IMPORTANCE_H;
@@ -743,7 +757,7 @@ float skyPdf(EnvironmentGpu env, float3 d) {
 
 // Draws a direction from the sky's luminance CDF (binary search, jittered inside the texel);
 // returns its radiance, with the direction and its solid-angle pdf.
-float3 skySample(EnvironmentGpu env, float u1, float u2, float u3, out float3 dir, out float pdf) {
+float3 skySample(EnvironmentGpu* env, float u1, float u2, float u3, out float3 dir, out float pdf) {
     let w = SKY_IMPORTANCE_W;
     let n = w * SKY_IMPORTANCE_H;
     uint lo = 0u;
@@ -762,7 +776,7 @@ float3 skySample(EnvironmentGpu env, float u1, float u2, float u3, out float3 di
     pdf = env.importance[n + 1u + i];
     // Explicit LOD 0: a ray-tracing stage has no derivatives (glslang emits the same).
     let texel = textures[NonUniformResourceIndex(env.tex)].SampleLevel(uv, 0.0).rgb;
-    return env.color.rgb * skyResidual(env, dir, texel) * env.sky_brightness;
+    return env.color.rgb * skyResidual(*env, dir, texel) * env.sky_brightness;
 }
 
 // ---- ray portals (src/portal.rs) -------------------------------------------------------
@@ -831,51 +845,49 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
 
 // ---- Fog light grid (src/fog_grid.rs) ------------------------------------------------------
 
-// Must match src/fog_grid.rs.
-static const uint FOG_GRID_TILE = 8u;
-static const uint FOG_GRID_SLICES = 64u;
 // Most steps the camera ray takes through the grid (lookups, so many more than `fog_steps`).
 static const uint FOG_GRID_STEPS = 24u;
 
-uint2 fogGridSize(uint2 launch) {
-    return max(launch / FOG_GRID_TILE, uint2(1u));
+// The grid's cells across, down and deep (src/fog_grid.rs).
+uint3 fogGridSize() {
+    return uint3(pc.uniforms.fog_grid_size_x, pc.uniforms.fog_grid_size_y, pc.uniforms.fog_grid_size_z);
 }
 
-// A world point's cell coordinate in LAST frame's grid (cell centres at +0.5): screen uv
-// up, slices quadratic in view depth out to `dist`.
-float3 fogGridCoord(float3 x, uint2 size, float dist) {
-    let clip = mat4MulVec(pc.uniforms.prev_view_proj, float4(x, 1.0));
+// A world point's cell coordinate in the grid seen through `view_proj` (cell centres at +0.5):
+// screen uv up, slices quadratic in view depth out to `dist`.
+float3 fogGridCoord(float view_proj[16], float3 x, uint3 size, float dist) {
+    let clip = mat4MulVec(view_proj, float4(x, 1.0));
     let w = max(clip.w, 1.0e-4);
     let uv = clip.xy / w * 0.5 + 0.5;
-    return float3(uv * float2(size), sqrt(saturate(w / dist)) * float(FOG_GRID_SLICES));
+    return float3(uv * float2(size.xy), sqrt(saturate(w / dist)) * float(size.z));
 }
 
-// Last frame's grid at a cell coordinate, trilinear; clamped to the grid's edges.
-float4 fogGridSample(uint2 size, float3 g) {
+// A grid at a cell coordinate, trilinear; clamped to the grid's edges.
+float4 fogGridSample(float4* grid, uint3 size, float3 g) {
     let p = g - 0.5;
     let b = int3(floor(p));
     let f = p - float3(b);
-    let hi = int3(int(size.x) - 1, int(size.y) - 1, int(FOG_GRID_SLICES) - 1);
+    let hi = int3(size) - 1;
     var r = float4(0.0);
     for (uint k = 0u; k < 8u; k++) {
         let o = int3(int(k & 1u), int((k >> 1u) & 1u), int(k >> 2u));
         let q = clamp(b + o, int3(0), hi);
         let w = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) * (o.z == 1 ? f.z : 1.0 - f.z);
-        r += w * pc.uniforms.fog_grid_prev[(uint(q.z) * size.y + uint(q.y)) * size.x + uint(q.x)];
+        r += w * grid[(uint(q.z) * size.y + uint(q.y)) * size.x + uint(q.x)];
     }
     return r;
 }
 
-// A cell's world point: (uv, slice) in [0, 1), unjittered at the centre.
+// A cell's world point: (uv, slice) in [0, 1) of the grid's own view, unjittered at the centre.
 float3 fogGridPoint(float2 uv, float s, float dist) {
-    let target = mat4MulVec(pc.uniforms.inverse_projection, float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
+    let target = mat4MulVec(pc.uniforms.fog_grid_inverse_projection, float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
     let view = target / max(-target.z, 1.0e-6);
-    return mat4MulVec(pc.uniforms.inverse_view, float4(view * (dist * s * s), 1.0)).xyz;
+    return mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(view * (dist * s * s), 1.0)).xyz;
 }
 
 // One light-table sample at fog point `x`, as the fog scatters it along `d`: RIS over
 // `light_candidates` from the power CDF, one shadow ray for the survivor, clamped.
-float3 fogTableLight(EnvironmentGpu env, uint ray_mask, float3 x, float3 d, float radiance_clamp,
+float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, float radiance_clamp,
                      inout HitPayload payload) {
     if (pc.uniforms.light_entries == 0u) {
         return float3(0.0);
@@ -926,29 +938,30 @@ float3 fogTableLight(EnvironmentGpu env, uint ray_mask, float3 x, float3 d, floa
     return L;
 }
 
-// This pixel's grid cell, if it has one: a random point in it lit by the suns, one
-// phase-sampled sky ray and the light table, blended into last frame's value at the cell's
-// reprojected centre.
-void fogGridUpdate(uint2 launch_id, uint2 launch_size, float tmax, float radiance_clamp,
-                   inout HitPayload payload) {
-    if (pc.uniforms.fog_grid_cells == 0u) {
+// One thread per grid cell (src/fog_grid.rs), ahead of the views that march it: a random point
+// in the cell lit by the suns, one phase-sampled sky ray and the light table, blended into
+// last frame's value at the cell's reprojected centre.
+[shader("raygeneration")]
+void fog_grid() {
+    let size = fogGridSize();
+    let id = DispatchRaysIndex();
+    let i = (id.z * size.y + id.y) * size.x + id.x;
+    if (pc.uniforms.fog_grid_cells == 0u || i >= pc.uniforms.fog_grid_cells) {
         return;
     }
-    let size = fogGridSize(launch_size);
-    let cells = size.x * size.y * FOG_GRID_SLICES;
-    let i = launch_id.y * launch_size.x + launch_id.x;
-    if (i >= cells || cells > pc.uniforms.fog_grid_cells) {
-        return;
-    }
+    HitPayload payload;
+    initRandom(uint2(pc.uniforms.fog_grid_cells, 1u), uint2(i, 0u), pc.uniforms.frame);
+    let tmax = 1.0e6;
+    let radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
     let ray_env = pc.uniforms.environment;
     let ray_mask = pc.uniforms.camera_mask;
-    let env = pc.uniforms.environments[ray_env];
+    let env = pc.uniforms.environments + ray_env;
     let dist = env.fog_grid_distance;
-    let cell = float3(float(i % size.x), float((i / size.x) % size.y), float(i / (size.x * size.y)));
-    let grid = float3(float2(size), float(FOG_GRID_SLICES));
+    let cell = float3(id);
+    let grid = float3(size);
     let r = float3(randf(), randf(), randf());
     let x = fogGridPoint((cell.xy + r.xy) / grid.xy, (cell.z + r.z) / grid.z, dist);
-    let cam = mat4MulVec(pc.uniforms.inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    let cam = mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
     let centre = fogGridPoint((cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
     let d = normalize(centre - cam);
 
@@ -970,8 +983,8 @@ void fogGridUpdate(uint2 launch_id, uint2 launch_size, float tmax, float radianc
     // dropped, which left those cells one raw sample every frame.
     var prev = float4(0.0);
     if (pc.uniforms.fog_grid_fresh == 0u) {
-        let g = fogGridCoord(centre, size, dist);
-        prev = fogGridSample(size, g);
+        let g = fogGridCoord(pc.uniforms.fog_grid_prev_view_proj, centre, size, dist);
+        prev = fogGridSample(pc.uniforms.fog_grid_prev, size, g);
         if (any(g < float3(0.0)) || any(g > grid)) {
             prev.w = min(prev.w, env.fog_grid_history * 0.25);
         }
@@ -991,13 +1004,13 @@ void fogGridUpdate(uint2 launch_id, uint2 launch_size, float tmax, float radianc
 
 // The camera ray through the fog like fogMarch, lit from last frame's grid instead of
 // shadow rays: the in-scatter goes into `acc`, the transmittance into `mask`.
-void fogMarchGrid(EnvironmentGpu env, float3 o, float3 d, float seg, bool base,
+void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
                   inout float3 mask, inout float3 acc) {
     let depth = fogMajorant(env, o, d, seg, base) * seg;
     if (depth <= 1.0e-6) {
         return;
     }
-    let size = fogGridSize(DispatchRaysDimensions().xy);
+    let size = fogGridSize();
     let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, FOG_GRID_STEPS);
     let jitter = randf();
     var T = 1.0;
@@ -1015,7 +1028,8 @@ void fogMarchGrid(EnvironmentGpu env, float3 o, float3 d, float seg, bool base,
             continue;
         }
         let step_t = exp(-sigma * dt);
-        let Ls = fogGridSample(size, fogGridCoord(x, size, env.fog_grid_distance)).rgb;
+        let Ls = fogGridSample(pc.uniforms.fog_grid_cur, size,
+                               fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, env.fog_grid_distance)).rgb;
         L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
         T *= step_t;
     }
@@ -1080,8 +1094,6 @@ void main() {
     var meter_albedo = 1.0;
     var meter_skip = false;
 
-    fogGridUpdate(launch_id, launch_size, tmax, radiance_clamp, payload);
-
     for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
         let offsetR = sqrt(randf());
         let offsetA = randf() * 2.0 * PI;
@@ -1144,7 +1156,7 @@ void main() {
             payload.cone = float2(cone_width, cone_spread);
             let trace_mask = camera_segment ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
             let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
-            trace(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
+            traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             if (sample_idx == 0u && bounce_idx == 0u) {
                 primary_t = payload.t;
             }
@@ -1280,12 +1292,12 @@ void main() {
                             if (dot(mirror, surface_normal) <= 0.0) {
                                 mirror = reflect(direction, surface_normal);
                             }
-                            let vertex = payload;
-                            payload.miss_flags = ray_env << 1;
-                            payload.cone = float2(cone_width, cone_spread);
-                            trace(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, payload);
-                            spec_hit = payload.t == 0.0 ? SPEC_HIT_FAR : min(payload.t, SPEC_HIT_FAR);
-                            payload = vertex;
+                            // Its own payload: the vertex's stays put instead of riding the trace.
+                            HitPayload probe = {};
+                            probe.miss_flags = ray_env << 1;
+                            probe.cone = float2(cone_width, cone_spread);
+                            traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, probe);
+                            spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t, SPEC_HIT_FAR);
                         }
                         guide_spec_hit[px] = float4(spec_hit, 0.0, 0.0, 0.0);
                     }
@@ -1304,7 +1316,7 @@ void main() {
             // this case, having an extra check for this is slower than
             // deferring to the generic emitter check)
             float fogDistance;
-            let env = pc.uniforms.environments[ray_env];
+            let env = pc.uniforms.environments + ray_env;
             let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
             if (camera_segment && env.fog_steps > 0u && fog_any) {
                 // The camera ray marches its fog (the shafts, without the noise of one random
@@ -1333,7 +1345,7 @@ void main() {
                         let r2 = randf();
                         let l = sampleCone(sun.direction.xyz, sun.direction.w, r1, r2);
                         var sun_radiance = sun.radiance.rgb;
-                        if (env.mode == 3u && si == 0u) {
+                        if (ATMOSPHERE_ON && env.mode == 3u && si == 0u) {
                             sun_radiance *= atmoSunTransmittanceAt(origin);
                         }
                         payload.t = -1.0;
@@ -1506,7 +1518,7 @@ void main() {
             // 2 on, a converged voxel ends the path with its cached outgoing radiance; every
             // participating vertex is also recorded as an update target, so the cache keeps
             // learning from the paths that do get traced (including ones that end in a query).
-            if (pc.uniforms.sharc != 0u && bounce_idx > 0
+            if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
                 && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
                 let slot = sharcSlot(origin, world_normal, initial_origin);
                 if (slot != 0xFFFFFFFFu) {
@@ -1533,7 +1545,7 @@ void main() {
             // Positions and areas are read live, so stale CDF weights change variance, never
             // the answer.
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
-                if (bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
+                if (RESTIR_ON && bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
                     var r_y = 0u;
                     var r_uv = 0u;
                     var r_wsum = 0.0;
@@ -1741,7 +1753,7 @@ void main() {
                     // Under an atmosphere the first sun's radiance is top-of-atmosphere: attenuate by
                     // the air above the hit, and (primary hits only) by the cloud shell.
                     var sun_radiance = sun.radiance.rgb;
-                    if (env.mode == 3u && si == 0u) {
+                    if (ATMOSPHERE_ON && env.mode == 3u && si == 0u) {
                         sun_radiance *= atmoSunTransmittanceAt(origin);
                         if (bounce_idx == 0u) {
                             sun_radiance *= cloudShadow(origin);
@@ -1859,7 +1871,7 @@ void main() {
     var mean = acc / float(SAMPLES);
     // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
     // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
-    if (pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
+    if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
         mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

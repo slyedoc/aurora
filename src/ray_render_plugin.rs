@@ -102,11 +102,20 @@ pub struct UniformData {
     /// Seconds since startup, for the fog volumes' drifting noise.
     time: f32,
     /// Fog light grid (src/fog_grid.rs): last frame's and this frame's cells (0 = off), the
-    /// cell count, and 1 when last frame's is not this view's history.
+    /// cell count, and 1 when last frame's is not this grid's history.
     fog_grid_prev: u64,
     fog_grid_cur: u64,
     fog_grid_cells: u32,
     fog_grid_fresh: u32,
+    /// The grid's own view (a headset's eyes share one): where its cells are, this frame's
+    /// view-projection (the camera ray looks the grid up) and last frame's (the update's
+    /// history), and its cells across, down and deep.
+    fog_grid_inverse_view: [f32; 16],
+    fog_grid_inverse_projection: [f32; 16],
+    fog_grid_view_proj: [f32; 16],
+    fog_grid_prev_view_proj: [f32; 16],
+    fog_grid_size: [u32; 3],
+    pad_grid: u32,
 }
 
 #[repr(C)]
@@ -415,6 +424,7 @@ fn render_frame(
         ResMut<crate::picking::Picker>,
         Res<crate::fog_volume::FogVolumeTable>,
         ResMut<crate::fog_grid::FogGridState>,
+        ResMut<crate::compute::FrameCommands>,
     ),
     camera: Query<
         (
@@ -443,6 +453,7 @@ fn render_frame(
         Local<bool>,
         // Rides along here because a system's parameter list stops at 16.
         Res<crate::camera_target::CameraTargets>,
+        ResMut<crate::gpu_profiler::GpuProfiler>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -472,8 +483,9 @@ fn render_frame(
         mut picker,
         fog_volumes,
         mut fog_grid,
+        mut frame_commands,
     ) = gpu;
-    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets) = dlss_stuff;
+    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut prof) = dlss_stuff;
 
     let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds) = dev_ui_stuff;
     let settings = settings
@@ -762,19 +774,47 @@ fn render_frame(
     render_device
         .map_buffer(&mut frame.environments)
         .copy_from_slice(&envs);
-    // Update each view's uniform buffer
+    // One fog grid per camera, in its first view's slot: a headset's two eyes share theirs.
+    let mut grids: Vec<(usize, Entity, crate::fog_grid::FogGridFrame)> = Vec::new();
     for view in &views {
+        if grids.iter().any(|(_, camera, _)| *camera == view.camera) {
+            continue;
+        }
         let environment = skies.view_environment(view.camera_mask as u8);
         let fog = skies.environments[environment as usize].fog;
+        let eyes: Vec<(Mat4, Mat4)> = views
+            .iter()
+            .filter(|v| v.camera == view.camera)
+            .map(|v| (v.inverse_view, v.projection))
+            .collect();
         let grid = fog_grid.ensure(
             &render_device,
             view.trace_extent,
+            fog.grid_tile,
+            fog.grid_slices,
+            crate::fog_grid::grid_view(&eyes),
             *frame_counter,
             view.slot,
             fog.grid_distance > 0.0
                 && fog.steps > 0
                 && (fog.density > 0.0 || fog_volumes.count() > 0),
         );
+        grids.push((view.slot, view.camera, grid));
+    }
+    for slot in 0..crate::MAX_VIEWS {
+        if !grids.iter().any(|(owner, _, _)| *owner == slot) {
+            fog_grid.release(&render_device, slot);
+        }
+    }
+
+    // Update each view's uniform buffer
+    for view in &views {
+        let environment = skies.view_environment(view.camera_mask as u8);
+        let grid = grids
+            .iter()
+            .find(|(_, camera, _)| *camera == view.camera)
+            .map(|(_, _, grid)| *grid)
+            .unwrap_or_default();
         let data = UniformData {
             inverse_view: view.inverse_view,
             inverse_projection: view.projection.inverse(),
@@ -834,6 +874,12 @@ fn render_frame(
             fog_grid_cur: grid.cur,
             fog_grid_cells: grid.cells,
             fog_grid_fresh: grid.fresh as u32,
+            fog_grid_inverse_view: grid.inverse_view.to_cols_array(),
+            fog_grid_inverse_projection: grid.projection.inverse().to_cols_array(),
+            fog_grid_view_proj: grid.view_proj.to_cols_array(),
+            fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
+            fog_grid_size: grid.size.to_array(),
+            pad_grid: 0,
         };
 
         let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
@@ -851,6 +897,7 @@ fn render_frame(
 
     unsafe {
         sync.wait();
+        prof.begin_frame(&render_device, time.elapsed_secs_f64());
         // The window's image for this frame, with its size and format, when there is one.
         let presenting = match (swapchain.as_deref_mut(), window.as_deref()) {
             (Some(swapchain), Some(window)) => {
@@ -887,13 +934,16 @@ fn render_frame(
 
         // Offscreen UI surfaces (world panels) render first, so this frame's trace samples
         // this frame's UI.
+        let frame_scope = prof.begin(&render_device, cmd_buffer, "frame");
         let section = info_span!("record_ui_surfaces").entered();
+        let scope = prof.begin(&render_device, cmd_buffer, "ui surfaces");
         crate::ui_render::draw_ui_surfaces(
             &render_device,
             cmd_buffer,
             sync.frame_count % 2,
             &mut ui,
         );
+        prof.end(&render_device, cmd_buffer, scope);
 
         // The in-flight fence was waited above, so the previous trace is done:
         // propagate this frame's transform deltas on the GPU, refresh the instance table from
@@ -912,11 +962,21 @@ fn render_frame(
         } else {
             cmd_buffer
         };
+        // Queued per-frame dispatches (landscape scatter writes instance rows): ahead of the
+        // TLAS build, in whichever buffer carries it.
+        let section = info_span!("record_frame_commands").entered();
+        let scope = prof.begin(&render_device, scene_cmd, "frame commands");
+        frame_commands.record(&render_device, &modules, scene_cmd);
+        prof.end(&render_device, scene_cmd, scope);
+        drop(section);
         crate::gpu_transform::world_barrier(&render_device, scene_cmd);
         let section = info_span!("record_skins").entered();
+        let scope = prof.begin(&render_device, scene_cmd, "skins");
         let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
+        prof.end(&render_device, scene_cmd, scope);
         drop(section);
         let section = info_span!("record_tlas").entered();
+        let scope = prof.begin(&render_device, scene_cmd, "tlas");
         tlas.record(
             &render_device,
             scene_cmd,
@@ -924,6 +984,7 @@ fn render_frame(
             &transforms,
             world_changed || skinned,
         );
+        prof.end(&render_device, scene_cmd, scope);
         if pick {
             let _submit = info_span!("submit_pick").entered();
             picker.submit(&render_device, scene_cmd, &modules, &tlas);
@@ -932,10 +993,13 @@ fn render_frame(
         // the instance rows the gather above wrote).
         drop(section);
         let section = info_span!("record_lights").entered();
+        let scope = prof.begin(&render_device, cmd_buffer, "lights");
         lights.record(&render_device, cmd_buffer, &modules, &tlas);
+        prof.end(&render_device, cmd_buffer, scope);
         // The radiance cache's per-frame resolve (and its first-use allocation).
         drop(section);
         let section = info_span!("record_sharc").entered();
+        let scope = prof.begin(&render_device, cmd_buffer, "sharc");
         sharc.record(
             &render_device,
             cmd_buffer,
@@ -943,10 +1007,12 @@ fn render_frame(
             *frame_counter,
             settings.sharc,
         );
+        prof.end(&render_device, cmd_buffer, scope);
         // Exposure: each camera meters its own last frame into this frame's exposure (the
         // raygen reads it). A headset's two eyes are one camera and share one meter.
         drop(section);
         let section = info_span!("record_exposure_atmo").entered();
+        let scope = prof.begin(&render_device, cmd_buffer, "exposure+atmosphere");
         let mut metered: Vec<(Entity, (u64, u64))> = Vec::new();
         for view in &mut views {
             if let Some((_, addresses)) = metered.iter().find(|(c, _)| *c == view.camera) {
@@ -978,6 +1044,7 @@ fn render_frame(
             camera.map_or(Vec3::ZERO, |c| c.2.translation()),
             time.delta_secs(),
         );
+        prof.end(&render_device, cmd_buffer, scope);
 
         drop(section);
         let section = info_span!("record_trace_dlss").entered();
@@ -1093,8 +1160,37 @@ fn render_frame(
                         bytemuck::cast_slice(&[push_constants]),
                     );
 
+                    // The camera's fog grid, by the first of its views: lit before any of them
+                    // marches it (a headset's second eye reuses it).
+                    if let Some((_, _, grid)) = grids
+                        .iter()
+                        .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)
+                    {
+                        let scope = prof.begin(&render_device, cmd_buffer, "fog grid");
+                        render_device.ext_rtx_pipeline.cmd_trace_rays(
+                            cmd_buffer,
+                            &sbt.fog_grid_region,
+                            &sbt.miss_region,
+                            &sbt.hit_region,
+                            &vk::StridedDeviceAddressRegionKHR::default(),
+                            grid.size.x,
+                            grid.size.y,
+                            grid.size.z,
+                        );
+                        prof.end(&render_device, cmd_buffer, scope);
+                        crate::compute::memory_barrier(
+                            &render_device,
+                            cmd_buffer,
+                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                            vk::AccessFlags2::SHADER_WRITE,
+                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                            vk::AccessFlags2::SHADER_READ,
+                        );
+                    }
+
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
                         renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
+                        let scope = prof.begin(&render_device, cmd_buffer, "trace");
                         render_device.ext_rtx_pipeline.cmd_trace_rays(
                             cmd_buffer,
                             &sbt.raygen_region,
@@ -1105,6 +1201,8 @@ fn render_frame(
                             plan.render.height,
                             1,
                         );
+                        prof.end(&render_device, cmd_buffer, scope);
+                        let scope = prof.begin(&render_device, cmd_buffer, "dlss");
                         renderer.record_evaluate(
                             &render_device,
                             cmd_buffer,
@@ -1115,6 +1213,7 @@ fn render_frame(
                             dlss_reset,
                             time.delta_secs() * 1000.0,
                         );
+                        prof.end(&render_device, cmd_buffer, scope);
                         dlss_ran = true;
                         // The raygen just filled the luminance buffer at this size.
                         ae.mark_traced(view.camera);
@@ -1125,6 +1224,7 @@ fn render_frame(
 
         drop(section);
         let section = info_span!("record_present_pass").entered();
+        let present_scope = prof.begin(&render_device, cmd_buffer, "present pass");
         let parity = sync.frame_count % 2;
         let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
         let debug_view = camera
@@ -1537,6 +1637,8 @@ fn render_frame(
             None
         };
 
+        prof.end(&render_device, cmd_buffer, present_scope);
+        prof.end(&render_device, cmd_buffer, frame_scope);
         render_device.end_command_buffer(cmd_buffer).unwrap();
         drop(section);
         drop(record);
@@ -1816,5 +1918,7 @@ mod tests {
         assert_eq!(offset_of!(U, time), 452);
         assert_eq!(offset_of!(U, fog_grid_prev), 456);
         assert_eq!(offset_of!(U, fog_grid_cells), 472);
+        assert_eq!(offset_of!(U, fog_grid_inverse_view), 480);
+        assert_eq!(offset_of!(U, fog_grid_size), 736);
     }
 }

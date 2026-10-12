@@ -77,10 +77,17 @@ pub struct Fog {
     #[reflect(@0..=32_u32)]
     pub steps: u32,
     /// The camera ray's fog is lit from a cached grid out to this far (metres; beyond it, the
-    /// farthest slice's light): shafts at an eighth of the resolution, for lookups instead of
-    /// a shadow ray per step, and the light table's lamps light the fog too. 0 = off.
+    /// farthest slice's light): shafts at the grid's resolution, for lookups instead of a
+    /// shadow ray per step, and the light table's lamps light the fog too. 0 = off.
     #[reflect(@0.0..=2000.0_f32)]
     pub grid_distance: f32,
+    /// Trace pixels per grid cell across: coarser is cheaper (fewer cells to light each frame)
+    /// and softer shafts.
+    #[reflect(@2..=64_u32)]
+    pub grid_tile: u32,
+    /// Grid depth slices out to `grid_distance` (quadratic, dense near the camera).
+    #[reflect(@4..=128_u32)]
+    pub grid_slices: u32,
     /// Frames the grid averages: more is smoother, fewer follows moving shadows sooner.
     #[reflect(@1.0..=128.0_f32)]
     pub grid_history: f32,
@@ -94,7 +101,9 @@ impl Default for Fog {
             height: 0.0,
             falloff: 0.0,
             steps: 6,
-            grid_distance: 150.0,
+            grid_distance: 80.0,
+            grid_tile: 16,
+            grid_slices: 32,
             grid_history: 32.0,
         }
     }
@@ -366,10 +375,12 @@ pub struct EnvironmentGpu {
     pub sun_clip: f32,
     /// [`Fog::steps`].
     pub fog_steps: u32,
-    /// [`Fog::grid_distance`] (0 = off), [`Fog::grid_history`].
+    /// [`Fog::grid_distance`] (0 = off), [`Fog::grid_history`], [`Fog::grid_tile`],
+    /// [`Fog::grid_slices`].
     pub fog_grid_distance: f32,
     pub fog_grid_history: f32,
-    pub pad_grid: [u32; 2],
+    pub fog_grid_tile: u32,
+    pub fog_grid_slices: u32,
     /// Flat: the radiance. HDR: the scale. Atmosphere: the space image's scale (0 = none).
     pub color: [f32; 4],
     pub zenith: [f32; 4],
@@ -434,7 +445,8 @@ impl EnvironmentGpu {
             fog_steps: fog.steps,
             fog_grid_distance: fog.grid_distance.max(0.0),
             fog_grid_history: fog.grid_history.max(1.0),
-            pad_grid: [0; 2],
+            fog_grid_tile: fog.grid_tile.max(1),
+            fog_grid_slices: fog.grid_slices.max(1),
             color: color.to_array(),
             zenith: environment
                 .gradient

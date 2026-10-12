@@ -106,6 +106,8 @@ pub struct RenderDeviceData {
     /// Every pipeline compiles through this; seeded from and saved to disk
     /// ([`RenderDevice::save_pipeline_cache`]) so a relaunch skips the driver's compile.
     pub pipeline_cache: vk::PipelineCache,
+    /// Command-buffer labels (gpu_profiler.rs).
+    pub ext_debug_utils: ash::ext::debug_utils::Device,
     pub destroyer: ManuallyDrop<VkDestroyer>,
     pub allocator_state: Arc<Mutex<ManuallyDrop<AllocatorState>>>,
     /// The validation messenger (debug / `dev` builds): destroyed right before the instance.
@@ -174,6 +176,7 @@ impl RenderDevice {
                 create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
             let linear_sampler = create_linear_sampler(device.clone());
             let pipeline_cache = create_pipeline_cache(&device);
+            let ext_debug_utils = ash::ext::debug_utils::Device::new(&instance, &device);
 
             let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
                 allocator: Arc::new(Mutex::new(
@@ -216,6 +219,7 @@ impl RenderDevice {
                 descriptor_pool,
                 linear_sampler,
                 pipeline_cache,
+                ext_debug_utils,
                 destroyer,
                 debug_messenger,
                 allocator_state,
@@ -527,11 +531,10 @@ unsafe fn create_instance(
         if sync_validation {
             instance_extensions.push(ash::ext::validation_features::NAME.as_ptr());
         }
-        if validate {
-            // For the messenger below: without it the layer prints to stdout only, and the
-            // sync-val tail is lost in scrollback exactly when a device loss needs it.
-            instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
+        // Always: command-buffer labels name the passes in Nsight (gpu_profiler.rs), and the
+        // messenger below needs it (without it the layer prints to stdout only, and the
+        // sync-val tail is lost in scrollback exactly when a device loss needs it).
+        instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
         let enabled = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
         let mut validation_features =
             vk::ValidationFeaturesEXT::default().enabled_validation_features(&enabled);
@@ -744,6 +747,8 @@ unsafe fn create_logical_device(
             // vertices out of the BLAS.
             ray_query::NAME.as_ptr(),
             ray_tracing_position_fetch::NAME.as_ptr(),
+            // Shader Execution Reordering: the raygen regroups its hits before shading.
+            vk::NV_RAY_TRACING_INVOCATION_REORDER_NAME.as_ptr(),
             deferred_host_operations::NAME.as_ptr(),
             spirv_1_4::NAME.as_ptr(),
             descriptor_indexing::NAME.as_ptr(),
@@ -843,6 +848,14 @@ unsafe fn create_logical_device(
             vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
                 .ray_tracing_position_fetch(true);
 
+        let mut features_reorder =
+            vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
+                .ray_tracing_invocation_reorder(true);
+
+        // gpu_profiler.rs resets its timestamps from the host after reading them.
+        let mut features_host_query_reset =
+            vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
+
         let mut features_scalar_block =
             vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
 
@@ -886,6 +899,8 @@ unsafe fn create_logical_device(
             .push_next(&mut features_raytracing_pipeline)
             .push_next(&mut features_ray_query)
             .push_next(&mut features_position_fetch)
+            .push_next(&mut features_reorder)
+            .push_next(&mut features_host_query_reset)
             .push_next(&mut features_scalar_block)
             .push_next(&mut features_float16);
         let device_info = if micromaps {

@@ -32,6 +32,7 @@ pub mod fog_grid;
 pub mod fog_volume;
 pub mod frame_sync;
 pub mod gizmo_render;
+pub mod gpu_profiler;
 pub mod gpu_transform;
 pub mod lights;
 pub mod material;
@@ -172,6 +173,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::environment::RenderEnvironmentPlugin);
         group = group.add(crate::tlas_builder::TLASBuilderPlugin);
         group = group.add(crate::picking::PickingPlugin);
+        group = group.add(crate::gpu_profiler::GpuProfilerPlugin);
         group = group.add(crate::pointer_picking::PointerPickingPlugin);
         group = group.add(crate::skinning::SkinningPlugin);
         group = group.add(crate::lights::LightsPlugin);

@@ -12,7 +12,7 @@
 use ash::vk;
 use bevy::prelude::*;
 use bevy_aurora::{
-    compute::{ComputeModules, compute_to_compute_barrier, record_dispatch},
+    compute::{ComputeModules, FrameCommands, memory_barrier, record_dispatch},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
 };
@@ -120,13 +120,14 @@ pub fn update_field(
     time: Res<Time>,
     settings: Res<InteractionSettings>,
     mut field: ResMut<InteractionField>,
+    mut frame: ResMut<FrameCommands>,
     viewers: Query<&GlobalTransform, With<LandscapeViewer>>,
     cameras: Query<(&GlobalTransform, &Camera), With<Camera3d>>,
     pushers: Query<(&GlobalTransform, &ScatterPusher)>,
 ) {
-    let Some(module) = modules.get(&kernels.interaction) else {
+    if modules.get(&kernels.interaction).is_none() {
         return;
-    };
+    }
     let Some(viewer) = viewer_position(&viewers, &cameras) else {
         return;
     };
@@ -161,14 +162,15 @@ pub fn update_field(
             rd.device
                 .cmd_fill_buffer(cmd, field.texels.handle, 0, vk::WHOLE_SIZE, 0);
         });
-        field.pushers =
-            rd.create_host_buffer(PUSHERS_MAX as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
+        field.pushers = rd.create_device_buffer(
+            PUSHERS_MAX as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
     }
     let mut rows = [[0.0f32; 4]; PUSHERS_MAX];
     for (row, (_, p)) in rows.iter_mut().zip(&near) {
         *row = *p;
     }
-    rd.map_buffer(&mut field.pushers).copy_from_slice(&rows);
     let centre = (viewer.xz() / FIELD_CELL).floor().as_ivec2();
     let push = FieldPush {
         field: field.texels.address,
@@ -178,9 +180,28 @@ pub fn update_field(
         centre_x: centre.x,
         centre_z: centre.y,
     };
-    rd.run_transfer_commands(|cmd| {
+    // Recorded into the frame's command buffer: a blocking submit here stalled the CPU on
+    // the GPU every frame.
+    let pushers = field.pushers.handle;
+    let kernel = kernels.interaction.clone();
+    frame.push(move |rd, modules, cmd| {
+        let Some(module) = modules.get(&kernel) else {
+            return;
+        };
+        unsafe {
+            rd.device
+                .cmd_update_buffer(cmd, pushers, 0, bytemuck::cast_slice(&rows));
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
         record_dispatch(
-            &rd,
+            rd,
             cmd,
             module,
             "field_update",
@@ -188,7 +209,6 @@ pub fn update_field(
             FIELD_N * FIELD_N,
             None,
         );
-        compute_to_compute_barrier(&rd, cmd);
     });
 }
 
