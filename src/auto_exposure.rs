@@ -173,15 +173,10 @@ pub struct AutoExposureSettings {
     /// dimmer than bright ones.
     #[reflect(@0.0..=1.0_f32)]
     pub adaptation: f32,
-    /// Ray Reconstruction's input exposure follows the full metering, but its history
-    /// cannot follow an exposure change: the input holds still within a quarter stop and
-    /// drifts at this many EV per second beyond it (slow enough to stay unseen)...
-    #[reflect(@0.0..=4.0_f32)]
+    /// How fast Ray Reconstruction's input exposure follows the look (1 / seconds of its
+    /// exponential ease; the look itself adapts at `speed_*`).
+    #[reflect(@0.1..=20.0_f32)]
     pub input_speed: f32,
-    /// ...and snaps to the metering, with one visible pop, once it is this many EV off
-    /// (the light changed wholesale).
-    #[reflect(@0.25..=6.0_f32)]
-    pub input_deadband: f32,
 }
 
 impl Default for AutoExposureSettings {
@@ -202,8 +197,7 @@ impl Default for AutoExposureSettings {
             compensation: -2.0,
             reference_ev: -13.0,
             adaptation: 0.8,
-            input_speed: 0.5,
-            input_deadband: 2.0,
+            input_speed: 4.0,
         }
     }
 }
@@ -219,6 +213,8 @@ struct AeGpu {
     /// Reconstruction's history sees a still input exposure.
     input_ev: f32,
     input_exposure: f32,
+    /// The full metering, written by `ae_resolve`; the CPU eases `input_ev` towards it.
+    metered: f32,
 }
 
 /// Must match `AeParams` in auto_exposure.slang.
@@ -241,8 +237,6 @@ struct AeParams {
     compensation: f32,
     min_ev: f32,
     max_ev: f32,
-    input_deadband: f32,
-    input_speed: f32,
     reference_ev: f32,
     adaptation: f32,
     /// Keeps the struct free of implicit tail padding (u64 alignment) for `Pod`.
@@ -266,6 +260,13 @@ struct ViewExposure {
     probe_nits: f32,
     /// `lum` holds a full traced frame at the current size (metering skips until then).
     primed: bool,
+    /// Host copy of last frame's state (its look `ev`), read after the frame fence.
+    readback: Buffer<AeGpu>,
+    /// Ray Reconstruction's input exposure (log2), decided here: the look, never the raw
+    /// metering. RR's history cannot follow an input-exposure change (a full-screen transient
+    /// per change; telling NGX the pre-exposure shifts its output but keeps the transient),
+    /// so it changes only as fast as the picture does: never under a fixed look.
+    input_ev: Option<f32>,
 }
 
 impl ViewExposure {
@@ -326,6 +327,77 @@ impl ViewExposure {
         }
     }
 
+    /// This frame's input exposure: a fixed look's own EV, or (Auto) eased towards last
+    /// frame's adapted look, read back after the fence.
+    fn update_input(&mut self, rd: &RenderDevice, exposure: &AuroraExposure, speed: f32, dt: f32) {
+        if let AuroraExposure::Fixed(fixed) = exposure {
+            self.input_ev = Some(fixed.ev);
+            return;
+        }
+        if self.readback.handle == vk::Buffer::null() || !self.primed {
+            return;
+        }
+        let look = rd.map_buffer(&mut self.readback)[0].ev;
+        if !look.is_finite() || look == 0.0 {
+            return;
+        }
+        let alpha = 1.0 - (-speed.max(0.0) * dt.clamp(0.0, 0.25)).exp();
+        self.input_ev = Some(match self.input_ev {
+            Some(ev) => ev + (look - ev) * alpha,
+            None => look,
+        });
+    }
+
+    /// Writes this frame's input exposure into the state (after `ae_resolve`) and copies the
+    /// state out for next frame's read.
+    fn write_input(&self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
+        let Some(ev) = self.input_ev else {
+            return;
+        };
+        let input = [ev, ev.exp2()];
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ,
+        );
+        unsafe {
+            rd.device.cmd_update_buffer(
+                cmd,
+                self.state.handle,
+                std::mem::offset_of!(AeGpu, input_ev) as u64,
+                bytemuck::cast_slice(&input),
+            );
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        unsafe {
+            rd.device.cmd_copy_buffer(
+                cmd,
+                self.state.handle,
+                self.readback.handle,
+                &[vk::BufferCopy::default().size(size_of::<AeGpu>() as u64)],
+            );
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
+    }
+
     /// Buffer addresses for the push constants: (per-pixel luminance, exposure state).
     fn addresses(&self) -> (u64, u64) {
         (self.lum.address, self.state.address)
@@ -338,6 +410,7 @@ impl ViewExposure {
             exposure: ev.exp2(),
             input_ev: ev,
             input_exposure: ev.exp2(),
+            metered: ev,
         };
         unsafe {
             rd.device
@@ -380,6 +453,7 @@ impl ViewExposure {
                 2 * (PROBE_SIDE * PROBE_SIDE) as u64,
                 vk::BufferUsageFlags::TRANSFER_DST,
             );
+            self.readback = rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_DST);
             unsafe {
                 rd.device
                     .cmd_fill_buffer(cmd, self.histogram.handle, 0, vk::WHOLE_SIZE, 0);
@@ -408,15 +482,16 @@ impl ViewExposure {
         };
         let (true, Some(module)) = (self.primed, module) else {
             // Not meterable yet: start adaptation from the reference exposure.
-            self.write_ev(
-                rd,
-                cmd,
-                settings
-                    .reference_ev
-                    .clamp(settings.min_ev, settings.max_ev),
-            );
+            let ev = settings
+                .reference_ev
+                .clamp(settings.min_ev, settings.max_ev);
+            self.write_ev(rd, cmd, ev);
+            self.input_ev = Some(ev);
+            self.update_input(rd, exposure, settings.input_speed, dt);
+            self.write_input(rd, cmd);
             return;
         };
+        self.update_input(rd, exposure, settings.input_speed, dt);
 
         let params = AeParams {
             lum: self.lum.address,
@@ -435,8 +510,6 @@ impl ViewExposure {
             compensation: settings.compensation,
             min_ev: settings.min_ev,
             max_ev: settings.max_ev.max(settings.min_ev),
-            input_deadband: settings.input_deadband.max(0.0),
-            input_speed: settings.input_speed.max(0.0),
             reference_ev: settings.reference_ev,
             adaptation: settings.adaptation.clamp(0.0, 1.0),
             _pad: 0,
@@ -473,11 +546,12 @@ impl ViewExposure {
             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
         );
         record_dispatch(rd, cmd, module, "ae_resolve", &params, 1, None);
+        self.write_input(rd, cmd);
         memory_barrier(
             rd,
             cmd,
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
             // The raygen applies the exposure; the blit reads it for a fixed look's ratio.
             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER,
@@ -491,6 +565,7 @@ impl ViewExposure {
             self.histogram.handle,
             self.state.handle,
             self.probe.handle,
+            self.readback.handle,
         ] {
             rd.destroyer.destroy_buffer(handle);
         }
