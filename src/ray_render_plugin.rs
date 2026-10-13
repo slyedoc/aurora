@@ -155,7 +155,7 @@ impl TlasRefs {
 
 /// One rendered view this frame: XR renders one per eye, a flat frame renders one per
 /// active camera in `Camera::order`. `slot` indexes the per-view resources (uniform buffer,
-/// DLSS feature, reservoirs, descriptor sets).
+/// DLSS feature, reservoirs, its descriptor-heap blocks).
 struct ViewFrame {
     slot: usize,
     /// Where this view's result goes.
@@ -1176,7 +1176,7 @@ fn render_frame(
             render_device.end_command_buffer(cmd_buffer).unwrap();
         };
 
-        // The view lane: each view's descriptor set, ReSTIR, fog grid, trace and DLSS.
+        // The view lane: each view's guide descriptors, ReSTIR, fog grid, trace and DLSS.
         // Returns the cameras whose trace filled their luminance buffer.
         let mut view_lane = |tlas: TlasRefs| -> Vec<Entity> {
             let _lane = info_span!("record_trace_dlss").entered();

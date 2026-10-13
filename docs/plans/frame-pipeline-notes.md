@@ -74,6 +74,21 @@ Plan: `frame-pipeline.html`. Notes kept while implementing; newest last.
   before evaluate (`DescriptorHeaps::leave`) fixes it. Driver 615.71.09 (610.43.02 earlier,
   same result).
 
+- Verified after phase 3: flat and XR (WiVRn, Abbey to Goldshire with controllers), screenshots,
+  video (`--record`: 240 frames in 4 s), GPU picks (footsteps), exposure.
+- Final flat bench, same driver (615.71.09) and 450 W cap for both, 3840x1080 vsync: aurora
+  aacbe99 busy 13.9 / trace 7.5 / dlss 2.7 / tlas 0.50 ms; with this work busy 12.8 / trace 6.2 /
+  dlss 2.7 / tlas 0.50 / idle 0.27 ms (idle was 0.75 ms). Most of the trace gain is the
+  `spec_hit_roughness` 0.3 change in the same commit; the pipeline's own win is the idle, the
+  heaps are neutral. Earlier `pipeline-1` (11.7 ms busy) was on 610.43 at 600 W with drifting
+  clocks: not comparable.
+- XR (Tracy, 92 s): 47 fps, GPU span 19.3 ms (trace 9.2, dlss 4.6, ReSTIR 2.7, present 1.0),
+  CPU record 0.5 ms, CPU waiting on the GPU 9.4 ms: GPU-bound. GPU idle 0.27 ms median but 10% of
+  frames idle > 2 ms (81% of all idle, up to ~8 ms): open, next to investigate.
+- Cleanup: `FrameSync` loses `FRAMES_IN_FLIGHT` and the `wait`/`wait_previous` pair; the
+  descriptor-set-only device features (update-after-bind, partially bound, variable count,
+  update-unused-while-pending) and the destroyer's descriptor-set-layout path are gone;
+  stale descriptor-set comments updated.
 ## Deviations
 
 - `run_transfer_commands*` keep their own transient fences (they block on them immediately;
@@ -94,3 +109,11 @@ Plan: `frame-pipeline.html`. Notes kept while implementing; newest last.
 - NGX evaluates stay in the view lane, after `DescriptorHeaps::leave` (a dummy descriptor set).
 - `create_buffer` only queries a device address for SHADER_DEVICE_ADDRESS buffers (the screenshot
   readback buffer tripped VUID-VkBufferDeviceAddressInfo-buffer-02601).
+- Parallel recording runs as three lanes inside `render_frame` on the compute task pool (D6 had
+  separate Bevy systems): the lanes share the frame's planned views and need a fixed submit order,
+  which one function holds without cross-system plumbing. A frame that grows the TLAS or instance
+  table runs the scene lane first (`TLAS::stable`).
+- Still deferred: dropping the queue mutex on the internally synchronized path, present fences for
+  resize (swapchain_maintenance1), present_wait2, timeline points for `run_transfer_commands`.
+- The queue is internally synchronized under XR too (aurora b5c101e's message says otherwise):
+  WiVRn's Monado fetches it with matching flags via slyedoc/WiVRn `aurora` patch 0012.

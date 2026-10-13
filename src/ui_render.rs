@@ -6,7 +6,7 @@
 //! `bevy_ui_render` does (background, border, outline, image, text glyphs), clips them against
 //! `CalculatedClip`, and draws them into the swapchain with a port of bevy's `ui.wesl` SDF
 //! shader. Textures (`ImageNode` images and glyph atlases) are plain `Image` assets, which
-//! [`crate::render_texture`] already uploads and registers in the bindless set.
+//! [`crate::render_texture`] already uploads and registers as bindless textures.
 //!
 //! Gradients (`BackgroundGradient` / `BorderGradient`) are a port of `gradient.wesl`: each color
 //! stop pair becomes a segment quad, interpolated in the gradient's color space by the same

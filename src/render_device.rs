@@ -944,15 +944,9 @@ unsafe fn create_logical_device(
         // radiance cache accumulates in fine fixed point (sharc.rs).
         let mut features_12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
-            .descriptor_indexing(true)
-            .descriptor_binding_partially_bound(true)
+            // The shaders' bindless `textures[]` (mapped onto the descriptor heap).
             .runtime_descriptor_array(true)
             .shader_sampled_image_array_non_uniform_indexing(true)
-            .descriptor_binding_sampled_image_update_after_bind(true)
-            .descriptor_binding_storage_image_update_after_bind(true)
-            .descriptor_binding_variable_descriptor_count(true)
-            // New bindless slots are written while the previous frame is still pending.
-            .descriptor_binding_update_unused_while_pending(true)
             .host_query_reset(true)
             .scalar_block_layout(true)
             .shader_float16(true)
@@ -1101,7 +1095,6 @@ pub enum VkDestroyCmd {
     Swapchain(vk::SwapchainKHR),
     Pipeline(vk::Pipeline),
     PipelineLayout(vk::PipelineLayout),
-    DescriptorSetLayout(vk::DescriptorSetLayout),
     AccelerationStructure(vk::AccelerationStructureKHR),
     Micromap(vk::MicromapEXT),
     Tick,
@@ -1158,14 +1151,6 @@ impl VkDestroyer {
             .as_ref()
             .unwrap()
             .send(VkDestroyCmd::PipelineLayout(layout))
-            .unwrap();
-    }
-
-    pub fn destroy_descriptor_set_layout(&self, layout: vk::DescriptorSetLayout) {
-        self.sender
-            .as_ref()
-            .unwrap()
-            .send(VkDestroyCmd::DescriptorSetLayout(layout))
             .unwrap();
     }
 
@@ -1252,9 +1237,6 @@ fn spawn_destroy_thread(
                             },
                             VkDestroyCmd::PipelineLayout(layout) => unsafe {
                                 device.destroy_pipeline_layout(layout, None);
-                            },
-                            VkDestroyCmd::DescriptorSetLayout(layout) => unsafe {
-                                device.destroy_descriptor_set_layout(layout, None);
                             },
                             VkDestroyCmd::AccelerationStructure(acceleration_structure) => unsafe {
                                 ext_acc_struct

@@ -1,6 +1,6 @@
 /// How many views one frame can render.
 ///
-/// A view owns per-view GPU state -- uniform buffer, descriptor set, ReSTIR reservoir pair,
+/// A view owns per-view GPU state -- uniform buffer, guide descriptors, ReSTIR reservoir pair,
 /// DLSS feature and its temporal history -- so views do NOT share denoiser history and each
 /// costs its own raygen dispatch. What they DO share is everything world-scale: the TLAS,
 /// the light table, GPU transforms and the SHARC cache are built once per frame regardless.
@@ -8,7 +8,7 @@
 ///
 /// Slots are allocated per frame in order. Four covers the cases that exist: an editor
 /// viewport plus two XR eyes, with one spare for a second viewport or a preview camera.
-/// Raising it costs one descriptor set per frame-in-flight per slot and nothing else --
+/// Raising it costs a few descriptor-heap slots per frame parity and nothing else --
 /// reservoirs and DLSS features are allocated lazily, so an unused slot holds no memory.
 pub const MAX_VIEWS: usize = 4;
 

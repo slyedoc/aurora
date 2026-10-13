@@ -1,6 +1,6 @@
-//! The frame's point on the GPU timeline and the frame counter. Every frame waits for the
-//! previous one before rewriting its resources (TLAS, instance buffers, the per-frame command
-//! buffer) and submits on the timeline again, whether or not there is a window to present to.
+//! The frame's point on the GPU timeline and the frame counter. A frame records first, then waits
+//! for the previous one (render_frame), and submits on the timeline whether or not there is a
+//! window to present to.
 
 use ash::vk;
 use bevy::prelude::*;
@@ -8,14 +8,12 @@ use bevy::prelude::*;
 use crate::render_device::RenderDevice;
 use crate::timeline::SubmitPoint;
 
-pub const FRAMES_IN_FLIGHT: usize = 1;
-
 #[derive(Resource)]
 pub struct FrameSync {
     device: RenderDevice,
     /// The last frame submit's point on the timeline (0 before the first).
     pub last_frame: SubmitPoint,
-    /// Frames submitted so far; its parity picks the per-frame command buffer and descriptor sets.
+    /// Frames submitted so far; its parity picks the per-frame command buffers and heap blocks.
     pub frame_count: usize,
 }
 
@@ -28,9 +26,9 @@ impl FrameSync {
         }
     }
 
-    /// Wait for the previous frame: before the CPU rewrites host-visible buffers the previous
-    /// frame may still be reading, and before anything it produced is read back.
-    pub unsafe fn wait_previous(&self) {
+    /// Waits for the previous frame: before anything it produced is read back, and before the
+    /// destroyer frees what it used.
+    pub unsafe fn wait(&self) {
         let _wait = info_span!("frame_fence_wait").entered();
         self.device
             .timeline
@@ -40,11 +38,6 @@ impl FrameSync {
                 crate::aftermath::note_device_lost(e);
                 panic!("frame wait failed: {e:?}");
             });
-    }
-
-    /// Wait for the previous frame.
-    pub unsafe fn wait(&mut self) {
-        unsafe { self.wait_previous() };
     }
 
     /// Submit the frame's command buffers, in order, on the timeline, after `points` (earlier submits this

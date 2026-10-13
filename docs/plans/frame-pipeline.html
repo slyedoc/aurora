@@ -19,6 +19,7 @@
 <body>
 <h1>aurora frame pipeline</h1>
 <p class="sub">Remove the ~1.7 ms GPU-idle bubble per frame, put all GPU sync on one timeline semaphore, add Reflex and present timing, record in parallel, and move binding to <code>VK_EXT_descriptor_heap</code>. Written 2026-10-13. Implementation notes: <code>frame-pipeline-notes.md</code>.</p>
+<p class="sub"><b>Status 2026-10-13:</b> phases 0&ndash;3 done (aurora b5c101e and the cleanup after it); results, deviations and what is deferred are in the notes.</p>
 
 <p><b>Why.</b> Measured in Northshire (Tracy, 4,109 frames): frame period 7.41 ms, CPU waits on the frame fence 0.02 ms, then records for a median <b>1.74 ms</b> (p90 2.41) before the next submit. With one frame in flight the GPU has nothing queued during that time: it is idle at least 23 % of every frame while "GPU-bound".</p>
 
