@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bevy::{
     app::Plugin,
     asset::AssetApp,
@@ -68,7 +69,7 @@ pub fn record_mip_chain(
                     .layer_count(1),
             );
         unsafe {
-            device.ext_sync2.cmd_pipeline_barrier2(
+            device.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(std::slice::from_ref(&barrier)),
@@ -411,7 +412,7 @@ pub fn load_texture_levels(
     let requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image_handle);
     let mut dedicated_requirements_info = vk::MemoryDedicatedRequirements::default();
     let mut requirements =
-        vk::MemoryRequirements2KHR::default().push_next(&mut dedicated_requirements_info);
+        vk::MemoryRequirements2KHR::default().push(&mut dedicated_requirements_info);
     unsafe {
         device
             .device
@@ -467,7 +468,7 @@ pub fn load_texture_levels(
         .src_access_mask(vk::AccessFlags2::NONE)
         .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
         .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-        device.ext_sync2.cmd_pipeline_barrier2(
+        device.device.cmd_pipeline_barrier2(
             cmd_buffer,
             &vk::DependencyInfo::default()
                 .image_memory_barriers(std::slice::from_ref(&to_transfer)),
@@ -525,7 +526,7 @@ pub fn load_texture_levels(
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::SHADER_READ)
             .subresource_range(all_levels);
-            device.ext_sync2.cmd_pipeline_barrier2(
+            device.device.cmd_pipeline_barrier2(
                 cmd_buffer,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(std::slice::from_ref(&to_shader)),
@@ -588,7 +589,7 @@ pub fn create_blank_texture(
     let requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image_handle);
     let mut dedicated_requirements_info = vk::MemoryDedicatedRequirements::default();
     let mut requirements =
-        vk::MemoryRequirements2KHR::default().push_next(&mut dedicated_requirements_info);
+        vk::MemoryRequirements2KHR::default().push(&mut dedicated_requirements_info);
     unsafe {
         device
             .device
@@ -628,7 +629,7 @@ pub fn create_blank_texture(
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::MEMORY_WRITE);
-        device.ext_sync2.cmd_pipeline_barrier2(
+        device.device.cmd_pipeline_barrier2(
             cmd_buffer,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_final)),
         );

@@ -8,6 +8,7 @@ use bevy::{
 use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use crate::color_target::TargetKind;
 use crate::post_process_filter::POST_TARGETS;
@@ -1112,7 +1113,7 @@ fn render_frame(
                             .dst_binding(100)
                             .descriptor_count(1)
                             .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                            .push_next(&mut ac_binding),
+                            .push(&mut ac_binding),
                     ];
                     // DLSS guide images + noisy colour, this view's feature.
                     let guide_infos: Vec<vk::DescriptorImageInfo> = dlss
@@ -1217,6 +1218,12 @@ fn render_frame(
 
                     // The camera's fog grid, by the first of its views: lit before any of them
                     // marches it (a headset's second eye reuses it).
+                    // Guides into GENERAL before the first dispatch: the fog grid runs with
+                    // this set bound, so validation checks their layout there too.
+                    if let (Some(_), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
+                        renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
+                    }
+
                     if let Some((_, _, grid)) = grids
                         .iter()
                         .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)
@@ -1244,7 +1251,6 @@ fn render_frame(
                     }
 
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
-                        renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
                         // The light grid the trace's path vertices (and ReSTIR's passes) draw
                         // from; without it the vertices keep the power CDF.
                         let grid_built = restir_on

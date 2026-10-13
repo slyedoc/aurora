@@ -475,7 +475,8 @@ public uint gridCell(RestirFrame* f, float3 p) {
 // `RaytracingPushConstants` in raytracing_pipeline.rs.
 public struct PushConstants {
     public UniformData* uniforms;
-    public void* materials;
+    // Not void*: slangc lowers it to the uint* type, which then loses its ArrayStride.
+    public uint64_t materials;
     // 64 bluenoise slices of 128x128 byte pairs.
     public uint* bluenoise;
     public float* focus;

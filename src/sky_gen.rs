@@ -388,7 +388,7 @@ fn copy_to_image(rd: &RenderDevice, cmd: vk::CommandBuffer, buffer: vk::Buffer, 
     .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
     .dst_access_mask(vk::AccessFlags2::SHADER_READ);
     unsafe {
-        rd.ext_sync2.cmd_pipeline_barrier2(
+        rd.device.cmd_pipeline_barrier2(
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_dst)),
         );
@@ -399,7 +399,7 @@ fn copy_to_image(rd: &RenderDevice, cmd: vk::CommandBuffer, buffer: vk::Buffer, 
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &[vk_init::buffer_image_copy(SKY_W, SKY_H)],
         );
-        rd.ext_sync2.cmd_pipeline_barrier2(
+        rd.device.cmd_pipeline_barrier2(
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_read)),
         );

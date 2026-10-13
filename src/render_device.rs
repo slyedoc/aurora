@@ -6,12 +6,12 @@ use std::{
 };
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use ash::{
-    ext::{descriptor_indexing, opacity_micromap},
+    ext::opacity_micromap,
     khr::{
-        acceleration_structure, deferred_host_operations, maintenance4, ray_query,
-        ray_tracing_pipeline, ray_tracing_position_fetch, spirv_1_4, surface, swapchain,
-        synchronization2,
+        acceleration_structure, deferred_host_operations, ray_query, ray_tracing_pipeline,
+        ray_tracing_position_fetch, surface, swapchain,
     },
 };
 use bevy::prelude::*;
@@ -90,7 +90,6 @@ pub struct RenderDeviceData {
     pub queue: Mutex<vk::Queue>,
     pub queue_family_idx: u32,
     pub ext_swapchain: swapchain::Device,
-    pub ext_sync2: synchronization2::Device,
     pub ext_rtx_pipeline: ray_tracing_pipeline::Device,
     pub ext_acc_struct: acceleration_structure::Device,
     /// `VK_EXT_opacity_micromap`, when the device has it (omm.rs); `None` otherwise.
@@ -153,7 +152,7 @@ impl RenderDevice {
         unsafe {
             let entry = ash::Entry::linked();
             let (instance, debug_messenger) = create_instance(display_handle, &entry, xr);
-            let ext_surface = surface::Instance::new(&entry, &instance);
+            let ext_surface = surface::Instance::load(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
             let (device, queue, micromaps) = create_logical_device(
                 &entry,
@@ -163,11 +162,10 @@ impl RenderDevice {
                 xr,
                 display_handle.is_some(),
             );
-            let ext_swapchain = swapchain::Device::new(&instance, &device);
-            let ext_sync2 = synchronization2::Device::new(&instance, &device);
-            let ext_rtx_pipeline = ray_tracing_pipeline::Device::new(&instance, &device);
-            let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
-            let ext_micromap = micromaps.then(|| opacity_micromap::Device::new(&instance, &device));
+            let ext_swapchain = swapchain::Device::load(&instance, &device);
+            let ext_rtx_pipeline = ray_tracing_pipeline::Device::load(&instance, &device);
+            let ext_acc_struct = acceleration_structure::Device::load(&instance, &device);
+            let ext_micromap = micromaps.then(|| opacity_micromap::Device::load(&instance, &device));
             let command_pool = create_command_pool(&device, queue_family_idx);
             let transfer_command_pool = Mutex::new(create_command_pool(&device, queue_family_idx));
             let command_buffers = create_command_buffers(&device, command_pool);
@@ -176,7 +174,7 @@ impl RenderDevice {
                 create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
             let linear_sampler = create_linear_sampler(device.clone());
             let pipeline_cache = create_pipeline_cache(&device);
-            let ext_debug_utils = ash::ext::debug_utils::Device::new(&instance, &device);
+            let ext_debug_utils = ash::ext::debug_utils::Device::load(&instance, &device);
 
             let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
                 allocator: Arc::new(Mutex::new(
@@ -206,7 +204,6 @@ impl RenderDevice {
                 queue,
                 queue_family_idx,
                 ext_swapchain,
-                ext_sync2,
                 ext_rtx_pipeline,
                 ext_acc_struct,
                 ext_micromap,
@@ -531,7 +528,7 @@ unsafe fn create_instance(
             .application_version(0)
             .engine_name(app_name)
             .engine_version(0)
-            .api_version(vk::make_api_version(0, 1, 3, 0));
+            .api_version(vk::API_VERSION_1_4);
 
         let sync_validation = cfg!(feature = "dev");
         if sync_validation {
@@ -550,7 +547,7 @@ unsafe fn create_instance(
             .enabled_layer_names(&layers_names_raw)
             .enabled_extension_names(&instance_extensions);
         if sync_validation {
-            instance_info = instance_info.push_next(&mut validation_features);
+            instance_info = instance_info.push(&mut validation_features);
         }
 
         // XR: the runtime performs the create (xrCreateVulkanInstanceKHR), adding whatever
@@ -565,7 +562,7 @@ unsafe fn create_instance(
         // (RenderDeviceData::drop), so the layer's own leak check stays quiet.
         let mut debug_messenger = None;
         if validate {
-            let debug_utils = ash::ext::debug_utils::Instance::new(entry, &instance);
+            let debug_utils = ash::ext::debug_utils::Instance::load(entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
@@ -716,6 +713,15 @@ unsafe fn pick_physical_device(
                 {
                     return None;
                 }
+                if info.api_version < vk::API_VERSION_1_4 {
+                    log::warn!(
+                        "vulkan: {} offers Vulkan {}.{}, aurora needs 1.4 (update the driver)",
+                        CStr::from_ptr(info.device_name.as_ptr()).to_string_lossy(),
+                        vk::api_version_major(info.api_version),
+                        vk::api_version_minor(info.api_version)
+                    );
+                    return None;
+                }
 
                 let properties = instance.get_physical_device_queue_family_properties(d);
                 properties.iter().enumerate().find_map(|(i, p)| {
@@ -726,7 +732,7 @@ unsafe fn pick_physical_device(
                     }
                 })
             })
-            .expect("Not a single device found!");
+            .expect("no NVIDIA device with Vulkan 1.4 and a graphics queue");
 
         let device_properties = instance.get_physical_device_properties(physical_device);
         log::info!(
@@ -747,8 +753,6 @@ unsafe fn create_logical_device(
 ) -> (ash::Device, Mutex<vk::Queue>, bool) {
     unsafe {
         let mut device_extensions = vec![
-            synchronization2::NAME.as_ptr(),
-            maintenance4::NAME.as_ptr(),
             acceleration_structure::NAME.as_ptr(),
             ray_tracing_pipeline::NAME.as_ptr(),
             // Picking (picking.rs): inline ray queries from compute, reading the hit triangle's
@@ -758,8 +762,6 @@ unsafe fn create_logical_device(
             // Shader Execution Reordering: the raygen regroups its hits before shading.
             vk::NV_RAY_TRACING_INVOCATION_REORDER_NAME.as_ptr(),
             deferred_host_operations::NAME.as_ptr(),
-            spirv_1_4::NAME.as_ptr(),
-            descriptor_indexing::NAME.as_ptr(),
         ];
         if windowed {
             device_extensions.push(swapchain::NAME.as_ptr());
@@ -825,25 +827,34 @@ unsafe fn create_logical_device(
             .queue_family_index(queue_family_idx)
             .queue_priorities(&[1.0]);
 
-        let mut sync2_info =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-
-        let mut dynamic_rendering_info =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-
-        let mut maintaince4_info =
-            vk::PhysicalDeviceMaintenance4Features::default().maintenance4(true);
-
-        let mut bda_info =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
-
-        let mut features_indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+        // gpu_profiler.rs resets its timestamps from the host after reading them. 16-bit
+        // arithmetic: Slang's f16tof32 / f32tof16 lower through 16-bit integer ops (core
+        // shaderInt16 below), and half math proper declares Float16. 64-bit atomic adds: the
+        // radiance cache accumulates in fine fixed point (sharc.rs).
+        let mut features_12 = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .descriptor_indexing(true)
             .descriptor_binding_partially_bound(true)
             .runtime_descriptor_array(true)
             .shader_sampled_image_array_non_uniform_indexing(true)
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_storage_image_update_after_bind(true)
-            .descriptor_binding_variable_descriptor_count(true);
+            .descriptor_binding_variable_descriptor_count(true)
+            .host_query_reset(true)
+            .scalar_block_layout(true)
+            .shader_float16(true)
+            .shader_buffer_int64_atomics(true)
+            .timeline_semaphore(true);
+
+        let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
+            .synchronization2(true)
+            .dynamic_rendering(true)
+            .maintenance4(true);
+
+        let mut features_14 = vk::PhysicalDeviceVulkan14Features::default()
+            .maintenance5(true)
+            .maintenance6(true)
+            .push_descriptor(true);
 
         let mut features_acceleration_structure =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
@@ -862,23 +873,6 @@ unsafe fn create_logical_device(
         let mut features_reorder =
             vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
                 .ray_tracing_invocation_reorder(true);
-
-        // gpu_profiler.rs resets its timestamps from the host after reading them.
-        let mut features_host_query_reset =
-            vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
-
-        let mut features_scalar_block =
-            vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
-
-        // 16-bit arithmetic in shaders: Slang's f16tof32 / f32tof16 lower through 16-bit
-        // integer ops (SPIR-V Int16, core shaderInt16 below), and half math proper declares
-        // Float16. Both are supported on every RTX-class device.
-        let mut features_float16 =
-            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
-
-        // 64-bit atomic adds: the radiance cache accumulates in fine fixed point (sharc.rs).
-        let mut features_atomic64 = vk::PhysicalDeviceShaderAtomicInt64Features::default()
-            .shader_buffer_int64_atomics(true);
 
         let mut features_micromap =
             vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true);
@@ -907,29 +901,23 @@ unsafe fn create_logical_device(
             .enabled_features(&core_features)
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_extensions)
-            .push_next(&mut sync2_info)
-            .push_next(&mut dynamic_rendering_info)
-            .push_next(&mut maintaince4_info)
-            .push_next(&mut bda_info)
-            .push_next(&mut features_indexing)
-            .push_next(&mut features_acceleration_structure)
-            .push_next(&mut features_raytracing_pipeline)
-            .push_next(&mut features_ray_query)
-            .push_next(&mut features_position_fetch)
-            .push_next(&mut features_reorder)
-            .push_next(&mut features_host_query_reset)
-            .push_next(&mut features_scalar_block)
-            .push_next(&mut features_float16)
-            .push_next(&mut features_atomic64);
+            .push(&mut features_12)
+            .push(&mut features_13)
+            .push(&mut features_14)
+            .push(&mut features_acceleration_structure)
+            .push(&mut features_raytracing_pipeline)
+            .push(&mut features_ray_query)
+            .push(&mut features_position_fetch)
+            .push(&mut features_reorder);
         let device_info = if micromaps {
-            device_info.push_next(&mut features_micromap)
+            device_info.push(&mut features_micromap)
         } else {
             device_info
         };
         let device_info = if diagnostics {
             device_info
-                .push_next(&mut features_diagnostics)
-                .push_next(&mut diagnostics_info)
+                .push(&mut features_diagnostics)
+                .push(&mut diagnostics_info)
         } else {
             device_info
         };
@@ -1024,7 +1012,7 @@ fn create_global_descriptor(
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .bindings(std::slice::from_ref(&image_binding))
         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-        .push_next(&mut layout_info_ext);
+        .push(&mut layout_info_ext);
 
     let descriptor_set_layout = unsafe {
         device
@@ -1038,7 +1026,7 @@ fn create_global_descriptor(
     let alloc_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-        .push_next(&mut alloc_info_ext);
+        .push(&mut alloc_info_ext);
 
     let descriptor_set = unsafe {
         device
@@ -1185,10 +1173,10 @@ fn spawn_destroy_thread(
     device: ash::Device,
     state: Arc<Mutex<ManuallyDrop<AllocatorState>>>,
 ) -> ManuallyDrop<VkDestroyer> {
-    let ext_swapchain = swapchain::Device::new(&instance, &device);
-    let ext_acc_struct = acceleration_structure::Device::new(&instance, &device);
+    let ext_swapchain = swapchain::Device::load(&instance, &device);
+    let ext_acc_struct = acceleration_structure::Device::load(&instance, &device);
     // Only ever called for micromaps created through the extension (present in that case).
-    let ext_micromap = opacity_micromap::Device::new(&instance, &device);
+    let ext_micromap = opacity_micromap::Device::load(&instance, &device);
     let (sender, receiver) = crossbeam::channel::unbounded();
     let thread = std::thread::spawn(move || {
         // Assuming 3 frames in flight

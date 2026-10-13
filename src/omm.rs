@@ -261,7 +261,7 @@ impl MicromapBuild {
             );
         unsafe {
             (ext.fp().cmd_build_micromaps_ext)(cmd, infos.len() as u32, infos.as_ptr());
-            rd.ext_sync2.cmd_pipeline_barrier2(
+            rd.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
             );

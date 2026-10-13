@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
 use crate::color_target::{DISPLAY_FORMAT, FormatPipelines, SCENE_RADIANCE_FORMAT};
@@ -177,7 +178,7 @@ impl VulkanAsset for PostProcessFilter {
                     .color_blend_state(&color_blend_state)
                     .dynamic_state(&dynamic_state)
                     .layout(pipeline_layout)
-                    .push_next(&mut pipeline_rendering_info);
+                    .push(&mut pipeline_rendering_info);
                 unsafe {
                     render_device.create_graphics_pipelines(
                         render_device.pipeline_cache,

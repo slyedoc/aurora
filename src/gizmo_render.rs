@@ -22,6 +22,7 @@
 //! -1 always in front, 0 the plain test, towards 1 pushed behind.
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bevy::{
     camera::{
         primitives::{Aabb, Frustum},
@@ -248,7 +249,7 @@ impl VulkanAsset for GizmoPipeline {
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
             .layout(pipeline_layout)
-            .push_next(&mut pipeline_rendering_info);
+            .push(&mut pipeline_rendering_info);
 
         let pipeline = unsafe {
             render_device.create_graphics_pipelines(

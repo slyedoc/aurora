@@ -126,6 +126,13 @@ thiserror = "1.0.57"
 
 # Redirect every bevy_* crate to the fork branch `aurora`: upstream main + render-free feathers
 # (`bevy_feathers_core`), the .bsn asset loader and free_camera tweaks.
+# Vulkan 1.4.352 headers + the NV cluster / partitioned AS loaders (unreleased ash master);
+# gpu-allocator, by version on ash, needs the fork renaming push_next.
+[patch.crates-io]
+ash = { git = "https://github.com/slyedoc/ash", branch = "aurora" }
+ash-window = { git = "https://github.com/slyedoc/ash", branch = "aurora" }
+gpu-allocator = { git = "https://github.com/slyedoc/gpu-allocator", branch = "ash-push-rename" }
+
 [patch."https://github.com/avianphysics/avian"]
 avian3d = { git = "https://github.com/slyedoc/avian", branch = "aurora" }
 

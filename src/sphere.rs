@@ -104,7 +104,7 @@ impl SphereBLAS {
                 .get_acceleration_structure_build_sizes(
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
                     &combined_build_info,
-                    &primitive_counts,
+                    Some(&primitive_counts),
                     &mut geometry_sizes,
                 )
         };
@@ -144,7 +144,7 @@ impl SphereBLAS {
                 device.ext_acc_struct.cmd_build_acceleration_structures(
                     cmd_buffer,
                     std::slice::from_ref(&build_geometry_info),
-                    std::slice::from_ref(&build_range_infos),
+                    &[Some(build_range_infos)],
                 );
             });
 

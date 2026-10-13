@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use crate::render_device::RenderDevice;
 
@@ -60,7 +61,7 @@ pub fn transition_image_layout(
         vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&image_barrier));
     unsafe {
         device
-            .ext_sync2
+            .device
             .cmd_pipeline_barrier2(cmd_buffer, &barrier_info);
     }
 }
@@ -70,7 +71,7 @@ pub fn get_raytracing_properties(
 ) -> vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'_> {
     let mut raytracing_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
     let mut properties2 =
-        vk::PhysicalDeviceProperties2KHR::default().push_next(&mut raytracing_properties);
+        vk::PhysicalDeviceProperties2KHR::default().push(&mut raytracing_properties);
     unsafe {
         device
             .instance
@@ -85,7 +86,7 @@ pub fn get_acceleration_structure_properties(
     let mut acceleration_structure_properties =
         vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
     let mut properties2 = vk::PhysicalDeviceProperties2KHR::default()
-        .push_next(&mut acceleration_structure_properties);
+        .push(&mut acceleration_structure_properties);
     unsafe {
         device
             .instance

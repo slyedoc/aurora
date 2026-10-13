@@ -679,7 +679,7 @@ fn build_sizes(
             .get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &info,
-                counts,
+                Some(counts),
                 &mut size_info,
             )
     };
@@ -779,7 +779,7 @@ fn build_chunk(
                 .cmd_build_acceleration_structures(
                     cmd_buffer,
                     std::slice::from_ref(info),
-                    std::slice::from_ref(ranges),
+                    &[Some(*ranges)],
                 );
             let one = vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
@@ -789,7 +789,7 @@ fn build_chunk(
                     vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
                         | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
                 );
-            render_device.ext_sync2.cmd_pipeline_barrier2(
+            render_device.device.cmd_pipeline_barrier2(
                 cmd_buffer,
                 &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&one)),
             );
@@ -803,7 +803,7 @@ fn build_chunk(
             .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
             .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
             .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR);
-        render_device.ext_sync2.cmd_pipeline_barrier2(
+        render_device.device.cmd_pipeline_barrier2(
             cmd_buffer,
             &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
         );

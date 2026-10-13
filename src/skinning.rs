@@ -720,8 +720,10 @@ impl Skins {
                 }
             })
             .collect();
-        let range_refs: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
-            ranges.iter().map(std::slice::from_ref).collect();
+        let range_refs: Vec<Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>> = ranges
+            .iter()
+            .map(|r| Some(std::slice::from_ref(r)))
+            .collect();
         unsafe {
             rd.ext_acc_struct
                 .cmd_build_acceleration_structures(cmd, &infos, &range_refs);
@@ -1054,7 +1056,7 @@ pub fn prepare_skins(
                             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                             .flags(BLAS_FLAGS)
                             .geometries(std::slice::from_ref(&geometry)),
-                        &[triangle_count],
+                        Some(&[triangle_count]),
                         &mut sizes,
                     );
             }

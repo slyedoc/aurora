@@ -268,7 +268,7 @@ pub fn memory_barrier(
         .dst_stage_mask(dst_stage)
         .dst_access_mask(dst_access);
     unsafe {
-        render_device.ext_sync2.cmd_pipeline_barrier2(
+        render_device.device.cmd_pipeline_barrier2(
             cmd_buffer,
             &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
         );

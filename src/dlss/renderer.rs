@@ -155,7 +155,7 @@ impl Pyramid {
             vk::AccessFlags2::TRANSFER_READ,
         );
         let pipeline = |barriers: &[vk::ImageMemoryBarrier2], memory: &[vk::MemoryBarrier2]| unsafe {
-            rd.ext_sync2.cmd_pipeline_barrier2(
+            rd.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(barriers)
@@ -677,7 +677,7 @@ impl DlssRenderer {
             ));
         }
         unsafe {
-            rd.ext_sync2.cmd_pipeline_barrier2(
+            rd.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&barriers),
             );
@@ -704,7 +704,7 @@ impl DlssRenderer {
                         vk::AccessFlags2::SHADER_READ,
                     ),
                 );
-                rd.ext_sync2.cmd_pipeline_barrier2(
+                rd.device.cmd_pipeline_barrier2(
                     cmd,
                     &vk::DependencyInfo::default()
                         .image_memory_barriers(std::slice::from_ref(&done)),
@@ -763,7 +763,7 @@ impl DlssRenderer {
             )])
             .collect();
         unsafe {
-            rd.ext_sync2.cmd_pipeline_barrier2(
+            rd.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&barriers),
             );
@@ -826,7 +826,7 @@ impl DlssRenderer {
             .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_READ);
         unsafe {
-            rd.ext_sync2.cmd_pipeline_barrier2(
+            rd.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&readable)),
             );

@@ -17,6 +17,7 @@
 //! stretched), `OuterColor`.
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bevy::{
     asset::{AssetId, uuid::Uuid},
     camera::{
@@ -299,7 +300,7 @@ impl VulkanAsset for UiPipeline {
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
             .layout(pipeline_layout)
-            .push_next(&mut pipeline_rendering_info);
+            .push(&mut pipeline_rendering_info);
 
         let pipeline = unsafe {
             render_device.create_graphics_pipelines(

@@ -740,7 +740,7 @@ impl TLAS {
                     .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
                     .flags(flags)
                     .geometries(std::slice::from_ref(&geometry)),
-                std::slice::from_ref(&primitive_count),
+                Some(std::slice::from_ref(&primitive_count)),
                 &mut build_size,
             )
         };
@@ -800,7 +800,7 @@ impl TLAS {
             rd.ext_acc_struct.cmd_build_acceleration_structures(
                 cmd,
                 std::slice::from_ref(&build_geometry),
-                std::slice::from_ref(&build_range_infos),
+                &[Some(build_range_infos)],
             );
         }
         memory_barrier(

@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use gpu_allocator::{
     MemoryLocation,
     vulkan::{AllocationCreateDesc, AllocationScheme},
@@ -130,7 +131,7 @@ impl BufferProvider for RenderDevice {
         let requirements_info = vk::BufferMemoryRequirementsInfo2::default().buffer(handle);
         let mut requirements = vk::MemoryRequirements2::default();
         let mut dedicated_allocation_info = vk::MemoryDedicatedRequirements::default();
-        let _ = requirements.push_next(&mut dedicated_allocation_info);
+        let _ = requirements.push(&mut dedicated_allocation_info);
 
         unsafe {
             self.device

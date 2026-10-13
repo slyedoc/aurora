@@ -30,6 +30,10 @@ pub struct GpuProfiler {
     labels: HashMap<&'static str, CString>,
     /// Smoothed milliseconds per scope name, in first-seen order.
     pub times: Vec<(&'static str, f64)>,
+    /// The last frame read back, unsmoothed (scopes of one name summed).
+    pub last_frame: Vec<(&'static str, f64)>,
+    /// Frames read back so far; `last_frame` changes when this does.
+    pub frames_read: u64,
     last_log: f64,
     #[cfg(feature = "trace_tracy")]
     plots: HashMap<&'static str, tracy_client::PlotName>,
@@ -58,6 +62,8 @@ impl GpuProfiler {
             recorded: Vec::new(),
             labels: HashMap::new(),
             times: Vec::new(),
+            last_frame: Vec::new(),
+            frames_read: 0,
             last_log: 0.0,
             #[cfg(feature = "trace_tracy")]
             plots: HashMap::new(),
@@ -88,6 +94,8 @@ impl GpuProfiler {
                         None => frame.push((name, ms)),
                     }
                 }
+                self.last_frame.clone_from(&frame);
+                self.frames_read += 1;
                 for (name, ms) in frame {
                     match self.times.iter_mut().find(|(n, _)| *n == name) {
                         Some((_, smooth)) => *smooth += (ms - *smooth) * SMOOTHING,

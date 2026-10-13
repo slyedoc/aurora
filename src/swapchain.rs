@@ -39,13 +39,13 @@ unsafe fn create_surface(
     window: &RawHandleWrapper,
 ) -> vk::SurfaceKHR {
     unsafe {
-        ash_window::create_surface(
-            &entry,
-            &instance,
+        ash_window::SurfaceFactory::new(
+            entry,
+            instance,
             window.get_handle().display_handle().unwrap().as_raw(),
-            window.get_handle().window_handle().unwrap().as_raw(),
-            None,
         )
+        .unwrap()
+        .create_surface(window.get_handle().window_handle().unwrap().as_raw(), None)
         .unwrap()
     }
 }
@@ -289,7 +289,7 @@ impl Swapchain {
 
     /// Present the acquired image once the submit has signalled it. The caller holds the queue;
     /// hand the result to [`Self::after_present`] after letting it go.
-    pub unsafe fn present(&self, queue: vk::Queue) -> ash::prelude::VkResult<bool> {
+    pub unsafe fn present(&self, queue: vk::Queue) -> ash::VkResult<bool> {
         unsafe {
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(std::slice::from_ref(
@@ -321,7 +321,7 @@ impl Swapchain {
     /// Rebuild after a present the compositor called out of date.
     pub unsafe fn after_present(
         &mut self,
-        result: ash::prelude::VkResult<bool>,
+        result: ash::VkResult<bool>,
         window: &RenderWindow,
     ) {
         unsafe {

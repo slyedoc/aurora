@@ -320,9 +320,8 @@ dependencies = [
 
 [[package]]
 name = "ash"
-version = "0.38.0+1.3.281"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+version = "0.38.0+1.4.352"
+source = "git+https://github.com/slyedoc/ash?branch=aurora#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
 dependencies = [
  "libloading 0.8.9",
 ]
@@ -330,8 +329,7 @@ dependencies = [
 [[package]]
 name = "ash-window"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52bca67b61cb81e5553babde81b8211f713cb6db79766f80168f3e5f40ea6c82"
+source = "git+https://github.com/slyedoc/ash?branch=aurora#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
 dependencies = [
  "ash",
  "raw-window-handle",
@@ -3599,8 +3597,7 @@ dependencies = [
 [[package]]
 name = "gpu-allocator"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51255ea7cfaadb6c5f1528d43e92a82acb2b96c43365989a28b2d44ee38f8795"
+source = "git+https://github.com/slyedoc/gpu-allocator?branch=ash-push-rename#b3c8f269487f9415dbf595ae8213cc660f6c3f33"
 dependencies = [
  "ash",
  "hashbrown 0.16.1",
