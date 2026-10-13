@@ -19,30 +19,6 @@ import disney;
 import light_eval;
 
 // `RestirFrameGpu` in src/restir.rs (scalar layout; pointers first).
-struct RestirFrame {
-    RestirSurface* surfaces;
-    // Last frame's final reservoirs, this frame's temporal output, this frame's final.
-    Reservoir* prev;
-    Reservoir* temporal;
-    Reservoir* final_;
-    uint2* grid;            // (entry, asuint(W)) per cell sample; entry ~0 = none
-    LightsHeader* lights;
-    float4* instances;
-    float4* positions;      // per light-table entry, this frame (restir_positions)
-    float prev_view_proj[16];
-    float grid_origin_x, grid_origin_y, grid_origin_z;
-    float grid_cell;
-    uint grid_x, grid_y, grid_z, grid_k;
-    uint width, height, frame, epoch;
-    uint candidates;        // N per pixel
-    float m_cap;            // temporal history cap (frames' worth of M)
-    uint spatial_samples;
-    float spatial_radius;   // pixels
-    float boiling;          // 0 = off
-    float emissive_boost;
-    uint grid_candidates;   // R per grid sample
-    uint light_entries;     // 0 = light NEE off
-};
 
 struct RestirPush {
     RestirFrame* f;
@@ -75,14 +51,6 @@ float3 entryPosition(LightCtx ctx, uint e) {
 }
 
 // The cell holding `p`, or ~0 outside the grid.
-uint gridCell(RestirFrame* f, float3 p) {
-    let rel = (p - float3(f.grid_origin_x, f.grid_origin_y, f.grid_origin_z)) / f.grid_cell;
-    let c = int3(floor(rel));
-    if (any(c < int3(0)) || c.x >= int(f.grid_x) || c.y >= int(f.grid_y) || c.z >= int(f.grid_z)) {
-        return NO_ENTRY;
-    }
-    return (uint(c.y) * f.grid_z + uint(c.z)) * f.grid_x + uint(c.x);
-}
 
 // Every light-table entry's position once per frame, for the grid's many candidates.
 [shader("compute")]

@@ -4,9 +4,10 @@
 //! rt_types.slang) and leaves the light table's direct light there to this module. Then, per
 //! view, in the frame's command buffer:
 //!
-//! 1. `restir_grid` (compute): a world grid of cells around the camera, each holding K light
-//!    samples resampled from the power CDF by power / distance² at the cell (ReGIR), so a
-//!    pixel's candidates are mostly lamps that can reach it.
+//! 1. `restir_grid` (compute, BEFORE the main trace): a world grid of cells around the camera,
+//!    each holding K light samples resampled from the power CDF by power / distance² at the
+//!    cell (ReGIR), so a pixel's candidates are mostly lamps that can reach it. The trace's own
+//!    path vertices past the primary draw their light candidates from it too.
 //! 2. `restir_temporal` (compute): N candidates from the pixel's cell, RIS folded to one sample,
 //!    merged with last frame's final reservoir at the reprojected pixel.
 //! 3. `restir_spatial` (compute): merges random neighbours' reservoirs, with a boiling filter.
@@ -101,6 +102,8 @@ pub struct RestirAddresses {
     pub surfaces: u64,
     pub prev: u64,
     pub final_: u64,
+    /// The parameter block (`RestirFrame`), for the raygen's light-grid lookups.
+    pub frame: u64,
 }
 
 #[derive(Default)]
@@ -247,11 +250,73 @@ impl RestirState {
             surfaces: view.surfaces.address,
             prev,
             final_,
+            frame: view.frame.address,
         }
     }
 
-    /// Records the compute passes (grid, temporal, spatial) for view `slot`, after the main
-    /// trace wrote its surfaces; the caller then traces `restir_shade`.
+    /// Records the light grid for view `slot` (light positions, then the cells), BEFORE the
+    /// main trace: its path vertices draw light candidates from it, and the temporal pass after.
+    pub fn record_grid(
+        &self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        modules: &ComputeModules,
+        slot: usize,
+        prof: &mut GpuProfiler,
+    ) -> bool {
+        let Some(module) = modules.get(&self.module) else {
+            return false;
+        };
+        let view = &self.views[slot];
+        if view.frame.address == 0 {
+            return false;
+        }
+        let push = RestirPush {
+            frame: view.frame.address,
+            base: 0,
+            pad: 0,
+        };
+        let base = Some(std::mem::offset_of!(RestirPush, base));
+        let barrier = |dst: vk::PipelineStageFlags2| {
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                dst,
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            );
+        };
+        let scope = prof.begin(rd, cmd, "restir grid");
+        record_dispatch(
+            rd,
+            cmd,
+            module,
+            "restir_positions",
+            &push,
+            view.entries,
+            base,
+        );
+        barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
+        record_dispatch(
+            rd,
+            cmd,
+            module,
+            "restir_grid",
+            &push,
+            view.grid_len as u32,
+            base,
+        );
+        prof.end(rd, cmd, scope);
+        barrier(
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+        );
+        true
+    }
+
+    /// Records the reuse passes (temporal, spatial) for view `slot`, after the main trace wrote
+    /// its surfaces (the grid is already built); the caller then traces `restir_shade`.
     pub fn record_passes(
         &self,
         rd: &RenderDevice,
@@ -286,28 +351,6 @@ impl RestirState {
         };
         // The main trace's surfaces (and last frame's shaded reservoirs) to compute.
         compute_barrier(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR);
-        let scope = prof.begin(rd, cmd, "restir grid");
-        record_dispatch(
-            rd,
-            cmd,
-            module,
-            "restir_positions",
-            &push,
-            view.entries,
-            base,
-        );
-        compute_barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
-        record_dispatch(
-            rd,
-            cmd,
-            module,
-            "restir_grid",
-            &push,
-            view.grid_len as u32,
-            base,
-        );
-        prof.end(rd, cmd, scope);
-        compute_barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
         let scope = prof.begin(rd, cmd, "restir temporal");
         record_dispatch(
             rd,

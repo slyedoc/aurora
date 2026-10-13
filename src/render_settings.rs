@@ -56,7 +56,9 @@ pub struct RenderSettings {
     #[reflect(@0.0..=8.0_f32)]
     pub one_shadow_ray_from: u32,
     /// ReSTIR DI for the light table at the primary vertex: candidates from a world light grid,
-    /// temporal and spatial reuse, one shadow ray (restir.rs).
+    /// temporal and spatial reuse, one shadow ray (restir.rs). On by default: at 1 spp without
+    /// it Ray Reconstruction drops the rare paths that find a lamp (Northshire's lamp-lit plaza
+    /// a quarter dark against a 4 spp reference; with it within ~3 %, for ~0.7 ms).
     pub restir: bool,
     /// Initial light candidates per pixel (from its grid cell).
     #[reflect(@1.0..=32.0_f32)]
@@ -112,10 +114,10 @@ impl Default for RenderSettings {
             spec_hit_roughness: 0.6,
             roulette_from: 1,
             one_shadow_ray_from: 0,
-            restir: false,
+            restir: true,
             restir_candidates: 8,
             restir_history: 8.0,
-            restir_spatial_samples: 5,
+            restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
             light_grid_cell: 4.0,

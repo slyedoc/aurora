@@ -1465,16 +1465,21 @@ void main() {
                     rs.pad = 0.0;
                     pc.restir_surfaces[px.y * int(launch_size.x) + px.x] = rs;
                 } else {
-                    // Resampled importance sampling, no reuse: M candidates from the power CDF, each
-                    // weighted by its MIS-weighted unshadowed contribution at THIS point over its
-                    // source pdf; one survives and gets the shadow ray. The table's power knows
-                    // nothing of distance, so with hundreds of lights a single sample nearly always
-                    // lands on one that contributes nothing. The MIS weight rides inside the
-                    // resampled integrand (against the candidate's own CDF pdf, which is what the
-                    // emitter-hit side uses), so the two strategies still sum to one. M = 1 is the
-                    // plain estimator.
+                    // Resampled importance sampling, no reuse: M candidates, each weighted by its
+                    // MIS-weighted unshadowed contribution at THIS point over its source pdf; one
+                    // survives and gets the shadow ray. Candidates come from ReSTIR's light grid
+                    // cell at this point when there is one (lamps resampled by power / distance^2
+                    // there, so a bounce off a lit wall finds the lamp beside it), else from the
+                    // power CDF, which knows nothing of distance: with hundreds of lights a single
+                    // draw nearly always lands on one that contributes nothing. The MIS weight
+                    // rides inside the resampled integrand against the candidate's own CDF pdf
+                    // (what the emitter-hit side uses), so the two strategies still sum to one;
+                    // only the RIS weight takes the grid's source pdf. M = 1 is the plain
+                    // estimator.
                     let M = bounce_idx == 0u ? pc.uniforms.light_candidates
                                              : max(1u, pc.uniforms.light_candidates / 4u);
+                    let grid = pc.restir_frame;
+                    let cell = grid != nullptr ? gridCell(grid, origin) : 0xFFFFFFFFu;
                     var wsum = 0.0;
                     var sel_val = float3(0.0);
                     var sel_phat = 0.0;
@@ -1482,7 +1487,25 @@ void main() {
                     var ldist = 0.0;
                     for (uint c = 0u; c < M; c++) {
                         float p_pick;
-                        let e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
+                        uint e;
+                        // The candidate's source pdf over its CDF pick probability.
+                        var src_ratio = 1.0;
+                        if (cell != 0xFFFFFFFFu) {
+                            let k = min(uint(randf() * float(grid.grid_k)), grid.grid_k - 1u);
+                            let gs = grid.grid[cell * grid.grid_k + k];
+                            let W = asfloat(gs.y);
+                            if (gs.x == 0xFFFFFFFFu || W <= 0.0) {
+                                continue;
+                            }
+                            e = gs.x;
+                            p_pick = lightsEntryPick(lightCtx(), e);
+                            if (p_pick <= 0.0) {
+                                continue;
+                            }
+                            src_ratio = 1.0 / (W * p_pick);
+                        } else {
+                            e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
+                        }
                         let su = randf();
                         let sv = randf();
                         float p_area, pdf_solid, cdist;
@@ -1497,7 +1520,7 @@ void main() {
                         let w = pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
                         let g = val * w;
                         let phat = luma(g);
-                        let wi = phat / p_area;
+                        let wi = phat / (p_area * src_ratio);
                         wsum += wi;
                         if (randf() * wsum < wi) {
                             sel_val = g;

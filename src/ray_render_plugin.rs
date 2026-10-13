@@ -1203,6 +1203,7 @@ fn render_frame(
                         lum_buffer: view.ae.0,
                         auto_exposure: view.ae.1,
                         atmo: atmo.address(),
+                        restir_frame: restir_addresses.frame,
                     };
 
                     render_device.cmd_push_constants(
@@ -1243,6 +1244,34 @@ fn render_frame(
 
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
                         renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
+                        // The light grid the trace's path vertices (and ReSTIR's passes) draw
+                        // from; without it the vertices keep the power CDF.
+                        let grid_built = restir_on
+                            && restir.record_grid(
+                                &render_device,
+                                cmd_buffer,
+                                &modules,
+                                view.slot,
+                                &mut prof,
+                            );
+                        if restir_on {
+                            // The grid's compute dispatches disturbed the push constants; a grid
+                            // that did not build leaves the vertices on the power CDF.
+                            render_device.cmd_push_constants(
+                                cmd_buffer,
+                                rtx_pipeline.pipeline_layout,
+                                vk::ShaderStageFlags::ALL,
+                                0,
+                                bytemuck::cast_slice(&[RaytracingPushConstants {
+                                    restir_frame: if grid_built {
+                                        push_constants.restir_frame
+                                    } else {
+                                        0
+                                    },
+                                    ..push_constants
+                                }]),
+                            );
+                        }
                         let scope = prof.begin(&render_device, cmd_buffer, "trace");
                         render_device.ext_rtx_pipeline.cmd_trace_rays(
                             cmd_buffer,

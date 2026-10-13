@@ -427,6 +427,51 @@ public struct AtmosphereParams {
     public float cloud_back_g;
 };
 
+// ReSTIR DI's per-view parameter block (`RestirFrameGpu` in restir.rs), shared with the raygen
+// for the light grid.
+public struct RestirFrame {
+    public RestirSurface* surfaces;
+    // Last frame's final reservoirs, this frame's temporal output, this frame's final.
+    public Reservoir* prev;
+    public Reservoir* temporal;
+    public Reservoir* final_;
+    public uint2* grid;            // (entry, asuint(W)) per cell sample; entry ~0 = none
+    public LightsHeader* lights;
+    public float4* instances;
+    public float4* positions;      // per light-table entry, this frame (restir_positions)
+    public float prev_view_proj[16];
+    public float grid_origin_x;
+    public float grid_origin_y;
+    public float grid_origin_z;
+    public float grid_cell;
+    public uint grid_x;
+    public uint grid_y;
+    public uint grid_z;
+    public uint grid_k;
+    public uint width;
+    public uint height;
+    public uint frame;
+    public uint epoch;
+    public uint candidates;        // N per pixel
+    public float m_cap;            // temporal history cap (frames' worth of M)
+    public uint spatial_samples;
+    public float spatial_radius;   // pixels
+    public float boiling;          // 0 = off
+    public float emissive_boost;
+    public uint grid_candidates;   // R per grid sample
+    public uint light_entries;     // 0 = light NEE off
+};
+
+// The light-grid cell holding `p`, or ~0 outside the grid.
+public uint gridCell(RestirFrame* f, float3 p) {
+    let rel = (p - float3(f.grid_origin_x, f.grid_origin_y, f.grid_origin_z)) / f.grid_cell;
+    let c = int3(floor(rel));
+    if (any(c < int3(0)) || c.x >= int(f.grid_x) || c.y >= int(f.grid_y) || c.z >= int(f.grid_z)) {
+        return 0xFFFFFFFFu;
+    }
+    return (uint(c.y) * f.grid_z + uint(c.z)) * f.grid_x + uint(c.x);
+}
+
 // `RaytracingPushConstants` in raytracing_pipeline.rs.
 public struct PushConstants {
     public UniformData* uniforms;
@@ -454,6 +499,9 @@ public struct PushConstants {
     public AeData* ae;
     // Atmosphere + cloud parameters and LUTs (valid whenever a world's mode is 3).
     public AtmosphereParams* atmo;
+    // ReSTIR DI's parameter block, this frame's light grid already built (null when off):
+    // path vertices past the primary draw their light candidates from it.
+    public RestirFrame* restir_frame;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

@@ -144,6 +144,9 @@ pub struct RaytracingPushConstants {
     pub auto_exposure: u64,
     /// Atmosphere + cloud parameter block (`atmosphere`; 0 until that sky first renders).
     pub atmo: u64,
+    /// ReSTIR DI's parameter block, its light grid built before the trace (`restir`; 0 when
+    /// off): path vertices draw light candidates from the grid.
+    pub restir_frame: u64,
 }
 
 impl VulkanAsset for RaytracingPipeline {
