@@ -146,6 +146,10 @@ pub struct XrState {
     /// VIEW reference space, located in `space` for the head pose.
     view_space: xr::Space,
     actions: XrActions,
+    /// Hold the head at the tracking origin, looking down -Z: each frame's eyes keep only
+    /// their offset from the head (IPD) and their fov, so the view is the rig's alone and the
+    /// same every run (benchmarks).
+    pub hold_head: bool,
 }
 
 struct EyeTarget {
@@ -341,6 +345,56 @@ impl XrFrame {
         let view = &self.views[eye];
         (pose_matrix(view.pose), projection(view.fov, near))
     }
+}
+
+/// The eyes relative to the head (their mid-point, the first eye's orientation): the head moved
+/// to the origin facing -Z. Without a tracked orientation (all zero before tracking starts),
+/// the eyes look straight ahead 64 mm apart.
+fn held(mut views: Vec<xr::View>) -> Vec<xr::View> {
+    let Some(first) = views.first() else {
+        return views;
+    };
+    let o = first.pose.orientation;
+    let head = Quat::from_xyzw(o.x, o.y, o.z, o.w);
+    if head.length_squared() < 0.5 {
+        let count = views.len() as f32;
+        for (i, view) in views.iter_mut().enumerate() {
+            view.pose = xr::Posef {
+                orientation: xr::Quaternionf::IDENTITY,
+                position: xr::Vector3f {
+                    x: 0.064 * (i as f32 - (count - 1.0) * 0.5),
+                    y: 0.0,
+                    z: 0.0,
+                },
+            };
+        }
+        return views;
+    }
+    let to_head = head.inverse();
+    let centre = views
+        .iter()
+        .map(|v| Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z))
+        .sum::<Vec3>()
+        / views.len() as f32;
+    for view in &mut views {
+        let (p, o) = (view.pose.position, view.pose.orientation);
+        let position = to_head * (Vec3::new(p.x, p.y, p.z) - centre);
+        let orientation = to_head * Quat::from_xyzw(o.x, o.y, o.z, o.w);
+        view.pose = xr::Posef {
+            orientation: xr::Quaternionf {
+                x: orientation.x,
+                y: orientation.y,
+                z: orientation.z,
+                w: orientation.w,
+            },
+            position: xr::Vector3f {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+            },
+        };
+    }
+    views
 }
 
 /// XR pose (LOCAL space, meters, -Z forward — same handedness as bevy) as a camera-to-world
@@ -720,6 +774,7 @@ impl XrState {
             predicted_time: None,
             view_space,
             actions,
+            hold_head: false,
         })
     }
 
@@ -840,6 +895,7 @@ impl XrState {
                 &self.space,
             )
             .unwrap();
+        let views = if self.hold_head { held(views) } else { views };
         Some(XrFrame {
             frame_state,
             image: self.images[index as usize],
