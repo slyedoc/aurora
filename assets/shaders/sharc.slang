@@ -56,10 +56,7 @@ void sharc_resolve(uint3 gid: SV_DispatchThreadID) {
     if (e.acc_n == 0) {
         return;
     }
-    // Signed: a path's sample goes in as two parts (raygen.slang sharcOpen / sharcClose), and
-    // one whose total was not finite left only its negative part.
-    let sum = float3(float(int64_t(e.acc_r)), float(int64_t(e.acc_g)), float(int64_t(e.acc_b)));
-    let fresh = max(sum, float3(0.0)) * (SHARC_UNIT / float(e.acc_n));
+    let fresh = float3(float(e.acc_r), float(e.acc_g), float(e.acc_b)) * (SHARC_UNIT / float(e.acc_n));
     let old = float3(e.res_r, e.res_g, e.res_b);
     // Anything not finite starts the voxel over rather than glowing until it washes out.
     let bits = asuint(float4(fresh, old.x + old.y + old.z));

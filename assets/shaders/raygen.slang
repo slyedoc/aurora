@@ -443,7 +443,7 @@ static const uint SHARC_ENTRIES = 1u << 20;
 static const float SHARC_TRAIN = 0.125;
 // Cache vertices a path records (its vertices past the camera's): all of max_bounces 4's.
 // Deeper paths' later vertices only read the cache. Every slot is live across every trace,
-// and the raygen's stack is what the trace's time follows.
+// and the raygen's stack is what the trace's time follows (4 slots: +0.17 ms at 3840x1080).
 static const uint SHARC_VERTICES = 3u;
 
 // The voxel size at a point: `sharc_voxel` near the camera, doubling per distance octave
@@ -517,44 +517,16 @@ bool sharcQuery(uint slot, out float3 radiance) {
 // moonlit voxel is not rounded to black).
 // A NaN from one degenerate hit (the camera inside a wall, a mirror up close) cast to an
 // integer poisoned a whole voxel's channel: it glowed red, blue or yellow until it washed out.
-// It goes in as two parts so a path keeps only the slot and 1 / throughput per vertex live
-// (snapshots of the throughput and the radiance so far were 28 bytes a vertex on the raygen's
-// stack): at the vertex the radiance gathered so far over its throughput, negated, with the
-// sample count (`sharcOpen`); at the path's end the whole path's over the same throughput
-// (`sharcClose`). The sums are two's complement (sharc.slang resolves them signed), so the
-// pair adds exactly what came after the vertex.
-uint64_t sharcFixed(float v) {
-    return uint64_t(v * 65536.0);
-}
-
-// 1 / a throughput, a channel the path no longer carries left out (0).
-float3 sharcInverse(float3 m) {
-    return float3(m.r > 1.0e-6 ? 1.0 / m.r : 0.0, m.g > 1.0e-6 ? 1.0 / m.g : 0.0,
-                  m.b > 1.0e-6 ? 1.0 / m.b : 0.0);
-}
-
-// False (nothing deposited) when the radiance so far is not finite: the path teaches nothing.
-bool sharcOpen(uint slot, float3 before) {
-    if (!sharcSane(before)) {
-        return false;
-    }
-    InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(0) - sharcFixed(before.r));
-    InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(0) - sharcFixed(before.g));
-    InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(0) - sharcFixed(before.b));
-    InterlockedAdd(pc.sharc[slot].acc_n, 1u);
-    pc.sharc[slot].frame = pc.uniforms.frame;
-    return true;
-}
-
-// A total that is not finite leaves the open part alone: the voxel's frame comes out low
-// (clamped at zero) instead of poisoned.
-void sharcClose(uint slot, float3 total) {
-    if (!sharcSane(total)) {
+void sharcDeposit(uint slot, float3 radiance) {
+    if (!sharcSane(radiance)) {
         return;
     }
-    InterlockedAdd(pc.sharc[slot].acc_r, sharcFixed(total.r));
-    InterlockedAdd(pc.sharc[slot].acc_g, sharcFixed(total.g));
-    InterlockedAdd(pc.sharc[slot].acc_b, sharcFixed(total.b));
+    let r = min(radiance, float3(1.0e5)) * 65536.0;
+    InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(r.r));
+    InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(r.g));
+    InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(r.b));
+    InterlockedAdd(pc.sharc[slot].acc_n, 1u);
+    pc.sharc[slot].frame = pc.uniforms.frame;
 }
 
 
@@ -1138,10 +1110,12 @@ void main() {
         var camera_segment = true;
         // Still in the view's own frustum (no portal yet): the fog grid lights only that.
         var in_view = true;
-        // Radiance-cache update targets along this path: the voxel and 1 / the throughput
-        // there (sharcOpen / sharcClose).
+        // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
+        // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
+        // once the path ends.
         uint sh_slot[SHARC_VERTICES];
-        float3 sh_inv[SHARC_VERTICES];
+        float3 sh_mask[SHARC_VERTICES];
+        float3 sh_acc[SHARC_VERTICES];
         var sh_n = 0u;
         // One path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
         // cache learns from (answered paths only pass on what it already knows).
@@ -1576,10 +1550,10 @@ void main() {
                             break;
                         }
                     }
-                    let inv = sharcInverse(mask);
-                    if (sh_n < SHARC_VERTICES && !cache_blind && sharcOpen(slot, acc * inv)) {
+                    if (sh_n < SHARC_VERTICES) {
                         sh_slot[sh_n] = slot;
-                        sh_inv[sh_n] = inv;
+                        sh_mask[sh_n] = mask;
+                        sh_acc[sh_n] = acc;
                         sh_n++;
                     }
                 }
@@ -1873,11 +1847,16 @@ void main() {
             guide_fog[px] = float4(g.rgb, g.a + fog_t / float(SAMPLES));
         }
 
-        // The path ended: everything gathered after each cache vertex, over its throughput, is
-        // one sample of that voxel's outgoing radiance (zero radiance included -- darkness is
-        // learned too); its open part went in at the vertex.
-        for (uint si = 0u; si < sh_n; si++) {
-            sharcClose(sh_slot[si], acc * sh_inv[si]);
+        // The path ended: everything gathered after each cache vertex, divided by its mask
+        // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
+        // darkness is learned too).
+        for (uint si = 0u; si < (cache_blind ? 0u : sh_n); si++) {
+            let delta = max(acc - sh_acc[si], float3(0.0));
+            let m = sh_mask[si];
+            sharcDeposit(sh_slot[si], float3(
+                m.r > 1.0e-6 ? delta.r / m.r : 0.0,
+                m.g > 1.0e-6 ? delta.g / m.g : 0.0,
+                m.b > 1.0e-6 ? delta.b / m.b : 0.0));
         }
     }
 
