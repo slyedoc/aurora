@@ -1,6 +1,6 @@
 // GPU scatter: one thread per cell of a species' window around the viewer (aurora_landscape
-// scatter.rs). Each cell's spot is a hash of its GLOBAL cell, so a plant stays put as the
-// window moves. The spot is kept by the material weights there (times the species' factor per
+// scatter.rs). Each cell's spot is a hash of its GLOBAL cell, and its slot is fixed by it, so a
+// plant stays put (and keeps its motion vectors) as the window moves. The spot is kept by the material weights there (times the species' factor per
 // palette id) and the slope, dropped onto the heights, and written straight into the
 // species' TLAS instance block; a dropped spot gets a zero transform (traces nothing). With
 // poses, each instance leans with a gust wave travelling across the field: the baked pose under
@@ -34,7 +34,16 @@ struct SpeciesTables {
     Pose poses[64];
     // The shear (x per y, plant space) standing in for one pose step.
     float wind_shear;
-    float pad[3];
+    // The window the block last held (prev_valid): cells outside it just entered.
+    int prev_cell0_x;
+    int prev_cell0_z;
+    uint prev_valid;
+    Instance* prev_instances;
+    // ScatterSpecies::clump, clump_size, edge_scale.
+    float clump;
+    float clump_size;
+    float edge_scale;
+    float pad;
 };
 
 // `ScatterPush` in scatter.rs (the whole 128-byte block).
@@ -83,6 +92,45 @@ MatSet texel_set(int2 t) {
     return mat_unpack(push.materials[texel_index(p.min_x, p.min_z, p.pages_x, p.pages_z, t.x, t.y)]);
 }
 
+// The species' keep factor at one texel: its palette factors under the texel's weights.
+float texel_density(int2 t) {
+    let s = texel_set(t);
+    var density = 0.0;
+    for (int k = 0; k < 4; k++) {
+        density += s.w[k] * push.tables.factors[s.ids[k]];
+    }
+    return density;
+}
+
+// Value noise in [0, 1] on a unit lattice.
+float value_noise(float2 x, uint seed) {
+    let i = floor(x);
+    let f = x - i;
+    let u = f * f * (3.0 - 2.0 * f);
+    let ix = int(i.x);
+    let iz = int(i.y);
+    float c[4];
+    for (int k = 0; k < 4; k++) {
+        let h = pcg(uint(ix + (k & 1)) * 73856093u ^ uint(iz + (k >> 1)) * 19349663u ^ seed);
+        c[k] = float(h) / 4294967296.0;
+    }
+    return lerp(lerp(c[0], c[1], u.x), lerp(c[2], c[3], u.x), u.y);
+}
+
+// Where plants bunch up: 0 bald .. 1 thick. Mostly shared by every species (grass grows where
+// grass grows), a little per species so flowers patch on their own.
+float clump(float2 xz, float size, uint seed) {
+    let shared = 0.65 * value_noise(xz / size, 0x9E3779B9u)
+        + 0.35 * value_noise(xz / (size * 0.4), 0x85EBCA6Bu);
+    let own = value_noise(xz / (size * 0.6), seed * 2654435761u);
+    return smoothstep(0.2, 0.75, lerp(shared, own, 0.3));
+}
+
+// a mod w in [0, w) for negative a too (int % runs unsigned on some GPUs).
+int2 wrapCell(int2 a, int w) {
+    return a - w * int2(floor(float2(a) / float(w)));
+}
+
 void drop_spot(uint slot) {
     push.instances[slot].t0 = float4(0.0);
     push.instances[slot].t1 = float4(0.0);
@@ -96,8 +144,18 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     if (i >= push.width * push.width) {
         return;
     }
+    // Slots are fixed per global cell (cell mod width), so a plant keeps its slot -- and its
+    // last-frame row for motion vectors -- while it stays in the window.
     let slot = push.first + i;
-    let cell = int2(push.cell0_x + int(i % push.width), push.cell0_z + int(i / push.width));
+    let w = int(push.width);
+    let cell0 = int2(push.cell0_x, push.cell0_z);
+    let cell = cell0 + wrapCell(int2(int(i % push.width), int(i / push.width)) - cell0, w);
+    let held = cell - int2(push.tables.prev_cell0_x, push.tables.prev_cell0_z);
+    if (push.tables.prev_valid == 0u || any(held < 0) || any(held >= w)) {
+        push.tables.prev_instances[slot].t0 = float4(0.0);
+        push.tables.prev_instances[slot].t1 = float4(0.0);
+        push.tables.prev_instances[slot].t2 = float4(0.0);
+    }
     let pose_count = push.seed_poses >> 24;
     var h = pcg(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ (push.seed_poses & 0xFFFFFFu));
     let jitter = float2(unit(h), unit(h));
@@ -125,12 +183,16 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
         return;
     }
 
-    // Density from the nearest texel's materials.
-    let s = texel_set(int2(round(xz / p.texel)));
-    var density = 0.0;
-    for (int k = 0; k < 4; k++) {
-        density += s.w[k] * push.tables.factors[s.ids[k]];
-    }
+    // Density from the materials, bilinear between texels so edges fade instead of stepping;
+    // the clump noise bunches it into tufts and bald spots.
+    let tx = xz / p.texel - 0.5;
+    let t0 = int2(floor(tx));
+    let tf = tx - floor(tx);
+    let cover = lerp(lerp(texel_density(t0), texel_density(t0 + int2(1, 0)), tf.x),
+                     lerp(texel_density(t0 + int2(0, 1)), texel_density(t0 + int2(1, 1)), tf.x), tf.y);
+    let tables = push.tables;
+    let bunch = clump(xz, tables.clump_size, push.seed_poses & 0xFFFFFFu);
+    let density = cover * lerp(1.0, saturate(1.5 * bunch), tables.clump);
     if (unit(h) >= density) {
         drop_spot(slot);
         return;
@@ -145,7 +207,10 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
     }
 
     let yaw = unit(h) * 6.2831853;
-    let scale = lerp(push.scale_lo, push.scale_hi, unit(h));
+    // Thick tufts stand taller; plants thinning into a path or another ground shrink with it.
+    let taper = lerp(tables.edge_scale, 1.0, smoothstep(0.1, 0.8, cover));
+    let tuft = lerp(1.0, lerp(0.7, 1.1, bunch), tables.clump);
+    let scale = lerp(push.scale_lo, push.scale_hi, unit(h)) * tuft * taper;
     let c = cos(yaw) * scale;
     let sn = sin(yaw) * scale;
     let at = float3(push.origin_x + xz.x, push.origin_y + ground - push.sink, push.origin_z + xz.y);

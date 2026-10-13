@@ -183,6 +183,11 @@ pub struct AutoExposureSettings {
     /// dimmer than bright ones.
     #[reflect(@0.0..=1.0_f32)]
     pub adaptation: f32,
+    /// ...but a dim scene's look stays at most this many stops under full adaptation: the
+    /// eye's dark adaptation, so moonlit ground is dark but readable while a room (a few
+    /// stops under daylight) keeps the partial look.
+    #[reflect(@0.0..=8.0_f32)]
+    pub max_dim: f32,
     /// How fast Ray Reconstruction's input exposure follows the look (1 / seconds of its
     /// exponential ease; the look itself adapts at `speed_*`).
     #[reflect(@0.1..=20.0_f32)]
@@ -215,6 +220,9 @@ impl Default for AutoExposureSettings {
             // indoor, moonlit ground stays darker still. (0.7 against the raw 1-spp meter, which
             // under-read sparse light by ~2 stops; the resolved meter reads it true.)
             adaptation: 0.75,
+            // The abbey (~9 stops under daylight) sits at ~2.25 under full adaptation;
+            // moonlight (~16 under) would be 4 and reads black.
+            max_dim: 1.5,
             input_speed: 4.0,
         }
     }
@@ -257,6 +265,9 @@ struct AeParams {
     max_ev: f32,
     reference_ev: f32,
     adaptation: f32,
+    max_dim: f32,
+    /// 1 on a view's first metered frame: the look starts at its target.
+    snap: u32,
     /// Keeps the struct free of implicit tail padding (u64 alignment) for `Pod`.
     _pad: u32,
 }
@@ -285,6 +296,8 @@ struct ViewExposure {
     /// per change; telling NGX the pre-exposure shifts its output but keeps the transient),
     /// so it changes only as fast as the picture does: never under a fixed look.
     input_ev: Option<f32>,
+    /// The look has started at its first metering (no fade up from the reference).
+    settled: bool,
 }
 
 impl ViewExposure {
@@ -530,6 +543,8 @@ impl ViewExposure {
             max_ev: settings.max_ev.max(settings.min_ev),
             reference_ev: settings.reference_ev,
             adaptation: settings.adaptation.clamp(0.0, 1.0),
+            max_dim: settings.max_dim.max(0.0),
+            snap: !std::mem::replace(&mut self.settled, true) as u32,
             _pad: 0,
         };
 

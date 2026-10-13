@@ -64,6 +64,14 @@ pub struct ScatterSpecies {
     pub seed: u32,
     /// Multiplies every `grows_on` factor: thins (or fills) the species without moving it.
     pub density: f32,
+    /// How much plants bunch into tufts and bald spots, thick tufts standing taller (0 = an
+    /// even carpet, 1 = full).
+    pub clump: f32,
+    /// Metres across a tuft.
+    pub clump_size: f32,
+    /// Scale of the plants where their ground thins out to nothing, so they shrink into a path
+    /// instead of standing full height at its edge (1 = no taper).
+    pub edge_scale: f32,
 }
 
 impl Default for ScatterSpecies {
@@ -82,6 +90,9 @@ impl Default for ScatterSpecies {
             wind_shear: 0.0,
             seed: 1,
             density: 1.0,
+            clump: 1.0,
+            clump_size: 7.0,
+            edge_scale: 0.45,
         }
     }
 }
@@ -128,7 +139,17 @@ struct SpeciesTables {
     factors: [f32; PALETTE_MAX],
     poses: [BlockPose; POSES_MAX],
     wind_shear: f32,
-    _pad: [f32; 3],
+    /// The window the block last held, when it still holds it (`prev_valid`): cells outside
+    /// it just entered and clear their slot's previous row (no motion from the cell they
+    /// replaced).
+    prev_cell0_x: i32,
+    prev_cell0_z: i32,
+    prev_valid: u32,
+    prev_instances: u64,
+    clump: f32,
+    clump_size: f32,
+    edge_scale: f32,
+    _pad: f32,
 }
 
 /// A species' GPU tables and what its block last held.
@@ -248,6 +269,17 @@ pub fn scatter_species(
         }
         tables.poses[..poses.len()].copy_from_slice(poses);
         tables.wind_shear = spec.wind_shear;
+        tables.clump = spec.clump.clamp(0.0, 1.0);
+        tables.clump_size = spec.clump_size.max(0.1);
+        tables.edge_scale = spec.edge_scale;
+        if let Some((last, g)) = state.last
+            && g == generation
+        {
+            tables.prev_cell0_x = last.x;
+            tables.prev_cell0_z = last.y;
+            tables.prev_valid = 1;
+        }
+        tables.prev_instances = tlas.prev_instances_address();
         state.last = Some((cell0, generation));
         let push = ScatterPush {
             instances: tlas.instances_address(),

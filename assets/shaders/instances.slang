@@ -29,12 +29,15 @@ struct InstanceRecord {
     uint sbt_and_flags;
     uint node;
     uint64_t blas;
-    uint64_t pad;
+    // The slot changed owner (a new transform node): it has no last frame.
+    uint fresh;
+    uint pad;
 };
 
 struct ScatterInstancesParams {
     InstanceRecord* records;
     Instance* instances;
+    Instance* prev_instances;
     uint* instance_node;
     uint count;
     uint base;
@@ -54,6 +57,11 @@ void scatter_instances(uint3 gid: SV_DispatchThreadID) {
     p.instances[r.slot].sbt_and_flags = r.sbt_and_flags;
     p.instances[r.slot].blas = r.blas;
     p.instance_node[r.slot] = r.node;
+    if (r.fresh != 0u) {
+        p.prev_instances[r.slot].t0 = float4(0.0);
+        p.prev_instances[r.slot].t1 = float4(0.0);
+        p.prev_instances[r.slot].t2 = float4(0.0);
+    }
 }
 
 struct GatherInstancesParams {

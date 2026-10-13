@@ -61,7 +61,10 @@ pub struct InstanceRecord {
     pub sbt_and_flags: u32,
     pub node: u32,
     pub blas: u64,
-    pub pad: u64,
+    /// The slot changed owner (a new transform node): its previous row is cleared, so the
+    /// first frame has no motion from whatever held the slot before.
+    pub fresh: u32,
+    pub pad: u32,
 }
 
 #[repr(C)]
@@ -69,6 +72,7 @@ pub struct InstanceRecord {
 struct ScatterInstancesParams {
     records: u64,
     instances: u64,
+    prev_instances: u64,
     instance_node: u64,
     count: u32,
     base: u32,
@@ -574,6 +578,41 @@ impl TLAS {
         self.rebuild = true;
     }
 
+    /// Keeps last frame's instance rows for motion vectors: call once per frame before anything
+    /// writes this frame's rows (the queued frame commands, then `record`).
+    pub fn snapshot_prev(&self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
+        let rows = self.count.min(self.capacity);
+        if rows == 0 {
+            return;
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        unsafe {
+            let copy = vk::BufferCopy::default().size(rows as u64 * 64);
+            rd.device.cmd_copy_buffer(
+                cmd,
+                self.instances_buf.handle,
+                self.prev_instances_buf.handle,
+                std::slice::from_ref(&copy),
+            );
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ,
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+        );
+    }
+
     /// Records this frame's instance updates and, when anything changed, the TLAS build. Call
     /// after the transform table's `record` (and the in-flight fence wait). `world_changed`
     /// also covers BLASes rebuilt in place this frame (skinning), which move the TLAS bounds.
@@ -606,33 +645,14 @@ impl TLAS {
             transfers = true;
         }
         transfers |= self.materials.upload(rd, cmd);
-
-        // Previous transforms for motion vectors: what the instances held when the last frame
-        // traced (before this frame's gather overwrites them).
+        // Rows the frame's queued kernels wrote (the landscape scatter) land before the
+        // gather and the build.
         memory_barrier(
             rd,
             cmd,
             vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
-        );
-        unsafe {
-            let copy = vk::BufferCopy::default().size(self.count as u64 * 64);
-            rd.device.cmd_copy_buffer(
-                cmd,
-                self.instances_buf.handle,
-                self.prev_instances_buf.handle,
-                std::slice::from_ref(&copy),
-            );
-        }
-        memory_barrier(
-            rd,
-            cmd,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ,
-            vk::PipelineStageFlags2::COMPUTE_SHADER
-                | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+            vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
         );
 
@@ -654,6 +674,7 @@ impl TLAS {
             let params = ScatterInstancesParams {
                 records: self.staging.address,
                 instances: self.instances_buf.address,
+                prev_instances: self.prev_instances_buf.address,
                 instance_node: self.instance_node_buf.address,
                 count: n,
                 base: 0,
@@ -1116,11 +1137,13 @@ pub fn prepare_instances(
             sbt_and_flags: ((2 * hit_offset) & 0x00FF_FFFF) | (flags << 24),
             node: source.node,
             blas,
+            fresh: 0,
             pad: 0,
         };
         if tlas.mirror[slot as usize] != record {
+            let fresh = (tlas.mirror[slot as usize].node != record.node) as u32;
             tlas.mirror[slot as usize] = record;
-            tlas.records.push(record);
+            tlas.records.push(InstanceRecord { fresh, ..record });
         }
         // A block's other slots copy the head's static half; its poses resolve alongside.
         if let Some((count, poses)) = tlas.blocks.get(&slot).cloned() {

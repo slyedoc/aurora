@@ -511,8 +511,7 @@ impl Skins {
         let cur = self.current();
         let prev = cur ^ 1;
 
-        // Palettes (host-visible, rewritten after the fence wait) and first-frame history.
-        let mut transfers = false;
+        // Palettes (host-visible, rewritten after the fence wait).
         for inst in self.instances.values_mut() {
             let Some(gpu) = inst.gpu.as_mut() else {
                 continue;
@@ -522,31 +521,6 @@ impl Skins {
                     .copy_from_slice(&inst.joint_nodes);
                 inst.joints_dirty = false;
             }
-            if gpu.builds == 0 {
-                // Last frame's stream starts as the rest pose: no fake motion on the first frame.
-                let copy = vk::BufferCopy::default()
-                    .size(gpu.vertex_count as u64 * std::mem::size_of::<Vertex>() as u64);
-                unsafe {
-                    rd.device.cmd_copy_buffer(
-                        cmd,
-                        gpu.rest.handle,
-                        gpu.vertices[prev].handle,
-                        std::slice::from_ref(&copy),
-                    );
-                }
-                transfers = true;
-            }
-        }
-        if transfers {
-            memory_barrier(
-                rd,
-                cmd,
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER
-                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                vk::AccessFlags2::SHADER_READ,
-            );
         }
 
         // Deform.
@@ -613,6 +587,43 @@ impl Skins {
             return false;
         }
         compute_to_compute_barrier(rd, cmd);
+        // A new instance's last frame is its first deformed pose: no fake motion from the rest
+        // pose on its first frame.
+        let fresh: Vec<&SkinnedGpu> = self
+            .instances
+            .values()
+            .filter_map(|i| i.gpu.as_ref().filter(|g| g.builds == 0 && i.source.node < node_count))
+            .collect();
+        if !fresh.is_empty() {
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
+            for gpu in fresh {
+                let copy = vk::BufferCopy::default()
+                    .size(gpu.vertex_count as u64 * std::mem::size_of::<Vertex>() as u64);
+                unsafe {
+                    rd.device.cmd_copy_buffer(
+                        cmd,
+                        gpu.vertices[cur].handle,
+                        gpu.vertices[prev].handle,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+            }
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::SHADER_READ,
+            );
+        }
         for inst in self.instances.values() {
             let Some(gpu) = inst.gpu.as_ref() else {
                 continue;

@@ -997,10 +997,12 @@ fn render_frame(
         } else {
             cmd_buffer
         };
-        // Queued per-frame dispatches (landscape scatter writes instance rows): ahead of the
-        // TLAS build, in whichever buffer carries it.
+        // Last frame's instance rows kept for motion vectors, then the queued per-frame dispatches
+        // (landscape scatter writes instance rows): ahead of the TLAS build, in whichever buffer
+        // carries it.
         let section = info_span!("record_frame_commands").entered();
         let scope = prof.begin(&render_device, scene_cmd, "frame commands");
+        tlas.snapshot_prev(&render_device, scene_cmd);
         frame_commands.record(&render_device, &modules, scene_cmd);
         prof.end(&render_device, scene_cmd, scope);
         drop(section);
@@ -1216,14 +1218,14 @@ fn render_frame(
                         bytemuck::cast_slice(&[push_constants]),
                     );
 
-                    // The camera's fog grid, by the first of its views: lit before any of them
-                    // marches it (a headset's second eye reuses it).
                     // Guides into GENERAL before the first dispatch: the fog grid runs with
                     // this set bound, so validation checks their layout there too.
                     if let (Some(_), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
                         renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
                     }
 
+                    // The camera's fog grid, by the first of its views: lit before any of them
+                    // marches it (a headset's second eye reuses it).
                     if let Some((_, _, grid)) = grids
                         .iter()
                         .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)

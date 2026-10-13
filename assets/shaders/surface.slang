@@ -247,6 +247,20 @@ public float3 surfaceShadingNormal(SurfaceHit hit) {
         hit, normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base)));
 }
 
+// Where an object-space point of this instance was last frame. A zero row is a slot with no
+// last frame (new, reused, grown, or a scatter cell that just entered): no object motion.
+public float3 prevWorldPos(float3 object_p) {
+    let base = InstanceIndex() * 4;
+    let r0 = pc.prev_instances[base + 0];
+    let r1 = pc.prev_instances[base + 1];
+    let r2 = pc.prev_instances[base + 2];
+    if (all(r0 == 0.0) && all(r1 == 0.0) && all(r2 == 0.0)) {
+        return WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
+    }
+    let p = float4(object_p, 1.0);
+    return float3(dot(r0, p), dot(r1, p), dot(r2, p));
+}
+
 // Hit distance, normals, identity for the light-table MIS lookup, and last frame's position
 // for motion vectors Call it after writing
 // colour, emission and roughness.
@@ -267,11 +281,7 @@ public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3
         }
         object_p = q[0] * hit.bary.x + q[1] * hit.bary.y + q[2] * hit.bary.z;
     }
-    let p = float4(object_p, 1.0);
-    let base = InstanceIndex() * 4;
-    payload.prev_world_pos = float3(dot(pc.prev_instances[base + 0], p),
-                                    dot(pc.prev_instances[base + 1], p),
-                                    dot(pc.prev_instances[base + 2], p));
+    payload.prev_world_pos = prevWorldPos(object_p);
     hitPayloadSetInside(payload, hit.inside);
     payload.lobes = packLobes(hit.material.diffuse_transmission, hit.material.clearcoat,
                               hit.material.clearcoat_roughness);

@@ -56,11 +56,7 @@ void closesthit(inout HitPayload payload, SphereAttributes attribs) {
     // Where this point of the sphere was last frame: its object-space point through last frame's
     // instance transform (as surface.slang does). The current hit point here gave a moving
     // sphere no motion, and Ray Reconstruction trailed it.
-    let p = float4(attribs.point, 1.0);
-    let base = InstanceIndex() * 4;
-    payload.prev_world_pos = float3(dot(pc.prev_instances[base + 0], p),
-                                    dot(pc.prev_instances[base + 1], p),
-                                    dot(pc.prev_instances[base + 2], p));
+    payload.prev_world_pos = prevWorldPos(attribs.point);
     hitPayloadSetTransmission(payload, material.specular_transmission_factor);
     hitPayloadSetRoughness(payload, material.roughness_factor);
     hitPayloadSetMetallic(payload, material.metallic_factor);

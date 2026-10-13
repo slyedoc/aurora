@@ -46,6 +46,9 @@ struct AeParams {
     float max_ev;
     float reference_ev;    // The look adapts around this exposure...
     float adaptation;      // ...by this fraction of the metered difference (1 = full auto).
+    float max_dim;         // ...staying at most this many stops under the metering.
+    uint snap;             // First metered frame: start at the target.
+    uint pad;
 };
 [[vk::push_constant]] AeParams p;
 
@@ -130,7 +133,11 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
         // so a night scene still reads darker than a sunlit one (a full-auto look renders
         // both the same). Linear-capped exponential approach (bevy's speed /
         // exponential_transition pair).
-        let target = clamp(lerp(p.reference_ev, metered, p.adaptation), p.min_ev, p.max_ev);
+        let partial = max(lerp(p.reference_ev, metered, p.adaptation), metered - p.max_dim);
+        let target = clamp(partial, p.min_ev, p.max_ev);
+        if (p.snap != 0u) {
+            state.ev = target;
+        }
         let speed = (target > state.ev) ? p.speed_brighten : p.speed_darken;
         let step_ = speed * p.dt;
         let d = target - state.ev;
