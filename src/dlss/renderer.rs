@@ -30,7 +30,9 @@ struct DlssImage {
 
 impl DlssImage {
     fn new(rd: &RenderDevice, format: vk::Format, extent: vk::Extent2D, storage: bool) -> Self {
-        let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         if storage {
             usage |= vk::ImageUsageFlags::STORAGE;
         }
@@ -68,6 +70,196 @@ impl DlssImage {
     }
 }
 
+/// Ray Reconstruction's output, halved level by level (half resolution down to one texel) by
+/// filtered blits after each evaluate: what local tone mapping reads a region's surroundings
+/// and the frame's average from (quad.slang), smooth where a few taps of the full image cast
+/// copies of every sharp silhouette.
+struct Pyramid {
+    image: vk::Image,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    levels: u32,
+}
+
+impl Pyramid {
+    fn new(rd: &RenderDevice, output: vk::Extent2D) -> Self {
+        let extent = vk::Extent2D {
+            width: (output.width / 2).max(1),
+            height: (output.height / 2).max(1),
+        };
+        let levels = 32 - extent.width.max(extent.height).leading_zeros();
+        let info = vk_init::image_info(
+            extent.width,
+            extent.height,
+            F_COLOR,
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .mip_levels(levels);
+        let image = rd.create_render_target(&info);
+        let view_info = vk_init::image_view_info(image, F_COLOR).subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(levels)
+                .layer_count(1),
+        );
+        let view = unsafe { rd.device.create_image_view(&view_info, None).unwrap() };
+        Self {
+            image,
+            view,
+            extent,
+            levels,
+        }
+    }
+
+    fn destroy(&self, rd: &RenderDevice) {
+        rd.destroyer.destroy_image_view(self.view);
+        rd.destroyer.destroy_image(self.image);
+    }
+
+    /// Blits `source` (in GENERAL, written by the evaluate) into level 0, then each level into
+    /// the next; leaves every level SHADER_READ_ONLY for the post-process.
+    fn record(&self, rd: &RenderDevice, cmd: vk::CommandBuffer, source: &DlssImage) {
+        let range = |base: u32, count: u32| {
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(base)
+                .level_count(count)
+                .layer_count(1)
+        };
+        let barrier = |base: u32,
+                       count: u32,
+                       old: vk::ImageLayout,
+                       new: vk::ImageLayout,
+                       src: (vk::PipelineStageFlags2, vk::AccessFlags2),
+                       dst: (vk::PipelineStageFlags2, vk::AccessFlags2)| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src.0)
+                .src_access_mask(src.1)
+                .dst_stage_mask(dst.0)
+                .dst_access_mask(dst.1)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.image)
+                .subresource_range(range(base, count))
+        };
+        let transfer_write = (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        let transfer_read = (
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        let pipeline = |barriers: &[vk::ImageMemoryBarrier2], memory: &[vk::MemoryBarrier2]| unsafe {
+            rd.ext_sync2.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(barriers)
+                    .memory_barriers(memory),
+            );
+        };
+        // The evaluate's writes to the blit; every level writable (overwritten in full).
+        pipeline(
+            &[barrier(
+                0,
+                self.levels,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                (
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                ),
+                transfer_write,
+            )],
+            &[vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)],
+        );
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let corner = |e: vk::Extent2D| vk::Offset3D {
+            x: e.width as i32,
+            y: e.height as i32,
+            z: 1,
+        };
+        let level_extent = |l: u32| vk::Extent2D {
+            width: (self.extent.width >> l).max(1),
+            height: (self.extent.height >> l).max(1),
+        };
+        let blit = |src_image: vk::Image,
+                    src_layout: vk::ImageLayout,
+                    src_level: u32,
+                    src_extent: vk::Extent2D,
+                    dst_level: u32| unsafe {
+            rd.device.cmd_blit_image(
+                cmd,
+                src_image,
+                src_layout,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageBlit::default()
+                    .src_subresource(layers.mip_level(src_level))
+                    .src_offsets([vk::Offset3D::default(), corner(src_extent)])
+                    .dst_subresource(layers.mip_level(dst_level))
+                    .dst_offsets([vk::Offset3D::default(), corner(level_extent(dst_level))])],
+                vk::Filter::LINEAR,
+            );
+        };
+        blit(source.image, vk::ImageLayout::GENERAL, 0, source.extent, 0);
+        for l in 1..self.levels {
+            pipeline(
+                &[barrier(
+                    l - 1,
+                    1,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    transfer_write,
+                    transfer_read,
+                )],
+                &[],
+            );
+            blit(
+                self.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                l - 1,
+                level_extent(l - 1),
+                l,
+            );
+        }
+        let to_shader = (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
+        let last = self.levels - 1;
+        let mut barriers = vec![barrier(
+            last,
+            1,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            transfer_write,
+            to_shader,
+        )];
+        if last > 0 {
+            barriers.push(barrier(
+                0,
+                last,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                transfer_read,
+                to_shader,
+            ));
+        }
+        pipeline(&barriers, &[]);
+    }
+}
+
 struct DlssView {
     handle: *mut NgxHandle,
     mode: AuroraDlss,
@@ -89,6 +281,7 @@ struct DlssView {
     /// seconds.
     exposure: DlssImage,
     output_image: DlssImage,
+    pyramid: Pyramid,
     first_evaluate: bool,
     /// Guides have been laid out once (UNDEFINED -> GENERAL); after that they cycle
     /// GENERAL <-> SHADER_READ_ONLY.
@@ -392,6 +585,7 @@ impl DlssRenderer {
             fog,
             exposure,
             output_image,
+            pyramid: Pyramid::new(rd, output),
             first_evaluate: true,
             guides_initialized: false,
         });
@@ -416,6 +610,7 @@ impl DlssRenderer {
         {
             image.destroy(rd);
         }
+        view.pyramid.destroy(rd);
     }
 
     pub fn guide_views(&self, slot: usize) -> Option<GuideViews> {
@@ -429,6 +624,7 @@ impl DlssRenderer {
             motion: v.motion.view,
             color: v.color.view,
             fog: v.fog.view,
+            pyramid: v.pyramid.view,
         })
     }
 
@@ -623,6 +819,7 @@ impl DlssRenderer {
         if let Err(e) = result {
             log::error!("dlss: {e}");
         }
+        view.pyramid.record(rd, cmd, &view.output_image);
         let readable = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)

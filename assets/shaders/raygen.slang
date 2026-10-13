@@ -497,15 +497,27 @@ uint sharcSlot(float3 pos, float3 n, float3 cam) {
 }
 
 // The resolved radiance, if the entry has folded in enough samples to be trusted.
+// Finite and non-negative, by bit pattern (fast-math may fold isnan away): exponent all ones
+// is NaN or infinity, the sign bit is negative.
+bool sharcSane(float3 v) {
+    let b = asuint(v);
+    return all((b & 0x7f800000u) != 0x7f800000u) && all((b & 0x80000000u) == 0u);
+}
+
 bool sharcQuery(uint slot, out float3 radiance) {
     radiance = float3(pc.sharc[slot].res_r, pc.sharc[slot].res_g, pc.sharc[slot].res_b);
-    return pc.sharc[slot].conf >= 16.0;
+    return pc.sharc[slot].conf >= 16.0 && sharcSane(radiance);
 }
 
 // One path sample of the voxel's outgoing radiance (nits; fixed point at 1/65536 nit, so a
 // moonlit voxel is not rounded to black).
+// A NaN from one degenerate hit (the camera inside a wall, a mirror up close) cast to an
+// integer poisoned a whole voxel's channel: it glowed red, blue or yellow until it washed out.
 void sharcDeposit(uint slot, float3 radiance) {
-    let r = clamp(radiance, float3(0.0), float3(1.0e6)) * 65536.0;
+    if (!sharcSane(radiance)) {
+        return;
+    }
+    let r = min(radiance, float3(1.0e5)) * 65536.0;
     InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(r.r));
     InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(r.g));
     InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(r.b));
@@ -950,9 +962,10 @@ void main() {
     }
 
     var acc = float3(0.0);
-    // Sample 0's camera-ray fog for the composite (`guide_fog`); none: nothing over the colour.
+    // The camera ray's fog for the composite (`guide_fog`), averaged over the samples; none:
+    // nothing over the colour.
     var fog_out = float3(0.0);
-    var fog_out_t = 1.0;
+    var fog_out_t = 0.0;
     let SAMPLES = pc.uniforms.samples;
     let MAX_BOUNCES = pc.uniforms.max_bounces;
     // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
@@ -1007,12 +1020,18 @@ void main() {
         // One path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
         // cache learns from (answered paths only pass on what it already knows).
         let sharc_train = SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN;
+        // The ray being traced left a rough surface: only then may the cache answer for what it
+        // hits (a mirror's or a glossy floor's reflection is traced, never the cache's cells).
+        var from_rough = false;
+        // The camera ray met the back of a solid surface first: the camera is inside geometry
+        // (a wall it clipped through). Such a path sees unlit insides and must not teach the
+        // cache -- it poisoned the voxels of the room side, which glowed until washed out.
+        var cache_blind = false;
         // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
         var guides_written = false;
-        // The camera ray's fog (sample 0 of a 1-spp frame): kept out of Ray Reconstruction's
-        // colour, its light and transmittance go to `guide_fog` for the composite.
-        let fog_aside = sample_idx == 0u && SAMPLES == 1u;
+        // The camera ray's fog: kept out of Ray Reconstruction's colour at any sample count,
+        // its light and transmittance go to `guide_fog` for the composite.
         var fog_light = float3(0.0);
         var fog_t = 1.0;
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
@@ -1196,6 +1215,9 @@ void main() {
             let transmission = hitPayloadGetTransmission(payload);
             let inside = hitPayloadGetInside(payload);
             let lob = unpackLobes(payload.lobes);
+            if (camera_segment && inside && transmission < 0.01 && !hitPayloadGetMasked(payload)) {
+                cache_blind = true;
+            }
 
             // fog bounce (skybox has a distance of 0 so will never hit
             // this case, having an extra check for this is slower than
@@ -1216,15 +1238,10 @@ void main() {
                     fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
                              payload.t > 0.0, fog_mask, fog_acc, payload);
                 }
-                if (fog_aside) {
-                    // The surface behind reaches RR unveiled; the composite applies both.
-                    let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
-                    fog_light += fog_t * fog_acc;
-                    fog_t *= seg_t;
-                } else {
-                    mask = fog_mask;
-                    acc += fog_acc;
-                }
+                // The surface behind reaches RR unveiled; the composite applies both.
+                let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
+                fog_light += fog_t * fog_acc;
+                fog_t *= seg_t;
             } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
                 surf_n = float3(0.0);
@@ -1410,14 +1427,16 @@ void main() {
 
             // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
             // indirect hit on, a converged voxel ends the path with its cached outgoing
-            // radiance -- unless the hit is closer than a voxel (the cache would leak light
-            // into contact shadows) or the path is a training one. Every participating vertex
-            // of a traced path is an update target.
+            // radiance -- when the ray came off a rough surface and its footprint (the cone's width
+            // here) covers a voxel: a mirror's reflection or a close contact showed the cache's
+            // cells as blocks and leaked light. Training paths never ask. Every participating
+            // vertex of a traced path is an update target.
             if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
                 && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
                 let slot = sharcSlot(origin, world_normal, initial_origin);
                 if (slot != 0xFFFFFFFFu) {
-                    if (!sharc_train && payload.t > sharcVoxelSize(origin, initial_origin)) {
+                    if (!sharc_train && from_rough
+                        && cone_width >= sharcVoxelSize(origin, initial_origin)) {
                         float3 cached;
                         if (sharcQuery(slot, cached)) {
                             acc += mask * cached;
@@ -1633,6 +1652,7 @@ void main() {
                 prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                 want_sun = false;
                 cone_spread = max(cone_spread, 0.37);
+                from_rough = true;
                 continue;
             }
             if (lob.clearcoat > 0.0) {
@@ -1650,6 +1670,7 @@ void main() {
                     prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                     want_sun = false;
                     cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
+                    from_rough = lob.coat_alpha >= 0.35;
                     continue;
                 }
             }
@@ -1699,6 +1720,7 @@ void main() {
             mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
+            from_rough = roughness >= 0.35;
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
@@ -1712,15 +1734,14 @@ void main() {
             }
         }
 
-        if (fog_aside) {
-            fog_out = fog_light;
-            fog_out_t = fog_t;
-        }
+        // Averaged over the samples, like the colour.
+        fog_out += fog_light / float(SAMPLES);
+        fog_out_t += fog_t / float(SAMPLES);
 
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
         // darkness is learned too).
-        for (uint si = 0u; si < sh_n; si++) {
+        for (uint si = 0u; si < (cache_blind ? 0u : sh_n); si++) {
             let delta = max(acc - sh_acc[si], float3(0.0));
             let m = sh_mask[si];
             sharcDeposit(sh_slot[si], float3(
@@ -1746,7 +1767,10 @@ void main() {
     // nothing; it is light in the air).
     let fog_nits = dot(float3(0.2125, 0.7154, 0.0721), fog_out);
     pc.lum[lum_at] = meter_skip ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
-    pc.lum[lum_at + 1u] = lum_nits;
+    // The pair's second slot: the albedo the meter divides by (< 0 = not metered), for the
+    // post-process pass, which re-meters from Ray Reconstruction's output (quad.slang) and
+    // leaves the raw nits there.
+    pc.lum[lum_at + 1u] = meter_skip ? -1.0 : max(meter_albedo, 0.04);
     // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
     // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
     // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the

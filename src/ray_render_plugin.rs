@@ -1408,6 +1408,9 @@ fn render_frame(
                             fog: 0,
                             local_tonemap,
                             _pad: 0.0,
+                            lum: views[eye].ae.0,
+                            lum_width: views[eye].trace_extent.width,
+                            lum_height: views[eye].trace_extent.height,
                         },
                     );
                 }
@@ -1493,6 +1496,9 @@ fn render_frame(
                             fog: 0,
                             local_tonemap,
                             _pad: 0.0,
+                            lum: view.ae.0,
+                            lum_width: view.trace_extent.width,
+                            lum_height: view.trace_extent.height,
                         },
                     );
                 }
@@ -1649,6 +1655,9 @@ fn render_frame(
                             fog: 0,
                             local_tonemap,
                             _pad: 0.0,
+                            lum: view.ae.0,
+                            lum_width: view.trace_extent.width,
+                            lum_height: view.trace_extent.height,
                         },
                     );
                 }
@@ -1862,7 +1871,7 @@ unsafe fn record_post_draw(
             .image_layout(vk::ImageLayout::GENERAL)
             .image_view(source_view)
             .sampler(render_device.linear_sampler);
-        let mut image_infos = [output_info; 9];
+        let mut image_infos = [output_info; 10];
         if let Some(g) = guides {
             for (slot, view) in [
                 (1, g.color),
@@ -1873,6 +1882,7 @@ unsafe fn record_post_draw(
                 (6, g.spec_hit),
                 (7, g.motion),
                 (8, g.fog),
+                (9, g.pyramid),
             ] {
                 image_infos[slot] = vk::DescriptorImageInfo::default()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)

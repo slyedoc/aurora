@@ -21,6 +21,11 @@ pub struct PostProcessPushConstants {
     /// `RenderSettings::local_tonemap`.
     pub local_tonemap: f32,
     pub _pad: f32,
+    /// The view's auto-exposure meter buffer (render resolution, 0 = none): the pass meters what
+    /// Ray Reconstruction resolved into it, over the raygen's own noisy meter.
+    pub lum: u64,
+    pub lum_width: u32,
+    pub lum_height: u32,
 }
 
 #[derive(Asset, TypePath, Debug, Clone)]
@@ -73,12 +78,12 @@ impl VulkanAsset for PostProcessFilter {
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
 
-        // 9 sampled images: the DLSS output, the guide buffers for the debug views and the
-        // camera ray's fog (quad.slang's `test[9]`).
+        // 10 sampled images: the DLSS output, the guide buffers for the debug views, the camera
+        // ray's fog and the output's mip pyramid (quad.slang's `test[10]`).
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .binding(0)
-            .descriptor_count(9)
+            .descriptor_count(10)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
 
         let descriptor_layout_info =

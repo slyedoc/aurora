@@ -899,7 +899,9 @@ unsafe fn create_logical_device(
         let core_features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
             .shader_float64(true)
-            .shader_int16(true);
+            .shader_int16(true)
+            // The post-process pass writes the exposure meter from what it displays.
+            .fragment_stores_and_atomics(true);
 
         let device_info = vk::DeviceCreateInfo::default()
             .enabled_features(&core_features)

@@ -34,13 +34,19 @@ struct QuadPush {
     // Local tone mapping strength (RenderSettings::local_tonemap); 0 = off.
     float local_tonemap;
     float pad;
+    // The view's auto-exposure meter, (meter, albedo) pairs at render resolution (null = none;
+    // auto_exposure.rs): the raygen wrote its noisy meter and the surface's albedo (< 0 = not
+    // metered); this pass replaces the meter with what Ray Reconstruction resolved.
+    float* lum;
+    uint lum_width;
+    uint lum_height;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
 // 0: the DLSS output; 1..=7 the guide images (colour, normals+roughness, diffuse, specular,
-// depth, specular hit distance, motion) for the debug views; 8 the camera ray's fog. Slots the
-// renderer cannot fill yet alias the output.
-[[vk::binding(0, 0)]] Sampler2D test[9];
+// depth, specular hit distance, motion) for the debug views; 8 the camera ray's fog; 9 the
+// output's mip pyramid (local tone mapping). Slots the renderer cannot fill yet alias the output.
+[[vk::binding(0, 0)]] Sampler2D test[10];
 
 struct VertexOut {
     float4 position : SV_Position;
@@ -81,37 +87,89 @@ float3 nitsFalseColor(float nits) {
     return c * (0.4 + 0.6 * edge);
 }
 
-// Local tone mapping: the log-average luminance of the surroundings (two rings of wide taps
-// on the resolved colour, ~3 % and ~9 % of the height out) against the whole frame's (a 4x4
-// grid) sets a gain that moves the region `strength` of the way toward the frame's average,
-// clamped to two stops either way. Low frequency only, so texture stays; shade under a canopy
-// lifts, sunlit ground comes down, and a frame dark all over (night) keeps its exposure.
+// Local tone mapping: a region's surroundings (the output's pyramid at the level ~3 % of the
+// height across, read smoothly) against the whole frame's (a 4x4 grid of log reads at a level
+// ~1/16 of the height) sets a gain that moves the region `strength` of the way toward the
+// frame's average, clamped to two stops either way. Low frequency only, so texture stays;
+// shade under a canopy lifts, sunlit ground comes down, and a frame dark all over (night) keeps
+// its exposure. A few taps of the full-resolution image instead cast faint copies of every
+// sharp silhouette against the sky; the surroundings are edge-aware, and the sky is left as is.
+float pyramidLog(float2 uv, float level, float scale) {
+    let c = test[9].SampleLevel(uv, level).rgb * scale;
+    return log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+}
+
+// A region's level at pyramid `level`, smoothed: four reads half a texel apart hide the
+// bilinear diamonds of a coarse level.
+float pyramidKey(float2 uv, float level, float scale, uint w, uint h) {
+    let t = exp2(level) / float2(float(w), float(h)) * 0.5;
+    return 0.25 * (pyramidLog(uv + float2(-t.x, -t.y), level, scale)
+                 + pyramidLog(uv + float2(t.x, -t.y), level, scale)
+                 + pyramidLog(uv + float2(-t.x, t.y), level, scale)
+                 + pyramidLog(uv + float2(t.x, t.y), level, scale));
+}
+
 float3 localGain(float2 uv, float scale, float strength) {
-    uint w, h;
-    test[0].GetDimensions(w, h);
-    let aspect = float(h) / float(w);
-    var sum = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
-    var n = 1.0;
-    for (int ring = 1; ring <= 2; ring++) {
-        let r = ring == 1 ? 0.03 : 0.09;
-        for (int k = 0; k < 8; k++) {
-            let a = (float(k) + (ring == 1 ? 0.0 : 0.5)) * 0.7853982;
-            let o = float2(cos(a) * aspect, sin(a)) * r;
-            let c = test[0].SampleLevel(uv + o, 0.0).rgb * scale;
-            sum += log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
-            n += 1.0;
-        }
+    uint w, h, levels;
+    test[9].GetDimensions(0, w, h, levels);
+    let top = float(levels) - 1.0;
+    // Level 0 is half the output: the level whose texel spans ~3 % of the height, one 1.5 levels
+    // finer, and level 0.
+    let coarse = clamp(log2(float(h) * 0.03), 0.0, top);
+    let own = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+    // Edge-aware surroundings: the three scales blended by how close each is to the pixel's own
+    // level (leaning coarse). Sky beside a canopy reads sky at the finer scales and keeps the
+    // sky's gain -- one coarse level bled the canopy's darkness across the silhouette, a halo.
+    var key = 0.0;
+    var wsum = 0.0;
+    for (int i = 0; i < 3; i++) {
+        let level = i == 0 ? 0.0 : max(coarse - float(2 - i) * 1.5, 0.0);
+        let k = pyramidKey(uv, level, scale, w, h);
+        let d = (own - k) / 0.75;
+        let wi = exp2(float(i)) * exp(-d * d);
+        key += wi * k;
+        wsum += wi;
     }
-    let key = sum / n;
+    key /= max(wsum, 1.0e-6);
+    let frame_level = clamp(log2(float(h) / 16.0), 0.0, top);
     var frame = 0.0;
     for (int y = 0; y < 4; y++) {
         for (int x = 0; x < 4; x++) {
-            let c = test[0].SampleLevel((float2(float(x), float(y)) + 0.5) / 4.0, 0.0).rgb * scale;
-            frame += log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
+            frame += pyramidLog((float2(float(x), float(y)) + 0.5) / 4.0, frame_level, scale);
         }
     }
     let stops = clamp((frame / 16.0 - key) * strength, -2.0, 2.0);
-    return float3(exp2(stops));
+    // The sky keeps its exposure (the depth guide holds 1e7 there; its bilinear blend softens
+    // the silhouette): pulled toward a darker frame it went deep blue, and any mismatch of
+    // the surroundings at a silhouette showed as a halo.
+    let sky = saturate(test[5].SampleLevel(uv, 0.0).r / 1.0e7);
+    return float3(exp2(stops * (1.0 - sky)));
+}
+
+// The exposure meter from the resolved image: at 1 spp most raw samples are exactly 0 (an
+// occluded shadow ray, a bounce that found nothing) or rare bright hits, and even strip-averaged
+// the raw meter read a scene up to a stop darker than it shows. Each render pixel's meter is
+// written by ONE output pixel (the first whose uv lands in it, in x and y), which reads the
+// raygen's albedo from the pair before overwriting it.
+void meterResolved(float2 uv, float3 src, float through, float3 veil, float input) {
+    let size = float2(float(push.lum_width), float(push.lum_height));
+    let r = min(int2(floor(uv * size)), int2(size) - 1);
+    let step = float2(abs(ddx(uv.x)), abs(ddy(uv.y)));
+    let before = int2(floor((uv - step) * size));
+    if (before.x == r.x || before.y == r.y) {
+        return;
+    }
+    let i = 2u * (uint(r.y) * push.lum_width + uint(r.x));
+    let albedo = push.lum[i + 1u];
+    if (albedo < 0.0) {
+        push.lum[i] = -1.0;
+        return;
+    }
+    let lw = float3(0.2125, 0.7154, 0.0721);
+    let surface = dot(src, lw) / input * through;
+    let fog = dot(veil, lw) / input;
+    push.lum[i] = surface / max(albedo, 0.04) + fog;
+    push.lum[i + 1u] = surface + fog;
 }
 
 float3 acesFilm(float3 x) {
@@ -206,8 +264,11 @@ float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
         return float4((src * through + veil) / input, 1.0);
     }
     let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
+    if (push.lum != nullptr && push.fog != 0u && view == 0u) {
+        meterResolved(uv, src, through, veil, input);
+    }
     var surface = src * through;
-    if (push.local_tonemap > 0.0 && view == 0u) {
+    if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u) {
         surface *= localGain(uv, look / input, push.local_tonemap);
     }
     let exposed = (surface + veil) * (look / input);

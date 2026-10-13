@@ -191,6 +191,8 @@ pub struct GuideViews {
     pub color: vk::ImageView,
     /// The camera ray's fog (composited after Ray Reconstruction).
     pub fog: vk::ImageView,
+    /// The output's mip pyramid (local tone mapping's surroundings).
+    pub pyramid: vk::ImageView,
 }
 
 pub(crate) fn halton(mut index: u32, base: u32) -> f32 {

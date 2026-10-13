@@ -211,9 +211,10 @@ impl Default for AutoExposureSettings {
             // curve, the abbey was shown ~4.5 stops apart).
             reference_ev: -13.0,
             reference_from_environment: false,
-            // 70 % of the way to the metering: a room ~9 stops under daylight reads dim and
-            // indoor (~2.7 under mid-gray), moonlit ground stays darker still.
-            adaptation: 0.7,
+            // 75 % of the way to the metering: a room ~9 stops under daylight reads dim and
+            // indoor, moonlit ground stays darker still. (0.7 against the raw 1-spp meter, which
+            // under-read sparse light by ~2 stops; the resolved meter reads it true.)
+            adaptation: 0.75,
             input_speed: 4.0,
         }
     }

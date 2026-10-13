@@ -58,6 +58,12 @@ void sharc_resolve(uint3 gid: SV_DispatchThreadID) {
     }
     let fresh = float3(float(e.acc_r), float(e.acc_g), float(e.acc_b)) * (SHARC_UNIT / float(e.acc_n));
     let old = float3(e.res_r, e.res_g, e.res_b);
+    // Anything not finite starts the voxel over rather than glowing until it washes out.
+    let bits = asuint(float4(fresh, old.x + old.y + old.z));
+    if (any((bits & 0x7f800000u) == 0x7f800000u)) {
+        p.entries[i] = SharcEntry();
+        return;
+    }
     let conf = e.conf;
     // Count-weighted blend, floored so the cache keeps tracking lighting changes (2 %: a
     // voxel's per-frame noise stays under Ray Reconstruction's notice, a change lands in a
