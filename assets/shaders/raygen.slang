@@ -34,7 +34,6 @@ static const bool ENABLE_BLUENOISE = true;
 // Paths per pixel and their maximum length come from the uniforms (`pc.uniforms.samples`
 // / `max_bounces`); the DLSS path runs 1 spp with a short cap.
 
-static const float g_extinction = 0.03;
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
 // sky does (rotation only), and still a finite half float.
 static const float SPEC_HIT_FAR = 65504.0;
@@ -255,11 +254,6 @@ float fogPhase(EnvironmentGpu* env, float cos_theta) {
     return fogPhaseG(env.fog_scatter, cos_theta);
 }
 
-
-
-float calcFogTransmittance(float distance) {
-    return exp(-g_extinction * distance);
-}
 
 float3 sampleFogScatterDirection(EnvironmentGpu* env, float3 incoming) {
     // Henyey-Greenstein phase function sampling
@@ -1373,10 +1367,9 @@ void main() {
             } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
                 surf_n = float3(0.0);
-                // Uniform fog keeps its old ad-hoc loss; height fog is delta-tracked, so the
-                // collision's weight is just the medium's single-scattering albedo.
-                mask *= env.fog_falloff > 0.0 || pc.uniforms.fog_volume_count > 0u
-                    ? FOG_ALBEDO : calcFogTransmittance(fogDistance);
+                // The distance was drawn from the fog's own density (exponential, or delta
+                // tracked), so the collision's weight is the medium's single-scattering albedo.
+                mask *= FOG_ALBEDO;
                 // The sun straight into the scatter point, through the phase function: the
                 // shafts of light through gaps (a scattered ray would rarely find its disc).
                 {

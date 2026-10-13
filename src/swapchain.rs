@@ -190,7 +190,10 @@ impl Swapchain {
                 .image_extent(surface_resolution)
                 // TRANSFER_SRC so a screenshot request can copy the presented frame out.
                 .image_usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        // The XR spectator is blitted in (ray_render_plugin.rs).
+                        | vk::ImageUsageFlags::TRANSFER_DST,
                 )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(pre_transform)

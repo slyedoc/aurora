@@ -1613,20 +1613,36 @@ fn render_frame(
             // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
             if let Some((swapchain_image, swapchain_view, window_size, window_format)) = presenting
             {
-                vk_utils::transition_image_layout(
-                    &render_device,
-                    cmd_buffer,
-                    swapchain_image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
-                );
+                // The XR spectator: the left eye's finished image (TRANSFER_SRC after its layer
+                // blit) letterboxed into the window by a blit, not a third run of the post-process.
+                let spectator = match (xr.as_deref(), xr_frame.as_ref()) {
+                    (Some(xr_state), Some(_)) if dlss_ran && postprocess.is_some() => {
+                        Some(xr_state)
+                    }
+                    _ => None,
+                };
+                if let Some(xr_state) = spectator {
+                    record_spectator(&render_device, cmd_buffer, xr_state, swapchain_image, window_size);
+                } else {
+                    vk_utils::transition_image_layout(
+                        &render_device,
+                        cmd_buffer,
+                        swapchain_image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                    );
+                }
 
                 let render_area = vk::Rect2D::default().extent(window_size);
 
                 let attachment_info = vk::RenderingAttachmentInfo::default()
                     .image_view(swapchain_view)
                     .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .load_op(if spectator.is_some() {
+                        vk::AttachmentLoadOp::LOAD
+                    } else {
+                        vk::AttachmentLoadOp::CLEAR
+                    })
                     .store_op(vk::AttachmentStoreOp::STORE);
 
                 let render_info = vk::RenderingInfo::default()
@@ -1639,7 +1655,7 @@ fn render_frame(
 
                 // Until the RT pipeline compiles and the first evaluate lands there is nothing
                 // to sample -- leave the clear (the UI still draws).
-                if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
+                if let Some(pipeline) = postprocess.filter(|_| dlss_ran && spectator.is_none()) {
                     let (window_w, window_h) =
                         (window_size.width as f32, window_size.height as f32);
                     // XR draws ONE letterboxed eye as the spectator image; a flat frame
@@ -1970,6 +1986,112 @@ fn render_frame(
 /// renderer has them). Guides sit in SHADER_READ_ONLY after the evaluate; the output stays
 /// GENERAL. Viewport and scissor are the caller's.
 #[allow(clippy::too_many_arguments)]
+/// The XR spectator into the acquired swapchain image: cleared, the left eye's finished image
+/// (TRANSFER_SRC_OPTIMAL after its layer blit) blitted aspect-fit into the middle, left in
+/// ATTACHMENT_OPTIMAL for the window's pass (gizmos, UI) to load.
+fn record_spectator(
+    rd: &RenderDevice,
+    cmd: vk::CommandBuffer,
+    xr: &crate::xr::XrState,
+    image: vk::Image,
+    window: vk::Extent2D,
+) {
+    use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
+    let barrier = |from, to, src_stage, src_access, dst_stage, dst_access| {
+        let b = crate::vk_init::layout_transition2(image, from, to)
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access);
+        unsafe {
+            rd.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&b)),
+            )
+        };
+    };
+    // Behind the acquire semaphore's wait (COLOR_ATTACHMENT_OUTPUT), as the attachment path.
+    barrier(
+        L::UNDEFINED,
+        L::TRANSFER_DST_OPTIMAL,
+        S::COLOR_ATTACHMENT_OUTPUT,
+        A::NONE,
+        S::CLEAR | S::BLIT,
+        A::TRANSFER_WRITE,
+    );
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    let (eye, _) = xr.eye_target(0);
+    let (src_w, src_h) = (xr.extent.width as f32, xr.extent.height as f32);
+    let (win_w, win_h) = (window.width as f32, window.height as f32);
+    let (w, h) = if src_w / src_h > win_w / win_h {
+        (win_w, win_w * src_h / src_w)
+    } else {
+        (win_h * src_w / src_h, win_h)
+    };
+    let (x, y) = (((win_w - w) * 0.5) as i32, ((win_h - h) * 0.5) as i32);
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    let region = vk::ImageBlit::default()
+        .src_subresource(layers)
+        .src_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D {
+                x: xr.extent.width as i32,
+                y: xr.extent.height as i32,
+                z: 1,
+            },
+        ])
+        .dst_subresource(layers)
+        .dst_offsets([
+            vk::Offset3D { x, y, z: 0 },
+            vk::Offset3D {
+                x: x + w as i32,
+                y: y + h as i32,
+                z: 1,
+            },
+        ]);
+    unsafe {
+        rd.device.cmd_clear_color_image(
+            cmd,
+            image,
+            L::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue { float32: [0.0; 4] },
+            std::slice::from_ref(&range),
+        );
+        // The clear and the blit both write the image: in order.
+        let b = vk::MemoryBarrier2::default()
+            .src_stage_mask(S::CLEAR)
+            .src_access_mask(A::TRANSFER_WRITE)
+            .dst_stage_mask(S::BLIT)
+            .dst_access_mask(A::TRANSFER_WRITE);
+        rd.device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&b)),
+        );
+        rd.device.cmd_blit_image(
+            cmd,
+            eye,
+            L::TRANSFER_SRC_OPTIMAL,
+            image,
+            L::TRANSFER_DST_OPTIMAL,
+            std::slice::from_ref(&region),
+            vk::Filter::LINEAR,
+        );
+    }
+    barrier(
+        L::TRANSFER_DST_OPTIMAL,
+        L::ATTACHMENT_OPTIMAL,
+        S::BLIT,
+        A::TRANSFER_WRITE,
+        S::COLOR_ATTACHMENT_OUTPUT,
+        A::COLOR_ATTACHMENT_READ | A::COLOR_ATTACHMENT_WRITE,
+    );
+}
+
 unsafe fn record_post_draw(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,

@@ -101,15 +101,15 @@ impl RrPreset {
 /// (there is no unfiltered path), so every mode is an NGX `PerfQuality` value: the render
 /// resolution comes from `NGX_DLSSD_GET_OPTIMAL_SETTINGS` at the output resolution. `Dlaa`
 /// is 1:1 (denoise + AA, no upscale). A camera spawned without one gets `$AURORA_DLSS`
-/// (or `Dlaa`); F5 cycles it.
+/// (or `Balanced`); F5 cycles it.
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub enum AuroraDlss {
     Dlaa,
     Quality,
+    #[default]
     Balanced,
     Performance,
-    #[default]
     UltraPerformance,
 }
 
@@ -150,7 +150,7 @@ impl AuroraDlss {
         }
     }
 
-    /// `$AURORA_DLSS` (`dlaa|quality|balanced|performance|ultra-performance`), else `Dlaa`.
+    /// `$AURORA_DLSS` (`dlaa|quality|balanced|performance|ultra-performance`), else `Balanced`.
     pub fn from_env() -> Self {
         std::env::var("AURORA_DLSS")
             .ok()

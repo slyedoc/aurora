@@ -49,10 +49,29 @@ struct QuadPush {
 // output's mip pyramid (local tone mapping). Slots the renderer cannot fill yet alias the output.
 [[vk::binding(0, 0)]] Sampler2D test[10];
 
+// What is the same for every pixel, worked out by the three vertices instead of each pixel (the
+// pass is texture-throughput bound): the pyramid's size and level count, the fog image's and
+// the output's sizes, and the local tone mapping's frame average.
+struct Frame {
+    float2 pyramid;
+    float levels;
+    float frame_log;
+    float2 fog;
+    float2 output;
+};
+
 struct VertexOut {
     float4 position : SV_Position;
     [[vk::location(0)]] float2 uv : TEXCOORD0;
+    [[vk::location(1)]] nointerpolation float4 pyramid : TEXCOORD1;
+    [[vk::location(2)]] nointerpolation float4 sizes : TEXCOORD2;
 };
+
+// The exposure the output is shown at over the one the raygen baked in.
+float lookScale() {
+    let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
+    return look / max(push.ae.input_exposure, 1.0e-12);
+}
 
 [shader("vertex")]
 VertexOut vertex(uint id : SV_VulkanVertexID) {
@@ -61,7 +80,27 @@ VertexOut vertex(uint id : SV_VulkanVertexID) {
     VertexOut o;
     o.position = float4(p, 0.0, 1.0);
     o.uv = (p + 1.0) * 0.5;
+    uint w, h, levels, fw, fh, ow, oh;
+    test[9].GetDimensions(0, w, h, levels);
+    test[8].GetDimensions(fw, fh);
+    test[0].GetDimensions(ow, oh);
+    var frame_log = 0.0;
+    if (push.local_tonemap > 0.0 && push.debug_view == 0u && push.fog != 0u) {
+        frame_log = frameLog(lookScale(), h, levels);
+    }
+    o.pyramid = float4(float(w), float(h), float(levels), frame_log);
+    o.sizes = float4(float(fw), float(fh), float(ow), float(oh));
     return o;
+}
+
+Frame frameOf(VertexOut v) {
+    Frame f;
+    f.pyramid = v.pyramid.xy;
+    f.levels = v.pyramid.z;
+    f.frame_log = v.pyramid.w;
+    f.fog = v.sizes.xy;
+    f.output = v.sizes.zw;
+    return f;
 }
 
 // Scene luminance in NITS, false-coloured against the authoring reference bands in
@@ -102,21 +141,31 @@ float pyramidLog(float2 uv, float level, float scale) {
 
 // A region's level at pyramid `level`, smoothed: four reads half a texel apart hide the
 // bilinear diamonds of a coarse level.
-float pyramidKey(float2 uv, float level, float scale, uint w, uint h) {
-    let t = exp2(level) / float2(float(w), float(h)) * 0.5;
+float pyramidKey(float2 uv, float level, float scale, float2 size) {
+    let t = exp2(level) / size * 0.5;
     return 0.25 * (pyramidLog(uv + float2(-t.x, -t.y), level, scale)
                  + pyramidLog(uv + float2(t.x, -t.y), level, scale)
                  + pyramidLog(uv + float2(-t.x, t.y), level, scale)
                  + pyramidLog(uv + float2(t.x, t.y), level, scale));
 }
 
-float3 localGain(float2 uv, float scale, float strength) {
-    uint w, h, levels;
-    test[9].GetDimensions(0, w, h, levels);
-    let top = float(levels) - 1.0;
+// The whole frame's level: a 4x4 grid of log reads at a level ~1/16 of the height.
+float frameLog(float scale, uint h, uint levels) {
+    let frame_level = clamp(log2(float(h) / 16.0), 0.0, float(levels) - 1.0);
+    var frame = 0.0;
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            frame += pyramidLog((float2(float(x), float(y)) + 0.5) / 4.0, frame_level, scale);
+        }
+    }
+    return frame / 16.0;
+}
+
+float3 localGain(float2 uv, float scale, float strength, Frame f) {
+    let top = f.levels - 1.0;
     // Level 0 is half the output: the level whose texel spans ~3 % of the height, one 1.5 levels
     // finer, and level 0.
-    let coarse = clamp(log2(float(h) * 0.03), 0.0, top);
+    let coarse = clamp(log2(f.pyramid.y * 0.03), 0.0, top);
     let own = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
     // Edge-aware surroundings: the three scales blended by how close each is to the pixel's own
     // level (leaning coarse). Sky beside a canopy reads sky at the finer scales and keeps the
@@ -125,21 +174,14 @@ float3 localGain(float2 uv, float scale, float strength) {
     var wsum = 0.0;
     for (int i = 0; i < 3; i++) {
         let level = i == 0 ? 0.0 : max(coarse - float(2 - i) * 1.5, 0.0);
-        let k = pyramidKey(uv, level, scale, w, h);
+        let k = pyramidKey(uv, level, scale, f.pyramid);
         let d = (own - k) / 0.75;
         let wi = exp2(float(i)) * exp(-d * d);
         key += wi * k;
         wsum += wi;
     }
     key /= max(wsum, 1.0e-6);
-    let frame_level = clamp(log2(float(h) / 16.0), 0.0, top);
-    var frame = 0.0;
-    for (int y = 0; y < 4; y++) {
-        for (int x = 0; x < 4; x++) {
-            frame += pyramidLog((float2(float(x), float(y)) + 0.5) / 4.0, frame_level, scale);
-        }
-    }
-    let stops = clamp((frame / 16.0 - key) * strength, -2.0, 2.0);
+    let stops = clamp((f.frame_log - key) * strength, -2.0, 2.0);
     // The sky keeps its exposure (the depth guide holds 1e7 there; its bilinear blend softens
     // the silhouette): pulled toward a darker frame it went deep blue, and any mismatch of
     // the surroundings at a silhouette showed as a halo.
@@ -186,14 +228,12 @@ void meterResolved(float2 uv, float3 src, float through, float3 veil, float inpu
 // and a wide faint skirt -- blurs of growing width summed, the shape of a real lens's glare
 // (equal weights spent most of the light on the widest, where it vanished). Clamped to
 // half-float range (the sun's disc overflows the pyramid).
-float3 bloomAt(float2 uv) {
-    uint w, h, levels;
-    test[9].GetDimensions(0, w, h, levels);
-    let top = min(6, int(levels) - 1);
+float3 bloomAt(float2 uv, Frame f) {
+    let top = min(6, int(f.levels) - 1);
     var sum = float3(0.0);
     var n = 0.0;
     for (int l = 1; l <= top; l++) {
-        let t = exp2(float(l)) / float2(float(w), float(h));
+        let t = exp2(float(l)) / f.pyramid;
         let level = float(l);
         var s = float3(0.0);
         for (int y = -1; y <= 1; y++) {
@@ -220,13 +260,11 @@ float3 acesFilm(float3 x) {
 
 // Aspect-corrected: 0 at the centre, 1 at the corners, so it is the same shape at any window
 // size; `strength` (0 = off) is how dark the corners get.
-float3 applyVignette(float3 color, float2 uv, float strength) {
+float3 applyVignette(float3 color, float2 uv, float strength, float2 output) {
     if (strength <= 0.0) {
         return color;
     }
-    uint w, h;
-    test[0].GetDimensions(w, h);
-    let aspect = float(w) / float(h);
+    let aspect = output.x / output.y;
     let half_extent = float2(aspect, 1.0) * 0.5;
     let dist = length((uv - 0.5) * float2(aspect, 1.0)) / length(half_extent);
     let falloff = smoothstep(1.0, 0.45, dist);
@@ -234,7 +272,9 @@ float3 applyVignette(float3 color, float2 uv, float strength) {
 }
 
 [shader("fragment")]
-float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
+float4 fragment(VertexOut v) : SV_Target0 {
+    let uv = v.uv;
+    let frame = frameOf(v);
     let view = push.debug_view;
     // Luminance: the one view that must UNDO the exposure. The colour guide is what Ray
     // Reconstruction ingests, pre-exposed at the quantised `input_exposure`; dividing that
@@ -275,25 +315,14 @@ float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
     // The fog in front of the surface, which Ray Reconstruction never saw: divided by a
     // surface's albedo there, a white veil bled colour halos around dark coloured surfaces.
     if (push.fog != 0u && view == 0u) {
-        // Nine bilinear taps 1.5 texels apart (~5x5 render texels): the fog grid's cell noise
-        // smoothed out, which Ray Reconstruction used to do. Fog has no fine detail to lose.
-        uint fw, fh;
-        test[8].GetDimensions(fw, fh);
-        let size = float2(float(fw), float(fh));
-        let texel = 1.5 / size;
+        // One bilinear read: the camera ray's fog comes from the grid's column sums, already
+        // smooth across cells (a 9-tap blur here once hid the per-cell noise of a march).
+        let size = frame.fog;
         // The fog was traced through this frame's sub-pixel jitter (render texel t holds the
         // scene at t + 0.5 + jitter) and Ray Reconstruction is not there to undo it: shift
         // back, or every fog edge shimmers by a fraction of a pixel each frame.
         let jitter = float2(push.uniforms[UNIFORM_JITTER_FLOAT], push.uniforms[UNIFORM_JITTER_FLOAT + 1]);
-        let fog_uv = uv - jitter / size;
-        var f = float4(0.0);
-        for (int y = -1; y <= 1; y++) {
-            for (int x = -1; x <= 1; x++) {
-                let w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
-                f += test[8].Sample(fog_uv + float2(float(x), float(y)) * texel) * w;
-            }
-        }
-        f /= 16.0;
+        let f = test[8].Sample(uv - jitter / size);
         veil = f.rgb;
         through = f.a;
     }
@@ -306,13 +335,13 @@ float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
     }
     var surface = src * through;
     if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u) {
-        surface *= localGain(uv, look / input, push.local_tonemap);
+        surface *= localGain(uv, look / input, push.local_tonemap, frame);
     }
     var exposed = (surface + veil) * (look / input);
     if (push.bloom > 0.0 && view == 0u && push.fog != 0u) {
-        exposed = lerp(exposed, bloomAt(uv) * (look / input), push.bloom);
+        exposed = lerp(exposed, bloomAt(uv, frame) * (look / input), push.bloom);
     }
     var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));
-    color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT]);
+    color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT], frame.output);
     return float4(color, 1.0);
 }
