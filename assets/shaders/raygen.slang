@@ -73,41 +73,39 @@ bool traceVisible(uint mask, float3 origin, float tmin, float3 direction, float 
 // brightness and, visible, adds that contribution / its pick probability (unbiased; one ray
 // instead of one per strategy). The root tempers a dominant light: in shade the sun's unshadowed
 // value would otherwise win nearly every pick, its ray blocked, and the sky's fill go unsampled.
+// Every proposal's ray leaves the vertex's surface (`resolve` rebuilds its origin), so a pick
+// holds only the kept contribution over its weight, its direction and its length: it is live
+// through all of the vertex's light sampling, where the raygen's registers peak.
 struct ShadowPick {
     float wsum;
-    float w;
-    float3 contribution;
-    float3 origin;
-    float tmin;
+    float3 scaled;
     float3 direction;
     float tmax;
 
     [mutating]
-    void propose(float3 c, float3 o, float t0, float3 d, float t1) {
+    void propose(float3 c, float3 d, float t1) {
         let wc = sqrt(luma(c));
         if (!(wc > 0.0)) {
             return;
         }
         wsum += wc;
         if (randf() * wsum < wc) {
-            w = wc;
-            contribution = c;
-            origin = o;
-            tmin = t0;
+            scaled = c / wc;
             direction = d;
             tmax = t1;
         }
     }
 
-    // The kept proposal's shadow ray; its contribution over its pick probability when visible.
-    float3 resolve(uint mask) {
+    // The kept proposal's shadow ray from `origin` off `normal`; its contribution over its pick
+    // probability when visible.
+    float3 resolve(uint mask, float3 origin, float3 normal) {
         if (wsum <= 0.0) {
             return float3(0.0);
         }
-        if (!traceVisible(mask, origin, tmin, direction, tmax)) {
+        if (!traceVisible(mask, leaveSurface(origin, normal, direction), 0.0, direction, tmax)) {
             return float3(0.0);
         }
-        return contribution * (wsum / w);
+        return scaled * wsum;
     }
 };
 
@@ -313,15 +311,15 @@ float fogMajorant(EnvironmentGpu* env, float3 o, float3 d, float t_max, bool bas
 // (closer together near the camera), each lit by the suns through a shadow ray -- the shafts
 // -- and one step, picked at random, by the sky in a phase-sampled direction. Adds the
 // in-scatter to `acc` and leaves the transmittance in `mask`; `base` takes the environment's
-// own fog in too (not on a ray to the sky, which the old scatter never fogged either). The
-// payload comes back as it went in.
+// own fog in too (not on a ray to the sky, which the old scatter never fogged either). Its sky
+// ray has a payload of its own: the camera ray's stays as it is.
 void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, float3 o, float3 d,
-              float seg, bool base, inout float3 mask, inout float3 acc, inout HitPayload payload) {
+              float seg, bool base, inout float3 mask, inout float3 acc) {
     let depth = fogMajorant(env, o, d, seg, base) * seg;
     if (depth <= 1.0e-6) {
         return;
     }
-    let vertex = payload;
+    HitPayload payload = {};
     let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, env.fog_steps);
     let jitter = randf();
     let sky_step = min(uint(randf() * float(n)), n - 1u);
@@ -356,7 +354,6 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
     }
     acc += mask * L;
     mask *= T;
-    payload = vertex;
 }
 
 // The suns' light at fog point `x`, as the fog scatters it along `d`. The HDR sky's sun is
@@ -1017,12 +1014,49 @@ void restir_shade() {
     dlss_color[px] = float4(clamp(prior + add, float3(0.0), float3(65504.0)), 1.0);
 }
 
+// The camera's position: the inverse view's translation. The camera values are recomputed
+// where they are used rather than held: anything held is live through the whole path.
+float3 cameraOrigin() {
+    return float3(pc.uniforms.inverse_view[12], pc.uniforms.inverse_view[13], pc.uniforms.inverse_view[14]);
+}
+
+// The camera ray's direction through the launch's pixel. A known sub-pixel jitter (told to NGX);
+// the launch y is flipped into the NDC-up space here, so the image-space offset is +jitter. Row 0
+// is the TOP row: its centre sits half a pixel below the top edge, (height - 1 - y) + 0.5 in the
+// up-space. (An earlier `height - y + 0.5` put every sample one whole pixel above its pixel: the
+// image was shifted a row against the depth/motion guides and the matrices Ray Reconstruction
+// reprojects with, and edges crawled.)
+float3 pixelDirection(uint2 launch_id, uint2 launch_size) {
+    let subpixel = float2(0.5 + pc.uniforms.jitter_x, 0.5 - pc.uniforms.jitter_y);
+    let pixel_center = float2(float(launch_id.x), float(launch_size.y - 1u - launch_id.y)) + subpixel;
+    let d = pixel_center / float2(launch_size) * 2.0 - 1.0;
+    let target = mat4MulVec(pc.uniforms.inverse_projection, float4(d, 1, 1)).xyz;
+    return mat4MulVec(pc.uniforms.inverse_view, float4(normalize(target), 0)).xyz;
+}
+
+// A sample's camera ray: from `lens` on the aperture toward the pixel's point in focus.
+void lensRay(float2 lens, uint2 launch_id, uint2 launch_size, out float3 origin, out float3 direction) {
+    let camera = cameraOrigin();
+    let focal = camera + pixelDirection(launch_id, launch_size) * pc.focus[0];
+    origin = mat4MulVec(pc.uniforms.inverse_view, float4(lens, 0, 1)).xyz;
+    direction = normalize(focal - origin);
+}
+
+// The camera path's flags (main's `path`).
+static const uint PATH_WANT_SUN = 1u;
+static const uint PATH_CAMERA = 2u;
+static const uint PATH_IN_VIEW = 4u;
+static const uint PATH_SHARC_TRAIN = 8u;
+static const uint PATH_FROM_ROUGH = 16u;
+static const uint PATH_CACHE_BLIND = 32u;
+static const uint PATH_GUIDES_WRITTEN = 64u;
+static const uint PATH_GUIDE_LIVE = 128u;
+
 [shader("raygeneration")]
 void main() {
     let launch_id = DispatchRaysIndex().xy;
     let launch_size = DispatchRaysDimensions().xy;
-    // The one ray payload, live across every trace like the GLSL global: hit / miss shaders
-    // leave fields they do not write as the previous trace left them.
+    // The camera path's payload, fresh before each of its traces (the bounce loop).
     HitPayload payload;
 
     // Fresh noise every frame for the temporal denoiser.
@@ -1035,25 +1069,10 @@ void main() {
     // Far range: the sim-scale sky domes sit kilometers out, a planet's horizon tens of km.
     let tmax = 1.0e6;
 
-    // A known sub-pixel jitter (told to NGX); the launch y is flipped into the NDC-up space
-    // here, so the image-space offset is +jitter. Row 0 is the TOP row: its centre sits half
-    // a pixel below the top edge, (height - 1 - y) + 0.5 in the up-space. (An earlier
-    // `height - y + 0.5` put every sample one whole pixel above its pixel: the image was
-    // shifted a row against the depth/motion guides and the matrices Ray Reconstruction
-    // reprojects with, and edges crawled.)
-    let subpixel = float2(0.5 + pc.uniforms.jitter_x, 0.5 - pc.uniforms.jitter_y);
-    let pixel_center = float2(float(launch_id.x), float(launch_size.y - 1u - launch_id.y)) + subpixel;
-    let inUV = pixel_center / float2(launch_size);
-    let d = inUV * 2.0 - 1.0;
-
-    let initial_origin = mat4MulVec(pc.uniforms.inverse_view, float4(0, 0, 0, 1)).xyz;
-    let target = mat4MulVec(pc.uniforms.inverse_projection, float4(d, 1, 1)).xyz;
-    let initial_direction = mat4MulVec(pc.uniforms.inverse_view, float4(normalize(target), 0)).xyz;
-    let focalPoint = initial_origin + initial_direction * pc.focus[0];
-
     if (pc.uniforms.pull_focus_x == launch_id.x && pc.uniforms.pull_focus_y == launch_id.y) {
         payload.cone = float2(0.0);
-        trace(FLAGS_OPAQUE, 0xFF, initial_origin, tmin, initial_direction, tmax, payload);
+        trace(FLAGS_OPAQUE, 0xFF, cameraOrigin(), tmin, pixelDirection(launch_id, launch_size), tmax,
+              payload);
         if (payload.t != 0.0) {
             pc.focus[0] = payload.t;
         }
@@ -1076,25 +1095,25 @@ void main() {
     // The camera ray's first hit distance (0 = sky), for the atmosphere composite below.
     var primary_t = 0.0;
     // Auto-exposure meters incident light: radiance over sample 0's guide-vertex albedo. Sky
-    // and emitters seen directly are left out of the meter.
+    // and emitters seen directly are left out of the meter (negative: skipped).
     var meter_albedo = 1.0;
-    var meter_skip = false;
 
     for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
         let offsetR = sqrt(randf());
         let offsetA = randf() * 2.0 * PI;
-        let offset = pc.uniforms.aperture * float2(offsetR * cos(offsetA), offsetR * sin(offsetA));
+        let lens = pc.uniforms.aperture * float2(offsetR * cos(offsetA), offsetR * sin(offsetA));
 
-        var origin = mat4MulVec(pc.uniforms.inverse_view, float4(offset, 0, 1)).xyz;
-        var direction = normalize(focalPoint - origin);
+        float3 origin, direction;
+        lensRay(lens, launch_id, launch_size, origin, direction);
         var mask = float3(1.0);
         // Russian roulette's boost so far (1 / the survival odds): the firefly clamp allows for
         // it, or it would clip back exactly the energy that keeps roulette unbiased (the canopy's
         // indirect light came out at less than half).
         var rr_boost = 1.0;
-        // The camera ray and pure-specular continuations may see the sun disc directly; after a
+        // The path's flags, one word (PATH_*, each explained where it would have been declared).
+        var path = PATH_WANT_SUN | PATH_CAMERA | PATH_IN_VIEW | PATH_GUIDE_LIVE;
+        // PATH_WANT_SUN: the camera ray and pure-specular continuations may see the sun disc directly; after a
         // BRDF-sampled bounce the sun comes from next-event estimation only.
-        var want_sun = true;
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
         // camera ray and delta continuations): the MIS partner of light-table sampling.
         var prev_pdf = 0.0;
@@ -1105,11 +1124,9 @@ void main() {
         // The normal of the surface `origin` sits on, for the next ray to leave it by; zero where
         // the ray does not start on a surface (the camera, a fog scatter, a portal exit).
         var surf_n = float3(0.0);
-        // Still on the camera ray (through cutouts and portals, before any scatter): it skips
+        // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
-        var camera_segment = true;
-        // Still in the view's own frustum (no portal yet): the fog grid lights only that.
-        var in_view = true;
+        // PATH_IN_VIEW: still in the view's own frustum (no portal yet): the fog grid lights only that.
         // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
         // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
         // once the path ends.
@@ -1117,19 +1134,18 @@ void main() {
         float3 sh_mask[SHARC_VERTICES];
         float3 sh_acc[SHARC_VERTICES];
         var sh_n = 0u;
-        // One path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
+        // PATH_SHARC_TRAIN: one path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
         // cache learns from (answered paths only pass on what it already knows).
-        let sharc_train = SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN;
-        // The ray being traced left a rough surface: only then may the cache answer for what it
+        if (SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN) {
+            path |= PATH_SHARC_TRAIN;
+        }
+        // PATH_FROM_ROUGH: the ray being traced left a rough surface: only then may the cache answer for what it
         // hits (a mirror's or a glossy floor's reflection is traced, never the cache's cells).
-        var from_rough = false;
-        // The camera ray met the back of a solid surface first: the camera is inside geometry
+        // PATH_CACHE_BLIND: the camera ray met the back of a solid surface first: the camera is inside geometry
         // (a wall it clipped through). Such a path sees unlit insides and must not teach the
         // cache -- it poisoned the voxels of the room side, which glowed until washed out.
-        var cache_blind = false;
-        // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
+        // PATH_GUIDES_WRITTEN: DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
-        var guides_written = false;
         // The camera ray's fog transmittance so far; its light goes to `guide_fog`.
         var fog_t = 1.0;
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
@@ -1138,25 +1154,27 @@ void main() {
         var cone_width = 0.0;
         // inverse_projection[1][1] (column 1, row 1).
         var cone_spread = 2.0 * pc.uniforms.inverse_projection[5] / float(launch_size.y);
-        // Stable guides (RTXPT "stable planes"): the guide chain follows the analytically
+        // PATH_GUIDE_LIVE: stable guides (RTXPT "stable planes"): the guide chain follows the analytically
         // DOMINANT Fresnel lobe through glass. When the radiance path rolls the minority lobe
         // instead, this frame's guide writes are abandoned (the images keep last frame's
         // dominant-branch values), so the guides never flicker between the reflected and the
         // refracted world -- per-pixel-random branch choices are exactly what RR cannot
         // share history across (see PathTracerStablePlanes.hlsli's seam note).
-        var guide_live = true;
         // PSR-lite: when guides defer through smooth-transmission (glass) vertices, the first
-        // non-delta vertex writes them at a VIRTUAL point this far along the camera ray.
-        let guide_cam_origin = origin;
-        let guide_cam_dir = direction;
+        // non-delta vertex writes them at a VIRTUAL point this far along the camera ray (rebuilt
+        // from `lens` there).
         var guide_dist = 0.0;
 
         for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
+            // A fresh payload every trace: a miss writes only t and the sky, and every hit
+            // read-modify-writes the flags word, so a payload carried over was an input to the
+            // next trace -- all of it live in registers through the whole loop.
+            payload = {};
             // Low bit: may this miss return the sun discs; above it the ray's environment (the
             // miss returns that environment's sky).
-            payload.miss_flags = (want_sun ? 1u : 0u) | (ray_env << 1);
+            payload.miss_flags = (((path & PATH_WANT_SUN) != 0u) ? 1u : 0u) | (ray_env << 1);
             payload.cone = float2(cone_width, cone_spread);
-            let trace_mask = camera_segment ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
+            let trace_mask = ((path & PATH_CAMERA) != 0u) ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
             let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
             traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             if (sample_idx == 0u && bounce_idx == 0u) {
@@ -1181,14 +1199,14 @@ void main() {
                 var p_origin = origin;
                 var p_dir = direction;
                 if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask, ray_env)) {
-                    if (!guides_written) {
+                    if ((path & PATH_GUIDES_WRITTEN) == 0u) {
                         guide_dist += payload.t;
                     }
                     origin = p_origin;
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
-                    in_view = false;
+                    path &= ~PATH_IN_VIEW;
                     continue;
                 }
             }
@@ -1219,11 +1237,11 @@ void main() {
                 && hitPayloadGetTransmission(payload) > 0.5
                 && hitPayloadGetRoughness(payload) < 0.1;
 
-            if (sample_idx == 0 && guide_live) {
-                if (!guides_written && !pass_through && !guide_defer) {
-                    guides_written = true;
+            if (sample_idx == 0 && ((path & PATH_GUIDE_LIVE) != 0u)) {
+                if ((path & PATH_GUIDES_WRITTEN) == 0u && !pass_through && !guide_defer) {
+                    path |= PATH_GUIDES_WRITTEN;
                     if (payload.t == 0.0) {
-                        meter_skip = true;
+                        meter_albedo = -1.0;
                         guide_normal_roughness[px] = float4(0.0, 0.0, 0.0, 1.0);
                         guide_diffuse[px] = float4(0.0);
                         guide_specular[px] = float4(0.5, 0.5, 0.5, 1.0); // sky: RR guide 3.4.2
@@ -1250,7 +1268,9 @@ void main() {
                         let hit_pos = origin + direction * payload.t;
                         // The end of the (possibly refracted) chain laid out along the primary ray at
                         // the accumulated distance. No glass in between => exactly hit_pos.
-                        let virtual_pos = guide_cam_origin + guide_cam_dir * (guide_dist + payload.t);
+                        float3 cam_origin, cam_dir;
+                        lensRay(lens, launch_id, launch_size, cam_origin, cam_dir);
+                        let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t);
                         let view_pos = mat4MulVec(pc.uniforms.view, float4(virtual_pos, 1.0));
                         let linear_depth = max(-view_pos.z, 1.0e-4);
                         let albedo = clamp(payload.color.rgb, float3(0.0), float3(1.0));
@@ -1265,8 +1285,9 @@ void main() {
                         let g_NoV = dot(world_normal, -direction);
                         let g_spec = envBRDFApprox2(g_f0, linear_roughness, g_NoV);
                         guide_specular[px] = float4(g_spec, 1.0);
-                        meter_albedo = dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
-                        meter_skip = any(payload.emission != float3(0.0));
+                        meter_albedo = any(payload.emission != float3(0.0))
+                            ? -1.0
+                            : dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
                         guide_depth[px] = float4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0);
                         // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
                         let cur_clip = mat4MulVec(pc.uniforms.view_proj, float4(virtual_pos, 1.0));
@@ -1305,7 +1326,7 @@ void main() {
                     }
                 }
             }
-            if (!guides_written) {
+            if ((path & PATH_GUIDES_WRITTEN) == 0u) {
                 guide_dist += payload.t;
             }
             let roughness = hitPayloadGetRoughness(payload);
@@ -1313,8 +1334,8 @@ void main() {
             let transmission = hitPayloadGetTransmission(payload);
             let inside = hitPayloadGetInside(payload);
             let lob = unpackLobes(payload.lobes);
-            if (camera_segment && inside && transmission < 0.01 && !hitPayloadGetMasked(payload)) {
-                cache_blind = true;
+            if (((path & PATH_CAMERA) != 0u) && inside && transmission < 0.01 && !hitPayloadGetMasked(payload)) {
+                path |= PATH_CACHE_BLIND;
             }
 
             // fog bounce (skybox has a distance of 0 so will never hit
@@ -1323,13 +1344,13 @@ void main() {
             float fogDistance;
             let env = pc.uniforms.environments + ray_env;
             let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
-            if (camera_segment && env.fog_steps > 0u && fog_any) {
+            if (((path & PATH_CAMERA) != 0u) && env.fog_steps > 0u && fog_any) {
                 // The camera ray marches its fog (the shafts, without the noise of one random
                 // scatter); a ray to the sky marches only as far as the volumes reach.
                 let seg = payload.t > 0.0 ? payload.t : fogVolumesReach(origin, direction);
                 var fog_mask = mask;
                 var fog_acc = float3(0.0);
-                if (seg > 0.0 && in_view && pc.uniforms.fog_grid_cells > 0u
+                if (seg > 0.0 && ((path & PATH_IN_VIEW) != 0u) && pc.uniforms.fog_grid_cells > 0u
                     && pc.uniforms.fog_grid_fresh == 0u) {
                     // A surface's segment takes the column sums; one to the sky only its
                     // volumes, which the sums (environment fog included) cannot leave out.
@@ -1340,7 +1361,7 @@ void main() {
                     }
                 } else if (seg > 0.0) {
                     fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
-                             payload.t > 0.0, fog_mask, fog_acc, payload);
+                             payload.t > 0.0, fog_mask, fog_acc);
                 }
                 // The surface behind reaches RR unveiled; the composite applies both.
                 let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
@@ -1376,7 +1397,7 @@ void main() {
                 }
                 direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
-                want_sun = false;
+                path &= ~PATH_WANT_SUN;
                 continue;
             }
 
@@ -1429,7 +1450,7 @@ void main() {
             if (pass_through) {
                 continue;
             }
-            camera_segment = false;
+            path &= ~PATH_CAMERA;
 
             // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
             // vector is sampled from the NDF, Fresnel is evaluated about it, and the ray
@@ -1477,8 +1498,8 @@ void main() {
                 let lobe_reflect = randf() <= pReflect;
                 // Minority Fresnel lobe on the guide chain: stop writing guides this frame (see
                 // `guide_live` above). The radiance stays unbiased -- only the guides sit out.
-                if (sample_idx == 0 && !guides_written && lobe_reflect != (pReflect > 0.5)) {
-                    guide_live = false;
+                if (sample_idx == 0 && (path & PATH_GUIDES_WRITTEN) == 0u && lobe_reflect != (pReflect > 0.5)) {
+                    path &= ~PATH_GUIDE_LIVE;
                 }
                 float3 new_dir;
                 if (lobe_reflect) {
@@ -1540,10 +1561,10 @@ void main() {
             // vertex of a traced path is an update target.
             if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
                 && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
-                let slot = sharcSlot(origin, world_normal, initial_origin);
+                let slot = sharcSlot(origin, world_normal, cameraOrigin());
                 if (slot != 0xFFFFFFFFu) {
-                    if (!sharc_train && from_rough
-                        && cone_width >= sharcVoxelSize(origin, initial_origin)) {
+                    if ((path & PATH_SHARC_TRAIN) == 0u && ((path & PATH_FROM_ROUGH) != 0u)
+                        && cone_width >= sharcVoxelSize(origin, cameraOrigin())) {
                         float3 cached;
                         if (sharcQuery(slot, cached)) {
                             acc += mask * cached;
@@ -1607,8 +1628,9 @@ void main() {
                     let grid = pc.restir_frame;
                     let cell = grid != nullptr ? gridCell(grid, origin) : 0xFFFFFFFFu;
                     var wsum = 0.0;
-                    var sel_val = float3(0.0);
-                    var sel_phat = 0.0;
+                    // The kept candidate's value over its target (one value fewer live through
+                    // the loop, the raygen's register peak).
+                    var sel_scaled = float3(0.0);
                     var ldir = float3(0.0);
                     var ldist = 0.0;
                     for (uint c = 0u; c < M; c++) {
@@ -1649,21 +1671,20 @@ void main() {
                         let wi = phat / (p_area * src_ratio);
                         wsum += wi;
                         if (randf() * wsum < wi) {
-                            sel_val = g;
-                            sel_phat = phat;
+                            sel_scaled = g / phat;
                             ldir = cdir;
                             ldist = cdist;
                         }
                     }
-                    if (wsum > 0.0 && sel_phat > 0.0) {
-                        var contribution = mask * sel_val * (wsum / (float(M) * sel_phat));
+                    if (wsum > 0.0) {
+                        var contribution = mask * sel_scaled * (wsum / float(M));
                         if (bounce_idx > 0 && radiance_clamp > 0.0) {
                             contribution *= min(1.0, radiance_clamp * rr_boost / max(luma(contribution), 1.0e-6));
                         }
-                        let o = leaveSurface(origin, surface_normal, ldir);
                         if (one_ray) {
-                            pick.propose(contribution, o, tmin, ldir, ldist * (1.0 - 1.0e-4));
-                        } else if (traceVisible(ray_mask, o, tmin, ldir, ldist * (1.0 - 1.0e-4))) {
+                            pick.propose(contribution, ldir, ldist * (1.0 - 1.0e-4));
+                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, ldir), tmin,
+                                                ldir, ldist * (1.0 - 1.0e-4))) {
                             acc += contribution;
                         }
                     }
@@ -1689,10 +1710,9 @@ void main() {
                     if (any(f > float3(0.0))) {
                         let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
                         let c = mask * f * abs(NoL) * L * (w / pdf_env);
-                        let o = leaveSurface(origin, surface_normal, l);
                         if (one_ray) {
-                            pick.propose(c, o, tmin, l, tmax);
-                        } else if (traceVisible(ray_mask, o, tmin, l, tmax)) {
+                            pick.propose(c, l, tmax);
+                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
                             acc += c;
                         }
                     }
@@ -1732,17 +1752,16 @@ void main() {
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
                         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                         let c = mask * f * abs(NoL) * sun_radiance * solid_angle;
-                        let o = leaveSurface(origin, surface_normal, l);
                         if (one_ray) {
-                            pick.propose(c, o, tmin, l, tmax);
-                        } else if (traceVisible(ray_mask, o, tmin, l, tmax)) {
+                            pick.propose(c, l, tmax);
+                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
                             acc += c;
                         }
                     }
                 }
             }
             if (one_ray) {
-                acc += pick.resolve(ray_mask);
+                acc += pick.resolve(ray_mask, origin, surface_normal);
             }
 
             // Thin layers before the base: through the surface with probability `transmission`
@@ -1757,9 +1776,9 @@ void main() {
                 direction = sampleTransmission(world_normal, r1, r2);
                 mask *= disney_mat.albedo;
                 prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
-                want_sun = false;
+                path &= ~PATH_WANT_SUN;
                 cone_spread = max(cone_spread, 0.37);
-                from_rough = true;
+                path |= PATH_FROM_ROUGH;
                 continue;
             }
             if (lob.clearcoat > 0.0) {
@@ -1775,9 +1794,9 @@ void main() {
                     direction = l;
                     mask *= lob.clearcoat * w / q;
                     prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
-                    want_sun = false;
+                    path &= ~PATH_WANT_SUN;
                     cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
-                    from_rough = lob.coat_alpha >= 0.35;
+                    path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
                     continue;
                 }
             }
@@ -1810,7 +1829,7 @@ void main() {
             }
 
             let brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
-            want_sun = false;
+            path &= ~PATH_WANT_SUN;
             // A failed sample (direction under the surface) carries nothing: the path ends.
             if (brdf.a < 0.0) {
                 break;
@@ -1827,7 +1846,7 @@ void main() {
             mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
-            from_rough = roughness >= 0.35;
+            path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
@@ -1850,7 +1869,7 @@ void main() {
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
         // darkness is learned too).
-        for (uint si = 0u; si < (cache_blind ? 0u : sh_n); si++) {
+        for (uint si = 0u; si < ((path & PATH_CACHE_BLIND) != 0u ? 0u : sh_n); si++) {
             let delta = max(acc - sh_acc[si], float3(0.0));
             let m = sh_mask[si];
             sharcDeposit(sh_slot[si], float3(
@@ -1864,7 +1883,8 @@ void main() {
     // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
     // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
     if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
-        mean = atmoComposite(initial_origin, initial_direction, primary_t, atmoBayer(px), mean);
+        mean = atmoComposite(cameraOrigin(), pixelDirection(launch_id, launch_size), primary_t,
+                             atmoBayer(px), mean);
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =
     // skipped) and the raw nits for the panel readout.
@@ -1878,11 +1898,11 @@ void main() {
     // The incident meter: the surface's light over its albedo, the fog's as is (it reflects
     // nothing; it is light in the air).
     let fog_nits = dot(float3(0.2125, 0.7154, 0.0721), fog_out);
-    pc.lum[lum_at] = meter_skip ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
+    pc.lum[lum_at] = meter_albedo < 0.0 ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
     // The pair's second slot: the albedo the meter divides by (< 0 = not metered), for the
     // post-process pass, which re-meters from Ray Reconstruction's output (quad.slang) and
     // leaves the raw nits there.
-    pc.lum[lum_at + 1u] = meter_skip ? -1.0 : max(meter_albedo, 0.04);
+    pc.lum[lum_at + 1u] = meter_albedo < 0.0 ? -1.0 : max(meter_albedo, 0.04);
     // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
     // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
     // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the
