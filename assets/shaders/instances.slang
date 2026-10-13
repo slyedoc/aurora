@@ -92,3 +92,122 @@ void gather_instances(uint3 gid: SV_DispatchThreadID) {
     p.instances[i].t1 = w.r1;
     p.instances[i].t2 = w.r2;
 }
+
+// The TLAS is built from the live slots only (src/tlas_builder.rs), packed in slot order: a
+// scatter window is mostly empty cells (zero transform), and the builder costs per instance
+// handed to it, live or not. Three passes over 64-slot blocks: count each block's live slots,
+// scan the counts (one group), write each live row at its block's offset plus its rank in the
+// block. `slots[i]` is packed row i's slot (instanceSlot() in surface.slang); rows from the
+// live count up to the build's size go inactive (no BLAS).
+struct LiveParams {
+    Instance* instances;
+    Instance* packed;
+    uint* slots;
+    // Per block: its live count, then (after the scan) its first packed row.
+    uint* blocks;
+    // The live count (word 0), read back by the CPU to size the next builds.
+    uint* total;
+    uint count;
+    uint base;
+    // Packed rows the build reads this frame.
+    uint build_count;
+    uint block_count;
+};
+[[vk::push_constant]] LiveParams live_params;
+
+bool slotLive(Instance r) {
+    let zero = all(r.t0.xyz == 0.0) && all(r.t1.xyz == 0.0) && all(r.t2.xyz == 0.0);
+    return r.blas != 0 && (r.custom_and_mask >> 24) != 0u && !zero;
+}
+
+groupshared uint live_wave[2];
+
+// The thread's rank among its block's live slots, and the block's live count.
+uint blockRank(bool live, uint lane_in_group, out uint block_live) {
+    let wave = lane_in_group / WaveGetLaneCount();
+    let rank = WavePrefixCountBits(live);
+    let in_wave = WaveActiveCountBits(live);
+    if (WaveIsFirstLane()) {
+        live_wave[wave] = in_wave;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    var before = 0u;
+    block_live = 0u;
+    for (uint w = 0u; w < 64u / WaveGetLaneCount(); w++) {
+        if (w < wave) {
+            before += live_wave[w];
+        }
+        block_live += live_wave[w];
+    }
+    return before + rank;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void live_count(uint3 gid: SV_DispatchThreadID, uint3 lid: SV_GroupThreadID) {
+    let p = live_params;
+    let slot = p.base + gid.x;
+    let live = slot < p.count && slotLive(p.instances[slot]);
+    uint block_live;
+    blockRank(live, lid.x, block_live);
+    if (lid.x == 0u) {
+        p.blocks[slot / 64u] = block_live;
+    }
+}
+
+groupshared uint scan_sums[64];
+
+// One group: each thread scans a run of blocks, then the runs are offset by a scan of their
+// sums. Exclusive offsets replace the counts; the total goes to `total`.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void live_scan(uint3 lid: SV_GroupThreadID) {
+    let p = live_params;
+    let run = (p.block_count + 63u) / 64u;
+    let first = lid.x * run;
+    var sum = 0u;
+    for (uint b = first; b < min(first + run, p.block_count); b++) {
+        sum += p.blocks[b];
+    }
+    scan_sums[lid.x] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    var offset = 0u;
+    for (uint t = 0u; t < lid.x; t++) {
+        offset += scan_sums[t];
+    }
+    for (uint b = first; b < min(first + run, p.block_count); b++) {
+        let n = p.blocks[b];
+        p.blocks[b] = offset;
+        offset += n;
+    }
+    if (lid.x == 63u) {
+        p.total[0] = offset;
+    }
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void live_write(uint3 gid: SV_DispatchThreadID, uint3 lid: SV_GroupThreadID) {
+    let p = live_params;
+    let slot = p.base + gid.x;
+    var r = Instance();
+    var live = false;
+    if (slot < p.count) {
+        r = p.instances[slot];
+        live = slotLive(r);
+    }
+    uint block_live;
+    let rank = blockRank(live, lid.x, block_live);
+    if (live) {
+        let at = p.blocks[slot / 64u] + rank;
+        if (at < p.build_count) {
+            p.packed[at] = r;
+            p.slots[at] = slot;
+        }
+    }
+    // The build's rows past the live ones: inactive.
+    let total = p.total[0];
+    if (slot >= total && slot < p.build_count) {
+        p.packed[slot].blas = 0;
+    }
+}

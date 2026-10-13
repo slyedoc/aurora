@@ -102,6 +102,7 @@ struct PickParams {
     hits: u64,
     count: u32,
     pad: u32,
+    slots: u64,
 }
 
 /// The pick pass: this frame's rays, the buffers they trace from and into, and the early
@@ -222,6 +223,7 @@ impl Picker {
                 hits: self.hits.address,
                 count,
                 pad: 0,
+                slots: tlas.instance_slots_address(),
             },
             count,
             None,

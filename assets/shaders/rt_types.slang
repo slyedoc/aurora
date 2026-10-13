@@ -493,6 +493,9 @@ public struct PushConstants {
     // Last frame's VkAccelerationStructureInstanceKHR array: 4 float4 per instance, rows
     // 0..2 are the 3x4 transform (row-major).
     public float4* prev_instances;
+    // Each TLAS row's instance slot (the TLAS holds the live slots only, packed): what
+    // InstanceIndex() means everywhere else.
+    public uint* instance_slots;
     // Emissive-triangle light table (valid whenever uniforms.light_entries > 0).
     public LightsHeader* lights;
     // This frame's instance rows (same layout as prev_instances), for light transforms.

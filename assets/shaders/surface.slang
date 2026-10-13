@@ -55,10 +55,13 @@ static const uint UNIFORM_EMISSIVE_BOOST_FLOAT = 103;
 public struct PushConstants {
     public float* uniforms;
     public Material* materials;
-    public void* bluenoise;
-    public void* focus;
+    // Not void*: slangc lowers it to the uint* type, which then loses its ArrayStride (and
+    // instance_slots is a uint*).
+    public uint64_t bluenoise;
+    public uint64_t focus;
     public uint pad0, pad1;
     public float4* prev_instances;
+    public uint* instance_slots;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 
@@ -247,10 +250,16 @@ public float3 surfaceShadingNormal(SurfaceHit hit) {
         hit, normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base)));
 }
 
+// This hit's instance slot: the TLAS is built from the live slots packed (tlas_builder.rs), so
+// InstanceIndex() is a packed row.
+public uint instanceSlot() {
+    return pc.instance_slots[InstanceIndex()];
+}
+
 // Where an object-space point of this instance was last frame. A zero row is a slot with no
 // last frame (new, reused, grown, or a scatter cell that just entered): no object motion.
 public float3 prevWorldPos(float3 object_p) {
-    let base = InstanceIndex() * 4;
+    let base = instanceSlot() * 4;
     let r0 = pc.prev_instances[base + 0];
     let r1 = pc.prev_instances[base + 1];
     let r2 = pc.prev_instances[base + 2];
@@ -267,7 +276,7 @@ public float3 prevWorldPos(float3 object_p) {
 public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3 world_normal) {
     payload.t = RayTCurrent();
     payload.surface_and_world_normal = packNormals(hit.face_normal, world_normal);
-    payload.slot = InstanceIndex();
+    payload.slot = instanceSlot();
     payload.prim_tri = record.triangles[GeometryIndex()].v + PrimitiveIndex();
 
     var object_p = ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection();

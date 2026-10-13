@@ -33,6 +33,8 @@ struct PickParams {
     Hit* hits;
     uint count;
     uint pad;
+    // Each TLAS row's instance slot (tlas_builder.rs packs the live slots).
+    uint* slots;
 };
 
 [[vk::push_constant]] PickParams pc;
@@ -89,7 +91,7 @@ void pick(uint3 id: SV_DispatchThreadID) {
     query.TraceRayInline(tlas, RAY_FLAG_NONE, ray.mask & 0xFF, desc);
     while (query.Proceed()) {
         Hit hit;
-        hit.instance = query.CandidateInstanceIndex();
+        hit.instance = pc.slots[query.CandidateInstanceIndex()];
         hit.primitive = query.CandidatePrimitiveIndex();
         hit.pad = 0;
         float3x4 to_world = query.CandidateObjectToWorld3x4();

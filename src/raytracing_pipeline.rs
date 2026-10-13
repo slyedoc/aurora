@@ -129,6 +129,8 @@ pub struct RaytracingPushConstants {
     pub restir_surfaces: u64,
     /// Last frame's instance transforms (`tlas_builder`), for motion vectors.
     pub prev_instances: u64,
+    /// Each TLAS row's instance slot (`tlas_builder`: the TLAS holds the live slots only).
+    pub instance_slots: u64,
     /// The emissive-triangle light table header (`lights`; 0 until built).
     pub lights: u64,
     /// This frame's instance rows, for light-sample transforms.

@@ -31,7 +31,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
-    compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
+    compute::{CompiledComputeModule, ComputeModule, ComputeModules, memory_barrier, record_dispatch},
     gpu_transform::{GpuNode, GpuTransforms, NO_NODE, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
@@ -76,6 +76,21 @@ struct ScatterInstancesParams {
     instance_node: u64,
     count: u32,
     base: u32,
+}
+
+/// `LiveParams` in instances.slang.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LiveParams {
+    instances: u64,
+    packed: u64,
+    slots: u64,
+    blocks: u64,
+    total: u64,
+    count: u32,
+    base: u32,
+    build_count: u32,
+    block_count: u32,
 }
 
 #[repr(C)]
@@ -397,6 +412,17 @@ pub struct TLAS {
     /// Instance records for the scatter kernel, read in place: one copy per frame in flight.
     staging: Flip<Buffer<InstanceRecord>>,
     rebuild: bool,
+    /// The TLAS's input: the live rows packed in slot order (instances.slang `live_*`), each
+    /// packed row's slot, the per-block counts / offsets, and the live count.
+    packed_buf: Buffer<u8>,
+    slots_buf: Buffer<u32>,
+    blocks_buf: Buffer<u32>,
+    total_buf: Buffer<u32>,
+    /// The live count copied back each build, and the packed rows that build read: a copy is
+    /// read two frames later (finished by then) to size the next build.
+    live_readback: [Buffer<u32>; 2],
+    built_rows: [u32; 2],
+    pack_parity: usize,
     warned_module: bool,
     /// Instance blocks by first slot: their length and pose meshes.
     blocks: HashMap<u32, (u32, Vec<AssetId<AuroraMesh>>)>,
@@ -432,6 +458,13 @@ impl TLAS {
             instance_node_buf: Buffer::default(),
             staging: Flip::default(),
             rebuild: false,
+            packed_buf: Buffer::default(),
+            slots_buf: Buffer::default(),
+            blocks_buf: Buffer::default(),
+            total_buf: Buffer::default(),
+            live_readback: Default::default(),
+            built_rows: [0; 2],
+            pack_parity: 0,
             warned_module: false,
             blocks: HashMap::new(),
             block_poses: HashMap::new(),
@@ -480,6 +513,12 @@ impl TLAS {
             && self.count <= self.capacity
             && self.count <= self.handle_count
             && self.materials.data.len() as u32 <= self.materials.capacity
+    }
+
+    /// Device address of each packed TLAS row's slot (instances.slang `live_write`):
+    /// `InstanceIndex()` is the packed row, this table its slot.
+    pub fn instance_slots_address(&self) -> u64 {
+        self.slots_buf.address
     }
 
     /// Device address of last frame's instance array (0 until the first frame).
@@ -558,7 +597,37 @@ impl TLAS {
         rd.destroyer.destroy_buffer(self.instances_buf.handle);
         rd.destroyer.destroy_buffer(self.prev_instances_buf.handle);
         rd.destroyer.destroy_buffer(self.instance_node_buf.handle);
+        for b in [
+            self.packed_buf.handle,
+            self.slots_buf.handle,
+            self.blocks_buf.handle,
+            self.total_buf.handle,
+        ] {
+            rd.destroyer.destroy_buffer(b);
+        }
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        self.packed_buf = rd.create_device_buffer(
+            self.capacity as u64 * 64,
+            storage | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+        );
+        self.slots_buf = rd.create_device_buffer(self.capacity as u64, storage);
+        self.blocks_buf = rd.create_device_buffer(self.capacity.div_ceil(64) as u64, storage);
+        self.total_buf = rd.create_device_buffer(1, storage | vk::BufferUsageFlags::TRANSFER_SRC);
+        for readback in &mut self.live_readback {
+            if readback.handle == vk::Buffer::null() {
+                *readback = rd.create_buffer(
+                    1,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                );
+            }
+        }
+        // The packed rows past any build's live count are inactive from the start.
+        unsafe {
+            rd.device
+                .cmd_fill_buffer(cmd, self.packed_buf.handle, 0, vk::WHOLE_SIZE, 0);
+        }
+        self.built_rows = [0; 2];
         self.instances_buf = rd.create_device_buffer(
             self.capacity as u64 * 64,
             storage
@@ -747,10 +816,79 @@ impl TLAS {
                 | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
         );
-        self.build(rd, cmd);
+        self.build(rd, cmd, module);
     }
 
-    fn build(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
+    /// Packs the live rows (instances.slang `live_count`, `live_scan`, `live_write`) and
+    /// returns how many packed rows this build reads: the live count of two frames ago with
+    /// headroom (the core indirect build that could read this frame's count on the GPU is not
+    /// exposed by NVIDIA). A build whose live count reached its size may have dropped the last
+    /// slots: the next one reads every row, and the sizing settles again.
+    fn pack(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, module: &CompiledComputeModule) -> u32 {
+        // This parity's copy was written by the pack before last: finished by now.
+        self.pack_parity ^= 1;
+        let parity = self.pack_parity;
+        let live = rd.map_buffer(&mut self.live_readback[parity])[0];
+        let read_rows = self.built_rows[parity];
+        let rows = if read_rows == 0 || live >= read_rows {
+            self.count
+        } else {
+            (live + live / 8 + 2048).next_multiple_of(1024).min(self.count)
+        };
+        self.built_rows[parity] = rows;
+
+        let blocks = self.count.div_ceil(64);
+        let params = LiveParams {
+            instances: self.instances_buf.address,
+            packed: self.packed_buf.address,
+            slots: self.slots_buf.address,
+            blocks: self.blocks_buf.address,
+            total: self.total_buf.address,
+            count: self.count,
+            base: 0,
+            build_count: rows,
+            block_count: blocks,
+        };
+        let base = Some(std::mem::offset_of!(LiveParams, base));
+        let compute_barrier = || {
+            memory_barrier(
+                rd,
+                cmd,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            )
+        };
+        record_dispatch(rd, cmd, module, "live_count", &params, blocks * 64, base);
+        compute_barrier();
+        record_dispatch(rd, cmd, module, "live_scan", &params, 64, None);
+        compute_barrier();
+        record_dispatch(rd, cmd, module, "live_write", &params, blocks * 64, base);
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
+                | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ,
+        );
+        unsafe {
+            let copy = vk::BufferCopy::default().size(4);
+            rd.device.cmd_copy_buffer(
+                cmd,
+                self.total_buf.handle,
+                self.live_readback[parity].handle,
+                std::slice::from_ref(&copy),
+            );
+        }
+        rows
+    }
+
+    fn build(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, module: &CompiledComputeModule) {
         if self.scratch_alignment == 0 {
             self.scratch_alignment = vk_utils::get_acceleration_structure_properties(rd)
                 .min_acceleration_structure_scratch_offset_alignment
@@ -763,10 +901,12 @@ impl TLAS {
                 instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
                     .array_of_pointers(false)
                     .data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: self.instances_buf.address,
+                        device_address: self.packed_buf.address,
                     }),
             });
         let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+        // Sized for every slot (no reallocation as the live count moves), built from the rows
+        // `pack` hands it.
         let primitive_count = self.count;
         let mut build_size = vk::AccelerationStructureBuildSizesInfoKHR::default();
         unsafe {
@@ -830,8 +970,8 @@ impl TLAS {
                     self.scratch_alignment,
                 ),
             });
-        let build_range =
-            vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(primitive_count);
+        let rows = self.pack(rd, cmd, module);
+        let build_range = vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(rows);
         let build_range_infos = std::slice::from_ref(&build_range);
         unsafe {
             rd.ext_acc_struct.cmd_build_acceleration_structures(
@@ -859,6 +999,12 @@ impl TLAS {
             self.instances_buf.handle,
             self.prev_instances_buf.handle,
             self.instance_node_buf.handle,
+            self.packed_buf.handle,
+            self.slots_buf.handle,
+            self.blocks_buf.handle,
+            self.total_buf.handle,
+            self.live_readback[0].handle,
+            self.live_readback[1].handle,
             self.staging.copies()[0].handle,
             self.staging.copies()[1].handle,
             self.materials.device.handle,
@@ -1222,7 +1368,7 @@ impl Plugin for TLASBuilderPlugin {
         let shader = asset_server.load(aurora_asset("shaders/instances.slang"));
         let module = asset_server.add(ComputeModule::new(
             shader,
-            &["scatter_instances", "gather_instances"],
+            &["scatter_instances", "gather_instances", "live_count", "live_scan", "live_write"],
         ));
 
         app.insert_resource(TLAS::new(module));

@@ -140,6 +140,7 @@ struct TlasRefs {
     instances: u64,
     prev_instances: u64,
     materials: u64,
+    instance_slots: u64,
 }
 
 impl TlasRefs {
@@ -151,6 +152,7 @@ impl TlasRefs {
             instances: tlas.instances_address(),
             prev_instances: tlas.prev_instances_address(),
             materials: tlas.material_address(),
+            instance_slots: tlas.instance_slots_address(),
         }
     }
 }
@@ -1273,6 +1275,7 @@ fn render_frame(
                         auto_exposure: view.ae.1,
                         atmo: atmo_address,
                         restir_frame: restir_addresses.frame,
+                        instance_slots: tlas.instance_slots,
                     };
 
                     push_trace(push_constants);
