@@ -9,6 +9,7 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 use ash::{
     ext::opacity_micromap,
+    nv::low_latency2,
     khr::{
         acceleration_structure, deferred_host_operations, ray_query, ray_tracing_pipeline,
         ray_tracing_position_fetch, surface, swapchain,
@@ -21,8 +22,6 @@ use raw_window_handle::DisplayHandle;
 
 use crate::render_texture::RenderTexture;
 use crate::xr::XrContext;
-
-const MAX_BINDLESS_IMAGES: u32 = 16536;
 
 pub struct AllocatorState {
     allocator: Arc<Mutex<Allocator>>,
@@ -94,14 +93,21 @@ pub struct RenderDeviceData {
     pub ext_acc_struct: acceleration_structure::Device,
     /// `VK_EXT_opacity_micromap`, when the device has it (omm.rs); `None` otherwise.
     pub ext_micromap: Option<opacity_micromap::Device>,
+    /// `VK_NV_low_latency2` (Reflex) with `VK_KHR_present_id`, on a windowed, non-XR NVIDIA
+    /// device (latency.rs); `None` otherwise.
+    pub ext_low_latency: Option<low_latency2::Device>,
     pub command_pool: vk::CommandPool,
-    pub bindless_descriptor_set: vk::DescriptorSet,
-    pub bindless_descriptor_set_layout: vk::DescriptorSetLayout,
     pub bindless_descriptor_map: Mutex<BindlessMap>,
+    /// The resource and sampler descriptor heaps (descriptor_heap.rs), set right after the
+    /// device is made.
+    heaps: std::sync::OnceLock<crate::descriptor_heap::DescriptorHeaps>,
     pub transfer_command_pool: Mutex<vk::CommandPool>,
     pub command_buffers: [vk::CommandBuffer; 2],
-    pub descriptor_pool: Mutex<vk::DescriptorPool>,
-    pub linear_sampler: vk::Sampler,
+    /// The frame's other recorders (render_frame: the view and present lanes), each with its
+    /// own pool so they record on their own threads; `command_pool` is the scene lane's.
+    pub lanes: [(vk::CommandPool, [vk::CommandBuffer; 2]); 2],
+    /// Every submit on the queue signals the next point on it (timeline.rs).
+    pub timeline: crate::timeline::GpuTimeline,
     /// Every pipeline compiles through this; seeded from and saved to disk
     /// ([`RenderDevice::save_pipeline_cache`]) so a relaunch skips the driver's compile.
     pub pipeline_cache: vk::PipelineCache,
@@ -131,6 +137,9 @@ pub struct RenderDevice(Arc<RenderDeviceData>);
 pub struct BindlessMap {
     pub by_view: HashMap<vk::ImageView, u32>,
     pub free: Vec<u32>,
+    /// Slots released while a frame that may sample them could still run: reusable once the
+    /// timeline passes the point.
+    pub retired: Vec<(crate::timeline::SubmitPoint, u32)>,
     pub next: u32,
 }
 
@@ -154,7 +163,7 @@ impl RenderDevice {
             let (instance, debug_messenger) = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::load(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
-            let (device, queue, micromaps) = create_logical_device(
+            let (device, queue, micromaps, low_latency) = create_logical_device(
                 &entry,
                 &instance,
                 physical_device,
@@ -166,13 +175,15 @@ impl RenderDevice {
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::load(&instance, &device);
             let ext_acc_struct = acceleration_structure::Device::load(&instance, &device);
             let ext_micromap = micromaps.then(|| opacity_micromap::Device::load(&instance, &device));
+            let ext_low_latency =
+                low_latency.then(|| low_latency2::Device::load(&instance, &device));
             let command_pool = create_command_pool(&device, queue_family_idx);
             let transfer_command_pool = Mutex::new(create_command_pool(&device, queue_family_idx));
             let command_buffers = create_command_buffers(&device, command_pool);
-            let descriptor_pool = create_descriptor_pool(&device);
-            let (bindless_descriptor_set, bindless_descriptor_set_layout) =
-                create_global_descriptor(device.clone(), *descriptor_pool.lock().unwrap());
-            let linear_sampler = create_linear_sampler(device.clone());
+            let lanes = std::array::from_fn(|_| {
+                let pool = create_command_pool(&device, queue_family_idx);
+                (pool, create_command_buffers(&device, pool))
+            });
             let pipeline_cache = create_pipeline_cache(&device);
             let ext_debug_utils = ash::ext::debug_utils::Device::load(&instance, &device);
 
@@ -195,6 +206,7 @@ impl RenderDevice {
             let destroyer =
                 spawn_destroy_thread(instance.clone(), device.clone(), allocator_state.clone());
 
+            let timeline = crate::timeline::GpuTimeline::new(&device);
             let ret = RenderDevice(Arc::new(RenderDeviceData {
                 entry,
                 instance,
@@ -207,20 +219,22 @@ impl RenderDevice {
                 ext_rtx_pipeline,
                 ext_acc_struct,
                 ext_micromap,
+                ext_low_latency,
                 command_pool,
-                bindless_descriptor_set,
-                bindless_descriptor_set_layout,
                 bindless_descriptor_map: Mutex::new(BindlessMap::default()),
+                heaps: std::sync::OnceLock::new(),
                 transfer_command_pool,
                 command_buffers,
-                descriptor_pool,
-                linear_sampler,
+                lanes,
+                timeline,
                 pipeline_cache,
                 ext_debug_utils,
                 destroyer,
                 debug_messenger,
                 allocator_state,
             }));
+            let heaps = crate::descriptor_heap::DescriptorHeaps::new(&ret);
+            let _ = ret.heaps.set(heaps);
 
             ret
         }
@@ -279,29 +293,29 @@ impl RenderDevice {
             return *index;
         }
 
+        let reached = self.timeline.last_completed(&self.device);
+        let map = &mut *map;
+        map.retired.retain(|&(point, slot)| {
+            let done = point <= reached;
+            if done {
+                map.free.push(slot);
+            }
+            !done
+        });
         let index = map.free.pop().unwrap_or_else(|| {
             let index = map.next;
             map.next += 1;
             index
         });
+        // Past the bindless range the slot would land on the per-frame descriptors after it.
+        assert!(
+            index < crate::descriptor_heap::BINDLESS_SLOTS,
+            "bindless textures exhausted ({} slots)",
+            crate::descriptor_heap::BINDLESS_SLOTS
+        );
         map.by_view.insert(texture.image_view, index);
 
-        let descriptor_info = vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(texture.image_view)
-            .sampler(self.linear_sampler);
-
-        let descriptor_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.bindless_descriptor_set)
-            .dst_binding(200)
-            .dst_array_element(index)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&descriptor_info));
-
-        unsafe {
-            self.device
-                .update_descriptor_sets(std::slice::from_ref(&descriptor_write), &[]);
-        }
+        self.heaps().write_bindless(index, texture.image_view);
 
         index
     }
@@ -317,8 +331,25 @@ impl RenderDevice {
     pub fn unregister_bindless_texture(&self, texture: &RenderTexture) {
         let mut map = self.bindless_descriptor_map.lock().unwrap();
         if let Some(index) = map.by_view.remove(&texture.image_view) {
-            map.free.push(index);
+            // The frame being recorded may already use it and has not been submitted yet.
+            let last = self.timeline.last_submitted();
+            map.retired
+                .push((crate::timeline::SubmitPoint(last.0 + 2), index));
         }
+    }
+
+    /// The descriptor heaps (descriptor_heap.rs).
+    pub fn heaps(&self) -> &crate::descriptor_heap::DescriptorHeaps {
+        self.heaps.get().expect("descriptor heaps are made with the device")
+    }
+
+    /// Creates an image view and notes how, so descriptors can be written from it.
+    pub fn create_view(&self, info: &vk::ImageViewCreateInfo) -> vk::ImageView {
+        let view = unsafe { self.device.create_image_view(info, None) }.unwrap();
+        if let Some(heaps) = self.heaps.get() {
+            heaps.track_view(view, info);
+        }
+        view
     }
 
     pub fn load_shader(
@@ -365,6 +396,35 @@ impl RenderDevice {
         {
             let queue = self.queue.lock().unwrap();
             self.submit_transfer(*queue, cmd_buffer, fence);
+        }
+        self.finish_transfer(cmd_buffer, fence);
+    }
+
+    /// [`run_transfer_commands`](Self::run_transfer_commands) for work that REWRITES buffers a
+    /// submitted frame may still read (light tables, landscape pages): its submit waits, on
+    /// the GPU, for everything already queued, so it never overlaps a frame in flight. Plain
+    /// uploads into fresh buffers use `run_transfer_commands` and do not wait.
+    pub fn run_transfer_commands_after_frames(&self, f: impl FnOnce(vk::CommandBuffer)) {
+        let (cmd_buffer, fence) = self.record_transfer(f);
+        {
+            let queue = self.queue.lock().unwrap();
+            let last = self.timeline.last_submitted();
+            unsafe {
+                self.timeline.submit(
+                    &self.device,
+                    *queue,
+                    std::slice::from_ref(&cmd_buffer),
+                    &[last],
+                    &[],
+                    &[],
+                    fence,
+                    None,
+                )
+            }
+            .unwrap_or_else(|e| {
+                crate::aftermath::note_device_lost(e);
+                panic!("ordered transfer submit failed: {e:?}");
+            });
         }
         self.finish_transfer(cmd_buffer, fence);
     }
@@ -436,23 +496,27 @@ impl Drop for RenderDeviceData {
             drop(destroyer);
 
             let mut alloc_state = self.allocator_state.lock().unwrap();
+            if let Some(heaps) = self.heaps.get() {
+                heaps.destroy_objects(&self.device);
+                for buffer in heaps.buffers() {
+                    alloc_state.free_buffer_allocation(buffer);
+                    self.device.destroy_buffer(buffer, None);
+                }
+            }
             let alloc_state = ManuallyDrop::take(&mut *alloc_state);
 
             drop(alloc_state);
 
-            self.destroy_descriptor_set_layout(self.bindless_descriptor_set_layout, None);
-
-            self.destroy_sampler(self.linear_sampler, None);
             self.destroy_pipeline_cache(self.pipeline_cache, None);
             {
                 let transfer_command_pool = self.transfer_command_pool.lock().unwrap();
                 self.destroy_command_pool(*transfer_command_pool, None);
             }
-            {
-                let descriptor_pool = self.descriptor_pool.lock().unwrap();
-                self.destroy_descriptor_pool(*descriptor_pool, None);
-            }
             self.destroy_command_pool(self.command_pool, None);
+            for (pool, _) in self.lanes {
+                self.destroy_command_pool(pool, None);
+            }
+            self.timeline.destroy(&self.device);
             self.device.destroy_device(None);
             if let Some((debug_utils, messenger)) = &self.debug_messenger {
                 debug_utils.destroy_debug_utils_messenger(*messenger, None);
@@ -750,7 +814,7 @@ unsafe fn create_logical_device(
     queue_family_idx: u32,
     xr: Option<&XrContext>,
     windowed: bool,
-) -> (ash::Device, Mutex<vk::Queue>, bool) {
+) -> (ash::Device, Mutex<vk::Queue>, bool, bool) {
     unsafe {
         let mut device_extensions = vec![
             acceleration_structure::NAME.as_ptr(),
@@ -803,6 +867,22 @@ unsafe fn create_logical_device(
             );
         }
 
+        // Reflex (latency.rs): low-latency sleep and markers, keyed by present ids. Windowed,
+        // flat only: in XR the OpenXR runtime paces the frame.
+        let has = |name: &CStr| {
+            supported
+                .iter()
+                .any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == name)
+        };
+        let low_latency = windowed
+            && xr.is_none()
+            && has(low_latency2::NAME)
+            && has(ash::khr::present_id::NAME);
+        if low_latency {
+            device_extensions.push(low_latency2::NAME.as_ptr());
+            device_extensions.push(ash::khr::present_id::NAME.as_ptr());
+        }
+
         // Nsight Aftermath (aftermath.rs): with the callbacks armed, ask the driver to
         // track resources, shader debug info, checkpoints, and shader error reporting, so
         // a crash dump names the faulting buffer / shader source line instead of a bare
@@ -823,7 +903,38 @@ unsafe fn create_logical_device(
                 .collect::<Vec<_>>()
         );
 
+        // An internally synchronized queue (VK_KHR_internally_synchronized_queues): the driver
+        // serializes access, so a submit that bypasses our mutex (NGX and the OpenXR runtime
+        // submit on this queue on their own) can no longer race one of ours.
+        let internal_sync = has(vk::KHR_INTERNALLY_SYNCHRONIZED_QUEUES_NAME) && {
+            let mut query = vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut query);
+            instance.get_physical_device_features2(physical_device, &mut features);
+            query.internally_synchronized_queues == vk::TRUE
+        };
+        if internal_sync {
+            device_extensions.push(vk::KHR_INTERNALLY_SYNCHRONIZED_QUEUES_NAME.as_ptr());
+        }
+        let queue_flags = if internal_sync {
+            vk::DeviceQueueCreateFlags::INTERNALLY_SYNCHRONIZED_KHR
+        } else {
+            vk::DeviceQueueCreateFlags::empty()
+        };
+        log::info!("vulkan: internally synchronized queue: {internal_sync}");
+        // Descriptor heaps (descriptor_heap.rs) are the only binding model: no fallback.
+        let heap_supported = has(ash::ext::descriptor_heap::NAME) && {
+            let mut query = vk::PhysicalDeviceDescriptorHeapFeaturesEXT::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut query);
+            instance.get_physical_device_features2(physical_device, &mut features);
+            query.descriptor_heap == vk::TRUE
+        };
+        assert!(
+            heap_supported,
+            "aurora needs VK_EXT_descriptor_heap (NVIDIA driver 610 or newer)"
+        );
+        device_extensions.push(ash::ext::descriptor_heap::NAME.as_ptr());
         let queue_info = vk::DeviceQueueCreateInfo::default()
+            .flags(queue_flags)
             .queue_family_index(queue_family_idx)
             .queue_priorities(&[1.0]);
 
@@ -840,6 +951,8 @@ unsafe fn create_logical_device(
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_storage_image_update_after_bind(true)
             .descriptor_binding_variable_descriptor_count(true)
+            // New bindless slots are written while the previous frame is still pending.
+            .descriptor_binding_update_unused_while_pending(true)
             .host_query_reset(true)
             .scalar_block_layout(true)
             .shader_float16(true)
@@ -909,8 +1022,25 @@ unsafe fn create_logical_device(
             .push(&mut features_ray_query)
             .push(&mut features_position_fetch)
             .push(&mut features_reorder);
+        let mut features_heap =
+            vk::PhysicalDeviceDescriptorHeapFeaturesEXT::default().descriptor_heap(true);
+        let device_info = device_info.push(&mut features_heap);
         let device_info = if micromaps {
             device_info.push(&mut features_micromap)
+        } else {
+            device_info
+        };
+        let mut features_present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut features_internal_sync =
+            vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default()
+                .internally_synchronized_queues(true);
+        let device_info = if internal_sync {
+            device_info.push(&mut features_internal_sync)
+        } else {
+            device_info
+        };
+        let device_info = if low_latency {
+            device_info.push(&mut features_present_id)
         } else {
             device_info
         };
@@ -930,9 +1060,14 @@ unsafe fn create_logical_device(
                 .create_device(physical_device, &device_info, None)
                 .unwrap(),
         };
-        let queue = device.get_device_queue(queue_family_idx, 0);
+        let queue = device.get_device_queue2(
+            &vk::DeviceQueueInfo2::default()
+                .flags(queue_flags)
+                .queue_family_index(queue_family_idx)
+                .queue_index(0),
+        );
 
-        (device, Mutex::new(queue), micromaps)
+        (device, Mutex::new(queue), micromaps, low_latency)
     }
 }
 
@@ -956,103 +1091,6 @@ fn create_command_buffers(device: &ash::Device, pool: vk::CommandPool) -> [vk::C
             .try_into()
             .unwrap()
     }
-}
-
-fn create_descriptor_pool(device: &ash::Device) -> Mutex<vk::DescriptorPool> {
-    let pool_sizes = [
-        vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 1000,
-        },
-        vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: MAX_BINDLESS_IMAGES,
-        },
-        vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_IMAGE,
-            descriptor_count: 256,
-        },
-        vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-            descriptor_count: 16,
-        },
-    ];
-
-    let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
-        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
-        .pool_sizes(&pool_sizes)
-        .max_sets(1000);
-
-    Mutex::new(unsafe {
-        device
-            .create_descriptor_pool(&descriptor_pool_info, None)
-            .unwrap()
-    })
-}
-
-fn create_global_descriptor(
-    device: ash::Device,
-    descriptor_pool: vk::DescriptorPool,
-) -> (vk::DescriptorSet, vk::DescriptorSetLayout) {
-    const MAX_BINDLESS_IMAGES: u32 = 16536;
-    let image_binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(200)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(MAX_BINDLESS_IMAGES)
-        .stage_flags(vk::ShaderStageFlags::ALL);
-
-    let bindless_flags = vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-        | vk::DescriptorBindingFlags::PARTIALLY_BOUND
-        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
-    let max_binding = MAX_BINDLESS_IMAGES - 1;
-
-    let mut layout_info_ext = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-        .binding_flags(std::slice::from_ref(&bindless_flags));
-
-    let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-        .bindings(std::slice::from_ref(&image_binding))
-        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-        .push(&mut layout_info_ext);
-
-    let descriptor_set_layout = unsafe {
-        device
-            .create_descriptor_set_layout(&layout_info, None)
-            .unwrap()
-    };
-
-    let mut alloc_info_ext = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
-        .descriptor_counts(std::slice::from_ref(&max_binding));
-
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-        .push(&mut alloc_info_ext);
-
-    let descriptor_set = unsafe {
-        device
-            .allocate_descriptor_sets(&alloc_info)
-            .unwrap()
-            .pop()
-            .unwrap()
-    };
-
-    return (descriptor_set, descriptor_set_layout);
-}
-
-fn create_linear_sampler(device: ash::Device) -> vk::Sampler {
-    let linear_sampler_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::REPEAT)
-        .address_mode_v(vk::SamplerAddressMode::REPEAT)
-        .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .anisotropy_enable(false)
-        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        // The default max_lod of 0 would pin every read to level 0.
-        .max_lod(vk::LOD_CLAMP_NONE);
-    unsafe { device.create_sampler(&linear_sampler_info, None).unwrap() }
 }
 
 #[derive(Debug)]

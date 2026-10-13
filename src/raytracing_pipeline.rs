@@ -1,6 +1,9 @@
 use std::time::Instant;
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
+
+use crate::descriptor_heap::{GUIDES, Mapping, stage_mapping};
 use bevy::{
     app::{Plugin, Update},
     asset::{Asset, AssetApp, AssetEvent, Assets, Handle},
@@ -78,12 +81,6 @@ pub type RTGroupHandle = [u8; 32];
 
 pub struct CompiledRaytracingPipeline {
     pub pipeline: vk::Pipeline,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub descriptor_set_layout: vk::DescriptorSetLayout,
-    /// One set per frame parity and view slot: `[frame_parity * MAX_VIEWS + slot]`. Each
-    /// trace dispatch in a frame needs its own set — a set already recorded into the
-    /// command buffer must not be rewritten.
-    pub descriptor_sets: [vk::DescriptorSet; 2 * crate::MAX_VIEWS],
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
@@ -147,6 +144,17 @@ pub struct RaytracingPushConstants {
     /// ReSTIR DI's parameter block, its light grid built before the trace (`restir`; 0 when
     /// off): path vertices draw light candidates from the grid.
     pub restir_frame: u64,
+}
+
+/// The trace's push data: the shaders' push-constant block, then what a descriptor set used to
+/// carry -- the TLAS address and the view's block of guide descriptors (descriptor_heap.rs).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RaytracingPushData {
+    pub constants: RaytracingPushConstants,
+    pub tlas: u64,
+    pub guides: u32,
+    pub pad: u32,
 }
 
 impl VulkanAsset for RaytracingPipeline {
@@ -272,74 +280,6 @@ impl VulkanAsset for RaytracingPipeline {
         let spec = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
             .data(bytemuck::cast_slice(&spec_data));
-
-        // 0..=6: the DLSS guide images (normal+roughness, diffuse, specular, depth,
-        // specular hit distance, motion, colour); 7: the camera ray's fog; 100: the TLAS.
-        let storage = |binding: u32| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
-        };
-        let bindings = [
-            storage(0),
-            storage(1),
-            storage(2),
-            storage(3),
-            storage(4),
-            storage(5),
-            storage(6),
-            storage(7),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(100)
-                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-        ];
-
-        let descriptor_set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-        let descriptor_set_layout = unsafe {
-            render_device
-                .create_descriptor_set_layout(&descriptor_set_layout_info, None)
-                .unwrap()
-        };
-
-        let push_constant_info = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::ALL)
-            .offset(0)
-            .size(std::mem::size_of::<RaytracingPushConstants>() as u32);
-
-        let set_layouts = [
-            descriptor_set_layout,
-            render_device.bindless_descriptor_set_layout,
-        ];
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_constant_info));
-
-        let pipeline_layout = unsafe {
-            render_device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-                .unwrap()
-        };
-
-        let descriptor_sets = {
-            let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 2 * crate::MAX_VIEWS];
-            let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(*descriptor_pool)
-                .set_layouts(&layouts);
-            unsafe {
-                render_device
-                    .allocate_descriptor_sets(&alloc_info)
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            }
-        };
 
         // Stage indices 0..=5 are fixed and the group table below names them literally;
         // each registered surface group appends its own stages after them.
@@ -533,12 +473,43 @@ impl VulkanAsset for RaytracingPipeline {
         } else {
             vk::PipelineCreateFlags::empty()
         };
+        // No descriptor sets: the raygen's guides (0..=7, set 0) come from the view's block of
+        // the resource heap, the TLAS (100) from its address in push data, the bindless
+        // textures (set 1, binding 200) from the heap's constant range (descriptor_heap.rs).
+        let heaps = render_device.heaps();
+        let mappings = heaps.mappings(&[
+            Mapping::Indexed {
+                set: 0,
+                binding: 0,
+                count: GUIDES,
+                base: heaps.guides_base(),
+                block: GUIDES,
+                push_offset: std::mem::offset_of!(RaytracingPushData, guides) as u32,
+                combined: false,
+            },
+            Mapping::Address {
+                set: 0,
+                binding: 100,
+                push_offset: std::mem::offset_of!(RaytracingPushData, tlas) as u32,
+            },
+            Mapping::Bindless {
+                set: 1,
+                binding: 200,
+            },
+        ]);
+        let mapping_info = stage_mapping(&mappings);
+        for stage in &mut shader_stages {
+            stage.p_next = (&raw const mapping_info).cast();
+        }
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
+            vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT
+                | vk::PipelineCreateFlags2::from_raw(flags.as_raw() as u64),
+        );
         let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .flags(flags)
             .stages(&shader_stages)
             .groups(&shader_group)
             .max_pipeline_ray_recursion_depth(1)
-            .layout(pipeline_layout);
+            .push(&mut flags2);
 
         let pipeline = unsafe {
             render_device
@@ -606,9 +577,6 @@ impl VulkanAsset for RaytracingPipeline {
 
         CompiledRaytracingPipeline {
             pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_sets,
             raygen_handle,
             fog_grid_handle,
             restir_shade_handle,
@@ -626,12 +594,6 @@ impl VulkanAsset for RaytracingPipeline {
         render_device: &crate::render_device::RenderDevice,
         prepared_asset: &Self::PreparedAsset,
     ) {
-        render_device
-            .destroyer
-            .destroy_descriptor_set_layout(prepared_asset.descriptor_set_layout);
-        render_device
-            .destroyer
-            .destroy_pipeline_layout(prepared_asset.pipeline_layout);
         render_device
             .destroyer
             .destroy_pipeline(prepared_asset.pipeline);

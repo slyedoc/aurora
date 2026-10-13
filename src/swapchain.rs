@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bevy::prelude::*;
 use bevy::window::RawHandleWrapper;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -24,8 +25,14 @@ pub struct Swapchain {
     /// The window size the current swapchain was built for; a different `RenderWindow`
     /// triggers a rebuild in `aquire_next_image`.
     requested: (u32, u32),
+    /// Bumped on every (re)creation: Reflex's sleep mode is per swapchain (latency.rs).
+    pub generation: u64,
     pub current_image_idx: u32,
-    pub image_available_semaphore: vk::Semaphore,
+    /// Acquire semaphores, one per frame parity: the next frame acquires while the previous
+    /// frame's submit may still be waiting on its own.
+    pub image_available_semaphores: [vk::Semaphore; 2],
+    /// The parity of the image acquired last.
+    available: usize,
     /// One per swapchain image, indexed by the acquired image: a present's wait on it is not
     /// covered by the in-flight fence, so a single shared semaphore could be re-signaled while
     /// still pending.
@@ -63,10 +70,12 @@ impl Swapchain {
                 )
                 .unwrap();
             let semaphore_info = vk::SemaphoreCreateInfo::default();
-            let image_available_semaphore = device
-                .device
-                .create_semaphore(&semaphore_info, None)
-                .unwrap();
+            let image_available_semaphores = std::array::from_fn(|_| {
+                device
+                    .device
+                    .create_semaphore(&semaphore_info, None)
+                    .unwrap()
+            });
 
             Swapchain {
                 device,
@@ -77,7 +86,9 @@ impl Swapchain {
                 swapchain_extent: vk::Extent2D::default(),
                 swapchain_format: vk::Format::UNDEFINED,
                 requested: (0, 0),
-                image_available_semaphore,
+                image_available_semaphores,
+                available: 0,
+                generation: 0,
                 render_finished_semaphores: Vec::new(),
                 current_image_idx: 0,
                 resized: false,
@@ -188,6 +199,14 @@ impl Swapchain {
                 .clipped(true)
                 .image_array_layers(1)
                 .old_swapchain(old_swapchain);
+            // Reflex (latency.rs): a swapchain takes latency markers and sleeps only when
+            // created for them.
+            let mut latency = vk::SwapchainLatencyCreateInfoNV::default().latency_mode_enable(true);
+            let swapchain_create_info = if self.device.ext_low_latency.is_some() {
+                swapchain_create_info.push(&mut latency)
+            } else {
+                swapchain_create_info
+            };
 
             self.swapchain = self
                 .device
@@ -196,6 +215,7 @@ impl Swapchain {
                 .unwrap();
 
             self.device.destroyer.destroy_swapchain(old_swapchain);
+            self.generation += 1;
             for image_view in self.swapchain_image_views.drain(..) {
                 self.device.destroyer.destroy_image_view(image_view);
             }
@@ -239,10 +259,13 @@ impl Swapchain {
         }
     }
 
+    /// Acquires the next image for frame `frame` (its parity picks the acquire semaphore).
     pub unsafe fn aquire_next_image(
         &mut self,
         window: &RenderWindow,
+        frame: usize,
     ) -> (vk::Image, vk::ImageView) {
+        self.available = frame % 2;
         unsafe {
             if self.swapchain == vk::SwapchainKHR::null()
                 || self.requested != (window.width, window.height)
@@ -250,8 +273,8 @@ impl Swapchain {
                 self.on_resize(window);
                 self.resized = true;
             }
-            // `FrameSync::wait` ran first: the previous frame's submit, which waits on
-            // `image_available_semaphore`, is done, so the semaphore can be signalled again.
+            // This parity's semaphore was last waited by the submit two frames back, which has
+            // finished (one frame in flight), so it can be signalled again.
             // A swapchain the compositor already invalidated (a fullscreen window settling
             // in) surfaces here; rebuild it and acquire again.
             let _acquire = info_span!("acquire_next_image").entered();
@@ -259,7 +282,7 @@ impl Swapchain {
                 match self.device.ext_swapchain.acquire_next_image(
                     self.swapchain,
                     u64::MAX,
-                    self.image_available_semaphore,
+                    self.image_available_semaphores[self.available],
                     vk::Fence::null(),
                 ) {
                     Ok((index, _)) => break index,
@@ -282,21 +305,29 @@ impl Swapchain {
     /// one it signals for the present.
     pub fn frame_semaphores(&self) -> (vk::Semaphore, vk::Semaphore) {
         (
-            self.image_available_semaphore,
+            self.image_available_semaphores[self.available],
             self.render_finished_semaphores[self.current_image_idx as usize],
         )
     }
 
-    /// Present the acquired image once the submit has signalled it. The caller holds the queue;
-    /// hand the result to [`Self::after_present`] after letting it go.
-    pub unsafe fn present(&self, queue: vk::Queue) -> ash::VkResult<bool> {
+    /// Present the acquired image once the submit has signalled it, tagged `present_id` when
+    /// Reflex is on (latency.rs). The caller holds the queue; hand the result to
+    /// [`Self::after_present`] after letting it go.
+    pub unsafe fn present(&self, queue: vk::Queue, present_id: Option<u64>) -> ash::VkResult<bool> {
         unsafe {
+            let ids = [present_id.unwrap_or(0)];
+            let mut id_info = vk::PresentIdKHR::default().present_ids(&ids);
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(std::slice::from_ref(
                     &self.render_finished_semaphores[self.current_image_idx as usize],
                 ))
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&self.current_image_idx));
+            let present_info = if present_id.is_some() {
+                present_info.push(&mut id_info)
+            } else {
+                present_info
+            };
             let _present = info_span!("queue_present").entered();
             let result = self
                 .device
@@ -352,8 +383,9 @@ impl Drop for Swapchain {
                 self.device.queue_wait_idle(*queue).unwrap();
             }
 
-            self.device
-                .destroy_semaphore(self.image_available_semaphore, None);
+            for semaphore in self.image_available_semaphores {
+                self.device.destroy_semaphore(semaphore, None);
+            }
             for semaphore in self.render_finished_semaphores.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
             }

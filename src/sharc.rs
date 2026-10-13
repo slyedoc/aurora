@@ -57,16 +57,8 @@ impl SharcState {
         self.buffer.address
     }
 
-    /// Creates the table on first use and records the per-frame resolve. Call before the
-    /// trace; cross-frame visibility is covered by the in-flight fence.
-    pub fn record(
-        &mut self,
-        rd: &RenderDevice,
-        cmd: vk::CommandBuffer,
-        modules: &ComputeModules,
-        frame: u32,
-        enabled: bool,
-    ) {
+    /// Creates the table on first use (its address is fixed from then on).
+    pub fn ensure(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, enabled: bool) {
         if self.buffer.handle == vk::Buffer::null() {
             if !enabled {
                 return;
@@ -93,6 +85,21 @@ impl SharcState {
                 SHARC_ENTRIES,
                 SHARC_ENTRIES as u64 * ENTRY_BYTES / (1024 * 1024)
             );
+        }
+    }
+
+    /// Records the per-frame resolve (after `ensure`). Call before the trace.
+    pub fn record(
+        &mut self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        modules: &ComputeModules,
+        frame: u32,
+        enabled: bool,
+    ) {
+        self.ensure(rd, cmd, enabled);
+        if self.buffer.handle == vk::Buffer::null() {
+            return;
         }
         let Some(module) = modules.get(&self.module) else {
             return;

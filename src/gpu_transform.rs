@@ -294,7 +294,8 @@ pub struct GpuTransforms {
     readback: Buffer<ReadbackRecord>,
     readback_total: Buffer<u32>,
     readback_cmd: vk::CommandBuffer,
-    readback_fence: vk::Fence,
+    /// The readback submit's point on the timeline.
+    readback_point: crate::timeline::SubmitPoint,
     /// A submitted readback the next `First` has to collect.
     readback_pending: bool,
     /// The build `record` just made was a full rebuild (read back every node).
@@ -331,7 +332,7 @@ impl GpuTransforms {
             readback: Buffer::default(),
             readback_total: Buffer::default(),
             readback_cmd: vk::CommandBuffer::null(),
-            readback_fence: vk::Fence::null(),
+            readback_point: crate::timeline::SubmitPoint::default(),
             readback_pending: false,
             rebuilt_full: false,
         }
@@ -715,9 +716,6 @@ impl GpuTransforms {
                         | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                     MemoryLocation::GpuToCpu,
                 );
-                self.readback_fence = rd
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .unwrap();
             }
         }
         // Normally collected by `apply_readback` already; this only covers a skipped `First`.
@@ -733,6 +731,16 @@ impl GpuTransforms {
             )
             .unwrap();
         }
+        // Submitted before the CPU waits for the previous frame: order everything here after
+        // that frame's work on the queue (it may still read the tables this rewrites).
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
         let changed = self.record(rd, cmd, modules);
         if changed && let Some(module) = modules.get(&self.module) {
             let params = ReadbackParams {
@@ -777,9 +785,10 @@ impl GpuTransforms {
         }
         unsafe {
             rd.end_command_buffer(cmd).unwrap();
-            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
             let queue = rd.queue.lock().unwrap();
-            rd.queue_submit(*queue, std::slice::from_ref(&submit), self.readback_fence)
+            self.readback_point = rd
+                .timeline
+                .submit(rd, *queue, std::slice::from_ref(&cmd), &[], &[], &[], vk::Fence::null(), None)
                 .unwrap_or_else(|e| {
                     crate::aftermath::note_device_lost(e);
                     panic!("transform submit failed: {e:?}");
@@ -793,15 +802,12 @@ impl GpuTransforms {
         if !self.readback_pending {
             return;
         }
-        unsafe {
-            rd.wait_for_fences(std::slice::from_ref(&self.readback_fence), true, u64::MAX)
-                .unwrap_or_else(|e| {
-                    crate::aftermath::note_device_lost(e);
-                    panic!("transform readback fence wait failed: {e:?}");
-                });
-            rd.reset_fences(std::slice::from_ref(&self.readback_fence))
-                .unwrap();
-        }
+        rd.timeline
+            .wait(rd, self.readback_point)
+            .unwrap_or_else(|e| {
+                crate::aftermath::note_device_lost(e);
+                panic!("transform readback wait failed: {e:?}");
+            });
         self.readback_pending = false;
     }
 
@@ -971,9 +977,6 @@ fn cleanup(world: &mut World) {
         rd.destroyer.destroy_buffer(table.staging_u32.handle);
         rd.destroyer.destroy_buffer(table.readback_total.handle);
         table.wait_readback(rd);
-        if table.readback_fence != vk::Fence::null() {
-            unsafe { rd.destroy_fence(table.readback_fence, None) };
-        }
     });
 }
 

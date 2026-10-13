@@ -585,7 +585,7 @@ fn prepare_lights(
         analytics: lights.analytics.address,
         entry_to_linst: lights.entry_to_linst.address,
     };
-    render_device.run_transfer_commands(|cmd| {
+    render_device.run_transfer_commands_after_frames(|cmd| {
         if !linsts.is_empty() {
             upload_slice(&render_device, cmd, &linsts, &lights.linsts);
         }

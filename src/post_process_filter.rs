@@ -2,6 +2,7 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
+use crate::descriptor_heap::{Mapping, POST_INPUTS, stage_mapping};
 use crate::color_target::{DISPLAY_FORMAT, FormatPipelines, SCENE_RADIANCE_FORMAT};
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
@@ -30,6 +31,17 @@ pub struct PostProcessPushConstants {
     pub lum_height: u32,
 }
 
+/// The post pass's push data: the constants, then the target's block of inputs in the resource
+/// heap (`DescriptorHeaps::post_block`: one per frame parity and target, targets being one per
+/// view slot plus `MAX_VIEWS` for the XR spectator window).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PostProcessPushData {
+    pub constants: PostProcessPushConstants,
+    pub inputs: u32,
+    pub pad: u32,
+}
+
 #[derive(Asset, TypePath, Debug, Clone)]
 pub struct PostProcessFilter {
     #[dependency]
@@ -40,13 +52,6 @@ pub struct PostProcessFilter {
 
 pub struct CompiledPostProcessFilter {
     pub pipelines: FormatPipelines,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub descriptor_set_layout: vk::DescriptorSetLayout,
-    /// One set per frame parity and target: `[frame_parity * POST_TARGETS + target]`,
-    /// targets being one per view slot (`0..MAX_VIEWS`) plus `MAX_VIEWS` for the XR
-    /// spectator window. Every draw in a frame needs its own set — a set already recorded
-    /// must not be rewritten.
-    pub descriptor_sets: [vk::DescriptorSet; 2 * POST_TARGETS],
 }
 
 /// Composite targets per frame parity: one per view slot, plus the XR spectator window.
@@ -80,51 +85,19 @@ impl VulkanAsset for PostProcessFilter {
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
 
-        // 10 sampled images: the DLSS output, the guide buffers for the debug views, the camera
-        // ray's fog and the output's mip pyramid (quad.slang's `test[10]`).
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .binding(0)
-            .descriptor_count(10)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-
-        let descriptor_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-        let descriptor_set_layout = unsafe {
-            render_device
-                .create_descriptor_set_layout(&descriptor_layout_info, None)
-                .unwrap()
-        };
-
-        let push_constant_info = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::ALL)
-            .offset(0)
-            .size(std::mem::size_of::<PostProcessPushConstants>() as u32);
-
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-            .push_constant_ranges(std::slice::from_ref(&push_constant_info));
-        let pipeline_layout = unsafe {
-            render_device
-                .create_pipeline_layout(&layout_info, None)
-                .unwrap()
-        };
-
-        let descriptor_sets = {
-            let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 2 * POST_TARGETS];
-            let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(*descriptor_pool)
-                .set_layouts(&layouts);
-            unsafe {
-                render_device
-                    .allocate_descriptor_sets(&alloc_info)
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            }
-        };
+        // No descriptor sets: quad.slang's `test[10]` (set 0, binding 0) reads the target's block
+        // of the resource heap, its index in push data after the constants.
+        let heaps = render_device.heaps();
+        let mappings = heaps.mappings(&[Mapping::Indexed {
+            set: 0,
+            binding: 0,
+            count: 1,
+            base: heaps.post_base(),
+            block: POST_INPUTS,
+            push_offset: std::mem::offset_of!(PostProcessPushData, inputs) as u32,
+            combined: true,
+        }]);
+        let mapping_info = stage_mapping(&mappings);
 
         let shader_stages = [
             render_device.load_shader_entry(
@@ -138,6 +111,11 @@ impl VulkanAsset for PostProcessFilter {
                 c"fragment",
             ),
         ];
+        let shader_stages = shader_stages.map(|stage| {
+            let mut stage = stage;
+            stage.p_next = (&raw const mapping_info).cast();
+            stage
+        });
 
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -168,6 +146,8 @@ impl VulkanAsset for PostProcessFilter {
                 let formats = [format];
                 let mut pipeline_rendering_info =
                     vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+                let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+                    .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
                 let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
                     .stages(&shader_stages)
                     .vertex_input_state(&vertex_input_state)
@@ -177,8 +157,8 @@ impl VulkanAsset for PostProcessFilter {
                     .multisample_state(&multisample_state)
                     .color_blend_state(&color_blend_state)
                     .dynamic_state(&dynamic_state)
-                    .layout(pipeline_layout)
-                    .push(&mut pipeline_rendering_info);
+                    .push(&mut pipeline_rendering_info)
+                    .push(&mut flags2);
                 unsafe {
                     render_device.create_graphics_pipelines(
                         render_device.pipeline_cache,
@@ -194,23 +174,12 @@ impl VulkanAsset for PostProcessFilter {
             render_device.destroy_shader_module(shader_stages[1].module, None);
         }
 
-        CompiledPostProcessFilter {
-            pipelines,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_sets,
-        }
+        CompiledPostProcessFilter { pipelines }
     }
     fn destroy_asset(
         render_device: &crate::render_device::RenderDevice,
         prepared_asset: &Self::PreparedAsset,
     ) {
-        render_device
-            .destroyer
-            .destroy_descriptor_set_layout(prepared_asset.descriptor_set_layout);
-        render_device
-            .destroyer
-            .destroy_pipeline_layout(prepared_asset.pipeline_layout);
         prepared_asset.pipelines.destroy(render_device);
     }
 }

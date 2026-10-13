@@ -169,8 +169,14 @@ impl BufferProvider for RenderDevice {
             state.register_buffer_allocation(handle, allocation);
         }
 
-        let address = unsafe {
-            self.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
+        let address = if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            unsafe {
+                self.get_buffer_device_address(
+                    &vk::BufferDeviceAddressInfo::default().buffer(handle),
+                )
+            }
+        } else {
+            0
         };
 
         Buffer {
@@ -243,4 +249,32 @@ impl BufferProvider for RenderDevice {
 
 impl<T> Drop for Buffer<T> {
     fn drop(&mut self) {}
+}
+
+/// Two copies of a host-visible buffer the GPU reads in place. Each write goes to the copy no
+/// submitted frame is reading ([`Flip::write`] flips first), so recording the next frame never
+/// rewrites memory the previous one may still read. At most one write per frame: a second
+/// would flip back onto the copy in flight.
+#[derive(Default)]
+pub struct Flip<T> {
+    copies: [T; 2],
+    current: usize,
+}
+
+impl<T> Flip<T> {
+    /// The copy the GPU reads this frame (the last one written).
+    pub fn current(&self) -> &T {
+        &self.copies[self.current]
+    }
+
+    /// Flips to the other copy and returns it for this frame's write.
+    pub fn write(&mut self) -> &mut T {
+        self.current ^= 1;
+        &mut self.copies[self.current]
+    }
+
+    /// Both copies (to destroy them).
+    pub fn copies(&self) -> &[T; 2] {
+        &self.copies
+    }
 }

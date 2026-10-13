@@ -22,6 +22,8 @@ struct AeState {
     float input_exposure;  // exp2(input_ev)
     // The full metering (log2 exposure that puts the scene at mid-gray).
     float metered;
+    // 0 until the look has jumped to its first real metering.
+    uint settled;
 };
 
 // One block for both kernels (the compute layout is push constants only).
@@ -47,8 +49,8 @@ struct AeParams {
     float reference_ev;    // The look adapts around this exposure...
     float adaptation;      // ...by this fraction of the metered difference (1 = full auto).
     float max_dim;         // ...staying at most this many stops under the metering.
-    uint snap;             // First metered frame: start at the target.
-    uint pad;
+    uint pad0;
+    uint pad1;
 };
 [[vk::push_constant]] AeParams p;
 
@@ -135,8 +137,12 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
         // exponential_transition pair).
         let partial = max(lerp(p.reference_ev, metered, p.adaptation), metered - p.max_dim);
         let target = clamp(partial, p.min_ev, p.max_ev);
-        if (p.snap != 0u) {
+        // The look starts at its first real metering rather than fading up from the
+        // reference -- once a quarter of the frame is metered: a frame still loading (black, or
+        // sky only) read as darkness and jumped the look to blinding before the scene arrived.
+        if (state.settled == 0u && sum * 4u >= p.pixel_count) {
             state.ev = target;
+            state.settled = 1u;
         }
         let speed = (target > state.ev) ? p.speed_brighten : p.speed_darken;
         let step_ = speed * p.dt;

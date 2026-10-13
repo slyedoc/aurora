@@ -5,20 +5,20 @@ use bevy::{
     window::{RawHandleWrapperHolder, WindowCloseRequested},
     winit::DisplayHandleWrapper,
 };
+use bevy::tasks::{ComputeTaskPool, TaskPool};
 use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
-use ash::vk::TaggedStructure as _;
 
 use crate::color_target::TargetKind;
-use crate::post_process_filter::POST_TARGETS;
+use crate::descriptor_heap::DescriptorHeaps;
 
 use crate::sky::{EnvironmentGpu, EnvironmentSkies, Sky};
 use crate::{
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
     bluenoise_plugin::BlueNoiseBuffer,
     post_process_filter::PostProcessFilter,
-    raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants},
+    raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants, RaytracingPushData},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     render_env::WHITE_TEXTURE_IDX,
@@ -35,6 +35,8 @@ pub struct RenderConfig {
     pub postprocess_pipeline: Handle<PostProcessFilter>,
     pub pull_focus: Option<(u32, u32)>,
 }
+
+const _: () = assert!(std::mem::size_of::<UniformData>() % 4 == 0);
 
 #[repr(C)]
 pub struct UniformData {
@@ -126,6 +128,31 @@ pub struct FocusData {
     focal_distance: f32,
 }
 
+/// What the view lane reads of the TLAS, taken while the scene lane may be rebuilding it.
+#[derive(Clone, Copy)]
+struct TlasRefs {
+    /// A structure is built and the SBT is ready: the views can trace.
+    traceable: bool,
+    /// The structure's device address (the raygen's TLAS comes from push data).
+    address: u64,
+    instances: u64,
+    prev_instances: u64,
+    materials: u64,
+}
+
+impl TlasRefs {
+    fn of(tlas: &TLAS, sbt_ready: bool) -> Self {
+        let handle = tlas.acceleration_structure.handle;
+        Self {
+            traceable: handle != vk::AccelerationStructureKHR::null() && sbt_ready,
+            address: tlas.acceleration_structure.address,
+            instances: tlas.instances_address(),
+            prev_instances: tlas.prev_instances_address(),
+            materials: tlas.material_address(),
+        }
+    }
+}
+
 /// One rendered view this frame: XR renders one per eye, a flat frame renders one per
 /// active camera in `Camera::order`. `slot` indexes the per-view resources (uniform buffer,
 /// DLSS feature, reservoirs, descriptor sets).
@@ -178,11 +205,13 @@ pub struct TeardownSchedule;
 
 /// The frame's stages, chained in [`Last`] after the simulation. One world: the systems in
 /// [`RenderSet::Extract`] read the ECS directly (transform deltas, instance changes, UI quads,
-/// asset events), [`RenderSet::Fence`] waits for the previous frame's GPU work,
-/// [`RenderSet::Prepare`] consumes the asset worker's results, and [`RenderSet::Render`]
-/// records and submits. Host-visible buffers the GPU reads (the SBT, the environment table,
-/// the uniforms, light and fog tables) are rewritten in place, so nothing may write one before
-/// the fence: Extract only gathers.
+/// asset events), [`RenderSet::Prepare`] consumes the asset worker's results, and
+/// [`RenderSet::Render`] records, waits for the previous frame, latches and submits. All of
+/// it runs while the previous frame may still be on the GPU, so nothing here writes memory a
+/// submitted frame reads: per-frame host buffers come in parity pairs or `Flip`s, small data
+/// goes through update-buffer commands, rewrites of shared tables go through
+/// `run_transfer_commands_after_frames`, and results read back from the GPU are consumed only
+/// after the wait (docs/plans/frame-pipeline.html). `Fence` is kept, empty, for ordering.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderSet {
     Shutdown,
@@ -190,12 +219,6 @@ pub enum RenderSet {
     Fence,
     Prepare,
     Render,
-}
-
-/// The previous frame's GPU work is done from here on (its fence stays signalled; Render
-/// rearms it before submitting).
-fn wait_previous_frame(sync: Res<crate::frame_sync::FrameSync>) {
-    unsafe { sync.wait_previous() };
 }
 
 pub struct RayRenderPlugin;
@@ -252,7 +275,6 @@ impl Plugin for RayRenderPlugin {
             (
                 shutdown.in_set(RenderSet::Shutdown),
                 update_render_window.in_set(RenderSet::Extract),
-                wait_previous_frame.in_set(RenderSet::Fence),
                 render_frame.in_set(RenderSet::Render),
             ),
         );
@@ -407,6 +429,7 @@ fn render_frame(
         Option<Res<RenderWindow>>,
         Option<ResMut<crate::swapchain::Swapchain>>,
         ResMut<crate::frame_sync::FrameSync>,
+        Res<crate::latency::Latency>,
     ),
     dev_ui_stuff: (
         Option<Res<crate::render_settings::RenderSettings>>,
@@ -475,7 +498,11 @@ fn render_frame(
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
-    let (window, mut swapchain, mut sync) = present;
+    let (window, mut swapchain, mut sync, latency) = present;
+    if let Some(swapchain) = swapchain.as_deref() {
+        latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::RENDERSUBMIT_START);
+    }
+    let present_id = latency.present_id().filter(|_| swapchain.is_some());
     // Last frame's window size: a view planned against it is clamped again at acquire.
     let window_extent = swapchain
         .as_ref()
@@ -503,7 +530,7 @@ fn render_frame(
         mut fog_grid,
         mut frame_commands,
     ) = gpu;
-    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut prof, mut video) =
+    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut profiler, mut video) =
         dlss_stuff;
 
     let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
@@ -718,14 +745,15 @@ fn render_frame(
     let plan = views.first().and_then(|v| v.plan);
     let dlss_reset = plan.is_some() && (!*dlss_was_active || reset_requested);
     *dlss_was_active = plan.is_some();
-    // Set once an evaluate has been recorded this frame: only then does a blit read a DLSS
-    // output (before the RT pipeline is compiled nothing has written them).
-    let mut dlss_ran = false;
 
-    // Ensure the per-view uniform buffers exist
+    // Ensure the per-view uniform buffers exist: device-local, written by update-buffer commands
+    // recorded at the head of the frame (so recording never touches memory the GPU reads).
     for buffer in &mut frame.uniform_buffers {
         if buffer.handle == vk::Buffer::null() {
-            *buffer = render_device.create_host_buffer(1, vk::BufferUsageFlags::UNIFORM_BUFFER);
+            *buffer = render_device.create_device_buffer(
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            );
         }
     }
 
@@ -761,8 +789,10 @@ fn render_frame(
 
     // Every environment's sky, suns and fog, by environment bit.
     if frame.environments.handle == vk::Buffer::null() {
-        frame.environments =
-            render_device.create_host_buffer(8, vk::BufferUsageFlags::STORAGE_BUFFER);
+        frame.environments = render_device.create_device_buffer(
+            8,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
     }
     let texture_index = |image: &Handle<Image>| {
         textures.get(image).map_or(WHITE_TEXTURE_IDX, |t| {
@@ -806,9 +836,6 @@ fn render_frame(
             )
         })
         .collect();
-    render_device
-        .map_buffer(&mut frame.environments)
-        .copy_from_slice(&envs);
     // One fog grid per camera, in its first view's slot: a headset's two eyes share theirs.
     let mut grids: Vec<(usize, Entity, crate::fog_grid::FogGridFrame)> = Vec::new();
     for view in &views {
@@ -843,6 +870,7 @@ fn render_frame(
     }
 
     // Update each view's uniform buffer
+    let mut uniform_uploads: Vec<(usize, UniformData)> = Vec::with_capacity(views.len());
     for view in &views {
         let environment = skies.view_environment(view.camera_mask as u8);
         let grid = grids
@@ -917,8 +945,7 @@ fn render_frame(
             one_shadow_ray_from: settings.one_shadow_ray_from,
         };
 
-        let mut mapped = render_device.map_buffer(&mut frame.uniform_buffers[view.slot]);
-        mapped.copy_from_slice(&[data]);
+        uniform_uploads.push((view.slot, data));
     }
 
     // A dev-snippet debug hotkey is (or is about to be) reallocating NGX-internal
@@ -931,12 +958,15 @@ fn render_frame(
     }
 
     unsafe {
-        sync.wait();
-        prof.begin_frame(&render_device, time.elapsed_secs_f64());
+        // Record first, wait after: this frame's commands are recorded while the previous frame
+        // still runs on the GPU. Recording writes only memory no submitted frame reads (parity
+        // copies, update-buffer commands, fresh buffers); anything computed from the previous
+        // frame's results is latched after the wait below, so nothing read back gets older.
+        profiler.begin_recording(sync.frame_count);
         // The window's image for this frame, with its size and format, when there is one.
         let presenting = match (swapchain.as_deref_mut(), window.as_deref()) {
             (Some(swapchain), Some(window)) => {
-                let (image, view) = swapchain.aquire_next_image(window);
+                let (image, view) = swapchain.aquire_next_image(window, sync.frame_count);
                 Some((
                     image,
                     view,
@@ -946,8 +976,14 @@ fn render_frame(
             }
             _ => None,
         };
-        render_device.destroyer.tick();
-        let cmd_buffer = render_device.command_buffers[sync.frame_count % 2];
+        // Three command buffers, recorded on three threads and submitted in this order: the
+        // scene (main pool: UI surfaces, the transform-driven chain, lights, SHaRC), the views
+        // (exposure, atmosphere, each view's trace and DLSS) and the present pass.
+        let parity = sync.frame_count % 2;
+        let frame_count = sync.frame_count;
+        let cmd_buffer = render_device.command_buffers[parity];
+        let view_cmd = render_device.lanes[0].1[parity];
+        let present_cmd = render_device.lanes[1].1[parity];
 
         if let Some((image, view, _, _)) = presenting {
             frame.swapchain_image = image;
@@ -955,101 +991,44 @@ fn render_frame(
         }
         let record = info_span!("record_frame").entered();
 
-        render_device
-            .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
-            .unwrap();
-
-        render_device
-            .begin_command_buffer(
-                cmd_buffer,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .unwrap();
+        for cmd in [cmd_buffer, view_cmd, present_cmd] {
+            render_device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            render_device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+        }
+        let prof = &*profiler;
 
         // Offscreen UI surfaces (world panels) render first, so this frame's trace samples
         // this frame's UI.
         let frame_scope = prof.begin(&render_device, cmd_buffer, "frame");
         let section = info_span!("record_ui_surfaces").entered();
         let scope = prof.begin(&render_device, cmd_buffer, "ui surfaces");
-        crate::ui_render::draw_ui_surfaces(
-            &render_device,
-            cmd_buffer,
-            sync.frame_count % 2,
-            &mut ui,
-        );
+        crate::ui_render::draw_ui_surfaces(&render_device, cmd_buffer, parity, &mut ui);
         prof.end(&render_device, cmd_buffer, scope);
-
-        // The in-flight fence was waited above, so the previous trace is done:
-        // propagate this frame's transform deltas on the GPU, refresh the instance table from
-        // them, and rebuild the single TLAS in place. With rays to pick, the instance table and
-        // TLAS go into their own command buffer, submitted ahead of the rest with the pick at
-        // its end, so the hits are ready long before the frame is (picking.rs).
         drop(section);
         // Transforms go first, in a submit of their own: their rows are read back into
         // `GlobalTransform` at the next `First` (gpu_transform.rs).
         let section = info_span!("submit_transforms").entered();
         let world_changed = transforms.submit(&render_device, &modules);
         drop(section);
+        // With rays to pick, the instance table and TLAS go into their own command buffer,
+        // submitted ahead of the rest with the pick at its end (picking.rs).
         let pick = picker.active(&modules, &tlas);
-        let scene_cmd = if pick {
-            picker.begin(&render_device, sync.frame_count)
-        } else {
-            cmd_buffer
-        };
-        // Last frame's instance rows kept for motion vectors, then the queued per-frame dispatches
-        // (landscape scatter writes instance rows): ahead of the TLAS build, in whichever buffer
-        // carries it.
-        let section = info_span!("record_frame_commands").entered();
-        let scope = prof.begin(&render_device, scene_cmd, "frame commands");
-        tlas.snapshot_prev(&render_device, scene_cmd);
-        frame_commands.record(&render_device, &modules, scene_cmd);
-        prof.end(&render_device, scene_cmd, scope);
-        drop(section);
-        crate::gpu_transform::world_barrier(&render_device, scene_cmd);
-        let section = info_span!("record_skins").entered();
-        let scope = prof.begin(&render_device, scene_cmd, "skins");
-        let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
-        prof.end(&render_device, scene_cmd, scope);
-        drop(section);
-        let section = info_span!("record_tlas").entered();
-        let scope = prof.begin(&render_device, scene_cmd, "tlas");
-        tlas.record(
-            &render_device,
-            scene_cmd,
-            &modules,
-            &transforms,
-            world_changed || skinned,
-        );
-        prof.end(&render_device, scene_cmd, scope);
-        if pick {
-            let _submit = info_span!("submit_pick").entered();
-            picker.submit(&render_device, scene_cmd, &modules, &tlas);
-        }
-        // The light table's weight/CDF kernels, whenever the light set changed (they read
-        // the instance rows the gather above wrote).
-        drop(section);
-        let section = info_span!("record_lights").entered();
-        let scope = prof.begin(&render_device, cmd_buffer, "lights");
-        lights.record(&render_device, cmd_buffer, &modules, &tlas);
-        prof.end(&render_device, cmd_buffer, scope);
-        // The radiance cache's per-frame resolve (and its first-use allocation).
-        drop(section);
-        let section = info_span!("record_sharc").entered();
-        let scope = prof.begin(&render_device, cmd_buffer, "sharc");
-        sharc.record(
-            &render_device,
-            cmd_buffer,
-            &modules,
-            *frame_counter,
-            settings.sharc,
-        );
-        prof.end(&render_device, cmd_buffer, scope);
+        // The radiance cache's first-use allocation, before the view lane reads its address.
+        sharc.ensure(&render_device, cmd_buffer, settings.sharc);
+
         // Exposure: each camera meters its own last frame into this frame's exposure (the
-        // raygen reads it). A headset's two eyes are one camera and share one meter.
-        drop(section);
+        // raygen reads it). A headset's two eyes are one camera and share one meter. Recorded
+        // here, at the head of the view lane, because the present lane needs the addresses.
         let section = info_span!("record_exposure_atmo").entered();
-        let scope = prof.begin(&render_device, cmd_buffer, "exposure+atmosphere");
+        let scope = prof.begin(&render_device, view_cmd, "exposure+atmosphere");
         let mut metered: Vec<(Entity, (u64, u64))> = Vec::new();
         for view in &mut views {
             if let Some((_, addresses)) = metered.iter().find(|(c, _)| *c == view.camera) {
@@ -1058,7 +1037,7 @@ fn render_frame(
             }
             view.ae = ae.record(
                 &render_device,
-                cmd_buffer,
+                view_cmd,
                 &modules,
                 view.camera,
                 view.trace_extent,
@@ -1073,7 +1052,7 @@ fn render_frame(
         // the miss shader read them); nothing unless the sky is the atmosphere.
         atmo.record(
             &render_device,
-            cmd_buffer,
+            view_cmd,
             &modules,
             &skies,
             &atmosphere,
@@ -1081,50 +1060,147 @@ fn render_frame(
             camera.map_or(Vec3::ZERO, |c| c.2.translation()),
             time.delta_secs(),
         );
-        prof.end(&render_device, cmd_buffer, scope);
-
+        prof.end(&render_device, view_cmd, scope);
         drop(section);
-        let section = info_span!("record_trace_dlss").entered();
-        if let Some(rtx_pipeline) = rtx_pipelines.get(&render_config.rtx_pipeline) {
-            if tlas.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
-                && sbt.data.address != 0
-            {
+
+        // What the lanes read of each other's state, taken before they start.
+        let light_entries = lights.active_entries;
+        let light_epoch = lights.epoch;
+        let light_header = lights.header_address();
+        let sharc_address = sharc.address();
+        let atmo_address = atmo.address();
+        let rtx_pipeline = rtx_pipelines.get(&render_config.rtx_pipeline);
+        let sbt_ready = sbt.data().address != 0;
+        let dlss_outputs: [(Option<vk::ImageView>, Option<crate::dlss::GuideViews>);
+            crate::MAX_VIEWS] = std::array::from_fn(|slot| {
+            dlss.renderer
+                .as_ref()
+                .map_or((None, None), |r| (r.output_view(slot), r.guide_views(slot)))
+        });
+        let has_dlss = dlss.renderer.is_some();
+        let heaps = render_device.heaps();
+        let delta_secs = time.delta_secs();
+        let frame: &Frame = &frame;
+        let views = &views;
+        let grids = &grids;
+        let settings = &settings;
+
+        // The scene lane: this frame's per-view uniforms and environment table, the queued
+        // dispatches, skins, the instance table and TLAS (and the pick), then the light table
+        // and the radiance cache resolve.
+        let mut scene = |tlas: &mut TLAS| {
+            let _lane = info_span!("record_scene").entered();
+            let scene_cmd = if pick {
+                picker.begin(&render_device, frame_count)
+            } else {
+                cmd_buffer
+            };
+            // Ahead of everything that reads them (sky generation's `sun_tint` then writes the
+            // sun into the environment table).
+            render_device.cmd_update_buffer(
+                scene_cmd,
+                frame.environments.handle,
+                0,
+                bytemuck::cast_slice(&envs),
+            );
+            for (slot, data) in &uniform_uploads {
+                render_device.cmd_update_buffer(
+                    scene_cmd,
+                    frame.uniform_buffers[*slot].handle,
+                    0,
+                    // SAFETY: `UniformData` is `repr(C)` plain data; update-buffer needs a size
+                    // that is a multiple of 4.
+                    std::slice::from_raw_parts(
+                        (data as *const UniformData).cast::<u8>(),
+                        std::mem::size_of::<UniformData>(),
+                    ),
+                );
+            }
+            crate::compute::memory_barrier(
+                &render_device,
+                scene_cmd,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::SHADER_READ
+                    | vk::AccessFlags2::SHADER_WRITE
+                    | vk::AccessFlags2::UNIFORM_READ,
+            );
+            // Last frame's instance rows kept for motion vectors, then the queued per-frame
+            // dispatches (landscape scatter writes instance rows), ahead of the TLAS build.
+            let section = info_span!("record_frame_commands").entered();
+            let scope = prof.begin(&render_device, scene_cmd, "frame commands");
+            tlas.snapshot_prev(&render_device, scene_cmd);
+            frame_commands.record(&render_device, &modules, scene_cmd);
+            prof.end(&render_device, scene_cmd, scope);
+            drop(section);
+            crate::gpu_transform::world_barrier(&render_device, scene_cmd);
+            let section = info_span!("record_skins").entered();
+            let scope = prof.begin(&render_device, scene_cmd, "skins");
+            let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
+            prof.end(&render_device, scene_cmd, scope);
+            drop(section);
+            let section = info_span!("record_tlas").entered();
+            let scope = prof.begin(&render_device, scene_cmd, "tlas");
+            tlas.record(
+                &render_device,
+                scene_cmd,
+                &modules,
+                &transforms,
+                world_changed || skinned,
+            );
+            prof.end(&render_device, scene_cmd, scope);
+            drop(section);
+            if pick {
+                let _submit = info_span!("submit_pick").entered();
+                picker.submit(&render_device, scene_cmd, &modules, tlas);
+            }
+            // The light table's weight/CDF kernels, whenever the light set changed (they read
+            // the instance rows the gather above wrote).
+            let section = info_span!("record_lights").entered();
+            let scope = prof.begin(&render_device, cmd_buffer, "lights");
+            lights.record(&render_device, cmd_buffer, &modules, tlas);
+            prof.end(&render_device, cmd_buffer, scope);
+            drop(section);
+            let section = info_span!("record_sharc").entered();
+            let scope = prof.begin(&render_device, cmd_buffer, "sharc");
+            sharc.record(
+                &render_device,
+                cmd_buffer,
+                &modules,
+                *frame_counter,
+                settings.sharc,
+            );
+            prof.end(&render_device, cmd_buffer, scope);
+            drop(section);
+            render_device.end_command_buffer(cmd_buffer).unwrap();
+        };
+
+        // The view lane: each view's descriptor set, ReSTIR, fog grid, trace and DLSS.
+        // Returns the cameras whose trace filled their luminance buffer.
+        let mut view_lane = |tlas: TlasRefs| -> Vec<Entity> {
+            let _lane = info_span!("record_trace_dlss").entered();
+            let mut traced = Vec::new();
+            if let (Some(rtx_pipeline), true) = (rtx_pipeline, tlas.traceable) {
                 static TRACED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::info!("first frame traced");
                 }
                 render_device.cmd_bind_pipeline(
-                    cmd_buffer,
+                    view_cmd,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
                     rtx_pipeline.pipeline,
                 );
 
-                for view in &views {
-                    // Each view's own descriptor set (a set already recorded into this
-                    // command buffer must not be rewritten).
-                    let mut ac_binding = vk::WriteDescriptorSetAccelerationStructureKHR::default()
-                        .acceleration_structures(std::slice::from_ref(
-                            &tlas.acceleration_structure.handle,
-                        ));
-                    let set = rtx_pipeline.descriptor_sets
-                        [(sync.frame_count as usize % 2) * crate::MAX_VIEWS + view.slot];
-                    let mut writes = vec![
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(set)
-                            .dst_binding(100)
-                            .descriptor_count(1)
-                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                            .push(&mut ac_binding),
-                    ];
-                    // DLSS guide images + noisy colour, this view's feature.
-                    let guide_infos: Vec<vk::DescriptorImageInfo> = dlss
-                        .renderer
-                        .as_ref()
-                        .filter(|_| view.plan.is_some())
-                        .and_then(|r| r.guide_views(view.slot))
-                        .map(|g| {
-                            [
+                for view in views {
+                    // This view's guides, in its block of the heap for this frame parity (a
+                    // block already recorded this frame must not be rewritten).
+                    let guides = DescriptorHeaps::guide_block(parity, view.slot);
+                    if let Some(g) = dlss_outputs[view.slot].1.filter(|_| view.plan.is_some()) {
+                        heaps.write_guides(
+                            guides,
+                            &[
                                 g.normal_roughness,
                                 g.diffuse,
                                 g.specular,
@@ -1133,95 +1209,75 @@ fn render_frame(
                                 g.motion,
                                 g.color,
                                 g.fog,
-                            ]
-                            .into_iter()
-                            .map(|view| {
-                                vk::DescriptorImageInfo::default()
-                                    .image_layout(vk::ImageLayout::GENERAL)
-                                    .image_view(view)
-                            })
-                            .collect()
-                        })
-                        .unwrap_or_default();
-                    for (i, info) in guide_infos.iter().enumerate() {
-                        writes.push(
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(set)
-                                .dst_binding(i as u32)
-                                .descriptor_count(1)
-                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                                .image_info(std::slice::from_ref(info)),
+                            ],
                         );
                     }
-
-                    render_device.update_descriptor_sets(&writes, &[]);
-
-                    render_device.cmd_bind_descriptor_sets(
-                        cmd_buffer,
-                        vk::PipelineBindPoint::RAY_TRACING_KHR,
-                        rtx_pipeline.pipeline_layout,
-                        0,
-                        &[set, render_device.bindless_descriptor_set],
-                        &[],
-                    );
+                    // Heaps and push data, again after anything that cleared them (compute
+                    // dispatches push constants; NGX binds its own sets).
+                    let push_trace = |constants: RaytracingPushConstants| {
+                        heaps.bind(view_cmd);
+                        heaps.push(
+                            view_cmd,
+                            &RaytracingPushData {
+                                constants,
+                                tlas: tlas.address,
+                                guides,
+                                pad: 0,
+                            },
+                        );
+                    };
 
                     // ReSTIR DI's buffers and this frame's parameters (none while it is off).
                     let restir_on = settings.restir
                         && settings.light_nee
-                        && lights.active_entries > 0
+                        && light_entries > 0
                         && view.plan.is_some();
                     let restir_addresses = if restir_on {
                         restir.prepare(
                             &render_device,
-                            cmd_buffer,
+                            view_cmd,
                             &crate::restir::RestirInput {
                                 extent: view.trace_extent,
                                 frame: *frame_counter,
                                 slot: view.slot,
                                 prev_view_proj: view.last_view_proj,
                                 camera: view.inverse_view.w_axis.truncate(),
-                                epoch: lights.epoch,
-                                lights: lights.header_address(),
-                                instances: tlas.instances_address(),
-                                light_entries: lights.active_entries,
-                                settings: &settings,
+                                epoch: light_epoch,
+                                lights: light_header,
+                                instances: tlas.instances,
+                                light_entries,
+                                settings,
                             },
                         )
                     } else {
                         restir.release(&render_device, view.slot);
                         crate::restir::RestirAddresses::default()
                     };
-                    fog_grid.record_clear(&render_device, cmd_buffer, view.slot);
+                    fog_grid.record_clear(&render_device, view_cmd, view.slot);
                     let push_constants = RaytracingPushConstants {
                         uniform_buffer: frame.uniform_buffers[view.slot].address,
-                        material_buffer: tlas.material_address(),
+                        material_buffer: tlas.materials,
                         bluenoise_buffer2: bluenoise_buffer.0.address,
                         focus_buffer: frame.focus_data.address,
                         restir_surfaces: restir_addresses.surfaces,
-                        prev_instances: tlas.prev_instances_address(),
-                        lights: lights.header_address(),
-                        instances: tlas.instances_address(),
+                        prev_instances: tlas.prev_instances,
+                        lights: light_header,
+                        instances: tlas.instances,
                         reservoirs_prev: restir_addresses.prev,
                         reservoirs_cur: restir_addresses.final_,
-                        sharc: sharc.address(),
+                        sharc: sharc_address,
                         lum_buffer: view.ae.0,
                         auto_exposure: view.ae.1,
-                        atmo: atmo.address(),
+                        atmo: atmo_address,
                         restir_frame: restir_addresses.frame,
                     };
 
-                    render_device.cmd_push_constants(
-                        cmd_buffer,
-                        rtx_pipeline.pipeline_layout,
-                        vk::ShaderStageFlags::ALL,
-                        0,
-                        bytemuck::cast_slice(&[push_constants]),
-                    );
+                    push_trace(push_constants);
 
                     // Guides into GENERAL before the first dispatch: the fog grid runs with
                     // this set bound, so validation checks their layout there too.
                     if let (Some(_), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
-                        renderer.record_pre_trace(&render_device, cmd_buffer, view.slot);
+                        renderer.record_pre_trace(&render_device, view_cmd, view.slot);
                     }
 
                     // The camera's fog grid, by the first of its views: lit before any of them
@@ -1230,9 +1286,9 @@ fn render_frame(
                         .iter()
                         .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)
                     {
-                        let scope = prof.begin(&render_device, cmd_buffer, "fog grid");
+                        let scope = prof.begin(&render_device, view_cmd, "fog grid");
                         render_device.ext_rtx_pipeline.cmd_trace_rays(
-                            cmd_buffer,
+                            view_cmd,
                             &sbt.fog_grid_region,
                             &sbt.miss_region,
                             &sbt.hit_region,
@@ -1241,10 +1297,10 @@ fn render_frame(
                             grid.size.y,
                             grid.size.z,
                         );
-                        prof.end(&render_device, cmd_buffer, scope);
+                        prof.end(&render_device, view_cmd, scope);
                         crate::compute::memory_barrier(
                             &render_device,
-                            cmd_buffer,
+                            view_cmd,
                             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                             vk::AccessFlags2::SHADER_WRITE,
                             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
@@ -1258,32 +1314,26 @@ fn render_frame(
                         let grid_built = restir_on
                             && restir.record_grid(
                                 &render_device,
-                                cmd_buffer,
+                                view_cmd,
                                 &modules,
                                 view.slot,
-                                &mut prof,
+                                prof,
                             );
                         if restir_on {
                             // The grid's compute dispatches disturbed the push constants; a grid
                             // that did not build leaves the vertices on the power CDF.
-                            render_device.cmd_push_constants(
-                                cmd_buffer,
-                                rtx_pipeline.pipeline_layout,
-                                vk::ShaderStageFlags::ALL,
-                                0,
-                                bytemuck::cast_slice(&[RaytracingPushConstants {
-                                    restir_frame: if grid_built {
-                                        push_constants.restir_frame
-                                    } else {
-                                        0
-                                    },
-                                    ..push_constants
-                                }]),
-                            );
+                            push_trace(RaytracingPushConstants {
+                                restir_frame: if grid_built {
+                                    push_constants.restir_frame
+                                } else {
+                                    0
+                                },
+                                ..push_constants
+                            });
                         }
-                        let scope = prof.begin(&render_device, cmd_buffer, "trace");
+                        let scope = prof.begin(&render_device, view_cmd, "trace");
                         render_device.ext_rtx_pipeline.cmd_trace_rays(
-                            cmd_buffer,
+                            view_cmd,
                             &sbt.raygen_region,
                             &sbt.miss_region,
                             &sbt.hit_region,
@@ -1292,28 +1342,22 @@ fn render_frame(
                             plan.render.height,
                             1,
                         );
-                        prof.end(&render_device, cmd_buffer, scope);
+                        prof.end(&render_device, view_cmd, scope);
                         // ReSTIR DI: its compute passes over the surfaces the trace just wrote,
                         // then one shadow ray per pixel into the colour (restir.rs).
                         if restir_on
                             && restir.record_passes(
                                 &render_device,
-                                cmd_buffer,
+                                view_cmd,
                                 &modules,
                                 view.slot,
-                                &mut prof,
+                                prof,
                             )
                         {
-                            render_device.cmd_push_constants(
-                                cmd_buffer,
-                                rtx_pipeline.pipeline_layout,
-                                vk::ShaderStageFlags::ALL,
-                                0,
-                                bytemuck::cast_slice(&[push_constants]),
-                            );
-                            let scope = prof.begin(&render_device, cmd_buffer, "restir shade");
+                            push_trace(push_constants);
+                            let scope = prof.begin(&render_device, view_cmd, "restir shade");
                             render_device.ext_rtx_pipeline.cmd_trace_rays(
-                                cmd_buffer,
+                                view_cmd,
                                 &sbt.restir_shade_region,
                                 &sbt.miss_region,
                                 &sbt.hit_region,
@@ -1322,121 +1366,129 @@ fn render_frame(
                                 plan.render.height,
                                 1,
                             );
-                            prof.end(&render_device, cmd_buffer, scope);
+                            prof.end(&render_device, view_cmd, scope);
                             crate::compute::memory_barrier(
                                 &render_device,
-                                cmd_buffer,
+                                view_cmd,
                                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                                 vk::AccessFlags2::SHADER_WRITE,
                                 vk::PipelineStageFlags2::ALL_COMMANDS,
                                 vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
                             );
                         }
-                        let scope = prof.begin(&render_device, cmd_buffer, "dlss");
+                        // NGX knows nothing of heaps (descriptor_heap.rs `leave`).
+                        heaps.leave(&render_device, view_cmd);
+                        let scope = prof.begin(&render_device, view_cmd, "dlss");
                         renderer.record_evaluate(
                             &render_device,
-                            cmd_buffer,
+                            view_cmd,
                             view.slot,
                             view.view_matrix,
                             view.projection,
                             plan.jitter,
                             dlss_reset,
-                            time.delta_secs() * 1000.0,
+                            delta_secs * 1000.0,
                         );
-                        prof.end(&render_device, cmd_buffer, scope);
-                        dlss_ran = true;
+                        prof.end(&render_device, view_cmd, scope);
                         // The raygen just filled the luminance buffer at this size.
-                        ae.mark_traced(view.camera);
+                        traced.push(view.camera);
                     }
                 }
             }
-        }
+            render_device.end_command_buffer(view_cmd).unwrap();
+            traced
+        };
 
-        drop(section);
-        let section = info_span!("record_present_pass").entered();
-        let present_scope = prof.begin(&render_device, cmd_buffer, "present pass");
-        let parity = sync.frame_count % 2;
-        let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
-        let debug_view = camera
-            .and_then(|c| c.5.copied())
-            .unwrap_or_default()
-            .shader_index();
+        // The present lane: the XR eyes, offscreen camera targets and the window (composite,
+        // gizmos, UI, screenshot and video copies).
+        let present_lane = |dlss_ran: bool| {
+            let _lane = info_span!("record_present_pass").entered();
+            let present_scope = prof.begin(&render_device, present_cmd, "present pass");
+            let cmd_buffer = present_cmd;
+            let postprocess = postprocess_filters.get(&render_config.postprocess_pipeline);
+            let debug_view = camera
+                .and_then(|c| c.5.copied())
+                .unwrap_or_default()
+                .shader_index();
 
-        // XR: resolve each eye through the post-process into its target and hand it to the
-        // compositor layer, before the window's own pass.
-        if let (Some(xr_state), Some(xr_frame), Some(pipeline), true) =
-            (xr.as_deref(), xr_frame.as_ref(), postprocess, dlss_ran)
-        {
-            for eye in 0..2 {
-                let (eye_image, eye_view) = xr_state.eye_target(eye);
-                vk_utils::transition_image_layout(
-                    &render_device,
-                    cmd_buffer,
-                    eye_image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
-                );
-                let render_area = vk::Rect2D::default().extent(xr_state.extent);
-                let attachment_info = vk::RenderingAttachmentInfo::default()
-                    .image_view(eye_view)
-                    .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE);
-                let render_info = vk::RenderingInfo::default()
-                    .layer_count(1)
-                    .render_area(render_area)
-                    .color_attachments(std::slice::from_ref(&attachment_info));
-                render_device.cmd_begin_rendering(cmd_buffer, &render_info);
-                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
-                render_device.cmd_set_viewport(
-                    cmd_buffer,
-                    0,
-                    std::slice::from_ref(
-                        &vk::Viewport::default()
-                            .width(xr_state.extent.width as f32)
-                            .height(xr_state.extent.height as f32)
-                            .min_depth(0.0)
-                            .max_depth(1.0),
-                    ),
-                );
-                if let Some(source_view) = dlss.renderer.as_ref().and_then(|r| r.output_view(eye)) {
-                    record_post_draw(
+            // XR: resolve each eye through the post-process into its target and hand it to the
+            // compositor layer, before the window's own pass.
+            if let (Some(xr_state), Some(xr_frame), Some(pipeline), true) =
+                (xr.as_deref(), xr_frame.as_ref(), postprocess, dlss_ran)
+            {
+                for eye in 0..2 {
+                    let (eye_image, eye_view) = xr_state.eye_target(eye);
+                    vk_utils::transition_image_layout(
                         &render_device,
                         cmd_buffer,
-                        pipeline,
-                        TargetKind::Display,
-                        pipeline.descriptor_sets[parity * POST_TARGETS + eye],
-                        source_view,
-                        dlss.renderer.as_ref().and_then(|r| r.guide_views(eye)),
-                        &crate::post_process_filter::PostProcessPushConstants {
-                            uniforms: frame.uniform_buffers[eye].address,
-                            auto_exposure: views[eye].ae.1,
-                            display_exposure: views[eye].exposure.display_exposure(),
-                            debug_view,
-                            scene_radiance: 0,
-                            fog: 0,
-                            local_tonemap,
-                            bloom,
-                            lum: views[eye].ae.0,
-                            lum_width: views[eye].trace_extent.width,
-                            lum_height: views[eye].trace_extent.height,
-                        },
+                        eye_image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL,
                     );
+                    let render_area = vk::Rect2D::default().extent(xr_state.extent);
+                    let attachment_info = vk::RenderingAttachmentInfo::default()
+                        .image_view(eye_view)
+                        .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE);
+                    let render_info = vk::RenderingInfo::default()
+                        .layer_count(1)
+                        .render_area(render_area)
+                        .color_attachments(std::slice::from_ref(&attachment_info));
+                    render_device.cmd_begin_rendering(cmd_buffer, &render_info);
+                    render_device.cmd_set_scissor(
+                        cmd_buffer,
+                        0,
+                        std::slice::from_ref(&render_area),
+                    );
+                    render_device.cmd_set_viewport(
+                        cmd_buffer,
+                        0,
+                        std::slice::from_ref(
+                            &vk::Viewport::default()
+                                .width(xr_state.extent.width as f32)
+                                .height(xr_state.extent.height as f32)
+                                .min_depth(0.0)
+                                .max_depth(1.0),
+                        ),
+                    );
+                    if let Some(source_view) = dlss_outputs[eye].0 {
+                        record_post_draw(
+                            &render_device,
+                            cmd_buffer,
+                            pipeline,
+                            TargetKind::Display,
+                            DescriptorHeaps::post_block(parity, eye),
+                            source_view,
+                            dlss_outputs[eye].1,
+                            &crate::post_process_filter::PostProcessPushConstants {
+                                uniforms: frame.uniform_buffers[eye].address,
+                                auto_exposure: views[eye].ae.1,
+                                display_exposure: views[eye].exposure.display_exposure(),
+                                debug_view,
+                                scene_radiance: 0,
+                                fog: 0,
+                                local_tonemap,
+                                bloom,
+                                lum: views[eye].ae.0,
+                                lum_width: views[eye].trace_extent.width,
+                                lum_height: views[eye].trace_extent.height,
+                            },
+                        );
+                    }
+                    render_device.cmd_end_rendering(cmd_buffer);
+                    xr_state.record_eye_to_layer(&render_device, cmd_buffer, xr_frame, eye);
                 }
-                render_device.cmd_end_rendering(cmd_buffer);
-                xr_state.record_eye_to_layer(&render_device, cmd_buffer, xr_frame, eye);
             }
-        }
 
-        // Offscreen camera targets, each in its own pass BEFORE the window's. Ordering
-        // matters twice over: this pass cannot share the swapchain's attachment, and a
-        // lower-`Camera::order` view whose target a later view samples must land first.
-        // Each image ends back in SHADER_READ_ONLY_OPTIMAL, which is where anything
-        // resolving the asset -- a UI node, a material, a hit shader -- expects it.
-        // The pass runs even with nothing to composite: an untraceable scene still owes its
-        // target a clear, which a window camera gets free from the window's own pass.
-        {
-            for view in &views {
+            // Offscreen camera targets, each in its own pass BEFORE the window's. Ordering
+            // matters twice over: this pass cannot share the swapchain's attachment, and a
+            // lower-`Camera::order` view whose target a later view samples must land first.
+            // Each image ends back in SHADER_READ_ONLY_OPTIMAL, which is where anything
+            // resolving the asset -- a UI node, a material, a hit shader -- expects it.
+            // The pass runs even with nothing to composite: an untraceable scene still owes its
+            // target a clear, which a window camera gets free from the window's own pass.
+            for view in views {
                 let ViewTarget::Image { asset } = view.target else {
                     continue;
                 };
@@ -1446,10 +1498,9 @@ fn render_frame(
                 // `dlss_ran` is frame-wide; the view's own plan says whether its slot holds
                 // an output.
                 let composite = postprocess.filter(|_| dlss_ran).and_then(|pipeline| {
-                    dlss.renderer
-                        .as_ref()
+                    dlss_outputs[view.slot]
+                        .0
                         .filter(|_| view.plan.is_some())
-                        .and_then(|r| r.output_view(view.slot))
                         .map(|source_view| (pipeline, source_view))
                 });
                 vk_utils::transition_image_layout(
@@ -1491,11 +1542,9 @@ fn render_frame(
                         cmd_buffer,
                         pipeline,
                         *kind,
-                        pipeline.descriptor_sets[parity * POST_TARGETS + view.slot],
+                        DescriptorHeaps::post_block(parity, view.slot),
                         source_view,
-                        dlss.renderer
-                            .as_ref()
-                            .and_then(|r| r.guide_views(view.slot)),
+                        dlss_outputs[view.slot].1,
                         &crate::post_process_filter::PostProcessPushConstants {
                             uniforms: frame.uniform_buffers[view.slot].address,
                             auto_exposure: view.ae.1,
@@ -1521,12 +1570,11 @@ fn render_frame(
                         cmd_buffer,
                         view.view_proj,
                         *extent,
-                        dlss.renderer
-                            .as_ref()
+                        dlss_outputs[view.slot]
+                            .1
                             .filter(|_| composite.is_some())
-                            .and_then(|r| r.guide_views(view.slot))
                             .map(|g| g.depth),
-                        sync.frame_count % 2,
+                        parity,
                         view.slot,
                         view.camera_mask,
                         &mut gizmos,
@@ -1541,284 +1589,342 @@ fn render_frame(
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 );
             }
-        }
 
-        // The window, when there is one: the flat render or the XR spectator (left eye,
-        // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
-        if let Some((swapchain_image, swapchain_view, window_size, window_format)) = presenting {
-            // The window: the flat render, or the XR spectator (left eye, aspect-fit).
-            vk_utils::transition_image_layout(
-                &render_device,
-                cmd_buffer,
-                swapchain_image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::ATTACHMENT_OPTIMAL,
-            );
-
-            let render_area = vk::Rect2D::default().extent(window_size);
-
-            let attachment_info = vk::RenderingAttachmentInfo::default()
-                .image_view(swapchain_view)
-                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE);
-
-            let render_info = vk::RenderingInfo::default()
-                .layer_count(1)
-                .render_area(render_area)
-                .color_attachments(std::slice::from_ref(&attachment_info));
-
-            render_device.cmd_begin_rendering(cmd_buffer, &render_info);
-            render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
-
-            // Until the RT pipeline compiles and the first evaluate lands there is nothing to
-            // sample -- leave the clear (the UI still draws).
-            if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
-                let (window_w, window_h) = (window_size.width as f32, window_size.height as f32);
-                // XR draws ONE letterboxed eye as the spectator image; a flat frame composites
-                // every window-targeted view into its own rect.
-                let composited: &[ViewFrame] = if xr_frame.is_some() {
-                    &views[..1.min(views.len())]
-                } else {
-                    &views[..]
-                };
-                for view in composited {
-                    let Some(source_view) = dlss
-                        .renderer
-                        .as_ref()
-                        .and_then(|r| r.output_view(view.slot))
-                    else {
-                        continue;
-                    };
-                    let ViewTarget::Window { rect } = view.target else {
-                        // Image targets are composited in their own pass, outside this one:
-                        // this render pass has the swapchain attached.
-                        continue;
-                    };
-                    let viewport = if xr_frame.is_some() {
-                        // Spectator: letterbox the eye image instead of stretching it.
-                        let source_aspect =
-                            view.output_extent.width as f32 / view.output_extent.height as f32;
-                        let (w, h) = if source_aspect > window_w / window_h {
-                            (window_w, window_w / source_aspect)
-                        } else {
-                            (window_h * source_aspect, window_h)
-                        };
-                        vk::Viewport::default()
-                            .x((window_w - w) * 0.5)
-                            .y((window_h - h) * 0.5)
-                            .width(w)
-                            .height(h)
-                    } else {
-                        // Land the traced image on the rect it was traced for. Unset
-                        // `Camera::viewport` gives the whole window, so a plain app is
-                        // unchanged.
-                        vk::Viewport::default()
-                            .x(rect.offset.x as f32)
-                            .y(rect.offset.y as f32)
-                            .width(rect.extent.width as f32)
-                            .height(rect.extent.height as f32)
-                    }
-                    .min_depth(0.0)
-                    .max_depth(1.0);
-                    render_device.cmd_set_viewport(cmd_buffer, 0, std::slice::from_ref(&viewport));
-                    // The composite is an OVERSIZED fullscreen triangle -- NDC
-                    // (-1,-1)(3,-1)(-1,3) in quad.slang -- so a viewport smaller than the window
-                    // is not enough on its own: the vertices past NDC map past the viewport rect
-                    // and would paint over roughly twice it, straight across the editor's UI (or
-                    // over the view composited before it). Clip to the rect; the UI pass below
-                    // puts the full scissor back.
-                    let scissor = vk::Rect2D::default()
-                        .offset(vk::Offset2D {
-                            x: viewport.x as i32,
-                            y: viewport.y as i32,
-                        })
-                        .extent(vk::Extent2D {
-                            width: viewport.width as u32,
-                            height: viewport.height as u32,
-                        });
-                    render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&scissor));
-
-                    // The spectator gets its own set; a flat view uses its slot's.
-                    let target = if xr_frame.is_some() {
-                        crate::MAX_VIEWS
-                    } else {
-                        view.slot
-                    };
-                    record_post_draw(
-                        &render_device,
-                        cmd_buffer,
-                        pipeline,
-                        TargetKind::Display,
-                        pipeline.descriptor_sets[parity * POST_TARGETS + target],
-                        source_view,
-                        dlss.renderer
-                            .as_ref()
-                            .and_then(|r| r.guide_views(view.slot)),
-                        &crate::post_process_filter::PostProcessPushConstants {
-                            uniforms: frame.uniform_buffers[view.slot].address,
-                            auto_exposure: view.ae.1,
-                            display_exposure: view.exposure.display_exposure(),
-                            debug_view: view.debug_view,
-                            scene_radiance: 0,
-                            fog: 0,
-                            local_tonemap,
-                            bloom,
-                            lum: view.ae.0,
-                            lum_width: view.trace_extent.width,
-                            lum_height: view.trace_extent.height,
-                        },
-                    );
-                }
-            }
-
-            // bevy_ui / feathers (including the dev panel), drawn over the scene, full-window.
-            // Restore the full scissor: the composite above narrowed it to the view's rect.
-            render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
-            render_device.cmd_set_viewport(
-                cmd_buffer,
-                0,
-                std::slice::from_ref(
-                    &vk::Viewport::default()
-                        .width(window_size.width as f32)
-                        .height(window_size.height as f32)
-                        .min_depth(0.0)
-                        .max_depth(1.0),
-                ),
-            );
-            // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the UI,
-            // depth-tested against the traced frame's depth guide (so not before there is one).
-            // Skipped under XR: the spectator's letterboxed blit does not match views[0]'s
-            // full-window projection.
-            // Window-targeted views only; an image target drew its own above. `.find()` because
-            // the lowest-order view may be an image target, or there may be no view at all.
-            let window_view = views
-                .iter()
-                .find(|v| matches!(v.target, ViewTarget::Window { .. }));
-            let scene_depth = window_view.filter(|_| dlss_ran).and_then(|view| {
-                dlss.renderer
-                    .as_ref()
-                    .and_then(|r| r.guide_views(view.slot))
-                    .map(|g| g.depth)
-            });
-            if let (None, Some(view)) = (&xr_frame, window_view) {
-                crate::gizmo_render::draw_gizmos(
+            // The window, when there is one: the flat render or the XR spectator (left eye,
+            // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
+            if let Some((swapchain_image, swapchain_view, window_size, window_format)) = presenting
+            {
+                vk_utils::transition_image_layout(
                     &render_device,
                     cmd_buffer,
-                    view.view_proj,
-                    window_size,
-                    scene_depth,
-                    sync.frame_count % 2,
-                    view.slot,
-                    view.camera_mask,
-                    &mut gizmos,
+                    swapchain_image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
                 );
-            }
-            crate::ui_render::draw_ui(
-                &render_device,
-                cmd_buffer,
-                window_size,
-                sync.frame_count % 2,
-                &mut ui,
-            );
 
-            render_device.cmd_end_rendering(cmd_buffer);
+                let render_area = vk::Rect2D::default().extent(window_size);
 
-            // A pending screenshot copies the finished frame (UI included) out through a host
-            // buffer on its way to present.
-            // The capture reads the WINDOW swapchain (UI included), so it must use the
-            // swapchain extent -- under XR `output_extent` is the eye extent, and sizing the
-            // copy with it reads out of the swapchain image's bounds (F12 crashed XR runs).
-            let capture_extent = window_size;
-            // Last frame's captures have landed (its fence passed): off to their encoder thread.
-            screenshots.collect(&render_device);
-            // A recording copies its frames out the same way (util/video.rs).
-            let copy_out = screenshots.has_pending() || video.wants_frame();
-            if copy_out {
+                let attachment_info = vk::RenderingAttachmentInfo::default()
+                    .image_view(swapchain_view)
+                    .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+
+                let render_info = vk::RenderingInfo::default()
+                    .layer_count(1)
+                    .render_area(render_area)
+                    .color_attachments(std::slice::from_ref(&attachment_info));
+
+                render_device.cmd_begin_rendering(cmd_buffer, &render_info);
+                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
+
+                // Until the RT pipeline compiles and the first evaluate lands there is nothing
+                // to sample -- leave the clear (the UI still draws).
+                if let Some(pipeline) = postprocess.filter(|_| dlss_ran) {
+                    let (window_w, window_h) =
+                        (window_size.width as f32, window_size.height as f32);
+                    // XR draws ONE letterboxed eye as the spectator image; a flat frame
+                    // composites every window-targeted view into its own rect.
+                    let composited: &[ViewFrame] = if xr_frame.is_some() {
+                        &views[..1.min(views.len())]
+                    } else {
+                        &views[..]
+                    };
+                    for view in composited {
+                        let Some(source_view) = dlss_outputs[view.slot].0 else {
+                            continue;
+                        };
+                        let ViewTarget::Window { rect } = view.target else {
+                            // Image targets are composited in their own pass, outside this
+                            // one: this render pass has the swapchain attached.
+                            continue;
+                        };
+                        let viewport = if xr_frame.is_some() {
+                            // Spectator: letterbox the eye image instead of stretching it.
+                            let source_aspect = view.output_extent.width as f32
+                                / view.output_extent.height as f32;
+                            let (w, h) = if source_aspect > window_w / window_h {
+                                (window_w, window_w / source_aspect)
+                            } else {
+                                (window_h * source_aspect, window_h)
+                            };
+                            vk::Viewport::default()
+                                .x((window_w - w) * 0.5)
+                                .y((window_h - h) * 0.5)
+                                .width(w)
+                                .height(h)
+                        } else {
+                            // Land the traced image on the rect it was traced for. Unset
+                            // `Camera::viewport` gives the whole window, so a plain app is
+                            // unchanged.
+                            vk::Viewport::default()
+                                .x(rect.offset.x as f32)
+                                .y(rect.offset.y as f32)
+                                .width(rect.extent.width as f32)
+                                .height(rect.extent.height as f32)
+                        }
+                        .min_depth(0.0)
+                        .max_depth(1.0);
+                        render_device.cmd_set_viewport(
+                            cmd_buffer,
+                            0,
+                            std::slice::from_ref(&viewport),
+                        );
+                        // The composite is an OVERSIZED fullscreen triangle -- NDC
+                        // (-1,-1)(3,-1)(-1,3) in quad.slang -- so a viewport smaller than the
+                        // window is not enough on its own: the vertices past NDC map past the
+                        // viewport rect and would paint over roughly twice it, straight across
+                        // the editor's UI (or over the view composited before it). Clip to the
+                        // rect; the UI pass below puts the full scissor back.
+                        let scissor = vk::Rect2D::default()
+                            .offset(vk::Offset2D {
+                                x: viewport.x as i32,
+                                y: viewport.y as i32,
+                            })
+                            .extent(vk::Extent2D {
+                                width: viewport.width as u32,
+                                height: viewport.height as u32,
+                            });
+                        render_device.cmd_set_scissor(
+                            cmd_buffer,
+                            0,
+                            std::slice::from_ref(&scissor),
+                        );
+
+                        // The spectator gets its own set; a flat view uses its slot's.
+                        let target = if xr_frame.is_some() {
+                            crate::MAX_VIEWS
+                        } else {
+                            view.slot
+                        };
+                        record_post_draw(
+                            &render_device,
+                            cmd_buffer,
+                            pipeline,
+                            TargetKind::Display,
+                            DescriptorHeaps::post_block(parity, target),
+                            source_view,
+                            dlss_outputs[view.slot].1,
+                            &crate::post_process_filter::PostProcessPushConstants {
+                                uniforms: frame.uniform_buffers[view.slot].address,
+                                auto_exposure: view.ae.1,
+                                display_exposure: view.exposure.display_exposure(),
+                                debug_view: view.debug_view,
+                                scene_radiance: 0,
+                                fog: 0,
+                                local_tonemap,
+                                bloom,
+                                lum: view.ae.0,
+                                lum_width: view.trace_extent.width,
+                                lum_height: view.trace_extent.height,
+                            },
+                        );
+                    }
+                }
+
+                // bevy_ui / feathers (including the dev panel), drawn over the scene,
+                // full-window. Restore the full scissor: the composite above narrowed it.
+                render_device.cmd_set_scissor(cmd_buffer, 0, std::slice::from_ref(&render_area));
+                render_device.cmd_set_viewport(
+                    cmd_buffer,
+                    0,
+                    std::slice::from_ref(
+                        &vk::Viewport::default()
+                            .width(window_size.width as f32)
+                            .height(window_size.height as f32)
+                            .min_depth(0.0)
+                            .max_depth(1.0),
+                    ),
+                );
+                // Debug gizmo lines (bevy_gizmos), world-space, over the scene and under the
+                // UI, depth-tested against the traced frame's depth guide (so not before there
+                // is one). Skipped under XR: the spectator's letterboxed blit does not match
+                // views[0]'s full-window projection.
+                // Window-targeted views only; an image target drew its own above. `.find()`
+                // because the lowest-order view may be an image target, or there may be none.
+                let window_view = views
+                    .iter()
+                    .find(|v| matches!(v.target, ViewTarget::Window { .. }));
+                let scene_depth = window_view
+                    .filter(|_| dlss_ran)
+                    .and_then(|view| dlss_outputs[view.slot].1.map(|g| g.depth));
+                if let (None, Some(view)) = (&xr_frame, window_view) {
+                    crate::gizmo_render::draw_gizmos(
+                        &render_device,
+                        cmd_buffer,
+                        view.view_proj,
+                        window_size,
+                        scene_depth,
+                        parity,
+                        view.slot,
+                        view.camera_mask,
+                        &mut gizmos,
+                    );
+                }
+                crate::ui_render::draw_ui(&render_device, cmd_buffer, window_size, parity, &mut ui);
+
+                render_device.cmd_end_rendering(cmd_buffer);
+
+                // A pending screenshot copies the finished frame (UI included) out through a
+                // host buffer on its way to present.
+                // The capture reads the WINDOW swapchain (UI included), so it must use the
+                // swapchain extent -- under XR `output_extent` is the eye extent, and sizing
+                // the copy with it reads out of the swapchain image's bounds (F12 crashed XR).
+                let capture_extent = window_size;
+                // A recording copies its frames out the same way (util/video.rs).
+                let copy_out = screenshots.has_pending() || video.wants_frame();
+                if copy_out {
+                    vk_utils::transition_image_layout(
+                        &render_device,
+                        cmd_buffer,
+                        frame.swapchain_image,
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    );
+                    video.record(
+                        &render_device,
+                        cmd_buffer,
+                        frame.swapchain_image,
+                        capture_extent,
+                        window_format,
+                        frame_count,
+                    );
+                }
+                if let Some(path) = screenshots.take_next() {
+                    let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
+                    // Read back on the CPU: host-cached memory, not the upload kind.
+                    let buffer: Buffer<u8> = render_device.create_buffer(
+                        size,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        gpu_allocator::MemoryLocation::GpuToCpu,
+                    );
+                    // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: capture_extent.width,
+                            height: capture_extent.height,
+                            depth: 1,
+                        });
+                    render_device.cmd_copy_image_to_buffer(
+                        cmd_buffer,
+                        frame.swapchain_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buffer.handle,
+                        std::slice::from_ref(&region),
+                    );
+                    screenshots.in_flight(path, buffer, capture_extent, window_format, frame_count);
+                }
+
+                // Make swapchain available for present
                 vk_utils::transition_image_layout(
                     &render_device,
                     cmd_buffer,
                     frame.swapchain_image,
-                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    if copy_out {
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    } else {
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL
+                    },
+                    vk::ImageLayout::PRESENT_SRC_KHR,
                 );
-                video.record(
-                    &render_device,
-                    cmd_buffer,
-                    frame.swapchain_image,
-                    capture_extent,
-                    window_format,
-                );
-            }
-            if let Some(path) = screenshots.take_next() {
-                let size = capture_extent.width as u64 * capture_extent.height as u64 * 4;
-                // Read back on the CPU: host-cached memory, not the upload kind.
-                let buffer: Buffer<u8> = render_device.create_buffer(
-                    size,
-                    vk::BufferUsageFlags::TRANSFER_DST,
-                    gpu_allocator::MemoryLocation::GpuToCpu,
-                );
-                // bufferRowLength 0 packs rows tightly: pitch is exactly width * 4.
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D {
-                        width: capture_extent.width,
-                        height: capture_extent.height,
-                        depth: 1,
-                    });
-                render_device.cmd_copy_image_to_buffer(
-                    cmd_buffer,
-                    frame.swapchain_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    buffer.handle,
-                    std::slice::from_ref(&region),
-                );
-                screenshots.in_flight(path, buffer, capture_extent, window_format);
             }
 
-            // Make swapchain available for present
-            vk_utils::transition_image_layout(
-                &render_device,
-                cmd_buffer,
-                frame.swapchain_image,
-                if copy_out {
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                } else {
-                    vk::ImageLayout::ATTACHMENT_OPTIMAL
-                },
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            );
+            prof.end(&render_device, cmd_buffer, present_scope);
+            prof.end(&render_device, cmd_buffer, frame_scope);
+            render_device.end_command_buffer(cmd_buffer).unwrap();
+        };
+
+        // A frame that grows the instance table or the TLAS records the scene lane first (the
+        // view lane reads the new handle and addresses); every other frame runs all three at
+        // once.
+        let dlss_ran_with = |tlas: &TlasRefs| {
+            rtx_pipeline.is_some()
+                && tlas.traceable
+                && sbt_ready
+                && has_dlss
+                && views.iter().any(|v| v.plan.is_some())
+        };
+        let pool = ComputeTaskPool::get_or_init(TaskPool::default);
+        let mut traced = Vec::new();
+        let dlss_ran;
+        if tlas.stable() {
+            let refs = TlasRefs::of(&tlas, sbt_ready);
+            dlss_ran = dlss_ran_with(&refs);
+            let tlas = &mut *tlas;
+            let traced = &mut traced;
+            pool.scope(|s| {
+                s.spawn(async move { scene(tlas) });
+                s.spawn(async move { *traced = view_lane(refs) });
+                s.spawn_on_scope(async move { present_lane(dlss_ran) });
+            });
+        } else {
+            scene(&mut tlas);
+            let refs = TlasRefs::of(&tlas, sbt_ready);
+            dlss_ran = dlss_ran_with(&refs);
+            let traced = &mut traced;
+            pool.scope(|s| {
+                s.spawn(async move { *traced = view_lane(refs) });
+                s.spawn_on_scope(async move { present_lane(dlss_ran) });
+            });
         }
-
-        prof.end(&render_device, cmd_buffer, present_scope);
-        prof.end(&render_device, cmd_buffer, frame_scope);
-        render_device.end_command_buffer(cmd_buffer).unwrap();
-        drop(section);
+        for camera in traced {
+            ae.mark_traced(camera);
+        }
         drop(record);
+        let prof = &mut *profiler;
+        // The previous frame: wait for it, then latch what this frame computes from its results
+        // (written into memory the commands recorded above pick up).
+        sync.wait();
+        let waited = std::time::Instant::now();
+        render_device.destroyer.tick();
+        prof.read_previous(&render_device, time.elapsed_secs_f64());
+        ae.latch(&render_device);
+        // The previous frame's screenshot and video copies have landed: off to their encoders.
+        if let Some(done) = sync.frame_count.checked_sub(1) {
+            screenshots.collect(&render_device, done);
+            video.latch(&render_device, done);
+        }
         {
             let mut waits = Vec::new();
             let mut signals = Vec::new();
+            let mut points = Vec::new();
             if let (Some(swapchain), Some(_)) = (swapchain.as_deref(), presenting) {
                 let (available, finished) = swapchain.frame_semaphores();
-                waits.push((available, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT));
+                waits.push((available, vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT));
                 signals.push(finished);
             }
             // The pick's scene work, submitted ahead of this frame (picking.rs).
             if pick {
-                waits.push((picker.semaphore, vk::PipelineStageFlags::ALL_COMMANDS));
+                points.push(picker.point);
             }
             let queue_lock = info_span!("queue_lock").entered();
             let queue = render_device.queue.lock().unwrap();
             drop(queue_lock);
-            sync.submit(*queue, cmd_buffer, &waits, &signals);
+            sync.submit(
+                *queue,
+                &[cmd_buffer, view_cmd, present_cmd],
+                &points,
+                &waits,
+                &signals,
+                present_id,
+            );
+            if let Some(swapchain) = swapchain.as_deref() {
+                latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::RENDERSUBMIT_END);
+                latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::PRESENT_START);
+            }
+            prof.note_cpu_record(waited.elapsed().as_secs_f64() * 1.0e3);
             let presented = match (swapchain.as_deref(), presenting) {
-                (Some(swapchain), Some(_)) => Some(swapchain.present(*queue)),
+                (Some(swapchain), Some(_)) => Some(swapchain.present(*queue, present_id)),
                 _ => None,
             };
+            if let Some(swapchain) = swapchain.as_deref() {
+                latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::PRESENT_END);
+            }
             drop(queue);
             if let (Some(result), Some(swapchain), Some(window)) =
                 (presented, swapchain.as_deref_mut(), window.as_deref())
@@ -1840,16 +1946,17 @@ fn render_frame(
     }
 }
 
-/// One post-process draw into the current render pass: slot 0 of `set` samples
-/// `source_view`, slots 1..=7 the guides for the debug views (aliasing the output until the
+/// One post-process draw into the current render pass: input 0 of `block` samples
+/// `source_view`, inputs 1..=9 the guides for the debug views (aliasing the output until the
 /// renderer has them). Guides sit in SHADER_READ_ONLY after the evaluate; the output stays
 /// GENERAL. Viewport and scissor are the caller's.
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_post_draw(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
     pipeline: &crate::post_process_filter::CompiledPostProcessFilter,
     kind: TargetKind,
-    set: vk::DescriptorSet,
+    block: u32,
     source_view: vk::ImageView,
     guides: Option<crate::dlss::GuideViews>,
     push_constants: &crate::post_process_filter::PostProcessPushConstants,
@@ -1857,67 +1964,48 @@ unsafe fn record_post_draw(
     let Some(format_pipeline) = pipeline.pipelines.get(kind.format()) else {
         return;
     };
-    let push_constants = crate::post_process_filter::PostProcessPushConstants {
+    let constants = crate::post_process_filter::PostProcessPushConstants {
         scene_radiance: (kind == TargetKind::SceneRadiance) as u32,
         fog: guides.is_some() as u32,
         ..*push_constants
     };
+    let heaps = render_device.heaps();
+    let mut inputs = [(source_view, vk::ImageLayout::GENERAL); 10];
+    if let Some(g) = guides {
+        for (slot, view) in [
+            (1, g.color),
+            (2, g.normal_roughness),
+            (3, g.diffuse),
+            (4, g.specular),
+            (5, g.depth),
+            (6, g.spec_hit),
+            (7, g.motion),
+            (8, g.fog),
+            (9, g.pyramid),
+        ] {
+            inputs[slot] = (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+    }
+    for (i, (view, layout)) in inputs.into_iter().enumerate() {
+        heaps.write_post(block, i as u32, view, layout);
+    }
     unsafe {
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
             format_pipeline,
         );
-        render_device.cmd_push_constants(
-            cmd_buffer,
-            pipeline.pipeline_layout,
-            vk::ShaderStageFlags::ALL,
-            0,
-            bytemuck::bytes_of(&push_constants),
-        );
-
-        let output_info = vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_view(source_view)
-            .sampler(render_device.linear_sampler);
-        let mut image_infos = [output_info; 10];
-        if let Some(g) = guides {
-            for (slot, view) in [
-                (1, g.color),
-                (2, g.normal_roughness),
-                (3, g.diffuse),
-                (4, g.specular),
-                (5, g.depth),
-                (6, g.spec_hit),
-                (7, g.motion),
-                (8, g.fog),
-                (9, g.pyramid),
-            ] {
-                image_infos[slot] = vk::DescriptorImageInfo::default()
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(view)
-                    .sampler(render_device.linear_sampler);
-            }
-        }
-
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_infos)];
-        render_device.update_descriptor_sets(&writes, &[]);
-
-        render_device.cmd_bind_descriptor_sets(
-            cmd_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline_layout,
-            0,
-            std::slice::from_ref(&set),
-            &[],
-        );
-
-        render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
     }
+    heaps.bind(cmd_buffer);
+    heaps.push(
+        cmd_buffer,
+        &crate::post_process_filter::PostProcessPushData {
+            constants,
+            inputs: block,
+            pad: 0,
+        },
+    );
+    unsafe { render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0) };
 }
 
 pub fn on_shutdown(world: &mut World) {

@@ -67,7 +67,17 @@ pub struct SBT {
     pub restir_shade_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
-    pub data: Buffer<u8>,
+    /// One table per frame parity: the frame being recorded writes its own while the previous
+    /// frame may still trace through the other.
+    buffers: [Buffer<u8>; 2],
+    current: usize,
+}
+
+impl SBT {
+    /// The table this frame traces with.
+    pub fn data(&self) -> &Buffer<u8> {
+        &self.buffers[self.current]
+    }
 }
 
 /// A hit offset's two records: `record` at 2n and its shadow twin at 2n + 1 -- the same
@@ -105,6 +115,7 @@ fn update_sbt(
     procedural_meshes: Res<VulkanAssets<ProceduralMesh>>,
     skins: Res<Skins>,
     render_config: Res<RenderConfig>,
+    sync: Res<crate::frame_sync::FrameSync>,
     mut aligments: Local<SBTAligments>,
 ) {
     if !aligments.initialized {
@@ -153,9 +164,13 @@ fn update_sbt(
         + sbt.hit_region.size;
 
     // recreate the buffer if the size has changed
-    if sbt.data.nr_elements != total_size {
-        render_device.destroyer.destroy_buffer(sbt.data.handle);
-        sbt.data = render_device
+    sbt.current = sync.frame_count % 2;
+    let current = sbt.current;
+    if sbt.buffers[current].nr_elements != total_size {
+        render_device
+            .destroyer
+            .destroy_buffer(sbt.buffers[current].handle);
+        sbt.buffers[current] = render_device
             .create_host_buffer(total_size, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR);
     }
 
@@ -175,7 +190,7 @@ fn update_sbt(
     }
 
     {
-        let mut data = render_device.map_buffer(&mut sbt.data);
+        let mut data = render_device.map_buffer(&mut sbt.buffers[current]);
         unsafe {
             let mut dst: *mut u8 = data.as_ptr_mut();
 
@@ -297,8 +312,8 @@ fn update_sbt(
         }
     }
 
-    sbt.raygen_region.device_address = sbt.data.address;
-    sbt.fog_grid_region.device_address = sbt.data.address + sbt.raygen_region.size;
+    sbt.raygen_region.device_address = sbt.buffers[current].address;
+    sbt.fog_grid_region.device_address = sbt.buffers[current].address + sbt.raygen_region.size;
     sbt.restir_shade_region.device_address =
         sbt.fog_grid_region.device_address + sbt.fog_grid_region.size;
     sbt.miss_region.device_address =
@@ -307,7 +322,9 @@ fn update_sbt(
 }
 
 fn cleanup_sbt(sbt: Res<SBT>, render_device: Res<RenderDevice>) {
-    render_device.destroyer.destroy_buffer(sbt.data.handle);
+    for buffer in &sbt.buffers {
+        render_device.destroyer.destroy_buffer(buffer.handle);
+    }
 }
 
 pub struct SBTPlugin;

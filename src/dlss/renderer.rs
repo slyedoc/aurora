@@ -38,11 +38,7 @@ impl DlssImage {
         }
         let info = vk_init::image_info(extent.width.max(1), extent.height.max(1), format, usage);
         let image = rd.create_render_target(&info);
-        let view = unsafe {
-            rd.device
-                .create_image_view(&vk_init::image_view_info(image, format), None)
-                .unwrap()
-        };
+        let view = rd.create_view(&vk_init::image_view_info(image, format));
         Self {
             image,
             view,
@@ -104,7 +100,7 @@ impl Pyramid {
                 .level_count(levels)
                 .layer_count(1),
         );
-        let view = unsafe { rd.device.create_image_view(&view_info, None).unwrap() };
+        let view = rd.create_view(&view_info);
         Self {
             image,
             view,

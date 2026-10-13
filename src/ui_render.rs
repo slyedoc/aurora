@@ -17,6 +17,8 @@
 //! stretched), `OuterColor`.
 
 use ash::vk;
+
+use crate::descriptor_heap::{Mapping, stage_mapping};
 use ash::vk::TaggedStructure as _;
 use bevy::{
     asset::{AssetId, uuid::Uuid},
@@ -198,7 +200,6 @@ pub struct UiPipeline {
 
 pub struct CompiledUiPipeline {
     pub pipeline: vk::Pipeline,
-    pub pipeline_layout: vk::PipelineLayout,
 }
 
 impl VulkanAsset for UiPipeline {
@@ -228,22 +229,13 @@ impl VulkanAsset for UiPipeline {
     ) -> Self::PreparedAsset {
         let (vertex_shader, fragment_shader) = asset;
 
-        let push_constant_info = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(std::mem::size_of::<UiPushConstants>() as u32);
-
-        // Set 0 is the crate-wide bindless texture set (binding 200).
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(
-                &render_device.bindless_descriptor_set_layout,
-            ))
-            .push_constant_ranges(std::slice::from_ref(&push_constant_info));
-        let pipeline_layout = unsafe {
-            render_device
-                .create_pipeline_layout(&layout_info, None)
-                .unwrap()
-        };
+        // ui.slang's bindless textures (set 0, binding 200) are the resource heap's constant
+        // range (descriptor_heap.rs); everything else arrives in push data.
+        let mappings = render_device.heaps().mappings(&[Mapping::Bindless {
+            set: 0,
+            binding: 200,
+        }]);
+        let mapping_info = stage_mapping(&mappings);
 
         let shader_stages = [
             render_device.load_shader_entry(
@@ -257,6 +249,11 @@ impl VulkanAsset for UiPipeline {
                 c"fragment",
             ),
         ];
+        let shader_stages = shader_stages.map(|stage| {
+            let mut stage = stage;
+            stage.p_next = (&raw const mapping_info).cast();
+            stage
+        });
 
         // Vertices are pulled from a buffer reference, so there is no vertex input state.
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
@@ -290,6 +287,8 @@ impl VulkanAsset for UiPipeline {
         let mut pipeline_rendering_info =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
 
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_state)
@@ -299,8 +298,8 @@ impl VulkanAsset for UiPipeline {
             .multisample_state(&multisample_state)
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .push(&mut pipeline_rendering_info);
+            .push(&mut pipeline_rendering_info)
+            .push(&mut flags2);
 
         let pipeline = unsafe {
             render_device.create_graphics_pipelines(
@@ -317,16 +316,10 @@ impl VulkanAsset for UiPipeline {
         }
 
         log::debug!("UI pipeline compiled");
-        CompiledUiPipeline {
-            pipeline,
-            pipeline_layout,
-        }
+        CompiledUiPipeline { pipeline }
     }
 
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
-        render_device
-            .destroyer
-            .destroy_pipeline_layout(prepared_asset.pipeline_layout);
         render_device
             .destroyer
             .destroy_pipeline(prepared_asset.pipeline);
@@ -1742,21 +1735,8 @@ pub unsafe fn draw_ui(
             vk::PipelineBindPoint::GRAPHICS,
             pipeline.pipeline,
         );
-        render_device.cmd_bind_descriptor_sets(
-            cmd_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline_layout,
-            0,
-            std::slice::from_ref(&render_device.bindless_descriptor_set),
-            &[],
-        );
-        render_device.cmd_push_constants(
-            cmd_buffer,
-            pipeline.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            0,
-            bytemuck::bytes_of(&push_constants),
-        );
+        render_device.heaps().bind(cmd_buffer);
+        render_device.heaps().push(cmd_buffer, &push_constants);
         render_device.cmd_draw(cmd_buffer, vertices.len() as u32, 1, 0, 0);
     }
 }
@@ -2228,25 +2208,12 @@ pub unsafe fn draw_ui_surfaces(
                     vk::PipelineBindPoint::GRAPHICS,
                     pipeline.pipeline,
                 );
-                render_device.cmd_bind_descriptor_sets(
-                    cmd_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.pipeline_layout,
-                    0,
-                    std::slice::from_ref(&render_device.bindless_descriptor_set),
-                    &[],
-                );
                 let push_constants = UiPushConstants {
                     vertex_buffer: buffer_address,
                     screen_size: [surface.size.x.max(1.0), surface.size.y.max(1.0)],
                 };
-                render_device.cmd_push_constants(
-                    cmd_buffer,
-                    pipeline.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(&push_constants),
-                );
+                render_device.heaps().bind(cmd_buffer);
+                render_device.heaps().push(cmd_buffer, &push_constants);
                 render_device.cmd_draw(cmd_buffer, count, 1, first, 0);
             }
             render_device.cmd_end_rendering(cmd_buffer);
@@ -2405,11 +2372,11 @@ fn drive_ui_pointers(
     mut sources: Query<(
         Entity,
         &Transform,
-        &GlobalTransform,
-        Has<ChildOf>,
+        Option<&ChildOf>,
         &mut UiPointerSource,
         &mut UiPointerTrack,
     )>,
+    frames: Query<(&Transform, Option<&ChildOf>)>,
     panels: Query<(Entity, &GlobalTransform, &UiSurfacePanel)>,
     targets: Res<UiSurfaceTargets>,
     mut writer: MessageWriter<PointerInput>,
@@ -2420,17 +2387,16 @@ fn drive_ui_pointers(
         PointerButton::Middle,
     ];
 
-    for (entity, local, global, is_child, mut source, mut track) in &mut sources {
+    for (entity, local, parent, mut source, mut track) in &mut sources {
         let id = *track.id.get_or_insert_with(|| {
             let id = PointerId::Custom(Uuid::new_v4());
             commands.entity(entity).insert(id);
             id
         });
-        let ray_tf = if is_child {
-            global.affine()
-        } else {
-            local.compute_affine()
-        };
+        // This frame's pose, not the read-back one (a tracked controller sits under the rig's
+        // environment).
+        let ray_tf =
+            crate::transform::pose_from_ancestors(local, parent.map(ChildOf::parent), &frames);
         let origin = ray_tf.translation.into();
         let dir = ray_tf.transform_vector3(Vec3::NEG_Z).normalize();
 

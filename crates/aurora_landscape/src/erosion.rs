@@ -245,7 +245,7 @@ pub fn run_bakes(
         };
         let count = n.x * n.y;
         let started = std::time::Instant::now();
-        rd.run_transfer_commands(|cmd| {
+        rd.run_transfer_commands_after_frames(|cmd| {
             let step = |entry: &str, iteration: u32| {
                 let push = ErosionPush { iteration, ..grid };
                 record_dispatch(&rd, cmd, module, entry, &push, count, None);

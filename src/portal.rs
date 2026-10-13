@@ -112,9 +112,10 @@ fn upload_portals(
     }
 
     let needed = entries.len().max(1) as u64;
-    if table.buffer.is_none() || table.capacity < needed {
+    // A fresh buffer on every change: a frame still in flight may be reading the old one,
+    // which the destroyer frees once it is done.
+    {
         if let Some(old) = table.buffer.take() {
-            // The destroyer defers the free past the frames in flight.
             render_device.destroyer.destroy_buffer(old.handle);
         }
         let capacity = needed.next_power_of_two().max(16);

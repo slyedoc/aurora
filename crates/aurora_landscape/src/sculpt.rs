@@ -294,7 +294,7 @@ pub fn apply_dabs(
     if jobs.is_empty() {
         return;
     }
-    rd.run_transfer_commands(|cmd| {
+    rd.run_transfer_commands_after_frames(|cmd| {
         for job in &jobs {
             record_dispatch(&rd, cmd, module, "sculpt_brush", job, PAGE_LEN as u32, None);
             compute_to_compute_barrier(&rd, cmd);

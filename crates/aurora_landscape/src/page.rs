@@ -782,7 +782,7 @@ pub fn evaluate_pages(
 
         let pages = &mut *pages;
         let started = std::time::Instant::now();
-        rd.run_transfer_commands(|cmd| {
+        rd.run_transfer_commands_after_frames(|cmd| {
             if !heights.is_empty() {
                 for &page in &heights {
                     let push = EvalPush {

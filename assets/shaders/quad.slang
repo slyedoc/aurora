@@ -153,8 +153,14 @@ float3 localGain(float2 uv, float scale, float strength) {
 // written by ONE output pixel (the first whose uv lands in it, in x and y), which reads the
 // raygen's albedo from the pair before overwriting it.
 void meterResolved(float2 uv, float3 src, float through, float3 veil, float input) {
+    // Only the image itself: a letterboxed spectator's scissor rounds its fractional viewport
+    // outward, and the sliver of fragments past the edge had uv < 0 -- texel -1, an index far
+    // past the buffer (a GPU page fault in XR).
+    if (any(uv < 0.0) || any(uv >= 1.0)) {
+        return;
+    }
     let size = float2(float(push.lum_width), float(push.lum_height));
-    let r = min(int2(floor(uv * size)), int2(size) - 1);
+    let r = clamp(int2(floor(uv * size)), int2(0), int2(size) - 1);
     let step = float2(abs(ddx(uv.x)), abs(ddy(uv.y)));
     let before = int2(floor((uv - step) * size));
     if (before.x == r.x || before.y == r.y) {

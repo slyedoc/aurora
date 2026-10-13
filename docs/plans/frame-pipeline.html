@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>aurora frame pipeline: no GPU bubble, one timeline, descriptor heaps</title>
+<style>
+  :root { --fg:#1d1f23; --muted:#5b6170; --bg:#fbfbfa; --card:#fff; --line:#e3e3df; --accent:#2f5bd3; --warn:#a4570a; --ok:#2a7a3b; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e6e6e3; --muted:#a2a6b0; --bg:#15161a; --card:#1d1f24; --line:#2d3038; --accent:#8aa8ff; --warn:#e3a35a; --ok:#7cc48a; } }
+  body { font: 15px/1.55 system-ui, sans-serif; color:var(--fg); background:var(--bg); max-width: 980px; margin: 2rem auto; padding: 0 1.2rem; }
+  h1 { font-size: 1.6rem; margin-bottom:.2rem } h2 { margin-top:2.2rem; border-bottom:1px solid var(--line); padding-bottom:.3rem }
+  h3 { margin-top:1.4rem } .sub { color:var(--muted) }
+  code, pre { font: 13px/1.45 ui-monospace, monospace } pre { background:var(--card); border:1px solid var(--line); padding:.8rem; overflow-x:auto; border-radius:6px }
+  table { border-collapse: collapse; width:100%; margin:.6rem 0; font-size:14px } th, td { border:1px solid var(--line); padding:.35rem .5rem; vertical-align:top; text-align:left } th { background:var(--card) }
+  .decision { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); padding:.6rem .9rem; margin:.9rem 0; border-radius:4px }
+  .decision h3 { margin:.1rem 0 .4rem } .tweak { color:var(--warn); font-weight:600 } .note { color:var(--muted); font-size:13.5px }
+  .ok { color:var(--ok) } .warn { color:var(--warn) }
+</style>
+</head>
+<body>
+<h1>aurora frame pipeline</h1>
+<p class="sub">Remove the ~1.7 ms GPU-idle bubble per frame, put all GPU sync on one timeline semaphore, add Reflex and present timing, record in parallel, and move binding to <code>VK_EXT_descriptor_heap</code>. Written 2026-10-13. Implementation notes: <code>frame-pipeline-notes.md</code>.</p>
+
+<p><b>Why.</b> Measured in Northshire (Tracy, 4,109 frames): frame period 7.41 ms, CPU waits on the frame fence 0.02 ms, then records for a median <b>1.74 ms</b> (p90 2.41) before the next submit. With one frame in flight the GPU has nothing queued during that time: it is idle at least 23 % of every frame while "GPU-bound".</p>
+
+<p><b>The rule this plan keeps.</b> No CPU-visible readback gets older than today. One frame stays in flight; the CPU waits for frame N before it consumes anything frame N produced (transform rows, exposure, pick hits, timestamps, screenshots). What moves is <i>recording</i>, which needs handles, not results. This is the line the old <code>aurora-rt-pipeline</code> branch crossed (camera on a rig, one-frame-late world poses) and this plan does not.</p>
+
+<h2>Decisions you are most likely to tweak</h2>
+
+<div class="decision">
+<h3>D1. The new order of <code>Last</code> <span class="tweak">(frame model)</span></h3>
+<pre>today:   Extract → Fence(wait N) → Prepare → Render(record + host writes) → Submit
+planned: Extract → Prepare → Record(N+1, parity p) → Fence(wait N) → Latch → Submit(N+1)</pre>
+<ul>
+<li><b>Prepare / Record</b> may only write memory the GPU is not reading: the parity-<code>p</code> half of a per-frame buffer, a <code>vkCmdUpdateBuffer</code> (copied into the command buffer at record time, applied in GPU order), or a fresh staging slice.</li>
+<li><b>Latch</b> runs after the wait: anything computed from frame N's readbacks (RR input exposure from the exposure readback, pick hits) is written there into small single-copy host buffers. Frame N is done, so single copies are safe.</li>
+<li>Systems not converted yet stay after the wait, as today. Conversion is per subsystem and can land in any order: a half-done tree is correct, just not yet fast.</li>
+</ul>
+<p class="note">Alternative considered: host-signalled timeline (submit early, <code>vkSignalSemaphore</code> after latching). Not needed once the latch is just readback-derived values; kept as a later option if Latch ever grows.</p>
+</div>
+
+<div class="decision">
+<h3>D2. One timeline semaphore replaces every fence <span class="tweak">(new type)</span></h3>
+<pre>pub struct GpuTimeline { semaphore: vk::Semaphore /* TIMELINE */, next: u64 }
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)] pub struct SubmitPoint(u64);
+
+impl GpuTimeline {
+    /// Queue `cmds` after `waits` (binary swapchain/XR semaphores keep their stage), signal and
+    /// return the next point. Caller holds the queue (until D7 makes that unnecessary).
+    pub fn submit(&amp;mut self, queue, cmds: &amp;[vk::CommandBuffer], waits, binary_signals) -&gt; SubmitPoint;
+    pub fn wait(&amp;self, point: SubmitPoint);          // vkWaitSemaphores
+    pub fn reached(&amp;self, point: SubmitPoint) -&gt; bool; // vkGetSemaphoreCounterValue
+}</pre>
+<ul>
+<li>Replaces: the frame fence (<code>FrameSync</code>), the transform readback fence, the picker fence and its binary semaphore, the per-call transfer fences in <code>run_transfer_commands</code>. Screenshot/video readbacks already ride the frame fence; they keep doing so through the frame's point.</li>
+<li>Swapchain acquire / present stay binary (the swap chain requires it), but get one acquire semaphore per parity (today one is shared by all frames).</li>
+<li>Vulkan's <code>vkQueueSubmit2</code> with <code>VkSemaphoreSubmitInfo</code> is used throughout (synchronization2 is core in 1.3).</li>
+<li class="warn">The destroyer keeps its two-tick deferral (an object enqueued while recording N+1 dies after N+1's own wait). Optionally later: key destruction on <code>SubmitPoint</code> instead of ticks.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D3. Per-frame data: <code>Parity&lt;T&gt;</code> and a staging ring <span class="tweak">(data model)</span></h3>
+<pre>pub struct Parity&lt;T&gt;([T; 2]);              // indexed by the frame being recorded
+impl&lt;T&gt; Parity&lt;T&gt; { fn cur(&amp;self, frame) -&gt; &amp;T; fn cur_mut(..) -&gt; &amp;mut T; }
+
+pub struct StagingRing { halves: Parity&lt;Buffer&lt;u8&gt;&gt;, head: usize }  // host, grows pow2
+impl StagingRing { fn push&lt;T: Pod&gt;(&amp;mut self, data: &amp;[T]) -&gt; vk::DeviceAddress /* or (buffer, offset) */ }</pre>
+<table>
+<tr><th>Kind</th><th>Rule</th><th>Who</th></tr>
+<tr><td>Small, per frame (≤64 KiB)</td><td><code>vkCmdUpdateBuffer</code> into the single device buffer</td><td>uniforms (~752 B × 4 views), environment table, ReSTIR frame, exposure state; already: atmosphere, lights, scatter, landscape rows/palette</td></tr>
+<tr><td>Bulk, per frame / per change</td><td>Write a <code>StagingRing</code> half, <code>cmd_copy_buffer</code> to the device buffer</td><td>transform deltas, TLAS records, materials, picker rays, skin palettes, fog-volume and portal tables, SBT</td></tr>
+<tr><td>Already parity-buffered</td><td>unchanged</td><td>UI and gizmo vertices, command buffers, RT/post/gizmo descriptor sets, picker command buffers, skinned vertex ping-pong</td></tr>
+<tr><td>Read by the GPU directly from host memory (shader pointers into host-visible buffers)</td><td>becomes device-local + copy, or <code>Parity</code> host copy</td><td class="tweak">decide per buffer: uniforms and the SBT are read in place today</td></tr>
+</table>
+<p class="note">The SBT is rewritten in full every frame because skinned hit records flip parity. Two options: <code>Parity&lt;SBT&gt;</code> (simple, 2× size) or move the flip into the hit shader (read <code>vertex_buffer[frame &amp; 1]</code>) so the SBT changes only with the scene. Plan: Parity first, shader flip later (it also removes the 0.21 ms <code>update_sbt</code>).</p>
+</div>
+
+<div class="decision">
+<h3>D4. What becomes user-facing <span class="tweak">(settings / F3)</span></h3>
+<ul>
+<li><b>F3 "Frame" graph</b>: GPU busy, GPU idle (gap between one frame's last timestamp and the next frame's first), CPU record time, latch time, present-to-display latency (D5). Also Tracy plots <code>gpu idle ms</code>, <code>cpu record ms</code>.</li>
+<li><b>Bench</b>: new scopes <code>idle</code> and <code>record</code> next to <code>busy</code>/<code>trace</code>/<code>dlss</code> (benches/northshire.rs in zero).</li>
+<li><b><code>RenderSettings::low_latency</code></b>: <code>Off | On | Boost</code> (Reflex). Default <b>On</b> where <code>VK_NV_low_latency2</code> exists, Off elsewhere. Not in XR (the OpenXR runtime paces).</li>
+<li>No new env vars; everything on <code>RenderSettings</code> and the F3 panel.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D5. Reflex and present timing (phase 1.5)</h3>
+<ul>
+<li>Swapchain created with <code>VkSwapchainLatencyCreateInfoNV</code>; per frame <code>vkSetLatencyMarkerNV</code>: SIMULATION_START (First), SIMULATION_END (end of PostUpdate), RENDERSUBMIT_START/END (around Record→Submit), PRESENT_START/END; <code>vkLatencySleepNV</code> at the top of First — the CPU is held there, not in the fence wait.</li>
+<li>Present timing via <code>VK_KHR_present_wait2</code> (present ids, measured display latency for F3) and <code>VK_EXT_swapchain_maintenance1</code> present fences so swapchain resources (acquire semaphores, old swapchains on resize) are released by fact, not by <code>queue_wait_idle</code>.</li>
+<li class="tweak">Reflex sleep vs. vsync/FIFO: with FIFO the driver already throttles; Reflex mostly matters for uncapped/VRR. Default proposal: On regardless (it is cheap); revisit if pacing looks worse.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D6. Parallel recording (phase 2)</h3>
+<ul>
+<li>Each recording system gets its own command pool per worker thread (<code>ThreadLocalPools</code>, reset at the frame's start) and records one primary command buffer; a final <code>submit_frame</code> system submits them in a fixed order in one <code>vkQueueSubmit2</code>. GPU order = submit order, so CPU recording order is free.</li>
+<li>Proposed split (Bevy runs them in parallel where access is disjoint):
+<br>scene (frame commands → skins → TLAS → lights/SHaRC; one chain, it is ordered by data) ‖ exposure+atmosphere ‖ per-view trace+DLSS (both XR eyes in parallel) ‖ UI surfaces ‖ present pass (post, gizmos, UI).</li>
+<li class="tweak">NGX (DLSS evaluate) thread safety across views is not documented as safe: proposal is to record the trace per view in parallel but call <code>evaluate</code> for all views from one system, serially, into their own command buffers.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D7. Queue access</h3>
+<ul>
+<li>Enable <code>VK_KHR_internally_synchronized_queues</code> when present: create the queue with <code>INTERNALLY_SYNCHRONIZED</code> and drop <code>rd.queue.lock()</code> on that path. Without it, keep the mutex.</li>
+<li class="warn">The XR runtime and NGX submit on the same queue internally. WiVRn/OpenXR still get the mutex around their calls (they do not know the queue is internally synchronized); keep <code>run_transfer_commands_exclusive</code> for NGX feature creation.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D8. Descriptor heaps (phase 3) <span class="tweak">(binding model)</span></h3>
+<ul>
+<li>One resource heap and one sampler heap (<code>vkCmdBindResourceHeapEXT</code>/<code>SamplerHeap</code>), descriptors written with <code>vkWriteResourceDescriptorsEXT</code> into a host-visible heap buffer. Replaces the bindless set (16,536 textures, binding 200), the RT sets (TLAS + 8 guides), the post sets (10 images), the gizmo sets.</li>
+<li>Per-frame descriptors (guides, swapchain views, TLAS) live in a <code>Parity</code> region of the heap; textures in a persistent region. Shaders get indices through push data (<code>vkCmdPushDataEXT</code>) or the existing push constants.</li>
+<li>Slang: compile with the <code>spvDescriptorHeapEXT</code> capability; bindless handles (<code>DescriptorHandle&lt;T&gt;</code>) become heap accesses. All <code>[[vk::binding]]</code> globals in raygen/quad/gizmo/ui shaders change.</li>
+<li class="tweak">Fallback when the extension is missing (AMD iGPU here, older NVIDIA drivers): <b>require it</b> (clear startup error naming driver 610+) vs. keep descriptor sets as a second path. Proposal: require it — two binding models double every shader's binding code, and both target machines are NVIDIA.</li>
+<li class="warn">Revision 1 extension; Khronos plans a KHR version, so expect a follow-up port. Validation-layer coverage in SDK 1.4.350 to be checked first.</li>
+</ul>
+</div>
+
+<h2>Existing hazards the inventory found (fixed along the way)</h2>
+<table>
+<tr><th>Hazard</th><th>Where</th><th>Fix</th></tr>
+<tr><td>Fence waited twice per frame (<code>wait_previous_frame</code> + <code>sync.wait()</code>), uniform and environment host writes sit between the two</td><td>ray_render_plugin.rs:197, 809-921, 934</td><td>One wait (Fence set), host writes move to Prepare via update-buffer (D3)</td></tr>
+<tr><td>One swapchain acquire semaphore shared by every frame</td><td>swapchain.rs:66</td><td>Per-parity acquire semaphores; acquire moves before Record</td></tr>
+<tr><td>Landscape page eval rewrites the device page/material buffers in a blocking transfer with no leading barrier, in PostUpdate, while the previous frame may still trace them</td><td>aurora_landscape page.rs:785-800</td><td>Wait on the previous frame's <code>SubmitPoint</code> before the transfer (or double-buffer pages): conservative fix first</td></tr>
+<tr><td>Environment table written by the CPU and by the GPU (<code>sun_tint</code>) in the same frame</td><td>ray_render_plugin.rs:763-811; sky_gen.rs:281-286</td><td>Move to device-local; CPU part via update-buffer before sky_gen's dispatch in the same command stream</td></tr>
+</table>
+
+<h2>Phases and how each is measured</h2>
+<table>
+<tr><th>Phase</th><th>Done when</th><th>Expect</th></tr>
+<tr><td>0. Metric</td><td>F3 + Tracy show GPU idle and CPU record per frame; bench <code>baseline-pipeline</code> saved at 3840x1080</td><td>idle ≈ 1.7 ms (matches Tracy)</td></tr>
+<tr><td>1. Timeline + record-before-wait</td><td>All per-frame host writes converted; Record runs before Fence; validation clean flat + XR</td><td>GPU idle → ≤0.3 ms; GPU-bound frame time −1 to −1.5 ms</td></tr>
+<tr><td>1.5 Reflex + present timing</td><td>Markers and sleep active; F3 shows display latency; resize without queue_wait_idle</td><td>lower input latency; no fps change</td></tr>
+<tr><td>2. Parallel recording + queues</td><td>Recording split across systems; mutex off with internally synchronized queues</td><td>CPU Last time −30–50 %; matters most in XR</td></tr>
+<tr><td>3. Descriptor heaps</td><td>No VkDescriptorSet left; validation clean</td><td>no per-frame <code>vkUpdateDescriptorSets</code>; simpler parity</td></tr>
+</table>
+<p class="note">Every phase: one GPU instance at a time (check <code>nvidia-smi</code> first), validation on (<code>--features dev</code>), flat Northshire + spheres in XR before calling it done. Nothing is committed until asked.</p>
+
+<h2>Mechanical work (per file)</h2>
+<table>
+<tr><th>File</th><th>Change</th><th>Phase</th></tr>
+<tr><td>frame_sync.rs</td><td>→ <code>GpuTimeline</code>, <code>SubmitPoint</code>; submit2</td><td>1</td></tr>
+<tr><td>render_device.rs</td><td>timeline feature (core 1.2); <code>run_transfer_commands</code> on the timeline; acquire/present per parity; internally synchronized queue flag; descriptor heap feature + heap buffers</td><td>1, 2, 3</td></tr>
+<tr><td>ray_render_plugin.rs</td><td>split <code>render_frame</code> into Record / Latch / Submit; single fence wait; uniforms + environments via update-buffer; later split into parallel recording systems</td><td>1, 2</td></tr>
+<tr><td>gpu_transform.rs</td><td>staging → <code>StagingRing</code>; readback fence → <code>SubmitPoint</code> (apply_readback waits that point)</td><td>1</td></tr>
+<tr><td>tlas_builder.rs</td><td>records/material staging → ring; grow before Record of N+1 (handles must be final when recorded)</td><td>1</td></tr>
+<tr><td>skinning.rs</td><td>joint_nodes host palette → ring + copy</td><td>1</td></tr>
+<tr><td>sbt.rs</td><td><code>Parity&lt;SBT&gt;</code>, later shader-side parity</td><td>1</td></tr>
+<tr><td>picking.rs</td><td>fence + semaphore → timeline; rays → ring</td><td>1</td></tr>
+<tr><td>restir.rs</td><td>host <code>view.frame</code> → update-buffer</td><td>1</td></tr>
+<tr><td>auto_exposure.rs</td><td>readback consumption + input_ev write move to Latch</td><td>1</td></tr>
+<tr><td>fog_volume.rs, portal.rs</td><td>host tables → ring + copy</td><td>1</td></tr>
+<tr><td>gpu_profiler.rs</td><td><code>Parity</code> query pools; absolute timestamps for idle; record/latch CPU spans</td><td>0, 1</td></tr>
+<tr><td>swapchain.rs</td><td>per-parity acquire semaphores; latency create info; present ids; present fences</td><td>1, 1.5</td></tr>
+<tr><td>xr.rs</td><td>begin/acquire stay before Record; end after Submit; mutex kept around runtime calls</td><td>1, 2</td></tr>
+<tr><td>aurora_landscape page.rs (+ sculpt/bake/erosion transfers)</td><td>wait previous frame's point before rewriting pages</td><td>1</td></tr>
+<tr><td>util/screenshot.rs, util/video.rs</td><td>collect by <code>SubmitPoint</code></td><td>1</td></tr>
+<tr><td>dev_ui / F3</td><td>Frame graph</td><td>0</td></tr>
+<tr><td>render_settings.rs</td><td><code>low_latency</code></td><td>1.5</td></tr>
+<tr><td>shaders (raygen, quad, gizmo, ui, slang build flags)</td><td>heap access</td><td>3</td></tr>
+<tr><td>zero benches/northshire.rs</td><td><code>idle</code>, <code>record</code> scopes</td><td>0</td></tr>
+</table>
+</body>
+</html>

@@ -538,7 +538,7 @@ pub fn load_texture_levels(
 
     let mut view_info = vk_init::image_view_info(image_handle, format);
     view_info.subresource_range.level_count = mip_levels;
-    let view = unsafe { device.device.create_image_view(&view_info, None).unwrap() };
+    let view = device.create_view(&view_info);
 
     RenderTexture {
         image: image_handle,
@@ -636,7 +636,7 @@ pub fn create_blank_texture(
     });
 
     let view_info = vk_init::image_view_info(image_handle, format);
-    let view = unsafe { device.device.create_image_view(&view_info, None).unwrap() };
+    let view = device.create_view(&view_info);
 
     RenderTexture {
         image: image_handle,

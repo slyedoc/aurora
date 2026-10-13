@@ -66,12 +66,25 @@ feature — `cargo run --release -p bsn --features xr -- bistro/bistro.bsn` walk
 path-traced bistro in a Quest 2/3, streamed from the PC over Wi-Fi with
 [WiVRn](https://github.com/WiVRn/WiVRn) (OpenXR, no SteamVR involved). One-time setup:
 
-1. **PC — install the WiVRn server** (Flathub; the client and server must be the same WiVRn
-   version, and the flatpak tracks the store client's releases):
+1. **PC — build the WiVRn server from our fork's `aurora` branch**
+   ([slyedoc/WiVRn](https://github.com/slyedoc/WiVRn/tree/aurora): the release plus
+   `patches/monado/0012`, `0013`). Stock WiVRn (and the Flathub build) fetches aurora's
+   internally synchronized queue with `vkGetDeviceQueue` and adds a second timeline-semaphore
+   feature struct to its device chain, both Vulkan validation errors, and prints the runtime's
+   info reports into the app's console (the fork keeps them for
+   `RUST_LOG=info,openxr=info`, which aurora passes on as `XRT_LOG`). The client and server must be
+   the same WiVRn version, so rebase the branch onto the tag the store client is on:
 
    ```sh
-   flatpak install flathub io.github.wivrn.wivrn
+   git clone --branch aurora https://github.com/slyedoc/WiVRn.git && cd WiVRn
+   cmake -B build-server -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWIVRN_BUILD_CLIENT=OFF \
+     -DWIVRN_BUILD_DASHBOARD=OFF -DWIVRN_BUILD_SERVER=ON -DWIVRN_BUILD_WIVRNCTL=ON \
+     -DWIVRN_USE_NVENC=ON -DWIVRN_OPENXR_MANIFEST_TYPE=relative
+   cmake --build build-server
    ```
+
+   Run `build-server/server/wivrn-server`, and point apps at the build's runtime with
+   `XR_RUNTIME_JSON=$PWD/build-server/openxr_wivrn-dev.json`.
 
 2. **PC — firewall**, if one is on: WiVRn streams on 9757 (TCP+UDP) and discovers over
    mDNS (5353/UDP):

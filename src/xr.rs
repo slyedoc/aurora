@@ -41,12 +41,13 @@ impl XrHand {
     }
 }
 
-/// A pose the runtime tracks, mirrored into the ECS as a root entity whose `Transform` is
-/// `rig * pose` — the rig being the single `Camera3d` entity, exactly as the render path
-/// anchors the eyes. Roots, not children of the camera: with the default
-/// [`crate::transform::TransformPlugin`] (no CPU propagation) a camera that gained children
-/// would stop getting its `GlobalTransform` synced. Apps parent their own visuals (laser,
-/// wrist panel, controller model) under these; they persist across game states.
+/// A pose the runtime tracks, mirrored into the ECS as a sibling of the single `Camera3d` (same
+/// parent, so in the camera's environment) whose `Transform` is `rig * pose` — the rig being
+/// the camera's own transform, exactly as the render path anchors the eyes. Not children of the
+/// camera: with the default [`crate::transform::TransformPlugin`] (no CPU propagation) a camera
+/// that gained children would stop getting its `GlobalTransform` synced. Apps parent their own
+/// visuals (laser, wrist panel, controller model) under these; they follow the camera between
+/// environments.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum XrTracked {
     Head,
@@ -458,19 +459,28 @@ fn poll_input(
 }
 
 /// `Transform = rig * pose` for every tracked entity, the rig being the `Camera3d`'s own
-/// transform (a root, so that is its world transform). Runs after the poll so `PreUpdate`
-/// readers (pointer rays) see this frame's poses, and again before propagation so the render
-/// sees the rig where gameplay left it this frame.
+/// transform; each tracked entity is kept under the camera's parent, so both transforms are in
+/// the same space (and the tracked visuals in the camera's environment). Runs after the poll so
+/// `PreUpdate` readers (pointer rays) see this frame's poses, and again before propagation so
+/// the render sees the rig where gameplay left it this frame.
 fn follow_rig(
-    rig: Option<Single<&Transform, (With<Camera3d>, Without<XrTracked>)>>,
-    mut tracked: Query<(&XrPose, &mut Transform), With<XrTracked>>,
+    mut commands: Commands,
+    rig: Option<Single<(&Transform, Option<&ChildOf>), (With<Camera3d>, Without<XrTracked>)>>,
+    mut tracked: Query<(Entity, &XrPose, &mut Transform, Option<&ChildOf>), With<XrTracked>>,
 ) {
     let Some(rig) = rig else { return };
-    let rig = **rig;
-    for (pose, mut tf) in &mut tracked {
-        let world = rig * pose.local;
-        if *tf != world {
-            *tf = world;
+    let (rig, rig_parent) = *rig;
+    let rig_parent = rig_parent.map(ChildOf::parent);
+    for (entity, pose, mut tf, parent) in &mut tracked {
+        if parent.map(ChildOf::parent) != rig_parent {
+            match rig_parent {
+                Some(parent) => commands.entity(entity).insert(ChildOf(parent)),
+                None => commands.entity(entity).remove::<ChildOf>(),
+            };
+        }
+        let local = *rig * pose.local;
+        if *tf != local {
+            *tf = local;
         }
     }
 }
@@ -486,8 +496,30 @@ fn level_rig(rig: Option<Single<&mut Transform, With<Camera3d>>>) {
     }
 }
 
+/// The OpenXR runtime's log level from `RUST_LOG`'s `openxr=<level>` directive (Monado reads
+/// `XRT_LOG`; an explicit `XRT_LOG` wins). `RUST_LOG=info,openxr=info` shows its reports.
+fn runtime_log_level() {
+    if std::env::var_os("XRT_LOG").is_some() {
+        return;
+    }
+    let Ok(filter) = std::env::var("RUST_LOG") else {
+        return;
+    };
+    let level = filter.split(',').find_map(|directive| {
+        let (target, level) = directive.trim().split_once('=')?;
+        (target == "openxr").then(|| level.to_ascii_lowercase())
+    });
+    if let Some(level) =
+        level.filter(|l| ["trace", "debug", "info", "warn", "error"].contains(&l.as_str()))
+    {
+        // Before the runtime loads; bevy's task pools are up but idle.
+        unsafe { std::env::set_var("XRT_LOG", level) };
+    }
+}
+
 impl XrContext {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        runtime_log_level();
         let entry = unsafe { xr::Entry::load()? };
         let available = entry.enumerate_extensions()?;
         if !available.khr_vulkan_enable2 {

@@ -23,6 +23,8 @@
 
 use ash::vk;
 use ash::vk::TaggedStructure as _;
+
+use crate::descriptor_heap::{DescriptorHeaps, Mapping, stage_mapping};
 use bevy::{
     camera::{
         primitives::{Aabb, Frustum},
@@ -82,6 +84,15 @@ struct GizmoPushConstants {
     _pad: u32,
 }
 
+/// The gizmo pass's push data: the constants, then the view's depth slot in the resource heap.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GizmoPushData {
+    constants: GizmoPushConstants,
+    depth: u32,
+    pad: u32,
+}
+
 /// Linear RGBA → packed RGBA8, clamped — gizmo colors are debug paint, not radiance, so HDR
 /// values saturate.
 fn pack_rgba8(c: LinearRgba) -> u32 {
@@ -104,12 +115,7 @@ pub struct GizmoPipeline {
 
 pub struct CompiledGizmoPipeline {
     pub pipeline: vk::Pipeline,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub descriptor_set_layout: vk::DescriptorSetLayout,
-    /// The scene depth binding, `[frame_parity * MAX_VIEWS + view_slot]`: a set already
-    /// recorded into this command buffer must not be rewritten.
-    pub descriptor_sets: [vk::DescriptorSet; 2 * crate::MAX_VIEWS],
-    /// Bound when no view traced: binding 0 needs a live image even though the fragment
+    /// Written when no view traced: binding 0 needs a live image even though the fragment
     /// shader will not sample it.
     pub depth_placeholder: crate::render_texture::RenderTexture,
 }
@@ -151,48 +157,20 @@ impl VulkanAsset for GizmoPipeline {
             1,
         );
 
-        let push_constant_info = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(std::mem::size_of::<GizmoPushConstants>() as u32);
-
-        // The vertices arrive through a buffer reference in the push constants; the one
-        // descriptor is the scene depth the fragment shader tests against.
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .binding(0)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-        let descriptor_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        let descriptor_set_layout = unsafe {
-            render_device
-                .create_descriptor_set_layout(&descriptor_layout_info, None)
-                .unwrap()
-        };
-        let descriptor_sets = {
-            let descriptor_pool = render_device.descriptor_pool.lock().unwrap();
-            let layouts = [descriptor_set_layout; 2 * crate::MAX_VIEWS];
-            let alloc_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(*descriptor_pool)
-                .set_layouts(&layouts);
-            unsafe {
-                render_device
-                    .allocate_descriptor_sets(&alloc_info)
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            }
-        };
-
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-            .push_constant_ranges(std::slice::from_ref(&push_constant_info));
-        let pipeline_layout = unsafe {
-            render_device
-                .create_pipeline_layout(&layout_info, None)
-                .unwrap()
-        };
+        // The vertices arrive through a buffer reference in push data; the one image is the
+        // scene depth the fragment shader tests against (set 0, binding 0), the view's gizmo
+        // slot of the resource heap, its index in push data after the constants.
+        let heaps = render_device.heaps();
+        let mappings = heaps.mappings(&[Mapping::Indexed {
+            set: 0,
+            binding: 0,
+            count: 1,
+            base: heaps.gizmo_base(),
+            block: 1,
+            push_offset: std::mem::offset_of!(GizmoPushData, depth) as u32,
+            combined: true,
+        }]);
+        let mapping_info = stage_mapping(&mappings);
 
         let shader_stages = [
             render_device.load_shader_entry(
@@ -206,6 +184,11 @@ impl VulkanAsset for GizmoPipeline {
                 c"fragment",
             ),
         ];
+        let shader_stages = shader_stages.map(|stage| {
+            let mut stage = stage;
+            stage.p_next = (&raw const mapping_info).cast();
+            stage
+        });
 
         // Vertices are pulled from a buffer reference, so there is no vertex input state.
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
@@ -239,6 +222,8 @@ impl VulkanAsset for GizmoPipeline {
         let mut pipeline_rendering_info =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
 
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_state)
@@ -248,8 +233,8 @@ impl VulkanAsset for GizmoPipeline {
             .multisample_state(&multisample_state)
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .push(&mut pipeline_rendering_info);
+            .push(&mut pipeline_rendering_info)
+            .push(&mut flags2);
 
         let pipeline = unsafe {
             render_device.create_graphics_pipelines(
@@ -268,9 +253,6 @@ impl VulkanAsset for GizmoPipeline {
         log::debug!("gizmo pipeline compiled");
         CompiledGizmoPipeline {
             pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_sets,
             depth_placeholder,
         }
     }
@@ -278,13 +260,7 @@ impl VulkanAsset for GizmoPipeline {
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
         render_device
             .destroyer
-            .destroy_pipeline_layout(prepared_asset.pipeline_layout);
-        render_device
-            .destroyer
             .destroy_pipeline(prepared_asset.pipeline);
-        render_device
-            .destroyer
-            .destroy_descriptor_set_layout(prepared_asset.descriptor_set_layout);
         render_device
             .destroyer
             .destroy_image_view(prepared_asset.depth_placeholder.image_view);
@@ -653,38 +629,29 @@ pub unsafe fn draw_gizmos(
         depth_guide: u32::from(scene_depth.is_some()),
         _pad: 0,
     };
-    let set = pipeline.descriptor_sets[(frame_slot % 2) * crate::MAX_VIEWS + view_slot];
-    let depth_info = vk::DescriptorImageInfo::default()
-        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .image_view(scene_depth.unwrap_or(pipeline.depth_placeholder.image_view))
-        .sampler(render_device.linear_sampler);
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(std::slice::from_ref(&depth_info))];
+    // The scene depth, in this view's gizmo slot for the frame parity (a slot already recorded
+    // this frame must not be rewritten).
+    let heaps = render_device.heaps();
+    let depth = DescriptorHeaps::gizmo_slot(frame_slot % 2, view_slot);
+    heaps.write_gizmo_depth(
+        depth,
+        scene_depth.unwrap_or(pipeline.depth_placeholder.image_view),
+    );
 
     unsafe {
-        render_device.update_descriptor_sets(&writes, &[]);
-        render_device.cmd_bind_descriptor_sets(
-            cmd_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline_layout,
-            0,
-            std::slice::from_ref(&set),
-            &[],
-        );
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
             pipeline.pipeline,
         );
-        render_device.cmd_push_constants(
+        heaps.bind(cmd_buffer);
+        heaps.push(
             cmd_buffer,
-            pipeline.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            0,
-            bytemuck::bytes_of(&push_constants),
+            &GizmoPushData {
+                constants: push_constants,
+                depth,
+                pad: 0,
+            },
         );
         // One draw per stretch this view's worlds share; `gl_VertexIndex` counts from `first`.
         for batch in params.frame.batches.iter().filter(visible) {

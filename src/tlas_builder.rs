@@ -37,7 +37,7 @@ use crate::{
     mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralMesh, ProceduralMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
-    render_buffer::{Buffer, BufferProvider},
+    render_buffer::{Buffer, BufferProvider, Flip},
     render_device::RenderDevice,
     sphere::{Sphere, SphereBLAS},
     vk_utils,
@@ -371,6 +371,8 @@ pub struct TLAS {
     pub acceleration_structure: AccelerationStructure,
     scratch_buffer: Buffer<u8>,
     handle_size: u64,
+    /// The instance count the structure was sized for (its size grows with the count).
+    handle_count: u32,
     scratch_alignment: u64,
     /// SBT hit-group record per mesh asset / owning slot, stable for its lifetime (0 = spheres).
     pub hit_offsets: HashMap<HitKey, u32>,
@@ -392,7 +394,8 @@ pub struct TLAS {
     /// shaders reproject through its transforms for motion vectors.
     prev_instances_buf: Buffer<u8>,
     instance_node_buf: Buffer<u32>,
-    staging: Buffer<InstanceRecord>,
+    /// Instance records for the scatter kernel, read in place: one copy per frame in flight.
+    staging: Flip<Buffer<InstanceRecord>>,
     rebuild: bool,
     warned_module: bool,
     /// Instance blocks by first slot: their length and pose meshes.
@@ -410,6 +413,7 @@ impl TLAS {
             acceleration_structure: AccelerationStructure::default(),
             scratch_buffer: Buffer::default(),
             handle_size: 0,
+            handle_count: 0,
             scratch_alignment: 0,
             hit_offsets: HashMap::new(),
             next_hit_offset: 1,
@@ -426,7 +430,7 @@ impl TLAS {
             instances_buf: Buffer::default(),
             prev_instances_buf: Buffer::default(),
             instance_node_buf: Buffer::default(),
-            staging: Buffer::default(),
+            staging: Flip::default(),
             rebuild: false,
             warned_module: false,
             blocks: HashMap::new(),
@@ -466,6 +470,16 @@ impl TLAS {
     /// Device address of the packed material buffer (`custom_index` indexes it).
     pub fn material_address(&self) -> u64 {
         self.materials.device.address
+    }
+
+    /// Whether this frame's `record` keeps the structure handle and every address the trace
+    /// reads: it reallocates only when the scene outgrew the instance table, the material
+    /// arena or the structure.
+    pub fn stable(&self) -> bool {
+        self.acceleration_structure.handle != vk::AccelerationStructureKHR::null()
+            && self.count <= self.capacity
+            && self.count <= self.handle_count
+            && self.materials.data.len() as u32 <= self.materials.capacity
     }
 
     /// Device address of last frame's instance array (0 until the first frame).
@@ -657,8 +671,9 @@ impl TLAS {
         );
 
         if !self.records.is_empty() {
-            ensure_staging(rd, &mut self.staging, self.records.len());
-            rd.map_buffer(&mut self.staging)
+            let staging = self.staging.write();
+            ensure_staging(rd, staging, self.records.len());
+            rd.map_buffer(staging)
                 .copy_from_slice(&self.records);
             if transfers {
                 memory_barrier(
@@ -672,7 +687,7 @@ impl TLAS {
             }
             let n = self.records.len() as u32;
             let params = ScatterInstancesParams {
-                records: self.staging.address,
+                records: self.staging.current().address,
                 instances: self.instances_buf.address,
                 prev_instances: self.prev_instances_buf.address,
                 instance_node: self.instance_node_buf.address,
@@ -788,6 +803,7 @@ impl TLAS {
             }
             .unwrap();
             self.handle_size = build_size.acceleration_structure_size;
+            self.handle_count = primitive_count;
             self.acceleration_structure.address = unsafe {
                 rd.ext_acc_struct.get_acceleration_structure_device_address(
                     &vk::AccelerationStructureDeviceAddressInfoKHR::default()
@@ -843,7 +859,8 @@ impl TLAS {
             self.instances_buf.handle,
             self.prev_instances_buf.handle,
             self.instance_node_buf.handle,
-            self.staging.handle,
+            self.staging.copies()[0].handle,
+            self.staging.copies()[1].handle,
             self.materials.device.handle,
         ] {
             rd.destroyer.destroy_buffer(b);

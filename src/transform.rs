@@ -11,15 +11,40 @@
 //!
 //! A host with no GPU (headless tests) has no readback: it uses bevy's own `TransformPlugin`
 //! and propagates on the CPU instead.
+//!
+//! avian propagates the whole hierarchy on the CPU before every physics step by default
+//! (`PhysicsTransformConfig::propagate_before_physics`): every skeleton bone, ~1.6 ms of worker
+//! time a frame in Northshire. Off here; physics reads the read-back `GlobalTransform`.
 
+use avian3d::physics_transform::PhysicsTransformConfig;
 use bevy::{
     app::ValidateParentHasComponentPlugin,
+    ecs::query::QueryFilter,
+    math::Affine3A,
     prelude::*,
     transform::{
         TransformSystems,
         systems::{StaticTransformOptimizations, sync_simple_transforms},
     },
 };
+
+/// This frame's world pose of an entity under `parent`, composed from its ancestors' `Transform`s
+/// (the read-back `GlobalTransform` is a frame old).
+pub fn pose_from_ancestors<F: QueryFilter>(
+    local: &Transform,
+    mut parent: Option<Entity>,
+    frames: &Query<(&Transform, Option<&ChildOf>), F>,
+) -> Affine3A {
+    let mut pose = local.compute_affine();
+    while let Some(entity) = parent {
+        let Ok((transform, up)) = frames.get(entity) else {
+            break;
+        };
+        pose = transform.compute_affine() * pose;
+        parent = up.map(ChildOf::parent);
+    }
+    pose
+}
 
 /// Cameras inside a hierarchy: this frame's pose from their ancestors' `Transform`s.
 #[allow(clippy::type_complexity)]
@@ -28,15 +53,7 @@ fn sync_child_cameras(
     frames: Query<(&Transform, Option<&ChildOf>), Without<Camera>>,
 ) {
     for (local, child_of, mut global) in &mut cameras {
-        let mut pose = local.compute_affine();
-        let mut parent = Some(child_of.parent());
-        while let Some(entity) = parent {
-            let Ok((transform, up)) = frames.get(entity) else {
-                break;
-            };
-            pose = transform.compute_affine() * pose;
-            parent = up.map(ChildOf::parent);
-        }
+        let pose = pose_from_ancestors(local, Some(child_of.parent()), &frames);
         global.set_if_neq(GlobalTransform::from(pose));
     }
 }
@@ -46,7 +63,11 @@ pub struct TransformPlugin;
 
 impl Plugin for TransformPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())
+        app.insert_resource(PhysicsTransformConfig {
+            propagate_before_physics: false,
+            ..default()
+        })
+        .add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())
             .init_resource::<StaticTransformOptimizations>()
             .add_systems(
                 PostStartup,

@@ -168,7 +168,7 @@ impl RestirState {
             view.reservoirs =
                 std::array::from_fn(|_| rd.create_device_buffer(pixels * RESERVOIR_BYTES, usage));
             view.grid = rd.create_device_buffer(grid_len, usage);
-            view.frame = rd.create_host_buffer(1, vk::BufferUsageFlags::STORAGE_BUFFER);
+            view.frame = rd.create_device_buffer(1, usage);
             for handle in [
                 view.surfaces.handle,
                 view.reservoirs[0].handle,
@@ -245,7 +245,19 @@ impl RestirState {
             grid_candidates: GRID_CANDIDATES,
             light_entries: input.light_entries,
         };
-        rd.map_buffer(&mut view.frame).copy_from_slice(&[gpu]);
+        // Recorded, not written through a mapping: the previous frame may still read it.
+        unsafe {
+            rd.device
+                .cmd_update_buffer(cmd, view.frame.handle, 0, bytemuck::bytes_of(&gpu));
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
         RestirAddresses {
             surfaces: view.surfaces.address,
             prev,
@@ -262,7 +274,7 @@ impl RestirState {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         slot: usize,
-        prof: &mut GpuProfiler,
+        prof: &GpuProfiler,
     ) -> bool {
         let Some(module) = modules.get(&self.module) else {
             return false;
@@ -323,7 +335,7 @@ impl RestirState {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         slot: usize,
-        prof: &mut GpuProfiler,
+        prof: &GpuProfiler,
     ) -> bool {
         let Some(module) = modules.get(&self.module) else {
             return false;

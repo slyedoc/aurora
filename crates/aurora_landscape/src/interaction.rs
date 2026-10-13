@@ -158,7 +158,7 @@ pub fn update_field(
             n,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         );
-        rd.run_transfer_commands(|cmd| unsafe {
+        rd.run_transfer_commands_after_frames(|cmd| unsafe {
             rd.device
                 .cmd_fill_buffer(cmd, field.texels.handle, 0, vk::WHOLE_SIZE, 0);
         });

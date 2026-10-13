@@ -249,7 +249,7 @@ impl LandscapePages {
             .as_slice_mut()
             .copy_from_slice(self.material_mirror_mut());
         let (pool, pool_materials) = self.device_buffers();
-        rd.run_transfer_commands(|cmd| unsafe {
+        rd.run_transfer_commands_after_frames(|cmd| unsafe {
             rd.device.cmd_copy_buffer(
                 cmd,
                 heights.handle,

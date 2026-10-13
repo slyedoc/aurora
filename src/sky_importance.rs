@@ -307,7 +307,7 @@ fn build_table(rd: &RenderDevice, image: &Image) -> Option<(Buffer<f32>, Option<
         table.len() as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
     );
-    rd.run_transfer_commands(|cmd| rd.upload_buffer(cmd, &host, &device));
+    rd.run_transfer_commands_after_frames(|cmd| rd.upload_buffer(cmd, &host, &device));
     rd.destroyer.destroy_buffer(host.handle);
     Some((device, sun))
 }

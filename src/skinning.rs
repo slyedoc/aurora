@@ -55,7 +55,7 @@ use crate::{
     gpu_transform::{GpuNode, GpuTransforms, NO_NODE},
     mesh::{AuroraMesh, AuroraMesh3d},
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
-    render_buffer::{Buffer, BufferProvider},
+    render_buffer::{Buffer, BufferProvider, Flip},
     render_device::RenderDevice,
     tlas_builder::{GpuInstance, InstanceOverride, TLAS, prepare_instances},
     vk_utils,
@@ -344,7 +344,8 @@ struct SkinnedGpu {
     vertices: [Buffer<Vertex>; 2],
     triangles: Buffer<Triangle>,
     /// Host-visible palette: transform-table node per joint.
-    joint_nodes: Buffer<u32>,
+    /// Transform-table node per joint, read in place by the deform: one copy per frame in flight.
+    joint_nodes: Flip<Buffer<u32>>,
     joint_count: u32,
     inverse_bind: u64,
     /// The mesh's opacity micromap (handle, per-triangle index address, usage counts):
@@ -367,7 +368,8 @@ impl SkinnedGpu {
             self.vertices[0].handle,
             self.vertices[1].handle,
             self.triangles.handle,
-            self.joint_nodes.handle,
+            self.joint_nodes.copies()[0].handle,
+            self.joint_nodes.copies()[1].handle,
             self.scratch.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
@@ -511,13 +513,13 @@ impl Skins {
         let cur = self.current();
         let prev = cur ^ 1;
 
-        // Palettes (host-visible, rewritten after the fence wait).
+        // Palettes (host-visible, each change into the copy no submitted frame reads).
         for inst in self.instances.values_mut() {
             let Some(gpu) = inst.gpu.as_mut() else {
                 continue;
             };
             if inst.joints_dirty {
-                rd.map_buffer(&mut gpu.joint_nodes)
+                rd.map_buffer(gpu.joint_nodes.write())
                     .copy_from_slice(&inst.joint_nodes);
                 inst.joints_dirty = false;
             }
@@ -538,7 +540,7 @@ impl Skins {
                         rest: gpu.rest.address,
                         skin: gpu.skin,
                         world,
-                        joint_nodes: gpu.joint_nodes.address,
+                        joint_nodes: gpu.joint_nodes.current().address,
                         inverse_bind: gpu.inverse_bind,
                         dst: gpu.vertices[cur].address,
                         count: gpu.vertex_count,
@@ -1007,8 +1009,10 @@ pub fn prepare_skins(
                     std::slice::from_ref(&icopy),
                 );
             });
+            // TRANSFER_SRC: a new instance's first deformed pose is copied into last frame's.
             let stream_usage = vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
             let vertices = [
                 render_device.create_device_buffer::<Vertex>(vertex_count as u64, stream_usage),
@@ -1019,10 +1023,13 @@ pub fn prepare_skins(
                 triangle_count as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
-            let joint_nodes = render_device.create_host_buffer::<u32>(
-                inst.source.joints().len().max(1) as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-            );
+            let mut joint_nodes = Flip::default();
+            for _ in 0..2 {
+                *joint_nodes.write() = render_device.create_host_buffer::<u32>(
+                    inst.source.joints().len().max(1) as u64,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                );
+            }
             let micromap = blas
                 .micromap
                 .as_ref()

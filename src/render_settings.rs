@@ -41,7 +41,9 @@ pub struct RenderSettings {
     #[reflect(@-2.0..=1.0_f32)]
     pub texture_lod_bias: f32,
     /// Ray Reconstruction's specular hit distance comes from one extra mirror ray at the
-    /// primary vertex for surfaces up to this roughness. 0 = no guide rays.
+    /// primary vertex for surfaces up to this roughness. 0 = no guide rays. Past ~0.3 the
+    /// reflection is too blurry for its motion to show, and at 0.6 the ray cost Northshire's
+    /// textured stone and wood ~1.4 ms at 3840x1080.
     #[reflect(@0.0..=1.0_f32)]
     pub spec_hit_roughness: f32,
     /// Russian roulette: from this bounce on, a path continues with probability its throughput
@@ -91,6 +93,9 @@ pub struct RenderSettings {
     pub omm: bool,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
     pub rr_preset: RrPreset,
+    /// Reflex (latency.rs): On makes the CPU wait for the driver at the start of a frame
+    /// instead of queueing work ahead of the GPU. Flat windows on NVIDIA only.
+    pub low_latency: crate::latency::LowLatency,
     /// Sub-pixel camera jitter: 1 = the full +-0.5 traced pixel, 0 = pixel centres.
     #[reflect(@0.0..=1.0_f32)]
     pub jitter_scale: f32,
@@ -117,7 +122,7 @@ impl Default for RenderSettings {
             light_nee: true,
             light_candidates: 4,
             texture_lod_bias: -1.0,
-            spec_hit_roughness: 0.6,
+            spec_hit_roughness: 0.3,
             roulette_from: 1,
             one_shadow_ray_from: 0,
             restir: true,
@@ -132,6 +137,7 @@ impl Default for RenderSettings {
             sharc_voxel: 0.25,
             omm: true,
             rr_preset: RrPreset::current(),
+            low_latency: crate::latency::LowLatency::On,
             jitter_scale: 1.0,
             local_tonemap: 0.4,
             bloom: 0.06,

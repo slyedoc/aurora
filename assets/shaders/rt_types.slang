@@ -378,6 +378,7 @@ public struct AeData {
     public float input_ev;
     public float input_exposure;
     public float metered;
+    public uint settled;
 };
 
 // Must match AtmosphereGpu in src/atmosphere.rs. Lengths in metres, coefficients per metre,

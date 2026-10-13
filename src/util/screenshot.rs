@@ -27,6 +27,8 @@ pub struct ScreenshotRequests {
 }
 
 struct InFlight {
+    /// The frame whose commands copy into `buffer`.
+    frame: usize,
     path: PathBuf,
     buffer: Buffer<u8>,
     extent: vk::Extent2D,
@@ -66,8 +68,10 @@ impl ScreenshotRequests {
         buffer: Buffer<u8>,
         extent: vk::Extent2D,
         format: vk::Format,
+        frame: usize,
     ) {
         self.in_flight.push(InFlight {
+            frame,
             path,
             buffer,
             extent,
@@ -75,9 +79,13 @@ impl ScreenshotRequests {
         });
     }
 
-    /// Last frame's copies, landed by now: their pixels go to a PNG thread each.
-    pub(crate) fn collect(&mut self, rd: &RenderDevice) {
-        for mut capture in self.in_flight.drain(..) {
+    /// After frame `done`'s wait: the copies of frames up to it have landed, and their pixels
+    /// go to a PNG thread each.
+    pub(crate) fn collect(&mut self, rd: &RenderDevice, done: usize) {
+        let (landed, waiting): (Vec<_>, Vec<_>) =
+            self.in_flight.drain(..).partition(|c| c.frame <= done);
+        self.in_flight = waiting;
+        for mut capture in landed {
             let mut pixels = rd.map_buffer(&mut capture.buffer).as_slice_mut().to_vec();
             rd.destroyer.destroy_buffer(capture.buffer.handle);
             let written = self.written.clone();

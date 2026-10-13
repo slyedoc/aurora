@@ -41,6 +41,10 @@ pub struct DevUIPanel;
 #[derive(Component, Default, Clone)]
 struct DevUIProbe;
 
+/// The frame timing line under the probe.
+#[derive(Component, Default, Clone)]
+struct DevUIFrame;
+
 /// The node the inspectors are built under, each in a section of its own (an inspector owns
 /// its whole panel: building one into a shared node clears the others).
 #[derive(Component, Default, Clone)]
@@ -68,7 +72,10 @@ impl Plugin for DevUIPlugin {
         }
 
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(Update, (toggle_panel, update_probe, inspect_camera));
+        app.add_systems(
+            Update,
+            (toggle_panel, update_probe, update_frame_readout, inspect_camera),
+        );
     }
 }
 
@@ -172,6 +179,7 @@ fn spawn_panel(world: &mut World) {
                 DevUIInspectorHost
                 --
                 @caption("centre: -") DevUIProbe
+                @caption("gpu: -") DevUIFrame
             ]
         })
         .expect("dev panel spawns")
@@ -252,6 +260,28 @@ fn update_probe(
     };
     for mut text in &mut probe {
         text.0 = format!("{:<11}{:>11}", fmt_nits(nits), exposure);
+    }
+}
+
+/// The frame's GPU timeline: span (first to last timestamp), the idle gap before it, the CPU's
+/// wait-to-submit time, and Reflex's simulation-to-present latency (0 without Reflex). Fixed
+/// width, like the probe line.
+fn update_frame_readout(
+    profiler: Option<Res<crate::gpu_profiler::GpuProfiler>>,
+    latency: Option<Res<crate::latency::Latency>>,
+    mut line: Query<&mut Text, With<DevUIFrame>>,
+) {
+    let Some(p) = profiler else { return };
+    let ms = |name| p.time(name).unwrap_or(0.0);
+    let lat = latency.map_or(0.0, |l| l.latency_ms);
+    for mut text in &mut line {
+        text.0 = format!(
+            "gpu {:5.2} idle {:4.2} rec {:4.2} lat {:5.1}",
+            ms("span"),
+            ms("idle"),
+            p.cpu_record,
+            lat
+        );
     }
 }
 

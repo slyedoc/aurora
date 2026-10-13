@@ -241,6 +241,8 @@ struct AeGpu {
     input_exposure: f32,
     /// The full metering, written by `ae_resolve`; the CPU eases `input_ev` towards it.
     metered: f32,
+    /// 0 until the look has jumped to its first real metering (`ae_resolve`).
+    settled: u32,
 }
 
 /// Must match `AeParams` in auto_exposure.slang.
@@ -266,10 +268,8 @@ struct AeParams {
     reference_ev: f32,
     adaptation: f32,
     max_dim: f32,
-    /// 1 on a view's first metered frame: the look starts at its target.
-    snap: u32,
     /// Keeps the struct free of implicit tail padding (u64 alignment) for `Pod`.
-    _pad: u32,
+    _pad: [u32; 2],
 }
 
 /// One camera's metering: its own luminance buffer and adaptation state.
@@ -296,8 +296,12 @@ struct ViewExposure {
     /// per change; telling NGX the pre-exposure shifts its output but keeps the transient),
     /// so it changes only as fast as the picture does: never under a fixed look.
     input_ev: Option<f32>,
-    /// The look has started at its first metering (no fade up from the reference).
-    settled: bool,
+    /// The input exposure for the frame being recorded, `[ev, exp2(ev)]`: written by
+    /// [`Self::latch`] after the previous frame's wait (it needs that frame's readback), copied
+    /// into `state` by the recorded commands.
+    latch: Buffer<[f32; 2]>,
+    /// What [`Self::latch`] eases the input with: the look, its speed and the frame's dt.
+    pending: Option<(AuroraExposure, f32, f32)>,
 }
 
 impl ViewExposure {
@@ -379,13 +383,26 @@ impl ViewExposure {
         });
     }
 
-    /// Writes this frame's input exposure into the state (after `ae_resolve`) and copies the
-    /// state out for next frame's read.
+    /// After the previous frame's wait: reads its probe and look back, eases the input
+    /// exposure and writes it where this frame's recorded copy picks it up.
+    fn latch(&mut self, rd: &RenderDevice) {
+        self.read_probe(rd);
+        if let Some((exposure, speed, dt)) = self.pending.take() {
+            self.update_input(rd, &exposure, speed, dt);
+        }
+        if let Some(ev) = self.input_ev
+            && self.latch.handle != vk::Buffer::null()
+        {
+            rd.map_buffer(&mut self.latch)[0] = [ev, ev.exp2()];
+        }
+    }
+
+    /// Copies this frame's input exposure (latched after the previous frame's wait) into the
+    /// state (after `ae_resolve`) and copies the state out for next frame's read.
     fn write_input(&self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
-        let Some(ev) = self.input_ev else {
+        if self.input_ev.is_none() {
             return;
-        };
-        let input = [ev, ev.exp2()];
+        }
         memory_barrier(
             rd,
             cmd,
@@ -395,11 +412,13 @@ impl ViewExposure {
             vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::TRANSFER_READ,
         );
         unsafe {
-            rd.device.cmd_update_buffer(
+            rd.device.cmd_copy_buffer(
                 cmd,
+                self.latch.handle,
                 self.state.handle,
-                std::mem::offset_of!(AeGpu, input_ev) as u64,
-                bytemuck::cast_slice(&input),
+                &[vk::BufferCopy::default()
+                    .dst_offset(std::mem::offset_of!(AeGpu, input_ev) as u64)
+                    .size(size_of::<[f32; 2]>() as u64)],
             );
         }
         memory_barrier(
@@ -442,6 +461,7 @@ impl ViewExposure {
             input_ev: ev,
             input_exposure: ev.exp2(),
             metered: ev,
+            settled: 0,
         };
         unsafe {
             rd.device
@@ -473,7 +493,6 @@ impl ViewExposure {
         exposure: &AuroraExposure,
         dt: f32,
     ) {
-        self.read_probe(rd);
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::TRANSFER_SRC;
@@ -485,6 +504,7 @@ impl ViewExposure {
                 vk::BufferUsageFlags::TRANSFER_DST,
             );
             self.readback = rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_DST);
+            self.latch = rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_SRC);
             unsafe {
                 rd.device
                     .cmd_fill_buffer(cmd, self.histogram.handle, 0, vk::WHOLE_SIZE, 0);
@@ -518,11 +538,11 @@ impl ViewExposure {
                 .clamp(settings.min_ev, settings.max_ev);
             self.write_ev(rd, cmd, ev);
             self.input_ev = Some(ev);
-            self.update_input(rd, exposure, settings.input_speed, dt);
+            self.pending = Some((exposure.clone(), settings.input_speed, dt));
             self.write_input(rd, cmd);
             return;
         };
-        self.update_input(rd, exposure, settings.input_speed, dt);
+        self.pending = Some((exposure.clone(), settings.input_speed, dt));
 
         let params = AeParams {
             lum: self.lum.address,
@@ -544,8 +564,7 @@ impl ViewExposure {
             reference_ev: settings.reference_ev,
             adaptation: settings.adaptation.clamp(0.0, 1.0),
             max_dim: settings.max_dim.max(0.0),
-            snap: !std::mem::replace(&mut self.settled, true) as u32,
-            _pad: 0,
+            _pad: [0; 2],
         };
 
         // Last frame's raygen wrote `lum`; this frame's raygen reads the exposure. The
@@ -599,6 +618,7 @@ impl ViewExposure {
             self.state.handle,
             self.probe.handle,
             self.readback.handle,
+            self.latch.handle,
         ] {
             rd.destroyer.destroy_buffer(handle);
         }
@@ -652,6 +672,14 @@ impl AutoExposureState {
         let view = self.views.entry(camera).or_default();
         view.record(rd, cmd, module, extent, exposure, dt);
         view.addresses()
+    }
+
+    /// After the previous frame's wait, before this frame's submit: every camera's readback
+    /// read and input exposure latched (see `ViewExposure::latch`).
+    pub fn latch(&mut self, rd: &RenderDevice) {
+        for view in self.views.values_mut() {
+            view.latch(rd);
+        }
     }
 
     pub fn set_primary(&mut self, camera: Option<Entity>) {

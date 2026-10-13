@@ -46,8 +46,8 @@ struct Session {
     path: PathBuf,
     extent: vk::Extent2D,
     buffers: [Buffer<u8>; 2],
-    /// The buffer filled last frame, and how many output slots it covers.
-    pending: Option<(usize, u32)>,
+    /// Copies recorded and not yet sent: (frame, buffer, output slots it covers), oldest first.
+    pending: Vec<(usize, usize, u32)>,
     next: usize,
     started: Instant,
     slots_written: u64,
@@ -83,9 +83,16 @@ impl VideoRecorder {
         matches!(self.request, Some(Request::Start(_))) || self.session.is_some()
     }
 
-    /// Render side, once per presented frame after the previous frame's fence: hands last
-    /// frame's capture to the encoder, applies a start/stop, and copies this frame out of the
-    /// swapchain image (in TRANSFER_SRC_OPTIMAL) when one is due. Returns whether it copied.
+    /// After frame `done`'s wait: its captures (and older) go to the encoder.
+    pub(crate) fn latch(&mut self, rd: &RenderDevice, done: usize) {
+        if let Some(session) = self.session.as_mut() {
+            session.flush(rd, done);
+        }
+    }
+
+    /// Render side, once per presented frame `frame`: applies a start/stop, and copies the
+    /// frame out of the swapchain image (in TRANSFER_SRC_OPTIMAL) when one is due; [`Self::latch`]
+    /// hands it to the encoder once the frame has finished. Returns whether it copied.
     pub(crate) fn record(
         &mut self,
         rd: &RenderDevice,
@@ -93,10 +100,8 @@ impl VideoRecorder {
         image: vk::Image,
         extent: vk::Extent2D,
         format: vk::Format,
+        frame: usize,
     ) -> bool {
-        if let Some(session) = self.session.as_mut() {
-            session.flush(rd);
-        }
         match self.request.take() {
             Some(Request::Start(path)) => {
                 self.finish(rd);
@@ -141,7 +146,7 @@ impl VideoRecorder {
                 std::slice::from_ref(&region),
             );
         }
-        session.pending = Some((i, repeat));
+        session.pending.push((frame, i, repeat));
         true
     }
 
@@ -153,10 +158,10 @@ impl VideoRecorder {
     fn finish(&mut self, rd: &RenderDevice) {
         if let Some(mut session) = self.session.take() {
             // The last copy may still be in flight: drain it before reading.
-            if session.pending.is_some() {
+            if !session.pending.is_empty() {
                 let _queue = rd.queue.lock().unwrap();
                 let _ = unsafe { rd.device.device_wait_idle() };
-                session.flush(rd);
+                session.flush(rd, usize::MAX);
             }
             let Session {
                 path,
@@ -256,7 +261,7 @@ impl Session {
             path,
             extent,
             buffers,
-            pending: None,
+            pending: Vec::new(),
             next: 0,
             started: Instant::now(),
             slots_written: 0,
@@ -266,18 +271,22 @@ impl Session {
         })
     }
 
-    /// Sends last frame's capture (landed: the frame's fence has passed) to the encoder.
-    fn flush(&mut self, rd: &RenderDevice) {
-        let Some((i, repeat)) = self.pending.take() else {
-            return;
-        };
-        let repeat = (repeat + self.carry).min(MAX_REPEAT);
-        let bytes = rd.map_buffer(&mut self.buffers[i]).as_slice_mut().to_vec();
-        self.carry = match self.frames.try_send((bytes, repeat)) {
-            Ok(()) => 0,
-            Err(TrySendError::Full(_)) => repeat,
-            Err(TrySendError::Disconnected(_)) => 0,
-        };
+    /// Sends the captures of frames up to `done` (landed: those frames finished) to the
+    /// encoder, in order.
+    fn flush(&mut self, rd: &RenderDevice, done: usize) {
+        while let Some(&(frame, i, repeat)) = self.pending.first() {
+            if frame > done {
+                break;
+            }
+            self.pending.remove(0);
+            let repeat = (repeat + self.carry).min(MAX_REPEAT);
+            let bytes = rd.map_buffer(&mut self.buffers[i]).as_slice_mut().to_vec();
+            self.carry = match self.frames.try_send((bytes, repeat)) {
+                Ok(()) => 0,
+                Err(TrySendError::Full(_)) => repeat,
+                Err(TrySendError::Disconnected(_)) => 0,
+            };
+        }
     }
 }
 
