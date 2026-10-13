@@ -33,7 +33,8 @@ struct QuadPush {
     uint fog;
     // Local tone mapping strength (RenderSettings::local_tonemap); 0 = off.
     float local_tonemap;
-    float pad;
+    // Bloom strength (RenderSettings::bloom); 0 = off.
+    float bloom;
     // The view's auto-exposure meter, (meter, albedo) pairs at render resolution (null = none;
     // auto_exposure.rs): the raygen wrote its noisy meter and the surface's albedo (< 0 = not
     // metered); this pass replaces the meter with what Ray Reconstruction resolved.
@@ -172,6 +173,36 @@ void meterResolved(float2 uv, float3 src, float through, float3 veil, float inpu
     push.lum[i + 1u] = surface + fog;
 }
 
+// Bloom: the lens scattering a share of every pixel's light over its surroundings. Levels 1-6
+// of the output's pyramid (filtered blits), each read as a 9-tap tent a texel apart so the
+// box-filtered levels upsample round and smooth (4 diagonal taps stamped a bright point into an
+// X and left square glows), weighted 0.6x per level: a bright core beside a light
+// and a wide faint skirt -- blurs of growing width summed, the shape of a real lens's glare
+// (equal weights spent most of the light on the widest, where it vanished). Clamped to
+// half-float range (the sun's disc overflows the pyramid).
+float3 bloomAt(float2 uv) {
+    uint w, h, levels;
+    test[9].GetDimensions(0, w, h, levels);
+    let top = min(6, int(levels) - 1);
+    var sum = float3(0.0);
+    var n = 0.0;
+    for (int l = 1; l <= top; l++) {
+        let t = exp2(float(l)) / float2(float(w), float(h));
+        let level = float(l);
+        var s = float3(0.0);
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                let k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+                s += test[9].SampleLevel(uv + float2(float(x), float(y)) * t, level).rgb * k;
+            }
+        }
+        let wl = pow(0.6, float(l - 1));
+        sum += min(s / 16.0, float3(65504.0)) * wl;
+        n += wl;
+    }
+    return n > 0.0 ? sum / n : float3(0.0);
+}
+
 float3 acesFilm(float3 x) {
     let a = 2.51;
     let b = 0.03;
@@ -271,7 +302,10 @@ float4 fragment([[vk::location(0)]] float2 uv : TEXCOORD0) : SV_Target0 {
     if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u) {
         surface *= localGain(uv, look / input, push.local_tonemap);
     }
-    let exposed = (surface + veil) * (look / input);
+    var exposed = (surface + veil) * (look / input);
+    if (push.bloom > 0.0 && view == 0u && push.fog != 0u) {
+        exposed = lerp(exposed, bloomAt(uv) * (look / input), push.bloom);
+    }
     var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT]);
     return float4(color, 1.0);

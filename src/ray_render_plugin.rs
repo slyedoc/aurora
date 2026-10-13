@@ -508,6 +508,7 @@ fn render_frame(
     let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
         dev_ui_stuff;
     let local_tonemap = settings.as_ref().map_or(0.0, |s| s.local_tonemap);
+    let bloom = settings.as_ref().map_or(0.0, |s| s.bloom);
     let settings = settings
         .map(|settings| settings.clone())
         .unwrap_or_default();
@@ -1407,7 +1408,7 @@ fn render_frame(
                             scene_radiance: 0,
                             fog: 0,
                             local_tonemap,
-                            _pad: 0.0,
+                            bloom,
                             lum: views[eye].ae.0,
                             lum_width: views[eye].trace_extent.width,
                             lum_height: views[eye].trace_extent.height,
@@ -1495,7 +1496,7 @@ fn render_frame(
                             scene_radiance: 0,
                             fog: 0,
                             local_tonemap,
-                            _pad: 0.0,
+                            bloom,
                             lum: view.ae.0,
                             lum_width: view.trace_extent.width,
                             lum_height: view.trace_extent.height,
@@ -1654,7 +1655,7 @@ fn render_frame(
                             scene_radiance: 0,
                             fog: 0,
                             local_tonemap,
-                            _pad: 0.0,
+                            bloom,
                             lum: view.ae.0,
                             lum_width: view.trace_extent.width,
                             lum_height: view.trace_extent.height,

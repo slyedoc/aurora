@@ -99,6 +99,12 @@ pub struct RenderSettings {
     /// back sunlit ground in one view; a frame dark all over keeps its exposure.
     #[reflect(@0.0..=1.0_f32)]
     pub local_tonemap: f32,
+    /// Bloom and glare: the share of each pixel's light spread over its surroundings (a lens's
+    /// scatter: the output's mip pyramid, levels 1-6 averaged). Energy-conserving -- it moves
+    /// light, so the sun, lamps and sunlit leaves spill into what is around them and nothing
+    /// brightens overall. 0 = off.
+    #[reflect(@0.0..=0.3_f32)]
+    pub bloom: f32,
 }
 
 impl Default for RenderSettings {
@@ -128,6 +134,7 @@ impl Default for RenderSettings {
             rr_preset: RrPreset::current(),
             jitter_scale: 1.0,
             local_tonemap: 0.4,
+            bloom: 0.06,
         }
     }
 }

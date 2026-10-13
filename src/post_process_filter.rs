@@ -20,7 +20,8 @@ pub struct PostProcessPushConstants {
     pub fog: u32,
     /// `RenderSettings::local_tonemap`.
     pub local_tonemap: f32,
-    pub _pad: f32,
+    /// `RenderSettings::bloom`.
+    pub bloom: f32,
     /// The view's auto-exposure meter buffer (render resolution, 0 = none): the pass meters what
     /// Ray Reconstruction resolved into it, over the raygen's own noisy meter.
     pub lum: u64,
