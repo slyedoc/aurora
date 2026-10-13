@@ -441,6 +441,10 @@ LightCtx lightCtx() {
 static const uint SHARC_ENTRIES = 1u << 20;
 // The share of paths that never query the cache (they train it).
 static const float SHARC_TRAIN = 0.125;
+// Cache vertices a path records (its vertices past the camera's): all of max_bounces 4's.
+// Deeper paths' later vertices only read the cache. Every slot is live across every trace,
+// and the raygen's stack is what the trace's time follows (4 slots: +0.17 ms at 3840x1080).
+static const uint SHARC_VERTICES = 3u;
 
 // The voxel size at a point: `sharc_voxel` near the camera, doubling per distance octave
 // past 8 m.
@@ -1056,11 +1060,13 @@ void main() {
     }
 
     var acc = float3(0.0);
-    // The camera ray's fog for the composite (`guide_fog`), averaged over the samples; none:
-    // nothing over the colour.
-    var fog_out = float3(0.0);
-    var fog_out_t = 0.0;
+    // The camera ray's fog for the composite, averaged over the samples, gathers in `guide_fog`
+    // itself (pre-exposed light, transmittance): kept in registers it was live across every
+    // trace, and the raygen's stack is what the trace's time follows. None: nothing over the
+    // colour.
+    guide_fog[px] = float4(0.0);
     let SAMPLES = pc.uniforms.samples;
+    let fog_scale = pc.ae.input_exposure / float(SAMPLES);
     let MAX_BOUNCES = pc.uniforms.max_bounces;
     // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
     // (0.18 / exposure), so it tracks the scene -- a sky, or a ceiling panel in a closed room.
@@ -1107,9 +1113,9 @@ void main() {
         // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
         // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
         // once the path ends.
-        uint sh_slot[4];
-        float3 sh_mask[4];
-        float3 sh_acc[4];
+        uint sh_slot[SHARC_VERTICES];
+        float3 sh_mask[SHARC_VERTICES];
+        float3 sh_acc[SHARC_VERTICES];
         var sh_n = 0u;
         // One path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
         // cache learns from (answered paths only pass on what it already knows).
@@ -1124,9 +1130,7 @@ void main() {
         // DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
         // alpha-cutout edges first).
         var guides_written = false;
-        // The camera ray's fog: kept out of Ray Reconstruction's colour at any sample count,
-        // its light and transmittance go to `guide_fog` for the composite.
-        var fog_light = float3(0.0);
+        // The camera ray's fog transmittance so far; its light goes to `guide_fog`.
         var fog_t = 1.0;
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
@@ -1340,7 +1344,10 @@ void main() {
                 }
                 // The surface behind reaches RR unveiled; the composite applies both.
                 let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
-                fog_light += fog_t * fog_acc;
+                if (any(fog_acc > float3(0.0))) {
+                    let g = guide_fog[px];
+                    guide_fog[px] = float4(min(g.rgb + fog_t * fog_acc * fog_scale, float3(65504.0)), g.a);
+                }
                 fog_t *= seg_t;
             } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
@@ -1543,7 +1550,7 @@ void main() {
                             break;
                         }
                     }
-                    if (sh_n < 4u) {
+                    if (sh_n < SHARC_VERTICES) {
                         sh_slot[sh_n] = slot;
                         sh_mask[sh_n] = mask;
                         sh_acc[sh_n] = acc;
@@ -1835,8 +1842,10 @@ void main() {
         }
 
         // Averaged over the samples, like the colour.
-        fog_out += fog_light / float(SAMPLES);
-        fog_out_t += fog_t / float(SAMPLES);
+        {
+            let g = guide_fog[px];
+            guide_fog[px] = float4(g.rgb, g.a + fog_t / float(SAMPLES));
+        }
 
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
@@ -1861,6 +1870,9 @@ void main() {
     // skipped) and the raw nits for the panel readout.
     // Meter what is seen: the surface through the fog plus the fog (composited after Ray
     // Reconstruction; metered without it, the exposure ignored the veil and it blew out).
+    let fog = guide_fog[px];
+    let fog_out = fog.rgb / max(pc.ae.input_exposure, 1.0e-20);
+    let fog_out_t = fog.a;
     let lum_nits = dot(float3(0.2125, 0.7154, 0.0721), mean * fog_out_t + fog_out);
     let lum_at = 2u * (uint(px.y) * launch_size.x + uint(px.x));
     // The incident meter: the surface's light over its albedo, the fog's as is (it reflects
@@ -1878,6 +1890,4 @@ void main() {
     // Finite and inside f16 range.
     let radiance = clamp(mean * pc.ae.input_exposure, float3(0.0), float3(65504.0));
     dlss_color[px] = float4(radiance, 1.0);
-    guide_fog[px] = float4(clamp(fog_out * pc.ae.input_exposure, float3(0.0), float3(65504.0)),
-                           fog_out_t);
 }

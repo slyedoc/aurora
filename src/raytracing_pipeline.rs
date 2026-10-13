@@ -596,7 +596,19 @@ impl VulkanAsset for RaytracingPipeline {
         let shadow_hit_handle = handles[shadow_hit_group];
         let shadow_empty_handle = handles[shadow_empty_group];
 
-        log::debug!("Raytracing pipeline compiled in {:?}", start.elapsed());
+        let raygen_stack = unsafe {
+            render_device
+                .ext_rtx_pipeline
+                .get_ray_tracing_shader_group_stack_size(
+                    pipeline,
+                    0,
+                    vk::ShaderGroupShaderKHR::GENERAL,
+                )
+        };
+        log::debug!(
+            "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B",
+            start.elapsed()
+        );
         render_device.save_pipeline_cache();
 
         CompiledRaytracingPipeline {
