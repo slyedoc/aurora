@@ -81,11 +81,12 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             let incidence = max(abs(dot(hit.surface_normal, WorldRayDirection())), 0.1);
             let footprint = coneWidth(payload) / incidence;
 
-            // No tangents on the tiles: +X projected onto the normal.
+            // No tangents on the tiles: +X projected onto the normal; the bitangent as the
+            // meshes build it (surface.slang), so a normal map's +Y is the top of its image.
             let n = hit.surface_normal;
             let reference = abs(n.x) > 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
             let tangent = normalize(reference - n * dot(reference, n));
-            let bitangent = cross(tangent, n);
+            let bitangent = cross(n, tangent);
 
             var a = float3(0.0);
             var rough = 0.0;
