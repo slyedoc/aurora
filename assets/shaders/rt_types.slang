@@ -232,6 +232,9 @@ public struct UniformData {
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
     // One shadow ray per vertex from this bounce on.
     public uint one_shadow_ray_from;
+    // The grid's columns summed front to back (`fog_integrate`): per cell, the in-scatter and
+    // transmittance from the grid's eye to the cell's far side.
+    public float4* fog_grid_sum;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -327,6 +330,10 @@ public struct Reservoir {
     public uint normal_pk;
     public float depth;
     public uint frame;
+    // The winner's target at this reservoir's own surface and the density its light's sampling
+    // map put the point there with, so spatial reuse never re-evaluates them.
+    public float phat;
+    public float density;
 };
 
 // `slot_to_linst` values with this bit are a sphere emitter's ANALYTIC entry, not a light

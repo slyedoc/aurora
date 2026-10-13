@@ -884,6 +884,100 @@ void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
     mask *= T;
 }
 
+// One thread per grid column, after `fog_grid`: front to back through its slices (density
+// at each slice's centre, light from this frame's grid as the march reads it), the running
+// in-scatter and transmittance stored per cell at its far side.
+[shader("raygeneration")]
+void fog_integrate() {
+    let size = fogGridSize();
+    let id = DispatchRaysIndex().xy;
+    if (pc.uniforms.fog_grid_cells == 0u || id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    let env = pc.uniforms.environments + pc.uniforms.environment;
+    let dist = env.fog_grid_distance;
+    let uv = (float2(id) + 0.5) / float2(size.xy);
+    let cam = fogGridPoint(uv, 0.0, dist);
+    // Metres along the column per metre of view depth.
+    let stretch = length(fogGridPoint(uv, 1.0, dist) - cam) / dist;
+    let slices = float(size.z);
+    var T = 1.0;
+    var L = float3(0.0);
+    var prev = 0.0;
+    for (uint k = 0u; k < size.z; k++) {
+        let f = float(k + 1u) / slices;
+        let depth = dist * f * f;
+        let dt = (depth - prev) * stretch;
+        prev = depth;
+        let s = (float(k) + 0.5) / slices;
+        let sigma = fogDensityAt(env, fogGridPoint(uv, s, dist), true);
+        if (sigma > 0.0) {
+            let step_t = exp(-sigma * dt);
+            let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
+                                       float3(float2(id) + 0.5, float(k) + 0.5)).rgb;
+            L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
+            T *= step_t;
+        }
+        pc.uniforms.fog_grid_sum[(k * size.y + id.y) * size.x + id.x] = float4(L, T);
+    }
+}
+
+// The fog from the grid's eye to `x` (in-scatter, transmittance): the column sums, bilinear
+// across columns and linear between slice sides; past the grid the far slice's light and the
+// density half way out cover the rest in one step.
+float4 fogGridSumAt(EnvironmentGpu* env, float3 x) {
+    let size = fogGridSize();
+    let dist = env.fog_grid_distance;
+    let clip = mat4MulVec(pc.uniforms.fog_grid_view_proj, float4(x, 1.0));
+    let w = max(clip.w, 1.0e-4);
+    let uv = clip.xy / w * 0.5 + 0.5;
+    let z = sqrt(saturate(w / dist)) * float(size.z);
+    let k0 = min(uint(z), size.z - 1u);
+    let fz = z - float(k0);
+    let p = uv * float2(size.xy) - 0.5;
+    let b = int2(floor(p));
+    let f = p - float2(b);
+    let hi = int2(size.xy) - 1;
+    var r = float4(0.0);
+    for (uint c = 0u; c < 4u; c++) {
+        let o = int2(int(c & 1u), int(c >> 1u));
+        let q = clamp(b + o, int2(0), hi);
+        let wxy = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        let col = uint(q.y) * size.x + uint(q.x);
+        let slice = size.x * size.y;
+        let near = k0 == 0u ? float4(0.0, 0.0, 0.0, 1.0) : pc.uniforms.fog_grid_sum[(k0 - 1u) * slice + col];
+        let far = pc.uniforms.fog_grid_sum[k0 * slice + col];
+        r += wxy * lerp(near, far, fz);
+    }
+    if (clip.w > dist) {
+        let cam = mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+        let xm = cam + (x - cam) * (0.5 * (dist + clip.w) / clip.w);
+        let sigma = fogDensityAt(env, xm, true);
+        if (sigma > 0.0) {
+            let step_t = exp(-sigma * length(x - cam) * (clip.w - dist) / clip.w);
+            let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
+                                       fogGridCoord(pc.uniforms.fog_grid_view_proj, xm, size, dist)).rgb;
+            r.rgb += r.a * FOG_ALBEDO * Ls * (1.0 - step_t);
+            r.a *= step_t;
+        }
+    }
+    return r;
+}
+
+// A camera ray segment's fog from the column sums: what lies between its two ends, as
+// fogMarchGrid leaves it (in-scatter into `acc`, transmittance into `mask`).
+void fogGridSegment(EnvironmentGpu* env, float3 o, float3 d, float seg,
+                    inout float3 mask, inout float3 acc) {
+    if (fogMajorant(env, o, d, seg, true) * seg <= 1.0e-6) {
+        return;
+    }
+    let a = fogGridSumAt(env, o);
+    let b = fogGridSumAt(env, o + d * seg);
+    let ta = max(a.a, 1.0e-6);
+    acc += mask * max(b.rgb - a.rgb, float3(0.0)) / ta;
+    mask *= saturate(b.a / ta);
+}
+
 // ReSTIR DI's shading (src/restir.rs), after its compute passes: the pixel's final reservoir
 // gets one shadow ray; visible, its contribution goes into the noisy colour (pre-exposed like
 // the main pass's). An occluded winner is NOT zeroed for reuse: carried forward, the zero
@@ -1233,7 +1327,13 @@ void main() {
                 var fog_acc = float3(0.0);
                 if (seg > 0.0 && in_view && pc.uniforms.fog_grid_cells > 0u
                     && pc.uniforms.fog_grid_fresh == 0u) {
-                    fogMarchGrid(env, origin, direction, seg, payload.t > 0.0, fog_mask, fog_acc);
+                    // A surface's segment takes the column sums; one to the sky only its
+                    // volumes, which the sums (environment fog included) cannot leave out.
+                    if (payload.t > 0.0) {
+                        fogGridSegment(env, origin, direction, seg, fog_mask, fog_acc);
+                    } else {
+                        fogMarchGrid(env, origin, direction, seg, false, fog_mask, fog_acc);
+                    }
                 } else if (seg > 0.0) {
                     fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
                              payload.t > 0.0, fog_mask, fog_acc, payload);

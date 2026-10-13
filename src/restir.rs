@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// `Reservoir` and `RestirSurface` in rt_types.slang.
-const RESERVOIR_BYTES: u64 = 32;
+const RESERVOIR_BYTES: u64 = 40;
 const SURFACE_BYTES: u64 = 96;
 /// The light grid's cells (x, y, z) around the camera.
 const GRID: [u32; 3] = [32, 8, 32];

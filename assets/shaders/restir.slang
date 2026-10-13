@@ -137,6 +137,8 @@ Reservoir emptyReservoir(RestirFrame* f, RestirSurface s) {
     r.normal_pk = s.normal_oct;
     r.depth = s.depth;
     r.frame = f.frame;
+    r.phat = 0.0;
+    r.density = 0.0;
     return r;
 }
 
@@ -145,6 +147,20 @@ bool similar(RestirSurface s, uint normal_oct, float depth) {
     let n0 = oct_to_float32x3(unpackHalf2(s.normal_oct));
     let n1 = oct_to_float32x3(unpackHalf2(normal_oct));
     return dot(n0, n1) > 0.9 && abs(depth - s.depth) < 0.1 * s.depth;
+}
+
+// The target of sample (entry, uv) at surface `s` (0 for an empty sample), and the area density
+// with which the light's sampling map put that uv's point there (the CDF pick divided out).
+float targetAt(LightCtx ctx, RestirSurface s, uint e, uint uv_pk, out float density) {
+    density = 0.0;
+    if (e == NO_ENTRY) {
+        return 0.0;
+    }
+    float p_area_cdf, p_cdf, dist;
+    float3 dir;
+    let phat = restirLuma(restirTarget(ctx, s, e, uv_pk, p_area_cdf, p_cdf, dir, dist));
+    density = p_cdf > 0.0 ? p_area_cdf / p_cdf : 0.0;
+    return phat;
 }
 
 [shader("compute")]
@@ -169,6 +185,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     var sel_y = NO_ENTRY;
     var sel_uv = 0u;
     var sel_phat = 0.0;
+    var sel_dens = 0.0;
     var wsum = 0.0;
     for (uint c = 0u; c < N; c++) {
         uint e;
@@ -201,6 +218,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
             sel_y = e;
             sel_uv = uv_pk;
             sel_phat = phat;
+            sel_dens = p_area_cdf / p_cdf;
         }
     }
     // RIS over N folds into one sample: M = 1, W = wsum / (N phat).
@@ -209,6 +227,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     var r_wsum = sel_phat * W0;
     var r_M = 1.0;
     var r_phat = sel_phat;
+    var r_dens = sel_dens;
     r.y = sel_y;
     r.uv_pk = sel_uv;
 
@@ -222,10 +241,9 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
             && similar(s, prev.normal_pk, prev.depth)) {
             let Mprev = min(prev.M, f.m_cap);
             var phat = 0.0;
+            var dens = 0.0;
             if (prev.W > 0.0 && prev.y != NO_ENTRY) {
-                float p_area_cdf, p_cdf, dist;
-                float3 dir;
-                phat = restirLuma(restirTarget(ctx, s, prev.y, prev.uv_pk, p_area_cdf, p_cdf, dir, dist));
+                phat = targetAt(ctx, s, prev.y, prev.uv_pk, dens);
             }
             if (phat > 0.0) {
                 let w = phat * prev.W * Mprev;
@@ -234,6 +252,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
                     r.y = prev.y;
                     r.uv_pk = prev.uv_pk;
                     r_phat = phat;
+                    r_dens = dens;
                 }
             }
             r_M += Mprev;
@@ -241,29 +260,14 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     }
     r.M = min(r_M, f.m_cap);
     r.W = (r_phat > 0.0 && r_M > 0.0) ? r_wsum / (r_M * r_phat) : 0.0;
+    r.phat = r_phat;
+    r.density = r_dens;
     if (r.W <= 0.0) {
         r.y = NO_ENTRY;
+        r.phat = 0.0;
+        r.density = 0.0;
     }
     f.temporal[idx] = r;
-}
-
-// The target of sample (entry, uv) at surface `s` (0 for an empty sample), and the area density
-// with which the light's sampling map put that uv's point there (the CDF pick divided out).
-float targetAt(LightCtx ctx, RestirSurface s, uint e, uint uv_pk, out float density) {
-    density = 0.0;
-    if (e == NO_ENTRY) {
-        return 0.0;
-    }
-    float p_area_cdf, p_cdf, dist;
-    float3 dir;
-    let phat = restirLuma(restirTarget(ctx, s, e, uv_pk, p_area_cdf, p_cdf, dir, dist));
-    density = p_cdf > 0.0 ? p_area_cdf / p_cdf : 0.0;
-    return phat;
-}
-
-float targetAt(LightCtx ctx, RestirSurface s, uint e, uint uv_pk) {
-    float density;
-    return targetAt(ctx, s, e, uv_pk, density);
 }
 
 static const uint MAX_SPATIAL = 16;
@@ -317,41 +321,58 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
 
     let Mc = max(own.M, 0.0);
     let own_valid = own.y != NO_ENTRY && own.W > 0.0;
-    let pc_yc = own_valid ? targetAt(ctx, s, own.y, own.uv_pk) : 0.0;
     var r = emptyReservoir(f, s);
     var r_wsum = 0.0;
     var r_phat = 0.0;
+    var r_dens = 0.0;
     var r_M = Mc;
     var mc_sum = 0.0;  // sum over i of (1 - a_i(y_c))
     var neighbour_c = 0.0;
-    for (uint j = 0u; j < k; j++) {
-        let qi = picked[j];
-        let qs = f.surfaces[qi];
-        let nr = f.temporal[qi];
-        let Mi = nr.M;
-        r_M += Mi;
-        // The canonical sample's share against this neighbour.
-        if (own_valid) {
-            let pi_yc = targetAt(ctx, qs, own.y, own.uv_pk);
-            let den = Mi * pi_yc + Mc * pc_yc;
-            mc_sum += den > 0.0 ? (Mc * pc_yc) / den : 1.0;
+    // The targets left to evaluate, as one job each through ONE call site (restirTarget
+    // inlined once: four copies overflowed the instruction cache), lanes in step: per
+    // neighbour, the canonical sample at its surface, then its sample here. A sample at its
+    // own surface comes with its reservoir (phat, density).
+    let pc_yc = own_valid ? own.phat : 0.0;
+    var nr = own;
+    var qs = s;
+    var pc_yi = 0.0;
+    [loop]
+    for (uint n = 0u; n < 2u * k; n++) {
+        let here = (n & 1u) == 1u;
+        if (!here) {
+            let qi = picked[n >> 1u];
+            qs = f.surfaces[qi];
+            nr = f.temporal[qi];
+            r_M += nr.M;
         }
-        // The neighbour's sample.
-        if (nr.y == NO_ENTRY || nr.W <= 0.0) {
+        let nr_valid = nr.y != NO_ENTRY && nr.W > 0.0;
+        var dens_here = 0.0;
+        var phat = 0.0;
+        if (here ? nr_valid : own_valid) {
+            phat = targetAt(ctx, here ? s : qs, here ? nr.y : own.y,
+                            here ? nr.uv_pk : own.uv_pk, dens_here);
+        }
+        if (!here) {
+            // The canonical sample's share against this neighbour.
+            if (own_valid) {
+                let den = nr.M * phat + Mc * pc_yc;
+                mc_sum += den > 0.0 ? (Mc * pc_yc) / den : 1.0;
+            }
             continue;
         }
-        float dens_here, dens_there;
-        let pc_yi = targetAt(ctx, s, nr.y, nr.uv_pk, dens_here);
+        // The neighbour's sample.
+        pc_yi = phat;
         if (pc_yi <= 0.0 || dens_here <= 0.0) {
             continue;
         }
-        let pi_yi = targetAt(ctx, qs, nr.y, nr.uv_pk, dens_there);
+        let Mi = nr.M;
+        let pi_yi = nr.phat;
         let den = Mi * pi_yi + Mc * pc_yi;
         let ai = den > 0.0 ? (Mi * pi_yi) / den : 0.0;
         // The sample is a uv replayed here, not a fixed point: a sphere lamp's cone sampling
         // lands it elsewhere on the sphere from another surface, so its weight takes the shift's
         // Jacobian, the ratio of the two sampling densities (1 for area-sampled triangles).
-        let jacobian = dens_there / dens_here;
+        let jacobian = nr.density / dens_here;
         let w = (ai / float(k)) * pc_yi * nr.W * jacobian;
         neighbour_c += pc_yi * nr.W;
         r_wsum += w;
@@ -359,6 +380,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
             r.y = nr.y;
             r.uv_pk = nr.uv_pk;
             r_phat = pc_yi;
+            r_dens = dens_here;
         }
     }
     if (own_valid && pc_yc > 0.0) {
@@ -368,6 +390,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
             r.y = own.y;
             r.uv_pk = own.uv_pk;
             r_phat = pc_yc;
+            r_dens = own.density;
         }
     }
 
@@ -383,8 +406,12 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
     // The MIS weights sum to one: no 1/M here.
     r.M = min(r_M, f.m_cap);
     r.W = r_phat > 0.0 ? r_wsum / r_phat : 0.0;
+    r.phat = r_phat;
+    r.density = r_dens;
     if (r.W <= 0.0) {
         r.y = NO_ENTRY;
+        r.phat = 0.0;
+        r.density = 0.0;
     }
     f.final_[idx] = r;
 }

@@ -3,8 +3,9 @@
 //! scatters toward the camera. A headset's two eyes share one, laid out from their mid-point
 //! over a frustum around both ([`grid_view`]). Its own raygen dispatch (`fog_grid` in
 //! raygen.slang, one thread per cell) lights every cell each frame (suns, one sky ray, one
-//! light-table sample) into last frame's reprojected value; then each view's camera ray marches
-//! this frame's grid: its fog costs lookups, not shadow rays.
+//! light-table sample) into last frame's reprojected value; `fog_integrate` then sums each
+//! column front to back, so a camera ray's fog is two lookups (where it starts and ends), not
+//! shadow rays or a march.
 //!
 //! [`Fog::grid_tile`]: crate::sky::Fog::grid_tile
 //! [`Fog::grid_slices`]: crate::sky::Fog::grid_slices
@@ -26,6 +27,8 @@ const CELL_BYTES: u64 = 16;
 #[derive(Default)]
 struct GridView {
     buffers: [Buffer<u8>; 2],
+    /// The column sums: in-scatter and transmittance from the eye to each cell's far side.
+    sum: Buffer<u8>,
     cells: u32,
     /// Last frame's grid view-projection: where the update finds a cell's history.
     prev_view_proj: Option<Mat4>,
@@ -39,6 +42,7 @@ struct GridView {
 pub struct FogGridFrame {
     pub prev: u64,
     pub cur: u64,
+    pub sum: u64,
     pub cells: u32,
     /// Last frame's buffer is not this grid's history (just created).
     pub fresh: bool,
@@ -135,20 +139,20 @@ impl FogGridState {
         let cells = if on { size.x * size.y * size.z } else { 0 };
         let fresh = cells != view.cells;
         if fresh {
-            for b in &view.buffers {
+            for b in view.buffers.iter().chain([&view.sum]) {
                 rd.destroyer.destroy_buffer(b.handle);
             }
-            view.buffers = if cells == 0 {
-                Default::default()
-            } else {
-                let bytes = cells as u64 * CELL_BYTES;
-                let usage =
-                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-                [
-                    rd.create_device_buffer(bytes, usage),
-                    rd.create_device_buffer(bytes, usage),
-                ]
+            let bytes = cells as u64 * CELL_BYTES;
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+            let create = || {
+                if cells == 0 {
+                    Buffer::default()
+                } else {
+                    rd.create_device_buffer(bytes, usage)
+                }
             };
+            view.buffers = [create(), create()];
+            view.sum = create();
             view.cells = cells;
             view.clear = cells != 0;
         }
@@ -162,6 +166,7 @@ impl FogGridState {
         FogGridFrame {
             prev: view.buffers[cur ^ 1].address,
             cur: view.buffers[cur].address,
+            sum: view.sum.address,
             cells,
             fresh,
             size,
@@ -180,7 +185,7 @@ impl FogGridState {
         if view.cells == 0 {
             return;
         }
-        for b in &view.buffers {
+        for b in view.buffers.iter().chain([&view.sum]) {
             rd.destroyer.destroy_buffer(b.handle);
         }
         *view = GridView::default();
@@ -212,7 +217,7 @@ impl FogGridState {
 
 fn cleanup_fog_grid(mut state: ResMut<FogGridState>, render_device: Res<RenderDevice>) {
     for view in &mut state.views {
-        for b in &view.buffers {
+        for b in view.buffers.iter().chain([&view.sum]) {
             render_device.destroyer.destroy_buffer(b.handle);
         }
         *view = GridView::default();

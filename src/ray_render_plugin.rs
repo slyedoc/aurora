@@ -121,6 +121,8 @@ pub struct UniformData {
     fog_grid_size: [u32; 3],
     /// One shadow ray per vertex from this bounce on (`RenderSettings::one_shadow_ray_from`).
     one_shadow_ray_from: u32,
+    /// The grid's columns summed front to back: in-scatter and transmittance per cell.
+    fog_grid_sum: u64,
 }
 
 #[repr(C)]
@@ -943,6 +945,7 @@ fn render_frame(
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
             one_shadow_ray_from: settings.one_shadow_ray_from,
+            fog_grid_sum: grid.sum,
         };
 
         uniform_uploads.push((view.slot, data));
@@ -1297,15 +1300,31 @@ fn render_frame(
                             grid.size.y,
                             grid.size.z,
                         );
-                        prof.end(&render_device, view_cmd, scope);
-                        crate::compute::memory_barrier(
-                            &render_device,
+                        let lit = || {
+                            crate::compute::memory_barrier(
+                                &render_device,
+                                view_cmd,
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                vk::AccessFlags2::SHADER_WRITE,
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                vk::AccessFlags2::SHADER_READ,
+                            )
+                        };
+                        lit();
+                        // Then each column summed front to back: a camera ray's fog is two
+                        // lookups instead of a march.
+                        render_device.ext_rtx_pipeline.cmd_trace_rays(
                             view_cmd,
-                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                            vk::AccessFlags2::SHADER_WRITE,
-                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                            vk::AccessFlags2::SHADER_READ,
+                            &sbt.fog_integrate_region,
+                            &sbt.miss_region,
+                            &sbt.hit_region,
+                            &vk::StridedDeviceAddressRegionKHR::default(),
+                            grid.size.x,
+                            grid.size.y,
+                            1,
                         );
+                        prof.end(&render_device, view_cmd, scope);
+                        lit();
                     }
 
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
@@ -2148,5 +2167,6 @@ mod tests {
         assert_eq!(offset_of!(U, fog_grid_cells), 472);
         assert_eq!(offset_of!(U, fog_grid_inverse_view), 480);
         assert_eq!(offset_of!(U, fog_grid_size), 736);
+        assert_eq!(offset_of!(U, fog_grid_sum), 752);
     }
 }
