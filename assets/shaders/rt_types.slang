@@ -514,6 +514,9 @@ public struct PushConstants {
     // ReSTIR DI's parameter block, this frame's light grid already built (null when off):
     // path vertices past the primary draw their light candidates from it.
     public RestirFrame* restir_frame;
+    // The Cost debug view (null unless shown): words 0-1 the frame's total ns (u64), then
+    // each traced pixel's raygen time in ns (VK_KHR_shader_clock).
+    public uint* cost;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

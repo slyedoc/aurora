@@ -41,6 +41,8 @@ struct QuadPush {
     float* lum;
     uint lum_width;
     uint lum_height;
+    // The Cost view's buffer at the meter's size (null = none; rt_types.slang `cost`).
+    uint* cost;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
@@ -125,6 +127,35 @@ float3 nitsFalseColor(float nits) {
     let f = frac(t);
     let edge = smoothstep(0.0, 0.035, f) * smoothstep(0.0, 0.035, 1.0 - f);
     return c * (0.4 + 0.6 * edge);
+}
+
+// Motion as flow colour: hue the direction, brightness the speed in render pixels per frame on a
+// log scale (1 px dim, 15 px full), still pixels black. The guide holds UV units (raygen.slang).
+float3 motionColor(float2 mv) {
+    uint w, h;
+    test[7].GetDimensions(w, h);
+    let px = mv * float2(float(w), float(h));
+    let speed = length(px);
+    let hue = atan2(px.y, px.x) / (2.0 * 3.14159265) + 0.5;
+    let rgb = saturate(abs(frac(hue + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+    return rgb * saturate(log2(1.0 + speed) / 4.0);
+}
+
+// A pixel's raygen cost in stops against the frame's mean, one band per stop with the edge
+// darkened: blue under the mean, green at it, yellow/orange/red over it, white at 16x or more.
+float3 costFalseColor(float stops) {
+    let t = clamp(stops, -4.0, 4.0);
+    float3 c;
+    if (t < -2.0) c = lerp(float3(0.02, 0.02, 0.10), float3(0.15, 0.15, 0.65), (t + 4.0) * 0.5);
+    else if (t < -1.0) c = lerp(float3(0.15, 0.15, 0.65), float3(0.00, 0.60, 0.90), t + 2.0);
+    else if (t < 0.0) c = lerp(float3(0.00, 0.60, 0.90), float3(0.00, 0.85, 0.40), t + 1.0);
+    else if (t < 1.0) c = lerp(float3(0.00, 0.85, 0.40), float3(0.85, 0.95, 0.00), t);
+    else if (t < 2.0) c = lerp(float3(0.85, 0.95, 0.00), float3(1.00, 0.60, 0.00), t - 1.0);
+    else if (t < 3.0) c = lerp(float3(1.00, 0.60, 0.00), float3(1.00, 0.10, 0.05), t - 2.0);
+    else c = lerp(float3(1.00, 0.10, 0.05), float3(1.00, 1.00, 1.00), t - 3.0);
+    let f = frac(t);
+    let edge = smoothstep(0.0, 0.035, f) * smoothstep(0.0, 0.035, 1.0 - f);
+    return saturate(c) * (0.4 + 0.6 * edge);
 }
 
 // Local tone mapping: a region's surroundings (the output's pyramid at the level ~3 % of the
@@ -280,6 +311,18 @@ float4 fragment(VertexOut v) : SV_Target0 {
     // Reconstruction ingests, pre-exposed at the quantised `input_exposure`; dividing that
     // back out recovers the scene's physical radiance in nits, independent of the look and
     // of whatever the metering is currently doing.
+    // Cost: the raygen's time for the render pixel under this one, against the frame's mean.
+    if (view == 10u) {
+        if (push.cost == nullptr || any(uv < 0.0) || any(uv >= 1.0)) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        let size = uint2(push.lum_width, push.lum_height);
+        let r = min(uint2(uv * float2(size)), size - 1u);
+        let ns = float(push.cost[2u + r.y * size.x + r.x]);
+        let total = float(((uint64_t*)push.cost)[0]);
+        let mean = total / float(size.x * size.y);
+        return float4(costFalseColor(log2(max(ns, 1.0) / max(mean, 1.0))), 1.0);
+    }
     if (view == 9u) {
         let pre = test[1].Sample(uv).rgb;
         let nits = dot(pre, float3(0.2126, 0.7152, 0.0722)) / max(push.ae.input_exposure, 1.0e-12);
@@ -297,7 +340,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
             case 5u: v = test[4].Sample(uv).rgb; break;                        // specular
             case 6u: v = float3(exp2(-test[5].Sample(uv).r / 32.0)); break;    // depth
             case 7u: v = float3(exp2(-test[6].Sample(uv).r / 32.0)); break;    // spec hit
-            default: v = float3(test[7].Sample(uv).rg * 0.1 + 0.5, 0.5); break; // motion
+            default: v = motionColor(test[7].Sample(uv).rg); break;           // motion
         }
         return float4(v, 1.0);
     }

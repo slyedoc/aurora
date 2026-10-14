@@ -2,8 +2,8 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 use bevy::{ecs::system::lifetimeless::SRes, prelude::*};
 
-use crate::descriptor_heap::{Mapping, POST_INPUTS, stage_mapping};
 use crate::color_target::{DISPLAY_FORMAT, FormatPipelines, SCENE_RADIANCE_FORMAT};
+use crate::descriptor_heap::{Mapping, POST_INPUTS, stage_mapping};
 use crate::vulkan_asset::{VulkanAsset, VulkanAssetExt};
 
 /// Must match `QuadPush` in quad.slang.
@@ -29,6 +29,8 @@ pub struct PostProcessPushConstants {
     pub lum: u64,
     pub lum_width: u32,
     pub lum_height: u32,
+    /// The Cost debug view's buffer at the meter's size (0 = none; `RaytracingPushConstants::cost`).
+    pub cost: u64,
 }
 
 /// The post pass's push data: the constants, then the target's block of inputs in the resource

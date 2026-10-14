@@ -29,13 +29,17 @@ pub enum AuroraDebugView {
     Depth,
     /// Specular hit distance, same encoding as depth.
     SpecHit,
-    /// Motion vectors (pixels), `mv * 0.1 + 0.5`.
+    /// Motion vectors as flow colour: hue = direction, brightness = render pixels per frame
+    /// (log, 1..15 px), black = still.
     Motion,
     /// Scene luminance in NITS, false-coloured against the authoring reference bands
     /// (aurora_files/lighting_units.md). The instrument for "is this emitter authored at
     /// the right magnitude, or is the exposure wrong?" -- two independent failures that
     /// look identical through a tonemapper.
     Luminance,
+    /// Raygen time per pixel (VK_KHR_shader_clock) in stops against the frame's mean: blue
+    /// under it, green at it, yellow/orange/red over it, white at 16x. Where the trace's time goes.
+    Cost,
 }
 
 impl AuroraDebugView {
@@ -50,6 +54,7 @@ impl AuroraDebugView {
         Self::SpecHit,
         Self::Motion,
         Self::Luminance,
+        Self::Cost,
     ];
 
     /// The value quad.slang switches on.
@@ -58,7 +63,7 @@ impl AuroraDebugView {
     }
 
     /// `$AURORA_DEBUG_VIEW`
-    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance`),
+    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost`),
     /// else the normal render: lets a headless run capture a guide view.
     pub fn from_env() -> Self {
         match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
@@ -71,6 +76,7 @@ impl AuroraDebugView {
             Some("spec-hit") => Self::SpecHit,
             Some("motion") => Self::Motion,
             Some("luminance") | Some("nits") => Self::Luminance,
+            Some("cost") => Self::Cost,
             _ => Self::None,
         }
     }

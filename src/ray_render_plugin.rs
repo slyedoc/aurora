@@ -1,3 +1,4 @@
+use bevy::tasks::{ComputeTaskPool, TaskPool};
 use bevy::{
     app::AppExit,
     ecs::{message::Messages, schedule::ScheduleLabel},
@@ -5,7 +6,6 @@ use bevy::{
     window::{RawHandleWrapperHolder, WindowCloseRequested},
     winit::DisplayHandleWrapper,
 };
-use bevy::tasks::{ComputeTaskPool, TaskPool};
 use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
@@ -189,6 +189,8 @@ struct ViewFrame {
     lens: crate::render_settings::AuroraLens,
     /// This camera's (luminance, exposure state) addresses, set when its metering records.
     ae: (u64, u64),
+    /// The Cost view's buffer (handle, address); null unless this view shows it.
+    cost: (vk::Buffer, u64),
 }
 
 /// Where a view's composited image lands.
@@ -423,6 +425,9 @@ pub struct Frame {
     pub focus_data: Buffer<FocusData>,
     /// The per-environment sky / sun / fog table, rewritten each frame.
     pub environments: Buffer<EnvironmentGpu>,
+    /// Per view slot, the Cost debug view's buffer: the frame's total ns (two words), then
+    /// each traced pixel's. Made the first time a view shows it.
+    pub cost_buffers: [Buffer<u32>; crate::MAX_VIEWS],
 }
 
 fn render_frame(
@@ -504,7 +509,11 @@ fn render_frame(
 ) {
     let (window, mut swapchain, mut sync, latency) = present;
     if let Some(swapchain) = swapchain.as_deref() {
-        latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::RENDERSUBMIT_START);
+        latency.mark(
+            &render_device,
+            swapchain,
+            vk::LatencyMarkerNV::RENDERSUBMIT_START,
+        );
     }
     let present_id = latency.present_id().filter(|_| swapchain.is_some());
     // Last frame's window size: a view planned against it is clamped again at acquire.
@@ -534,8 +543,14 @@ fn render_frame(
         mut fog_grid,
         mut frame_commands,
     ) = gpu;
-    let (mut dlss, mut prev_view_proj, mut dlss_was_active, camera_targets, mut profiler, mut video) =
-        dlss_stuff;
+    let (
+        mut dlss,
+        mut prev_view_proj,
+        mut dlss_was_active,
+        camera_targets,
+        mut profiler,
+        mut video,
+    ) = dlss_stuff;
 
     let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
         dev_ui_stuff;
@@ -743,6 +758,7 @@ fn render_frame(
                 exposure,
                 lens,
                 ae: (0, 0),
+                cost: (vk::Buffer::null(), 0),
             }
         })
         .collect();
@@ -759,6 +775,23 @@ fn render_frame(
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             );
         }
+    }
+
+    // The Cost view's buffers, at their view's trace size.
+    for view in &mut views {
+        if view.debug_view != crate::debug_view::AuroraDebugView::Cost.shader_index() {
+            continue;
+        }
+        let buffer = &mut frame.cost_buffers[view.slot];
+        let len = 2 + view.trace_extent.width as u64 * view.trace_extent.height as u64;
+        if buffer.nr_elements != len {
+            render_device.destroyer.destroy_buffer(buffer.handle);
+            *buffer = render_device.create_device_buffer(
+                len,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            );
+        }
+        view.cost = (buffer.handle, buffer.address);
     }
 
     // Ensure the focus_data buffer exists
@@ -1259,6 +1292,20 @@ fn render_frame(
                         crate::restir::RestirAddresses::default()
                     };
                     fog_grid.record_clear(&render_device, view_cmd, view.slot);
+                    // The Cost view's frame total, summed into by the raygen.
+                    if view.cost.1 != 0 {
+                        render_device
+                            .device
+                            .cmd_fill_buffer(view_cmd, view.cost.0, 0, 8, 0);
+                        crate::compute::memory_barrier(
+                            &render_device,
+                            view_cmd,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                        );
+                    }
                     let push_constants = RaytracingPushConstants {
                         uniform_buffer: frame.uniform_buffers[view.slot].address,
                         material_buffer: tlas.materials,
@@ -1276,6 +1323,7 @@ fn render_frame(
                         atmo: atmo_address,
                         restir_frame: restir_addresses.frame,
                         instance_slots: tlas.instance_slots,
+                        cost: view.cost.1,
                     };
 
                     push_trace(push_constants);
@@ -1495,6 +1543,7 @@ fn render_frame(
                                 lum: views[eye].ae.0,
                                 lum_width: views[eye].trace_extent.width,
                                 lum_height: views[eye].trace_extent.height,
+                                cost: views[eye].cost.1,
                             },
                         );
                     }
@@ -1579,6 +1628,7 @@ fn render_frame(
                             lum: view.ae.0,
                             lum_width: view.trace_extent.width,
                             lum_height: view.trace_extent.height,
+                            cost: view.cost.1,
                         },
                     );
                 }
@@ -1625,7 +1675,13 @@ fn render_frame(
                     _ => None,
                 };
                 if let Some(xr_state) = spectator {
-                    record_spectator(&render_device, cmd_buffer, xr_state, swapchain_image, window_size);
+                    record_spectator(
+                        &render_device,
+                        cmd_buffer,
+                        xr_state,
+                        swapchain_image,
+                        window_size,
+                    );
                 } else {
                     vk_utils::transition_image_layout(
                         &render_device,
@@ -1679,8 +1735,8 @@ fn render_frame(
                         };
                         let viewport = if xr_frame.is_some() {
                             // Spectator: letterbox the eye image instead of stretching it.
-                            let source_aspect = view.output_extent.width as f32
-                                / view.output_extent.height as f32;
+                            let source_aspect =
+                                view.output_extent.width as f32 / view.output_extent.height as f32;
                             let (w, h) = if source_aspect > window_w / window_h {
                                 (window_w, window_w / source_aspect)
                             } else {
@@ -1755,6 +1811,7 @@ fn render_frame(
                                 lum: view.ae.0,
                                 lum_width: view.trace_extent.width,
                                 lum_height: view.trace_extent.height,
+                                cost: view.cost.1,
                             },
                         );
                     }
@@ -1952,8 +2009,16 @@ fn render_frame(
                 present_id,
             );
             if let Some(swapchain) = swapchain.as_deref() {
-                latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::RENDERSUBMIT_END);
-                latency.mark(&render_device, swapchain, vk::LatencyMarkerNV::PRESENT_START);
+                latency.mark(
+                    &render_device,
+                    swapchain,
+                    vk::LatencyMarkerNV::RENDERSUBMIT_END,
+                );
+                latency.mark(
+                    &render_device,
+                    swapchain,
+                    vk::LatencyMarkerNV::PRESENT_START,
+                );
             }
             prof.note_cpu_record(waited.elapsed().as_secs_f64() * 1.0e3);
             let presented = match (swapchain.as_deref(), presenting) {
@@ -2166,8 +2231,10 @@ pub fn on_shutdown(world: &mut World) {
 
     let frame = world.remove_resource::<Frame>().unwrap();
 
-    for buffer in &frame.uniform_buffers {
-        render_device.destroyer.destroy_buffer(buffer.handle);
+    for buffer in (frame.uniform_buffers.iter().map(|b| b.handle))
+        .chain(frame.cost_buffers.iter().map(|b| b.handle))
+    {
+        render_device.destroyer.destroy_buffer(buffer);
     }
     render_device
         .destroyer

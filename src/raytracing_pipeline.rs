@@ -148,6 +148,9 @@ pub struct RaytracingPushConstants {
     /// ReSTIR DI's parameter block, its light grid built before the trace (`restir`; 0 when
     /// off): path vertices draw light candidates from the grid.
     pub restir_frame: u64,
+    /// The Cost debug view's buffer (0 unless shown): the frame's total ns (u64), then each traced
+    /// pixel's raygen ns.
+    pub cost: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to

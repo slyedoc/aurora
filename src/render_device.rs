@@ -9,11 +9,11 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 use ash::{
     ext::opacity_micromap,
-    nv::low_latency2,
     khr::{
         acceleration_structure, deferred_host_operations, ray_query, ray_tracing_pipeline,
         ray_tracing_position_fetch, surface, swapchain,
     },
+    nv::low_latency2,
 };
 use bevy::prelude::*;
 use crossbeam::channel::Sender;
@@ -174,7 +174,8 @@ impl RenderDevice {
             let ext_swapchain = swapchain::Device::load(&instance, &device);
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::load(&instance, &device);
             let ext_acc_struct = acceleration_structure::Device::load(&instance, &device);
-            let ext_micromap = micromaps.then(|| opacity_micromap::Device::load(&instance, &device));
+            let ext_micromap =
+                micromaps.then(|| opacity_micromap::Device::load(&instance, &device));
             let ext_low_latency =
                 low_latency.then(|| low_latency2::Device::load(&instance, &device));
             let command_pool = create_command_pool(&device, queue_family_idx);
@@ -340,7 +341,9 @@ impl RenderDevice {
 
     /// The descriptor heaps (descriptor_heap.rs).
     pub fn heaps(&self) -> &crate::descriptor_heap::DescriptorHeaps {
-        self.heaps.get().expect("descriptor heaps are made with the device")
+        self.heaps
+            .get()
+            .expect("descriptor heaps are made with the device")
     }
 
     /// Creates an image view and notes how, so descriptors can be written from it.
@@ -874,10 +877,8 @@ unsafe fn create_logical_device(
                 .iter()
                 .any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == name)
         };
-        let low_latency = windowed
-            && xr.is_none()
-            && has(low_latency2::NAME)
-            && has(ash::khr::present_id::NAME);
+        let low_latency =
+            windowed && xr.is_none() && has(low_latency2::NAME) && has(ash::khr::present_id::NAME);
         if low_latency {
             device_extensions.push(low_latency2::NAME.as_ptr());
             device_extensions.push(ash::khr::present_id::NAME.as_ptr());
@@ -933,6 +934,8 @@ unsafe fn create_logical_device(
             "aurora needs VK_EXT_descriptor_heap (NVIDIA driver 610 or newer)"
         );
         device_extensions.push(ash::ext::descriptor_heap::NAME.as_ptr());
+        // The raygen times each pixel for the Cost debug view (debug_view.rs).
+        device_extensions.push(ash::khr::shader_clock::NAME.as_ptr());
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .flags(queue_flags)
             .queue_family_index(queue_family_idx)
@@ -981,6 +984,9 @@ unsafe fn create_logical_device(
             vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
                 .ray_tracing_invocation_reorder(true);
 
+        let mut features_clock =
+            vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_device_clock(true);
+
         let mut features_micromap =
             vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true);
 
@@ -1015,7 +1021,8 @@ unsafe fn create_logical_device(
             .push(&mut features_raytracing_pipeline)
             .push(&mut features_ray_query)
             .push(&mut features_position_fetch)
-            .push(&mut features_reorder);
+            .push(&mut features_reorder)
+            .push(&mut features_clock);
         let mut features_heap =
             vk::PhysicalDeviceDescriptorHeapFeaturesEXT::default().descriptor_heap(true);
         let device_info = device_info.push(&mut features_heap);
@@ -1024,7 +1031,8 @@ unsafe fn create_logical_device(
         } else {
             device_info
         };
-        let mut features_present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut features_present_id =
+            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
         let mut features_internal_sync =
             vk::PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR::default()
                 .internally_synchronized_queues(true);

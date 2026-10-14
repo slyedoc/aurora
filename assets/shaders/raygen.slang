@@ -1050,6 +1050,9 @@ static const uint PATH_GUIDE_LIVE = 128u;
 void main() {
     let launch_id = DispatchRaysIndex().xy;
     let launch_size = DispatchRaysDimensions().xy;
+    // The Cost view's start: the device clock (ns). The subgroup clock is per SM, and a thread
+    // SER moves can end on another SM: a third of the deltas came back negative.
+    let clock_start = getRealtimeClock().x;
     // The camera path's payload, fresh before each of its traces (the bounce loop).
     HitPayload payload;
 
@@ -1903,4 +1906,14 @@ void main() {
     // Finite and inside f16 range.
     let radiance = clamp(mean * pc.ae.input_exposure, float3(0.0), float3(65504.0));
     dlss_color[px] = float4(radiance, 1.0);
+
+    // The Cost view: this pixel's raygen ns, and the frame's total (one atomic per wave).
+    if (pc.cost != nullptr) {
+        let ns = getRealtimeClock().x - clock_start;
+        pc.cost[2u + uint(px.y) * launch_size.x + uint(px.x)] = ns;
+        let total = WaveActiveSum(uint64_t(ns));
+        if (WaveIsFirstLane()) {
+            InterlockedAdd(((uint64_t*)pc.cost)[0], total);
+        }
+    }
 }
