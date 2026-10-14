@@ -216,7 +216,11 @@ float3 localGain(float2 uv, float scale, float strength, Frame f) {
     // The sky keeps its exposure (the depth guide holds 1e7 there; its bilinear blend softens
     // the silhouette): pulled toward a darker frame it went deep blue, and any mismatch of
     // the surroundings at a silhouette showed as a halo.
-    let sky = saturate(test[5].SampleLevel(uv, 0.0).r / 1.0e7);
+    // Faded in by distance (300 m to 3 km), not sky-or-not: the depth guide is traced through
+    // each frame's jitter, and at a far ridge against the sky a hard mask flipped the edge pixels
+    // between the sky's gain and the ground's every frame (boil). Terrain that far keeps the
+    // sky's exposure too, so the two sides of the edge agree.
+    let sky = saturate(log2(test[5].SampleLevel(uv, 0.0).r / 300.0) / log2(10.0));
     return float3(exp2(stops * (1.0 - sky)));
 }
 

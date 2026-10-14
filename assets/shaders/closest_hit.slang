@@ -15,8 +15,12 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
     payload.color = base * sampleLod(material.base_color_texture, hit.uv, hit.lod_base);
     if (material.alpha_cutoff > 0.0) {
         // A cutout's coverage comes from level 0, like the any-hit test: a blurred alpha would
-        // thin foliage out with distance.
-        payload.color.a = base.a * sampleLevel(material.base_color_texture, hit.uv, 0.0).a;
+        // thin foliage out with distance. Binary at the cutoff, the any-hit's own test: the
+        // raygen's pass-through coin on a fractional edge alpha flipped leaf edges between the leaf
+        // and what lies behind it every frame, guides and all, and Ray Reconstruction boiled them
+        // (worst against the sky). The DLSS jitter anti-aliases the hard edge instead.
+        let coverage = base.a * sampleLevel(material.base_color_texture, hit.uv, 0.0).a;
+        payload.color.a = coverage >= material.alpha_cutoff ? 1.0 : 0.0;
     }
     payload.emission = materialEmissive(material)
         * sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base).rgb
