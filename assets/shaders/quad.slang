@@ -138,6 +138,16 @@ float3 nitsFalseColor(float nits) {
     return c * (0.4 + 0.6 * edge);
 }
 
+// Specular hit distance. 0 = not traced (rougher than RenderSettings::spec_hit_roughness: the reflection
+// is pinned to the surface), dark purple; the far value (the probe missed) black; a distance
+// grey like the depth view, white at the surface.
+float3 specHitColor(float t) {
+    if (t <= 0.0) {
+        return float3(0.12, 0.05, 0.18);
+    }
+    return float3(exp2(-t / 32.0));
+}
+
 // Motion as flow colour: hue the direction, brightness the speed in render pixels per frame on a
 // log scale (1 px dim, 15 px full), still pixels black. The guide holds UV units (raygen.slang).
 float3 motionColor(float2 mv) {
@@ -401,7 +411,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
             case 4u: v = test[3].Sample(uv).rgb; break;                        // diffuse
             case 5u: v = test[4].Sample(uv).rgb; break;                        // specular
             case 6u: v = float3(exp2(-test[5].Sample(uv).r / 32.0)); break;    // depth
-            case 7u: v = float3(exp2(-test[6].Sample(uv).r / 32.0)); break;    // spec hit
+            case 7u: v = specHitColor(test[6].Sample(uv).r); break;          // spec hit
             default: v = motionColor(test[7].Sample(uv).rg); break;           // motion
         }
         return float4(v, 1.0);

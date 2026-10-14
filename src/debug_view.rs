@@ -27,7 +27,8 @@ pub enum AuroraDebugView {
     Specular,
     /// Linear depth, `exp2(-d / 32)`.
     Depth,
-    /// Specular hit distance, same encoding as depth.
+    /// Specular hit distance, grey like depth; dark purple = not traced (rougher than
+    /// `RenderSettings::spec_hit_roughness`), black = the mirror probe missed.
     SpecHit,
     /// Motion vectors as flow colour: hue = direction, brightness = render pixels per frame
     /// (log, 1..15 px), black = still.
