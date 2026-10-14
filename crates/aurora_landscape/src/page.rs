@@ -5,7 +5,14 @@
 //! reading the GPU's upload memory back is uncached and takes seconds).
 
 use ash::vk;
-use bevy::{asset::LoadState, ecs::lifecycle::Remove, platform::collections::HashSet, prelude::*};
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use bevy::{
+    asset::LoadState,
+    ecs::lifecycle::Remove,
+    platform::collections::{HashMap, HashSet},
+    prelude::*,
+};
 use bevy_aurora::{
     compute::{ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch},
     render_buffer::{Buffer, BufferProvider, BufferView},
@@ -23,6 +30,7 @@ use crate::{
         MaterialFootprint, MaterialLayer, MaterialRuleLayer, SplatmapLayer, SplatmapSource,
     },
     sculpt::{PaintPages, SculptPages},
+    shading::HOLE,
 };
 
 const PAGE_LEN: usize = (PAGE_TEXELS * PAGE_TEXELS) as usize;
@@ -128,6 +136,17 @@ pub struct LandscapePages {
     pub(crate) baked: Option<AssetId<crate::bake::BakedPages>>,
     /// The last bake applied or passed over, so it is not applied again.
     pub(crate) bake_seen: Option<AssetId<crate::bake::BakedPages>>,
+    /// Each page's hole texels as last seen (a hash; absent = none yet), so tiles and colliders
+    /// rebuild when holes change rather than on every paint stroke.
+    pub(crate) hole_signatures: HashMap<IVec2, u64>,
+}
+
+/// Pages whose holes changed (tiles refill and colliders rebuild over them, like
+/// [`PagesEvaluated`]).
+#[derive(Message, Clone, Debug)]
+pub struct HolesChanged {
+    pub landscape: Entity,
+    pub pages: Vec<IVec2>,
 }
 
 /// Pages whose heights a frame re-evaluated (tiles refill and colliders rebuild over them).
@@ -264,6 +283,25 @@ impl LandscapePages {
         })
     }
 
+    /// Whether global texel `t` is a hole: [`HOLE`] holds at least half its weight
+    /// (`mat_is_hole` in materials.slang).
+    pub fn texel_is_hole(&self, t: IVec2) -> bool {
+        self.texel_materials(t)
+            .iter()
+            .any(|&(id, w)| id == HOLE && w >= 128.0 / 255.0)
+    }
+
+    /// Whether the ground under a landscape-local xz is cut away (the texel it falls in, as the
+    /// tiles and colliders cut it).
+    pub fn is_hole(&self, xz: Vec2) -> bool {
+        self.texel_is_hole((xz / self.texel).floor().as_ivec2())
+    }
+
+    /// One page's hole texels, row-major (none when no mirror).
+    pub fn page_holes(&self, page: IVec2) -> Option<Vec<bool>> {
+        Some(self.material_page(page)?.iter().map(|&t| texel_hole(t)).collect())
+    }
+
     /// The materials of the texel nearest a landscape-local xz.
     pub fn materials_at(&self, xz: Vec2) -> [(u8, f32); 4] {
         self.texel_materials((xz / self.texel).round().as_ivec2())
@@ -302,8 +340,19 @@ impl LandscapePages {
     }
 
     /// The first ground hit along a landscape-local ray, marched at half-texel steps and
-    /// refined by bisection.
+    /// refined by bisection. Holes are surface here (an editor's brush lands in them);
+    /// [`Self::raycast_solid`] passes them.
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_distance: f32) -> Option<Vec3> {
+        self.march(origin, dir, max_distance, false)
+    }
+
+    /// [`Self::raycast`] through holes: a crossing into one is no hit, the ray carries on under
+    /// the ground until it comes back up.
+    pub fn raycast_solid(&self, origin: Vec3, dir: Vec3, max_distance: f32) -> Option<Vec3> {
+        self.march(origin, dir, max_distance, true)
+    }
+
+    fn march(&self, origin: Vec3, dir: Vec3, max_distance: f32, solid: bool) -> Option<Vec3> {
         let dir = dir.try_normalize()?;
         let step = self.texel * 0.5;
         let above = |p: Vec3| p.y - self.height_at(p.xz());
@@ -312,8 +361,10 @@ impl LandscapePages {
         }
         let mut t0 = 0.0;
         let mut t = step;
+        let mut below = false;
         while t <= max_distance {
-            if above(origin + dir * t) < 0.0 {
+            let a = above(origin + dir * t);
+            if a < 0.0 && !below {
                 let mut t1 = t;
                 for _ in 0..16 {
                     let mid = (t0 + t1) * 0.5;
@@ -323,11 +374,17 @@ impl LandscapePages {
                         t0 = mid;
                     }
                 }
-                return Some(origin + dir * t1);
+                let hit = origin + dir * t1;
+                if !solid || !self.is_hole(hit.xz()) {
+                    return Some(hit);
+                }
+                below = true;
+            } else if a >= 0.0 {
+                below = false;
             }
             t0 = t;
             // Coarser steps far above the ground.
-            t += step.max(above(origin + dir * t) * 0.5);
+            t += step.max(a * 0.5);
         }
         None
     }
@@ -467,6 +524,7 @@ pub fn allocate_pages(
             material_order: Vec::new(),
             baked: None,
             bake_seen: None,
+            hole_signatures: HashMap::new(),
         };
         pages.dirty_all();
         commands.entity(entity).insert(pages);
@@ -1028,5 +1086,53 @@ pub fn on_pages_removed(
 pub fn release_pages(mut pages: Query<&mut LandscapePages>, rd: Res<RenderDevice>) {
     for mut pages in &mut pages {
         pages.destroy(&rd);
+    }
+}
+
+/// Whether an evaluated texel is a hole (`mat_is_hole` in materials.slang).
+pub(crate) fn texel_hole([ids, weights]: [u32; 2]) -> bool {
+    (0..4).any(|i| (ids >> (8 * i)) & 0xFF == HOLE as u32 && (weights >> (8 * i)) & 0xFF >= 128)
+}
+
+/// Pages whose holes changed since they were last seen, after their materials evaluated
+/// (`MaterialsEvaluated`, a stack's or a bake's).
+pub fn track_holes(
+    mut evaluated: MessageReader<MaterialsEvaluated>,
+    mut landscapes: Query<&mut LandscapePages>,
+    mut changed: MessageWriter<HolesChanged>,
+) {
+    for msg in evaluated.read() {
+        let Ok(mut pages) = landscapes.get_mut(msg.landscape) else {
+            continue;
+        };
+        if !pages.mirrored {
+            continue;
+        }
+        let mut moved = Vec::new();
+        for &page in &msg.pages {
+            let Some(texels) = pages.material_page(page) else {
+                continue;
+            };
+            let mut hasher = DefaultHasher::new();
+            let mut any = false;
+            for (i, &t) in texels.iter().enumerate() {
+                if texel_hole(t) {
+                    i.hash(&mut hasher);
+                    any = true;
+                }
+            }
+            let signature = if any { hasher.finish() } else { 0 };
+            let before = pages.hole_signatures.insert(page, signature).unwrap_or(0);
+            if before != signature {
+                moved.push(page);
+            }
+        }
+        if !moved.is_empty() {
+            log::debug!("landscape: holes changed on {} pages", moved.len());
+            changed.write(HolesChanged {
+                landscape: msg.landscape,
+                pages: moved,
+            });
+        }
     }
 }

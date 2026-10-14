@@ -3,6 +3,10 @@
 // meet at any texel (a WoW chunk's four layers import losslessly); a page holds any number.
 module materials;
 
+// The palette id that is no ground (aurora_landscape shading.rs `HOLE`): a texel where it
+// outweighs the rest is a hole.
+public static const uint HOLE = 255;
+
 public struct MatSet {
     public uint ids[4];
     public float w[4];
@@ -96,4 +100,14 @@ public uint2 mat_pack_raw(MatSet s) {
         t.y |= uint(clamp(round(s.w[i] * 255.0), 0.0, 255.0)) << (8 * i);
     }
     return t;
+}
+
+// Whether an evaluated texel is a hole: the hole id holds at least half its weight.
+public bool mat_is_hole(uint2 t) {
+    for (int i = 0; i < 4; i++) {
+        if (((t.x >> (8 * i)) & 0xFFu) == HOLE && ((t.y >> (8 * i)) & 0xFFu) >= 128u) {
+            return true;
+        }
+    }
+    return false;
 }

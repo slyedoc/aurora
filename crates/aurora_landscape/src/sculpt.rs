@@ -34,11 +34,13 @@ pub enum BrushKind {
     Paint,
     /// Fade a paint layer's coverage back out.
     Erase,
+    /// Paint [`HOLE`](crate::shading::HOLE): cut the ground away (paint layers; Erase fills it).
+    Hole,
 }
 
 impl BrushKind {
     pub fn paints(self) -> bool {
-        matches!(self, Self::Paint | Self::Erase)
+        matches!(self, Self::Paint | Self::Erase | Self::Hole)
     }
 }
 

@@ -95,7 +95,9 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             var total = 0.0;
             for (int i = 0; i < 4; i++) {
                 let w = s.w[i];
-                if (w <= 1.0e-3) {
+                // A hole's id shades nothing (its texels' triangles are gone; at their rim
+                // the ground beside it shows).
+                if (w <= 1.0e-3 || s.ids[i] == HOLE) {
                     continue;
                 }
                 let e = r.palette[min(s.ids[i], r.palette_len - 1)];

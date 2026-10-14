@@ -94,6 +94,10 @@ MatSet texel_set(int2 t) {
 
 // The species' keep factor at one texel: its palette factors under the texel's weights.
 float texel_density(int2 t) {
+    let p = push.pool;
+    if (mat_is_hole(push.materials[texel_index(p.min_x, p.min_z, p.pages_x, p.pages_z, t.x, t.y)])) {
+        return 0.0;
+    }
     let s = texel_set(t);
     var density = 0.0;
     for (int k = 0; k < 4; k++) {

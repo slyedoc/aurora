@@ -10,6 +10,7 @@ static const uint SMOOTH = 2;
 static const uint FLATTEN = 3;
 static const uint PAINT = 4;
 static const uint ERASE = 5;
+static const uint HOLE_BRUSH = 6;
 
 // `BrushPush` in sculpt.rs. Sculpt writes `delta`, paint / erase write `paint` (a uint2 per
 // texel); `target` is the painted palette id. Two typed pointers, not one cast: a reinterpreted
@@ -47,10 +48,10 @@ void sculpt_brush(uint3 gid: SV_DispatchThreadID) {
     if (push.kind >= PAINT) {
         var s = mat_unpack(push.paint[gid.x]);
         let k = saturate(push.strength * w);
-        if (push.kind == PAINT) {
+        if (push.kind == PAINT || push.kind == HOLE_BRUSH) {
             // Toward full coverage of the painted id, the rest giving way.
             mat_scale(s, 1.0 - k);
-            mat_add(s, uint(push.target), k);
+            mat_add(s, push.kind == HOLE_BRUSH ? HOLE : uint(push.target), k);
         } else {
             mat_scale(s, 1.0 - k);
         }

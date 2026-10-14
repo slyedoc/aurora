@@ -26,6 +26,11 @@ const ROWS: u64 = 64;
 /// Palette ids are a byte.
 pub const PALETTE_MAX: usize = 256;
 
+/// The palette id that is no ground: painted (`BrushKind::Hole`) or laid by any material layer,
+/// a texel where it outweighs the rest is a hole (no tile triangles, collider cells or scatter;
+/// `materials.slang` `mat_is_hole`, [`crate::LandscapePages::is_hole`]). Never a palette entry.
+pub const HOLE: u8 = 255;
+
 /// One palette material. `tile_size` is metres per texture repeat; `clearcoat` a film of
 /// water over it (wet stone, mud).
 #[derive(Clone, Debug, Reflect)]

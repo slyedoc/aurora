@@ -20,7 +20,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     Landscape, LandscapeKernels, LandscapeViewer,
     collider::PageCollider,
-    page::{GpuPagePool, LandscapePages, PagesEvaluated},
+    page::{GpuPagePool, HolesChanged, LandscapePages, PagesEvaluated},
     quadtree::{NodeId, QuadTree},
     topology::{PatchTopologies, vertex_count},
 };
@@ -64,6 +64,8 @@ pub struct TileParams {
     /// boundary between LOD levels, where neighbouring tiles sample different pools.
     skirt_edges: u32,
     pad: u32,
+    /// The evaluated materials (`LandscapePages::materials_address`; 0 = none): holes.
+    materials: u64,
 }
 
 #[derive(Component, Clone, Debug)]
@@ -214,20 +216,24 @@ pub fn spawn_roots(
     }
 }
 
-/// Tiles over re-evaluated pages refill.
+/// Tiles over re-evaluated pages, or pages whose holes changed, refill.
 pub fn mark_refills(
     mut commands: Commands,
     mut evaluated: MessageReader<PagesEvaluated>,
+    mut holes: MessageReader<HolesChanged>,
     landscapes: Query<&Landscape>,
     tiles: Query<(Entity, &LandscapeTile)>,
 ) {
-    for msg in evaluated.read() {
-        let Ok(landscape) = landscapes.get(msg.landscape) else {
+    let changed = evaluated
+        .read()
+        .map(|m| (m.landscape, &m.pages))
+        .chain(holes.read().map(|m| (m.landscape, &m.pages)));
+    for (landscape_entity, pages) in changed {
+        let Ok(landscape) = landscapes.get(landscape_entity) else {
             continue;
         };
         let texel = Vec2::splat(landscape.texel_size);
-        let rects: Vec<Rect> = msg
-            .pages
+        let rects: Vec<Rect> = pages
             .iter()
             .map(|&p| {
                 let r = landscape.page_rect(p);
@@ -235,7 +241,7 @@ pub fn mark_refills(
             })
             .collect();
         for (entity, tile) in &tiles {
-            if tile.landscape == msg.landscape
+            if tile.landscape == landscape_entity
                 && rects.iter().any(|r| !r.intersect(tile.rect).is_empty())
             {
                 commands.entity(entity).insert(Refill);
@@ -485,6 +491,7 @@ pub fn spawn_tiles(
             origin_y: at.y,
             skirt_edges: item.skirts as u32,
             pad: 0,
+            materials: pages.materials_address(),
         };
         let mesh = procedural.add(tile_mesh(&kernels, &mut topologies, &params));
         let entity = commands

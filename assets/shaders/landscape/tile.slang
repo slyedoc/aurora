@@ -8,6 +8,7 @@
 // skirt rows of `res` (bottom, top, left, right) dropped `skirt_depth`.
 import procedural;
 import pages;
+import materials;
 import sphere;
 
 struct TilePush {
@@ -33,8 +34,20 @@ struct TilePush {
     // boundary between LOD levels (aurora_landscape ring.rs).
     uint skirt_edges;
     uint pad;
+    // The evaluated materials (same layout as the heights; null = none): holes.
+    uint2* materials;
 };
 [[vk::push_constant]] TilePush push;
+
+// Whether the texel under lattice point `s` is a hole (`HOLE` in materials.slang).
+bool hole_at(Sample s) {
+    if (push.materials == nullptr) {
+        return false;
+    }
+    let p = push.pool;
+    let t = int2(floor(float2(float(s.x), float(s.z)) / p.texel));
+    return mat_is_hole(push.materials[texel_index(p.min_x, p.min_z, p.pages_x, p.pages_z, t.x, t.y)]);
+}
 
 struct Sample {
     double x;
@@ -153,6 +166,13 @@ void tile_fill(uint3 gid: SV_DispatchThreadID) {
     }
     if (skirt && ((push.skirt_edges >> skirt_edge) & 1u) != 0u) {
         pos -= up * push.skirt_depth;
+    }
+
+    // A hole: a quad's centre (its four triangles' shared vertex) or a skirt vertex goes NaN,
+    // which makes every triangle on it inactive in the acceleration structure (Vulkan's
+    // inactive primitives), so rays and shadows pass. Grid vertices stay: neighbours share them.
+    if ((centre || skirt) && hole_at(c)) {
+        pos = float3(asfloat(0x7FC00000u));
     }
 
     Vertex out;

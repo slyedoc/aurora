@@ -46,11 +46,11 @@ pub use layer::{
     HeightBlend, HeightLayer, HeightmapLayer, MaterialLayer, MaterialRuleLayer, PaintLayer,
     SculptLayer, SplatmapLayer,
 };
-pub use page::{LandscapePages, MaterialsEvaluated, PagesEvaluated};
+pub use page::{HolesChanged, LandscapePages, MaterialsEvaluated, PagesEvaluated};
 pub use ring::LandscapeRing;
 pub use scatter::ScatterSpecies;
 pub use sculpt::{BrushKind, LayerPages, PaintPages, SculptDab, SculptDabs, SculptPages};
-pub use shading::{LandscapeMaterial, LandscapePalette};
+pub use shading::{HOLE, LandscapeMaterial, LandscapePalette};
 
 pub use tiles::LandscapeTile;
 
@@ -366,6 +366,7 @@ impl Plugin for LandscapePlugin {
             .init_resource::<SculptDabs>()
             .add_message::<PagesEvaluated>()
             .add_message::<MaterialsEvaluated>()
+            .add_message::<HolesChanged>()
             .register_type::<Landscape>()
             .register_type::<LandscapeViewer>()
             .register_type::<HeightLayer>()
@@ -409,6 +410,7 @@ impl Plugin for LandscapePlugin {
                         erosion::start_bakes,
                         page::evaluate_pages,
                         erosion::run_bakes,
+                        page::track_holes,
                     )
                         .chain(),
                     // Geometry and physics.
