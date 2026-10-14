@@ -31,6 +31,12 @@ pub struct PostProcessPushConstants {
     pub lum_height: u32,
     /// The Cost debug view's buffer at the meter's size (0 = none; `RaytracingPushConstants::cost`).
     pub cost: u64,
+    /// Running averages at output resolution (0 = none): local tone mapping's sky mask, last
+    /// frame's (read, reprojected) and this frame's (written), then the fog veil's likewise.
+    pub history: [u64; 4],
+    /// 1: last frame's histories are invalid (just made or resized).
+    pub history_reset: u32,
+    pub pad: u32,
 }
 
 /// The post pass's push data: the constants, then the target's block of inputs in the resource

@@ -954,6 +954,8 @@ unsafe fn create_logical_device(
             .scalar_block_layout(true)
             .shader_float16(true)
             .shader_buffer_int64_atomics(true)
+            // 64-bit wave reductions (the Cost view's per-wave total, raygen.slang).
+            .shader_subgroup_extended_types(true)
             .timeline_semaphore(true);
 
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()

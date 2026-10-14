@@ -43,6 +43,15 @@ struct QuadPush {
     uint lum_height;
     // The Cost view's buffer at the meter's size (null = none; rt_types.slang `cost`).
     uint* cost;
+    // Running averages at output resolution (null = none): local tone mapping's sky mask, last
+    // frame's (read, reprojected) and this frame's (written), then the fog veil's likewise;
+    // history_reset = 1 when last frame's are invalid.
+    float* sky_prev;
+    float* sky_cur;
+    float4* fog_prev;
+    float4* fog_cur;
+    uint history_reset;
+    uint pad_history;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
@@ -158,6 +167,40 @@ float3 costFalseColor(float stops) {
     return saturate(c) * (0.4 + 0.6 * edge);
 }
 
+// The render-resolution inputs the composite uses unresolved (the fog veil, the sky mask) are
+// traced through each frame's jitter: at an edge between very different values (a far ridge's
+// haze against the sky) a pixel reads one side one frame and the other the next. Each keeps a
+// running average at output resolution, reprojected by the motion guide and clamped to this
+// frame's 3x3 render-pixel neighbourhood (`lo`, `hi`): inside a surface the range is tight and
+// nothing ghosts; across an edge it spans both sides and the average settles to the coverage.
+static const float HISTORY_BLEND = 0.1;
+
+// This pixel's slot in the histories and last frame's slot (or -1: none / off screen).
+int2 historySlots(float2 uv, float2 output) {
+    if (any(uv < 0.0) || any(uv >= 1.0)) {
+        return int2(-1);
+    }
+    let size = uint2(output);
+    let p = min(uint2(uv * output), size - 1u);
+    let prev_uv = uv - test[7].SampleLevel(uv, 0.0).rg;
+    var prev = -1;
+    if (push.history_reset == 0u && all(prev_uv >= 0.0) && all(prev_uv < 1.0)) {
+        let q = min(uint2(prev_uv * output), size - 1u);
+        prev = int(q.y * size.x + q.x);
+    }
+    return int2(int(p.y * size.x + p.x), prev);
+}
+
+static const float2 NEIGHBOURS[8] = {
+    float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0), float2(-1.0, 0.0),
+    float2(1.0, 0.0), float2(-1.0, 1.0), float2(0.0, 1.0), float2(1.0, 1.0),
+};
+
+// The sky exemption at `uv` (depth guide, faded in from 300 m to 3 km).
+float skyAt(float2 uv) {
+    return saturate(log2(test[5].SampleLevel(uv, 0.0).r / 300.0) / log2(10.0));
+}
+
 // Local tone mapping: a region's surroundings (the output's pyramid at the level ~3 % of the
 // height across, read smoothly) against the whole frame's (a 4x4 grid of log reads at a level
 // ~1/16 of the height) sets a gain that moves the region `strength` of the way toward the
@@ -220,7 +263,22 @@ float3 localGain(float2 uv, float scale, float strength, Frame f) {
     // each frame's jitter, and at a far ridge against the sky a hard mask flipped the edge pixels
     // between the sky's gain and the ground's every frame (boil). Terrain that far keeps the
     // sky's exposure too, so the two sides of the edge agree.
-    let sky = saturate(log2(test[5].SampleLevel(uv, 0.0).r / 300.0) / log2(10.0));
+    var sky = skyAt(uv);
+    // A history like the fog veil's (above `historySlots`).
+    let slots = historySlots(uv, f.output);
+    if (push.sky_cur != nullptr && slots.x >= 0) {
+        if (slots.y >= 0) {
+            var lo = sky;
+            var hi = sky;
+            for (int i = 0; i < 8; i++) {
+                let n = skyAt(uv + NEIGHBOURS[i] / f.fog);
+                lo = min(lo, n);
+                hi = max(hi, n);
+            }
+            sky = lerp(clamp(push.sky_prev[slots.y], lo, hi), sky, HISTORY_BLEND);
+        }
+        push.sky_cur[slots.x] = sky;
+    }
     return float3(exp2(stops * (1.0 - sky)));
 }
 
@@ -369,7 +427,22 @@ float4 fragment(VertexOut v) : SV_Target0 {
         // scene at t + 0.5 + jitter) and Ray Reconstruction is not there to undo it: shift
         // back, or every fog edge shimmers by a fraction of a pixel each frame.
         let jitter = float2(push.uniforms[UNIFORM_JITTER_FLOAT], push.uniforms[UNIFORM_JITTER_FLOAT + 1]);
-        let f = test[8].Sample(uv - jitter / size);
+        let at = uv - jitter / size;
+        var f = test[8].Sample(at);
+        let slots = historySlots(uv, frame.output);
+        if (push.fog_cur != nullptr && slots.x >= 0) {
+            if (slots.y >= 0) {
+                var lo = f;
+                var hi = f;
+                for (int i = 0; i < 8; i++) {
+                    let n = test[8].Sample(at + NEIGHBOURS[i] / size);
+                    lo = min(lo, n);
+                    hi = max(hi, n);
+                }
+                f = lerp(clamp(push.fog_prev[slots.y], lo, hi), f, HISTORY_BLEND);
+            }
+            push.fog_cur[slots.x] = f;
+        }
         veil = f.rgb;
         through = f.a;
     }

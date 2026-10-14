@@ -191,6 +191,9 @@ struct ViewFrame {
     ae: (u64, u64),
     /// The Cost view's buffer (handle, address); null unless this view shows it.
     cost: (vk::Buffer, u64),
+    /// The composite's histories (`Frame::histories`): last frame's and this frame's sky mask,
+    /// last frame's and this frame's fog veil, and whether last frame's are invalid.
+    history: ([u64; 4], u32),
 }
 
 /// Where a view's composited image lands.
@@ -428,6 +431,11 @@ pub struct Frame {
     /// Per view slot, the Cost debug view's buffer: the frame's total ns (two words), then
     /// each traced pixel's. Made the first time a view shows it.
     pub cost_buffers: [Buffer<u32>; crate::MAX_VIEWS],
+    /// Per view slot, by frame parity, the composite's running averages at output resolution:
+    /// local tone mapping's sky mask and the camera ray's fog veil. Each frame reads the other
+    /// parity's (reprojected) and writes its own.
+    pub sky_masks: [[Buffer<f32>; 2]; crate::MAX_VIEWS],
+    pub fog_veils: [[Buffer<[f32; 4]>; 2]; crate::MAX_VIEWS],
 }
 
 fn render_frame(
@@ -759,6 +767,7 @@ fn render_frame(
                 lens,
                 ae: (0, 0),
                 cost: (vk::Buffer::null(), 0),
+                history: ([0; 4], 1),
             }
         })
         .collect();
@@ -792,6 +801,34 @@ fn render_frame(
             );
         }
         view.cost = (buffer.handle, buffer.address);
+    }
+
+    // The composite's histories, at each view's output size.
+    for view in &mut views {
+        let len = view.output_extent.width as u64 * view.output_extent.height as u64;
+        let mut reset = 0;
+        for buffer in frame.sky_masks[view.slot].iter_mut() {
+            if buffer.nr_elements != len {
+                render_device.destroyer.destroy_buffer(buffer.handle);
+                *buffer = render_device
+                    .create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
+                reset = 1;
+            }
+        }
+        for buffer in frame.fog_veils[view.slot].iter_mut() {
+            if buffer.nr_elements != len {
+                render_device.destroyer.destroy_buffer(buffer.handle);
+                *buffer = render_device
+                    .create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
+                reset = 1;
+            }
+        }
+        let cur = (*frame_counter & 1) as usize;
+        let (sky, fog) = (&frame.sky_masks[view.slot], &frame.fog_veils[view.slot]);
+        view.history = (
+            [sky[1 - cur].address, sky[cur].address, fog[1 - cur].address, fog[cur].address],
+            reset,
+        );
     }
 
     // Ensure the focus_data buffer exists
@@ -1544,6 +1581,9 @@ fn render_frame(
                                 lum_width: views[eye].trace_extent.width,
                                 lum_height: views[eye].trace_extent.height,
                                 cost: views[eye].cost.1,
+                                history: views[eye].history.0,
+                                history_reset: views[eye].history.1,
+                                pad: 0,
                             },
                         );
                     }
@@ -1629,6 +1669,9 @@ fn render_frame(
                             lum_width: view.trace_extent.width,
                             lum_height: view.trace_extent.height,
                             cost: view.cost.1,
+                            history: view.history.0,
+                            history_reset: view.history.1,
+                            pad: 0,
                         },
                     );
                 }
@@ -1812,6 +1855,9 @@ fn render_frame(
                                 lum_width: view.trace_extent.width,
                                 lum_height: view.trace_extent.height,
                                 cost: view.cost.1,
+                                history: view.history.0,
+                                history_reset: view.history.1,
+                                pad: 0,
                             },
                         );
                     }
@@ -2233,6 +2279,8 @@ pub fn on_shutdown(world: &mut World) {
 
     for buffer in (frame.uniform_buffers.iter().map(|b| b.handle))
         .chain(frame.cost_buffers.iter().map(|b| b.handle))
+        .chain(frame.sky_masks.iter().flatten().map(|b| b.handle))
+        .chain(frame.fog_veils.iter().flatten().map(|b| b.handle))
     {
         render_device.destroyer.destroy_buffer(buffer);
     }
