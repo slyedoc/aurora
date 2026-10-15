@@ -208,6 +208,8 @@ struct ViewFrame {
     /// The composite's histories (`Frame::histories`): last frame's and this frame's sky mask,
     /// last frame's and this frame's fog veil, and whether last frame's are invalid.
     history: ([u64; 4], u32),
+    /// The composite prepass's outputs (src/post_prep.rs).
+    prep: crate::post_prep::PrepFrame,
 }
 
 /// Where a view's composited image lands.
@@ -528,6 +530,7 @@ fn render_frame(
         Res<crate::camera_target::CameraTargets>,
         ResMut<crate::gpu_profiler::GpuProfiler>,
         ResMut<crate::util::video::VideoRecorder>,
+        ResMut<crate::post_prep::PostPrepState>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -574,6 +577,7 @@ fn render_frame(
         camera_targets,
         mut profiler,
         mut video,
+        mut post_prep,
     ) = dlss_stuff;
 
     let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
@@ -784,6 +788,7 @@ fn render_frame(
                 cost: (vk::Buffer::null(), 0),
                 primary_hits: 0,
                 history: ([0; 4], 1),
+                prep: Default::default(),
             }
         })
         .collect();
@@ -860,6 +865,15 @@ fn render_frame(
                 fog[cur].address,
             ],
             reset,
+        );
+    }
+
+    for view in &mut views {
+        view.prep = post_prep.ensure(
+            &render_device,
+            view.slot,
+            view.output_extent,
+            view.trace_extent,
         );
     }
 
@@ -1549,6 +1563,26 @@ fn render_frame(
                             delta_secs * 1000.0,
                         );
                         prof.end(&render_device, view_cmd, scope);
+                        if let Some(guides) = renderer.guide_views(view.slot) {
+                            let scope = prof.begin(&render_device, view_cmd, "post prep");
+                            post_prep.record(
+                                &render_device,
+                                view_cmd,
+                                &modules,
+                                &view.prep,
+                                DescriptorHeaps::prep_block(parity, view.slot),
+                                &crate::post_prep::PrepInputs {
+                                    pyramid: guides.pyramid,
+                                    fog: guides.fog,
+                                    depth: guides.depth,
+                                    auto_exposure: view.ae.1,
+                                    display_exposure: view.exposure.display_exposure(),
+                                    bloom: bloom > 0.0,
+                                    local_tonemap: local_tonemap > 0.0,
+                                },
+                            );
+                            prof.end(&render_device, view_cmd, scope);
+                        }
                         // The raygen just filled the luminance buffer at this size.
                         traced.push(view.camera);
                     }
@@ -1636,6 +1670,7 @@ fn render_frame(
                                 history: views[eye].history.0,
                                 history_reset: views[eye].history.1,
                                 pad: 0,
+                                prep: views[eye].prep,
                             },
                         );
                     }
@@ -1724,6 +1759,7 @@ fn render_frame(
                             history: view.history.0,
                             history_reset: view.history.1,
                             pad: 0,
+                            prep: view.prep,
                         },
                     );
                 }
@@ -1910,6 +1946,7 @@ fn render_frame(
                                 history: view.history.0,
                                 history_reset: view.history.1,
                                 pad: 0,
+                                prep: view.prep,
                             },
                         );
                     }

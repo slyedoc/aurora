@@ -29,6 +29,9 @@ pub const GUIDES: u32 = 8;
 pub const VOLUMES: u32 = 2;
 /// Post-process inputs per target (quad.slang's `test[10]`).
 pub const POST_INPUTS: u32 = 10;
+/// The composite's prepass inputs per view (post_prep.slang's `prep_in`): the output's pyramid,
+/// the fog guide, the depth guide.
+pub const PREP_INPUTS: u32 = 3;
 
 /// What a heap-using pipeline reads: [`DescriptorHeaps::mappings`] turns these into the
 /// create-time mapping of the shader's `(set, binding)` declarations.
@@ -37,6 +40,13 @@ pub enum Mapping {
     /// The storage volumes (VOLUMES per view and frame parity) at `(set, binding)`, as one
     /// array indexed from [`DescriptorHeaps::volume_base`].
     Volumes { set: u32, binding: u32 },
+    /// The composite prepass's inputs (PREP_INPUTS combined image samplers) at `(set, binding)`,
+    /// at the block whose index is the u32 at `push_offset` ([`DescriptorHeaps::prep_block`]).
+    Prep {
+        set: u32,
+        binding: u32,
+        push_offset: u32,
+    },
     /// The bindless texture array at `(set, binding)`: a constant heap range.
     Bindless { set: u32, binding: u32 },
     /// `count` consecutive bindings from `binding`, at the heap block whose index is the u32 at
@@ -120,6 +130,7 @@ pub struct DescriptorHeaps {
     post: u32,
     gizmo: u32,
     volumes: u32,
+    prep: u32,
     /// Every image view the device made, by handle: descriptors are written from these.
     views: Mutex<HashMap<vk::ImageView, ViewDesc>>,
 }
@@ -151,8 +162,9 @@ impl DescriptorHeaps {
         let post = guides + 2 * crate::MAX_VIEWS as u64 * GUIDES as u64 * stride;
         let gizmo = post + 2 * POST_TARGETS as u64 * POST_INPUTS as u64 * stride;
         let volumes = gizmo + 2 * crate::MAX_VIEWS as u64 * stride;
+        let prep = volumes + 2 * crate::MAX_VIEWS as u64 * VOLUMES as u64 * stride;
         let resource_size = align(
-            volumes + 2 * crate::MAX_VIEWS as u64 * VOLUMES as u64 * stride,
+            prep + 2 * crate::MAX_VIEWS as u64 * PREP_INPUTS as u64 * stride,
             props.resource_heap_alignment,
         );
         let sampler_stride = align(
@@ -239,6 +251,7 @@ impl DescriptorHeaps {
             post: post as u32,
             gizmo: gizmo as u32,
             volumes: volumes as u32,
+            prep: prep as u32,
             views: Mutex::new(HashMap::new()),
         };
         let linear = linear_sampler_info();
@@ -434,6 +447,21 @@ impl DescriptorHeaps {
         );
     }
 
+    /// The block of prepass inputs for `(parity, view slot)`.
+    pub fn prep_block(parity: usize, slot: usize) -> u32 {
+        (parity * crate::MAX_VIEWS + slot) as u32
+    }
+
+    /// Writes prepass input `i` of `block` (sampled, SHADER_READ_ONLY).
+    pub fn write_prep(&self, block: u32, i: u32, view: vk::ImageView) {
+        self.write_image(
+            self.prep + (block * PREP_INPUTS + i) * self.stride,
+            view,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::DescriptorType::SAMPLED_IMAGE,
+        );
+    }
+
     /// The gizmo depth slot for `(parity, view slot)`.
     pub fn gizmo_slot(parity: usize, slot: usize) -> u32 {
         (parity * crate::MAX_VIEWS + slot) as u32
@@ -459,6 +487,7 @@ impl DescriptorHeaps {
         self.gizmo
     }
 
+
     /// The create-time mapping for a pipeline reading `mappings`.
     pub fn mappings(
         &self,
@@ -477,6 +506,27 @@ impl DescriptorHeaps {
                         constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default()
                             .heap_offset(self.volumes)
                             .heap_array_stride(self.stride),
+                    }),
+                Mapping::Prep {
+                    set,
+                    binding,
+                    push_offset,
+                } => vk::DescriptorSetAndBindingMappingEXT::default()
+                    .descriptor_set(set)
+                    .first_binding(binding)
+                    .binding_count(1)
+                    .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
+                    .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_PUSH_INDEX)
+                    .source_data(vk::DescriptorMappingSourceDataEXT {
+                        push_index: vk::DescriptorMappingSourcePushIndexEXT::default()
+                            .heap_offset(self.prep)
+                            .push_offset(push_offset)
+                            .heap_index_stride(PREP_INPUTS * self.stride)
+                            .heap_array_stride(self.stride)
+                            .sampler_heap_offset(self.linear_sampler)
+                            .sampler_push_offset(push_offset)
+                            .sampler_heap_index_stride(0)
+                            .sampler_heap_array_stride(0),
                     }),
                 Mapping::Bindless { set, binding } => {
                     vk::DescriptorSetAndBindingMappingEXT::default()

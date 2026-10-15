@@ -37,6 +37,8 @@ pub struct PostProcessPushConstants {
     /// 1: last frame's histories are invalid (just made or resized).
     pub history_reset: u32,
     pub pad: u32,
+    /// The view's prepass outputs (bloom, local tone mapping's keys, the histories' ranges).
+    pub prep: crate::post_prep::PrepFrame,
 }
 
 /// The post pass's push data: the constants, then the target's block of inputs in the resource

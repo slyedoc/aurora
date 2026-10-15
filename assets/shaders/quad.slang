@@ -52,6 +52,19 @@ struct QuadPush {
     float4* fog_cur;
     uint history_reset;
     uint pad_history;
+    // `PrepFrame` in post_prep.rs, filled by post_prep.slang (null = none). Bloom, half4 per
+    // texel at the pyramid's level 1; local tone mapping's three keys (half) at its level 0; the
+    // fog veil's 3x3 range (half4 min, max) and the sky mask's (half min, max) per render pixel.
+    uint2* bloom_buf;
+    uint bloom_width;
+    uint bloom_height;
+    uint2* keys;
+    uint key_width;
+    uint key_height;
+    uint4* fog_range;
+    uint* sky_range;
+    uint range_width;
+    uint range_height;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
@@ -201,10 +214,34 @@ int2 historySlots(float2 uv, float2 output) {
     return int2(int(p.y * size.x + p.x), prev);
 }
 
-static const float2 NEIGHBOURS[8] = {
-    float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0), float2(-1.0, 0.0),
-    float2(1.0, 0.0), float2(-1.0, 1.0), float2(0.0, 1.0), float2(1.0, 1.0),
-};
+float2 unpackHalf2(uint q) {
+    return float2(f16tof32(q & 0xFFFFu), f16tof32(q >> 16));
+}
+
+// The prepass's buffer index of the render pixel under `uv` (post_prep.slang `range_prep`).
+uint rangeIndex(float2 uv) {
+    let size = uint2(push.range_width, push.range_height);
+    let p = min(uint2(max(uv, 0.0) * float2(size)), size - 1u);
+    return p.y * size.x + p.x;
+}
+
+// Local tone mapping's three keys (post_prep.slang `key_prep`), read bilinearly.
+float3 keysTexel(int2 p) {
+    let q = push.keys[uint(p.y) * push.key_width + uint(p.x)];
+    return float3(unpackHalf2(q.x), unpackHalf2(q.y).x);
+}
+
+float3 keysRead(float2 uv) {
+    let size = int2(int(push.key_width), int(push.key_height));
+    let x = uv * float2(size) - 0.5;
+    let p = int2(floor(x));
+    let f = x - float2(p);
+    let a = clamp(p, int2(0), size - 1);
+    let b = clamp(p + 1, int2(0), size - 1);
+    let top = lerp(keysTexel(a), keysTexel(int2(b.x, a.y)), f.x);
+    let bottom = lerp(keysTexel(int2(a.x, b.y)), keysTexel(b), f.x);
+    return lerp(top, bottom, f.y);
+}
 
 // The sky exemption at `uv` (depth guide, faded in from 300 m to 3 km).
 float skyAt(float2 uv) {
@@ -223,16 +260,6 @@ float pyramidLog(float2 uv, float level, float scale) {
     return log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
 }
 
-// A region's level at pyramid `level`, smoothed: four reads half a texel apart hide the
-// bilinear diamonds of a coarse level.
-float pyramidKey(float2 uv, float level, float scale, float2 size) {
-    let t = exp2(level) / size * 0.5;
-    return 0.25 * (pyramidLog(uv + float2(-t.x, -t.y), level, scale)
-                 + pyramidLog(uv + float2(t.x, -t.y), level, scale)
-                 + pyramidLog(uv + float2(-t.x, t.y), level, scale)
-                 + pyramidLog(uv + float2(t.x, t.y), level, scale));
-}
-
 // The whole frame's level: a 4x4 grid of log reads at a level ~1/16 of the height.
 float frameLog(float scale, uint h, uint levels) {
     let frame_level = clamp(log2(float(h) / 16.0), 0.0, float(levels) - 1.0);
@@ -245,20 +272,18 @@ float frameLog(float scale, uint h, uint levels) {
     return frame / 16.0;
 }
 
-float3 localGain(float2 uv, float scale, float strength, Frame f) {
-    let top = f.levels - 1.0;
-    // Level 0 is half the output: the level whose texel spans ~3 % of the height, one 1.5 levels
-    // finer, and level 0.
-    let coarse = clamp(log2(f.pyramid.y * 0.03), 0.0, top);
+float3 localGain(float2 uv, float scale, float strength, Frame f, int2 slots) {
     let own = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
     // Edge-aware surroundings: the three scales blended by how close each is to the pixel's own
     // level (leaning coarse). Sky beside a canopy reads sky at the finer scales and keeps the
     // sky's gain -- one coarse level bled the canopy's darkness across the silhouette, a halo.
+    // The three scales (post_prep.slang `key_prep`): level 0, the level whose texel spans ~3 % of
+    // the height, and one 1.5 levels finer.
+    let keys = keysRead(uv);
     var key = 0.0;
     var wsum = 0.0;
     for (int i = 0; i < 3; i++) {
-        let level = i == 0 ? 0.0 : max(coarse - float(2 - i) * 1.5, 0.0);
-        let k = pyramidKey(uv, level, scale, f.pyramid);
+        let k = keys[i];
         let d = (own - k) / 0.75;
         let wi = exp2(float(i)) * exp(-d * d);
         key += wi * k;
@@ -274,17 +299,13 @@ float3 localGain(float2 uv, float scale, float strength, Frame f) {
     // between the sky's gain and the ground's every frame (boil). Terrain that far keeps the
     // sky's exposure too, so the two sides of the edge agree.
     var sky = skyAt(uv);
-    // A history like the fog veil's (above `historySlots`).
-    let slots = historySlots(uv, f.output);
+    // A history like the fog veil's (above `historySlots`), clamped to the 3x3 render-pixel
+    // range under `uv` (post_prep.slang `range_prep`).
     if (push.sky_cur != nullptr && slots.x >= 0) {
-        if (slots.y >= 0) {
-            var lo = sky;
-            var hi = sky;
-            for (int i = 0; i < 8; i++) {
-                let n = skyAt(uv + NEIGHBOURS[i] / f.fog);
-                lo = min(lo, n);
-                hi = max(hi, n);
-            }
+        if (slots.y >= 0 && push.sky_range != nullptr) {
+            let range = unpackHalf2(push.sky_range[rangeIndex(uv)]);
+            let lo = min(range.x, sky);
+            let hi = max(range.y, sky);
             sky = lerp(clamp(push.sky_prev[slots.y], lo, hi), sky, HISTORY_BLEND);
         }
         push.sky_cur[slots.x] = sky;
@@ -324,32 +345,22 @@ void meterResolved(float2 uv, float3 src, float through, float3 veil, float inpu
     push.lum[i + 1u] = surface + fog;
 }
 
-// Bloom: the lens scattering a share of every pixel's light over its surroundings. Levels 1-6
-// of the output's pyramid (filtered blits), each read as a 9-tap tent a texel apart so the
-// box-filtered levels upsample round and smooth (4 diagonal taps stamped a bright point into an
-// X and left square glows), weighted 0.6x per level: a bright core beside a light
-// and a wide faint skirt -- blurs of growing width summed, the shape of a real lens's glare
-// (equal weights spent most of the light on the widest, where it vanished). Clamped to
-// half-float range (the sun's disc overflows the pyramid).
-float3 bloomAt(float2 uv, Frame f) {
-    let top = min(6, int(f.levels) - 1);
-    var sum = float3(0.0);
-    var n = 0.0;
-    for (int l = 1; l <= top; l++) {
-        let t = exp2(float(l)) / f.pyramid;
-        let level = float(l);
-        var s = float3(0.0);
-        for (int y = -1; y <= 1; y++) {
-            for (int x = -1; x <= 1; x++) {
-                let k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
-                s += test[9].SampleLevel(uv + float2(float(x), float(y)) * t, level).rgb * k;
-            }
-        }
-        let wl = pow(0.6, float(l - 1));
-        sum += min(s / 16.0, float3(65504.0)) * wl;
-        n += wl;
-    }
-    return n > 0.0 ? sum / n : float3(0.0);
+// Bloom (post_prep.slang `bloom_prep`), upsampled bilinearly from the pyramid's level 1.
+float3 bloomTexel(int2 p) {
+    let q = push.bloom_buf[uint(p.y) * push.bloom_width + uint(p.x)];
+    return float3(f16tof32(q.x & 0xFFFFu), f16tof32(q.x >> 16), f16tof32(q.y & 0xFFFFu));
+}
+
+float3 bloomRead(float2 uv) {
+    let size = int2(int(push.bloom_width), int(push.bloom_height));
+    let x = uv * float2(size) - 0.5;
+    let p = int2(floor(x));
+    let f = x - float2(p);
+    let a = clamp(p, int2(0), size - 1);
+    let b = clamp(p + 1, int2(0), size - 1);
+    let top = lerp(bloomTexel(a), bloomTexel(int2(b.x, a.y)), f.x);
+    let bottom = lerp(bloomTexel(int2(a.x, b.y)), bloomTexel(b), f.x);
+    return lerp(top, bottom, f.y);
 }
 
 float3 acesFilm(float3 x) {
@@ -429,6 +440,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
     var through = 1.0;
     // The fog in front of the surface, which Ray Reconstruction never saw: divided by a
     // surface's albedo there, a white veil bled colour halos around dark coloured surfaces.
+    let slots = push.fog != 0u && view == 0u ? historySlots(uv, frame.output) : int2(-1);
     if (push.fog != 0u && view == 0u) {
         // One bilinear read: the camera ray's fog comes from the grid's column sums, already
         // smooth across cells (a 9-tap blur here once hid the per-cell noise of a march).
@@ -439,16 +451,11 @@ float4 fragment(VertexOut v) : SV_Target0 {
         let jitter = float2(push.uniforms[UNIFORM_JITTER_FLOAT], push.uniforms[UNIFORM_JITTER_FLOAT + 1]);
         let at = uv - jitter / size;
         var f = test[8].Sample(at);
-        let slots = historySlots(uv, frame.output);
         if (push.fog_cur != nullptr && slots.x >= 0) {
-            if (slots.y >= 0) {
-                var lo = f;
-                var hi = f;
-                for (int i = 0; i < 8; i++) {
-                    let n = test[8].Sample(at + NEIGHBOURS[i] / size);
-                    lo = min(lo, n);
-                    hi = max(hi, n);
-                }
+            if (slots.y >= 0 && push.fog_range != nullptr) {
+                let q = push.fog_range[rangeIndex(at)];
+                let lo = min(float4(unpackHalf2(q.x), unpackHalf2(q.y)), f);
+                let hi = max(float4(unpackHalf2(q.z), unpackHalf2(q.w)), f);
                 f = lerp(clamp(push.fog_prev[slots.y], lo, hi), f, HISTORY_BLEND);
             }
             push.fog_cur[slots.x] = f;
@@ -464,12 +471,12 @@ float4 fragment(VertexOut v) : SV_Target0 {
         meterResolved(uv, src, through, veil, input);
     }
     var surface = src * through;
-    if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u) {
-        surface *= localGain(uv, look / input, push.local_tonemap, frame);
+    if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u && push.keys != nullptr) {
+        surface *= localGain(uv, look / input, push.local_tonemap, frame, slots);
     }
     var exposed = (surface + veil) * (look / input);
-    if (push.bloom > 0.0 && view == 0u && push.fog != 0u) {
-        exposed = lerp(exposed, bloomAt(uv, frame) * (look / input), push.bloom);
+    if (push.bloom > 0.0 && view == 0u && push.fog != 0u && push.bloom_buf != nullptr) {
+        exposed = lerp(exposed, bloomRead(uv) * (look / input), push.bloom);
     }
     var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT], frame.output);
