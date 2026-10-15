@@ -168,7 +168,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     if (idx >= f.width * f.height) {
         return;
     }
-    let s = f.surfaces[idx];
+    let s = restirSurfaceLoad(f.surfaces + idx);
     if (s.frame != f.frame) {
         return;
     }
@@ -281,7 +281,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
     if (idx >= f.width * f.height) {
         return;
     }
-    let s = f.surfaces[idx];
+    let s = restirSurfaceLoad(f.surfaces + idx);
     if (s.frame != f.frame) {
         return;
     }
@@ -302,7 +302,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
             continue;
         }
         let qi = uint(q.y) * f.width + uint(q.x);
-        let qs = f.surfaces[qi];
+        let qs = restirSurfaceLoad(f.surfaces + qi);
         if (qs.frame != f.frame || f.temporal[qi].M <= 0.0 || !similar(s, qs.normal_oct, qs.depth)) {
             continue;
         }
@@ -336,7 +336,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
         let here = (n & 1u) == 1u;
         if (!here) {
             let qi = picked[n >> 1u];
-            qs = f.surfaces[qi];
+            qs = restirSurfaceLoad(f.surfaces + qi);
             nr = f.temporal[qi];
             r_M += nr.M;
         }

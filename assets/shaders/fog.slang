@@ -91,8 +91,8 @@ public uint3 fogGridSizeU(UniformData* u) {
 
 // A world point's cell coordinate in the grid seen through `view_proj` (cell centres at +0.5):
 // screen uv up, slices quadratic in view depth out to `dist`.
-public float3 fogGridCoord(float view_proj[16], float3 x, uint3 size, float dist) {
-    let clip = mat4MulVec(view_proj, float4(x, 1.0));
+public float3 fogGridCoord(float* view_proj, float3 x, uint3 size, float dist) {
+    let clip = mat4MulVecAt(view_proj, float4(x, 1.0));
     let w = max(clip.w, 1.0e-4);
     let uv = clip.xy / w * 0.5 + 0.5;
     return float3(uv * float2(size.xy), sqrt(saturate(w / dist)) * float(size.z));
@@ -116,9 +116,9 @@ public float4 fogGridSample(float4* grid, uint3 size, float3 g) {
 
 // A cell's world point: (uv, slice) in [0, 1) of the grid's own view, unjittered at the centre.
 public float3 fogGridPointU(UniformData* u, float2 uv, float s, float dist) {
-    let target = mat4MulVec(u.fog_grid_inverse_projection, float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
+    let target = mat4MulVecAt(&u.fog_grid_inverse_projection[0], float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
     let view = target / max(-target.z, 1.0e-6);
-    return mat4MulVec(u.fog_grid_inverse_view, float4(view * (dist * s * s), 1.0)).xyz;
+    return mat4MulVecAt(&u.fog_grid_inverse_view[0], float4(view * (dist * s * s), 1.0)).xyz;
 }
 
 // Which cells `fog_grid` lights this frame: one of every `stride` x `stride` block, the block's

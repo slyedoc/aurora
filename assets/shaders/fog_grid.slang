@@ -42,7 +42,7 @@ void fog_reproject(uint3 gid: SV_DispatchThreadID) {
     let cell = float3(i % size.x, (i / size.x) % size.y, i / (size.x * size.y));
     let grid = float3(size);
     let centre = fogGridPointU(u, (cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
-    let g = fogGridCoord(u.fog_grid_prev_view_proj, centre, size, dist);
+    let g = fogGridCoord(&u.fog_grid_prev_view_proj[0], centre, size, dist);
     var prev = fogGridSample(u.fog_grid_prev, size, g);
     // Off last frame's grid (past its far slice moving forward, its edges turning) the
     // nearest edge cell is still the best guess: kept at a quarter of its weight rather than

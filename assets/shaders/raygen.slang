@@ -702,7 +702,7 @@ void fog_grid() {
     let grid = float3(size);
     let r = float3(randf(), randf(), randf());
     let x = fogGridPoint((cell.xy + r.xy) / grid.xy, (cell.z + r.z) / grid.z, dist);
-    let cam = mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    let cam = mat4MulVecAt(&pc.uniforms.fog_grid_inverse_view[0], float4(0.0, 0.0, 0.0, 1.0)).xyz;
     let centre = fogGridPoint((cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
     let d = normalize(centre - cam);
 
@@ -769,7 +769,7 @@ void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
             continue;
         }
         let step_t = exp(-sigma * dt);
-        let Ls = fogGridSoftAt(size, fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, dist));
+        let Ls = fogGridSoftAt(size, fogGridCoord(&pc.uniforms.fog_grid_view_proj[0], x, size, dist));
         L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
         T *= step_t;
     }
@@ -783,7 +783,7 @@ void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
 float4 fogGridSumAt(EnvironmentGpu* env, float3 x) {
     let size = fogGridSize();
     let dist = env.fog_grid_distance;
-    let clip = mat4MulVec(pc.uniforms.fog_grid_view_proj, float4(x, 1.0));
+    let clip = mat4MulVecAt(&pc.uniforms.fog_grid_view_proj[0], float4(x, 1.0));
     let w = max(clip.w, 1.0e-4);
     let uv = clip.xy / w * 0.5 + 0.5;
     // Slice 0 of the sums volume is the eye; slice k + 1 the sums through slice k.
@@ -791,12 +791,12 @@ float4 fogGridSumAt(EnvironmentGpu* env, float3 x) {
     let vsize = uint3(size.xy, size.z + 1u);
     var r = fogVolume(pc.uniforms.fog_grid_sum_tex, float3(uv, (z + 0.5) / float(vsize.z)), vsize);
     if (clip.w > dist) {
-        let cam = mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+        let cam = mat4MulVecAt(&pc.uniforms.fog_grid_inverse_view[0], float4(0.0, 0.0, 0.0, 1.0)).xyz;
         let xm = cam + (x - cam) * (0.5 * (dist + clip.w) / clip.w);
         let sigma = fogDensityAt(env, xm, true);
         if (sigma > 0.0) {
             let step_t = exp(-sigma * length(x - cam) * (clip.w - dist) / clip.w);
-            let Ls = fogGridSoftAt(size, fogGridCoord(pc.uniforms.fog_grid_view_proj, xm, size, dist));
+            let Ls = fogGridSoftAt(size, fogGridCoord(&pc.uniforms.fog_grid_view_proj[0], xm, size, dist));
             r.rgb += r.a * FOG_ALBEDO * Ls * (1.0 - step_t);
             r.a *= step_t;
         }
@@ -839,8 +839,8 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         // Sky motion: reproject the ray direction at infinity (w = 0 cancels the
         // translation -- infinitely far points only parallax under rotation). Zero
         // here pins the sky to the screen and it smears whenever the camera turns.
-        let sky_cur = mat4MulVec(pc.uniforms.view_proj, float4(direction, 0.0));
-        let sky_prev = mat4MulVec(pc.uniforms.prev_view_proj, float4(direction, 0.0));
+        let sky_cur = mat4MulVecAt(&pc.uniforms.view_proj[0], float4(direction, 0.0));
+        let sky_prev = mat4MulVecAt(&pc.uniforms.prev_view_proj[0], float4(direction, 0.0));
         var sky_motion = float2(0.0);
         if (sky_cur.w > 1.0e-4 && sky_prev.w > 1.0e-4) {
             let cuv = (sky_cur.xy / sky_cur.w) * float2(0.5, -0.5);
@@ -858,7 +858,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         float3 cam_origin, cam_dir;
         lensRay(lens, launch_id, launch_size, cam_origin, cam_dir);
         let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t);
-        let view_pos = mat4MulVec(pc.uniforms.view, float4(virtual_pos, 1.0));
+        let view_pos = mat4MulVecAt(&pc.uniforms.view[0], float4(virtual_pos, 1.0));
         let linear_depth = max(-view_pos.z, 1.0e-4);
         let albedo = clamp(payload.color.rgb, float3(0.0), float3(1.0));
         // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
@@ -877,10 +877,10 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
             : dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
         guide_depth[px] = float4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0);
         // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
-        let cur_clip = mat4MulVec(pc.uniforms.view_proj, float4(virtual_pos, 1.0));
+        let cur_clip = mat4MulVecAt(&pc.uniforms.view_proj[0], float4(virtual_pos, 1.0));
         // The end vertex's own frame-to-frame motion, applied to the virtual point
         // (identical to prev_world_pos when no glass was traversed).
-        let prev_clip = mat4MulVec(pc.uniforms.prev_view_proj,
+        let prev_clip = mat4MulVecAt(&pc.uniforms.prev_view_proj[0],
                                    float4(virtual_pos - (hit_pos - payload.prev_world_pos), 1.0));
         var motion = float2(0.0);
         if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
@@ -1091,11 +1091,11 @@ void primary() {
                     rec.state = PRIMARY_HIT | (bounce << 2) | ((ray_mask & 0xFFu) << 8) | ((ray_env & 7u) << 16);
                     // ReSTIR DI's surface: its passes run between this pass and the path tracer.
                     if (RESTIR_ON && pc.restir_surfaces != nullptr && pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
-                        pc.restir_surfaces[launch_id.y * launch_size.x + launch_id.x] = restirSurfacePack(
+                        restirSurfaceStore(pc.restir_surfaces + (launch_id.y * launch_size.x + launch_id.x), restirSurfacePack(
                             hit_point, pc.uniforms.frame, payload.prev_world_pos,
-                            mat4MulVec(pc.uniforms.view_proj, float4(hit_point, 1.0)).w, payload.color.rgb,
+                            mat4MulVecAt(&pc.uniforms.view_proj[0], float4(hit_point, 1.0)).w, payload.color.rgb,
                             hitPayloadGetMetallic(payload), hitPayloadGetRoughness(payload), payload.lobes,
-                            mask, ray_mask, world_normal, surface_normal, -direction);
+                            mask, ray_mask, world_normal, surface_normal, -direction));
                     }
                 }
             }
@@ -1215,15 +1215,15 @@ float3 pixelDirection(uint2 launch_id, uint2 launch_size) {
     let subpixel = float2(0.5 + pc.uniforms.jitter_x, 0.5 - pc.uniforms.jitter_y);
     let pixel_center = float2(float(launch_id.x), float(launch_size.y - 1u - launch_id.y)) + subpixel;
     let d = pixel_center / float2(launch_size) * 2.0 - 1.0;
-    let target = mat4MulVec(pc.uniforms.inverse_projection, float4(d, 1, 1)).xyz;
-    return mat4MulVec(pc.uniforms.inverse_view, float4(normalize(target), 0)).xyz;
+    let target = mat4MulVecAt(&pc.uniforms.inverse_projection[0], float4(d, 1, 1)).xyz;
+    return mat4MulVecAt(&pc.uniforms.inverse_view[0], float4(normalize(target), 0)).xyz;
 }
 
 // A sample's camera ray: from `lens` on the aperture toward the pixel's point in focus.
 void lensRay(float2 lens, uint2 launch_id, uint2 launch_size, out float3 origin, out float3 direction) {
     let camera = cameraOrigin();
     let focal = camera + pixelDirection(launch_id, launch_size) * pc.focus[0];
-    origin = mat4MulVec(pc.uniforms.inverse_view, float4(lens, 0, 1)).xyz;
+    origin = mat4MulVecAt(&pc.uniforms.inverse_view[0], float4(lens, 0, 1)).xyz;
     direction = normalize(focal - origin);
 }
 

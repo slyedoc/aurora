@@ -10,10 +10,14 @@ __exported import hit_payload;
 
 public static const float PI = 3.141592653589793;
 
-// Column-major 4x4 matrix times a column vector (GLSL `mat4 * vec4`).
-public float4 mat4MulVec(float m[16], float4 v) {
-    return float4(m[0], m[1], m[2], m[3]) * v.x + float4(m[4], m[5], m[6], m[7]) * v.y
-        + float4(m[8], m[9], m[10], m[11]) * v.z + float4(m[12], m[13], m[14], m[15]) * v.w;
+// Column-major 4x4 matrix in a buffer (`&uniforms.view_proj[0]`) times a column vector (GLSL
+// `mat4 * vec4`), its columns read as four 16-byte loads: a by-value `float m[16]` from a
+// pointer is sixteen 4-byte loads (scalar layout marks every pointer access 4-byte aligned).
+// The uniform block's matrices sit on 16-byte boundaries.
+public float4 mat4MulVecAt(float* m, float4 v) {
+    let c = (float4*)m;
+    return loadAligned<16>(c) * v.x + loadAligned<16>(c + 1) * v.y
+        + loadAligned<16>(c + 2) * v.z + loadAligned<16>(c + 3) * v.w;
 }
 
 // Rows u, v, w: `mul(x, orthonormalBasis(n))` is GLSL's `mat3(u, v, w) * x`.
@@ -300,6 +304,38 @@ public struct RestirSurface {
     public uint view_oct;
     public uint pad;
 };
+
+// A RestirSurface as four 16-byte stores / loads (the buffers' 64-byte records are 16-byte
+// aligned; a struct access is sixteen 4-byte ones).
+public void restirSurfaceStore(RestirSurface* p, RestirSurface s) {
+    let d = (uint4*)p;
+    storeAligned<16>(d, uint4(asuint(s.position), s.frame));
+    storeAligned<16>(d + 1, uint4(asuint(s.prev_position), asuint(s.depth)));
+    storeAligned<16>(d + 2, uint4(s.albedo_metallic, s.material, s.throughput_rg, s.throughput_b_mask));
+    storeAligned<16>(d + 3, uint4(s.normal_oct, s.geo_normal_oct, s.view_oct, s.pad));
+}
+
+public RestirSurface restirSurfaceLoad(RestirSurface* p) {
+    let d = (uint4*)p;
+    let a = loadAligned<16>(d);
+    let b = loadAligned<16>(d + 1);
+    let c = loadAligned<16>(d + 2);
+    let e = loadAligned<16>(d + 3);
+    RestirSurface s;
+    s.position = asfloat(a.xyz);
+    s.frame = a.w;
+    s.prev_position = asfloat(b.xyz);
+    s.depth = asfloat(b.w);
+    s.albedo_metallic = c.x;
+    s.material = c.y;
+    s.throughput_rg = c.z;
+    s.throughput_b_mask = c.w;
+    s.normal_oct = e.x;
+    s.geo_normal_oct = e.y;
+    s.view_oct = e.z;
+    s.pad = e.w;
+    return s;
+}
 
 // Where the path tracer resumes sample 0 (docs/plans/primary-pass.html), written by the
 // primary pass per traced pixel. 64 bytes.
