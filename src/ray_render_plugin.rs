@@ -121,8 +121,17 @@ pub struct UniformData {
     fog_grid_size: [u32; 3],
     /// One shadow ray per vertex from this bounce on (`RenderSettings::one_shadow_ray_from`).
     one_shadow_ray_from: u32,
-    /// The grid's columns summed front to back: in-scatter and transmittance per cell.
-    fog_grid_sum: u64,
+    /// Bindless 3D images: the grid's columns summed front to back (in-scatter and
+    /// transmittance per cell, behind a first slice of nothing) and the grid blurred once
+    /// across x and y. A camera ray's lookups filter them in the texture unit.
+    fog_grid_sum_tex: u32,
+    fog_grid_soft_tex: u32,
+    /// The soft grid as a buffer (`fog_integrate` reads it).
+    fog_grid_soft: u64,
+    /// The update lights one cell of every stride x stride block per frame ([`Fog::grid_stride`](crate::sky::Fog::grid_stride)).
+    fog_grid_stride: u32,
+    /// [`RenderSettings::ab`].
+    ab: u32,
 }
 
 #[repr(C)]
@@ -452,7 +461,6 @@ fn render_frame(
         Option<Res<crate::render_settings::RenderSettings>>,
         crate::ui_render::UiDrawParams,
         Res<EnvironmentSkies>,
-        Res<crate::sky_importance::SkyImportance>,
         crate::gizmo_render::GizmoDrawParams,
         Res<Atmosphere>,
         Res<CloudLayer>,
@@ -560,8 +568,7 @@ fn render_frame(
         mut video,
     ) = dlss_stuff;
 
-    let (settings, mut ui, skies, importance, mut gizmos, atmosphere, clouds, sky_gen) =
-        dev_ui_stuff;
+    let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
     let local_tonemap = settings.as_ref().map_or(0.0, |s| s.local_tonemap);
     let bloom = settings.as_ref().map_or(0.0, |s| s.bloom);
     let settings = settings
@@ -810,23 +817,28 @@ fn render_frame(
         for buffer in frame.sky_masks[view.slot].iter_mut() {
             if buffer.nr_elements != len {
                 render_device.destroyer.destroy_buffer(buffer.handle);
-                *buffer = render_device
-                    .create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
+                *buffer =
+                    render_device.create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
                 reset = 1;
             }
         }
         for buffer in frame.fog_veils[view.slot].iter_mut() {
             if buffer.nr_elements != len {
                 render_device.destroyer.destroy_buffer(buffer.handle);
-                *buffer = render_device
-                    .create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
+                *buffer =
+                    render_device.create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
                 reset = 1;
             }
         }
         let cur = (*frame_counter & 1) as usize;
         let (sky, fog) = (&frame.sky_masks[view.slot], &frame.fog_veils[view.slot]);
         view.history = (
-            [sky[1 - cur].address, sky[cur].address, fog[1 - cur].address, fog[cur].address],
+            [
+                sky[1 - cur].address,
+                sky[cur].address,
+                fog[1 - cur].address,
+                fog[cur].address,
+            ],
             reset,
         );
     }
@@ -878,16 +890,10 @@ fn render_frame(
         .iter()
         .enumerate()
         .map(|(bit, environment)| {
-            let mut importance_address = importance.address(bit);
+            let importance_address = sky_gen.table(bit);
             let (tex, space) = match &environment.sky {
                 Sky::Hdr { image, .. } => (texture_index(image), Vec4::ZERO),
-                Sky::Generated => match sky_gen.sky(bit) {
-                    Some((tex, table)) => {
-                        importance_address = table;
-                        (tex, Vec4::ZERO)
-                    }
-                    None => (WHITE_TEXTURE_IDX, Vec4::ZERO),
-                },
+                Sky::Generated => (sky_gen.tex(bit).unwrap_or(WHITE_TEXTURE_IDX), Vec4::ZERO),
                 // The space image behind the air (colour = its scale; 0 = none).
                 Sky::Atmosphere => match &atmosphere.space {
                     Some(image) => (texture_index(image), Vec4::splat(atmosphere.space_scale)),
@@ -900,7 +906,6 @@ fn render_frame(
                 tex,
                 space,
                 importance_address,
-                importance.sun(bit),
                 environment
                     .air
                     .stars
@@ -928,6 +933,7 @@ fn render_frame(
             view.trace_extent,
             fog.grid_tile,
             fog.grid_slices,
+            fog.grid_stride,
             crate::fog_grid::grid_view(&eyes),
             *frame_counter,
             view.slot,
@@ -1017,7 +1023,11 @@ fn render_frame(
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
             one_shadow_ray_from: settings.one_shadow_ray_from,
-            fog_grid_sum: grid.sum,
+            fog_grid_sum_tex: grid.sum_tex,
+            fog_grid_soft_tex: grid.soft_tex,
+            fog_grid_soft: grid.soft,
+            fog_grid_stride: grid.stride,
+            ab: settings.ab,
         };
 
         uniform_uploads.push((view.slot, data));
@@ -1372,47 +1382,44 @@ fn render_frame(
                     }
 
                     // The camera's fog grid, by the first of its views: lit before any of them
-                    // marches it (a headset's second eye reuses it).
+                    // marches it (a headset's second eye reuses it). History carried forward
+                    // (compute), this frame's cells lit (raygen), blurred and summed (compute).
                     if let Some((_, _, grid)) = grids
                         .iter()
                         .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)
                     {
+                        let uniforms = frame.uniform_buffers[view.slot].address;
                         let scope = prof.begin(&render_device, view_cmd, "fog grid");
-                        render_device.ext_rtx_pipeline.cmd_trace_rays(
+                        if fog_grid.record_reproject(
+                            &render_device,
                             view_cmd,
-                            &sbt.fog_grid_region,
-                            &sbt.miss_region,
-                            &sbt.hit_region,
-                            &vk::StridedDeviceAddressRegionKHR::default(),
-                            grid.size.x,
-                            grid.size.y,
-                            grid.size.z,
-                        );
-                        let lit = || {
-                            crate::compute::memory_barrier(
+                            &modules,
+                            uniforms,
+                            grid,
+                        ) {
+                            push_trace(push_constants);
+                            let stride = grid.stride.max(1);
+                            render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                view_cmd,
+                                &sbt.fog_grid_region,
+                                &sbt.miss_region,
+                                &sbt.hit_region,
+                                &vk::StridedDeviceAddressRegionKHR::default(),
+                                grid.size.x.div_ceil(stride),
+                                grid.size.y.div_ceil(stride),
+                                grid.size.z,
+                            );
+                            fog_grid.record_integrate(
                                 &render_device,
                                 view_cmd,
-                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                                vk::AccessFlags2::SHADER_WRITE,
-                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                                vk::AccessFlags2::SHADER_READ,
-                            )
-                        };
-                        lit();
-                        // Then each column summed front to back: a camera ray's fog is two
-                        // lookups instead of a march.
-                        render_device.ext_rtx_pipeline.cmd_trace_rays(
-                            view_cmd,
-                            &sbt.fog_integrate_region,
-                            &sbt.miss_region,
-                            &sbt.hit_region,
-                            &vk::StridedDeviceAddressRegionKHR::default(),
-                            grid.size.x,
-                            grid.size.y,
-                            1,
-                        );
+                                &modules,
+                                uniforms,
+                                grid,
+                                view.slot,
+                            );
+                            push_trace(push_constants);
+                        }
                         prof.end(&render_device, view_cmd, scope);
-                        lit();
                     }
 
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
@@ -2046,6 +2053,7 @@ fn render_frame(
             let queue_lock = info_span!("queue_lock").entered();
             let queue = render_device.queue.lock().unwrap();
             drop(queue_lock);
+            let traced = crate::nsight::begin_frame(*queue);
             sync.submit(
                 *queue,
                 &[cmd_buffer, view_cmd, present_cmd],
@@ -2054,6 +2062,9 @@ fn render_frame(
                 &signals,
                 present_id,
             );
+            if traced {
+                crate::nsight::end_frame(*queue);
+            }
             if let Some(swapchain) = swapchain.as_deref() {
                 latency.mark(
                     &render_device,
@@ -2407,6 +2418,8 @@ mod tests {
         assert_eq!(offset_of!(U, fog_grid_cells), 472);
         assert_eq!(offset_of!(U, fog_grid_inverse_view), 480);
         assert_eq!(offset_of!(U, fog_grid_size), 736);
-        assert_eq!(offset_of!(U, fog_grid_sum), 752);
+        assert_eq!(offset_of!(U, fog_grid_sum_tex), 752);
+        assert_eq!(offset_of!(U, fog_grid_soft), 760);
+        assert_eq!(offset_of!(U, fog_grid_stride), 768);
     }
 }

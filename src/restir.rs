@@ -33,7 +33,7 @@ use crate::{
 
 /// `Reservoir` and `RestirSurface` in rt_types.slang.
 const RESERVOIR_BYTES: u64 = 40;
-const SURFACE_BYTES: u64 = 96;
+const SURFACE_BYTES: u64 = 64;
 /// The light grid's cells (x, y, z) around the camera.
 const GRID: [u32; 3] = [32, 8, 32];
 /// Power-CDF candidates resampled into each grid sample. Many: with hundreds of lamps of equal
@@ -70,6 +70,9 @@ struct RestirFrameGpu {
     emissive_boost: f32,
     grid_candidates: u32,
     light_entries: u32,
+    /// [`RenderSettings::ab`].
+    ab: u32,
+    pad: u32,
 }
 
 /// `RestirPush` in restir.slang.
@@ -244,6 +247,8 @@ impl RestirState {
             emissive_boost: settings.emissive_boost.max(0.0),
             grid_candidates: GRID_CANDIDATES,
             light_entries: input.light_entries,
+            ab: input.settings.ab,
+            pad: 0,
         };
         // Recorded, not written through a mapping: the previous frame may still read it.
         unsafe {
@@ -255,7 +260,8 @@ impl RestirState {
             cmd,
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_READ,
         );
         RestirAddresses {

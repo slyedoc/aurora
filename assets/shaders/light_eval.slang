@@ -12,42 +12,11 @@ public struct LightCtx {
     public float emissive_boost;
 };
 
-public float3 vertexPosition(float* verts, uint i) {
-    let b = i * 8u;
-    return float3(verts[b], verts[b + 1u], verts[b + 2u]);
-}
-
-// The world-space corners of triangle `tri` of light instance `li`, through the live
-// TLAS instance row (3x4 row-major, as in prev_instances); `g` gets the geometry index.
-public void lightTriangleWorld(LightCtx ctx, LightInstance li, uint tri, out uint g, out float3 w0, out float3 w1, out float3 w2) {
-    g = 0u;
-    for (uint k = 1u; k < li.geom_count; k++) {
-        if (li.geom_to_triangle[k] <= tri) {
-            g = k;
-        } else {
-            break;
-        }
-    }
-    let idx = li.geom_to_index[g] + (tri - li.geom_to_triangle[g]) * 3u;
-    let p0 = vertexPosition(li.vertices, li.indices[idx + 0u]);
-    let p1 = vertexPosition(li.vertices, li.indices[idx + 1u]);
-    let p2 = vertexPosition(li.vertices, li.indices[idx + 2u]);
-    let base = li.slot * 4u;
-    let r0 = ctx.instances[base + 0u];
-    let r1 = ctx.instances[base + 1u];
-    let r2 = ctx.instances[base + 2u];
-    w0 = float3(dot(r0, float4(p0, 1.0)), dot(r1, float4(p0, 1.0)), dot(r2, float4(p0, 1.0)));
-    w1 = float3(dot(r0, float4(p1, 1.0)), dot(r1, float4(p1, 1.0)), dot(r2, float4(p1, 1.0)));
-    w2 = float3(dot(r0, float4(p2, 1.0)), dot(r1, float4(p2, 1.0)), dot(r2, float4(p2, 1.0)));
-}
-
 // Solid-angle pdf of the light table picking direction onto triangle `tri` of `li` at
 // distance `t` along `dir` (for MIS against BRDF sampling). 0 when degenerate.
 public float lightTrianglePdf(LightCtx ctx, LightInstance li, uint tri, float p_pick, float t, float3 dir) {
-    uint g;
-    float3 w0, w1, w2;
-    lightTriangleWorld(ctx, li, tri, g, w0, w1, w2);
-    let lng = cross(w1 - w0, w2 - w0);
+    let r = ctx.lights.prepared + (li.entry_base + tri) * 4u;
+    let lng = cross(r[1].xyz, r[2].xyz);
     let area2 = length(lng);
     if (area2 <= 0.0) {
         return 0.0;
@@ -106,14 +75,63 @@ public float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMater
     return evalLayered(v, n, dir, mat, lob, true) * abs(NoL);
 }
 
+// A cheap stand-in for thinSurface, luminance only: Lambert for the diffuse share, GGX D with
+// Schlick's F0 and one Smith G1 for the base and the coat, Lambert through a translucent one.
+// ReSTIR resamples by it (any target that is non-zero wherever the light can contribute keeps
+// it unbiased); the shade evaluates the exact layered BSDF for the winner.
+public float cheapSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+    let NoL = dot(n, dir);
+    let a = dot(mat.albedo, float3(0.2126, 0.7152, 0.0722));
+    if (lob.transmission > 0.0 && NoL < 0.0 && dot(dir, ns) < 0.0) {
+        return a * lob.transmission * (-NoL) / PI;
+    }
+    if (NoL <= 0.0 || dot(dir, ns) <= 0.0) {
+        return 0.0;
+    }
+    let NoV = max(dot(n, v), 0.05);
+    let NoH = saturate(dot(n, normalize(v + dir)));
+    let f0 = lerp(0.04, a, mat.metallic);
+    let diffuse = a * (1.0 - mat.metallic) * (1.0 - lob.transmission) * NoL / PI;
+    return diffuse + f0 * cheapGgx(max(mat.roughness * mat.roughness, 0.002), NoH, NoL, NoV)
+        + 0.04 * lob.clearcoat * cheapGgx(lob.coat_alpha, NoH, NoL, NoV);
+}
+
+// GGX D times one Smith G1 (at the light), over 4 NoV: a specular lobe times NoL, F left out.
+float cheapGgx(float alpha, float NoH, float NoL, float NoV) {
+    let a2 = alpha * alpha;
+    let d = NoH * NoH * (a2 - 1.0) + 1.0;
+    let g1 = 2.0 * NoL / (NoL + sqrt(a2 + (1.0 - a2) * NoL * NoL));
+    return a2 * g1 / (PI * d * d * 4.0 * NoV);
+}
+
+float3 surfaceResponse(bool cheap, float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+    return cheap ? float3(cheapSurface(v, n, ns, dir, mat, lob)) : thinSurface(v, n, ns, dir, mat, lob);
+}
+
+public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, float sv,
+                                 float3 sp, float3 n, float3 ns, float3 v,
+                                 DisneyMaterial mat, Lobes lob, bool fixed_point,
+                                 out float p_area, out float pdf_solid, out float3 dir, out float dist) {
+    return analyticSampleEvalWith(ctx, e, p_pick, su, sv, sp, n, ns, v, mat, lob, fixed_point, false,
+                                  p_area, pdf_solid, dir, dist);
+}
+
+public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, float su, float sv,
+                              float3 sp, float3 n, float3 ns, float3 v,
+                              DisneyMaterial mat, Lobes lob, uint ray_mask, bool fixed_point,
+                              out float p_area, out float pdf_solid, out float3 dir, out float dist) {
+    return lightSampleEvalWith(ctx, e, li_idx, p_pick, su, sv, sp, n, ns, v, mat, lob, ray_mask,
+                               fixed_point, false, p_area, pdf_solid, dir, dist);
+}
+
 // Unshadowed contribution of analytic light `e` (same contract as lightSampleEval below).
 // A radius-0 point or spot is a delta: `p_area` is just the pick probability and
 // `pdf_solid` a huge sentinel, so the MIS weight against BRDF sampling goes to 1. Points,
 // spots and rects have no geometry -- a BRDF ray never finds them, so nothing takes the
 // complementary weight. A sphere emitter (kind 3) does: see sphereEmitterPdf.
-public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, float sv,
+float3 analyticSampleEvalWith(LightCtx ctx, uint e, float p_pick, float su, float sv,
                           float3 sp, float3 n, float3 ns, float3 v,
-                          DisneyMaterial mat, Lobes lob, bool fixed_point,
+                          DisneyMaterial mat, Lobes lob, bool fixed_point, bool cheap,
                           out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     p_area = 0.0;
     pdf_solid = 0.0;
@@ -140,7 +158,7 @@ public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, f
         if ((al.flags & 1u) != 0u) {
             cos_l = abs(cos_l);
         }
-        let surf = thinSurface(v, n, ns, dir, mat, lob);
+        let surf = surfaceResponse(cheap, v, n, ns, dir, mat, lob);
         if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
             return float3(0.0);
         }
@@ -181,7 +199,7 @@ public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, f
         }
         dist = centre_dist;
         dir = centre_dir;
-        let surf = thinSurface(v, n, ns, dir, mat, lob);
+        let surf = surfaceResponse(cheap, v, n, ns, dir, mat, lob);
         if (all(surf == float3(0.0))) {
             return float3(0.0);
         }
@@ -208,7 +226,7 @@ public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, f
         if (cos_l <= 1.0e-4) {
             return float3(0.0);
         }
-        let surf = thinSurface(v, n, ns, dir, mat, lob);
+        let surf = surfaceResponse(cheap, v, n, ns, dir, mat, lob);
         if (all(surf == float3(0.0))) {
             return float3(0.0);
         }
@@ -235,7 +253,7 @@ public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, f
     if (surface_dist <= 1.0e-4) {
         return float3(0.0);
     }
-    let surf = thinSurface(v, n, ns, dir, mat, lob);
+    let surf = surfaceResponse(cheap, v, n, ns, dir, mat, lob);
     if (all(surf == float3(0.0))) {
         return float3(0.0);
     }
@@ -273,9 +291,9 @@ public float sphereEmitterPdf(LightCtx ctx, uint e, float3 from) {
 // the shadow-ray direction / distance; returns 0 on any rejection -- including a light in
 // another world than `ray_mask`'s (the shadow ray could not see its geometry, so it would
 // otherwise light through).
-public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, float su, float sv,
+float3 lightSampleEvalWith(LightCtx ctx, uint e, uint li_idx, float p_pick, float su, float sv,
                        float3 sp, float3 n, float3 ns, float3 v,
-                       DisneyMaterial mat, Lobes lob, uint ray_mask, bool fixed_point,
+                       DisneyMaterial mat, Lobes lob, uint ray_mask, bool fixed_point, bool cheap,
                        out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     if (e < ctx.lights.analytic_count) {
         if (((ctx.lights.analytics[e].flags >> 8) & ray_mask & 0xFFu) == 0u) {
@@ -285,7 +303,7 @@ public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, f
             dist = 0.0;
             return float3(0.0);
         }
-        return analyticSampleEval(ctx, e, p_pick, su, sv, sp, n, ns, v, mat, lob, fixed_point,
+        return analyticSampleEvalWith(ctx, e, p_pick, su, sv, sp, n, ns, v, mat, lob, fixed_point, cheap,
                                   p_area, pdf_solid, dir, dist)
             * ctx.emissive_boost;
     }
@@ -293,21 +311,22 @@ public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, f
     pdf_solid = 0.0;
     dir = float3(0.0);
     dist = 0.0;
-    let li = ctx.lights.linsts[li_idx];
-    // The emitter's world: its instance row's mask (packed above the custom index).
-    if (((asuint(ctx.instances[li.slot * 4u + 3u].x) >> 24) & ray_mask & 0xFFu) == 0u) {
+    // The entry as `light_prepare` resolved it this frame; its world mask first (a light in
+    // another world than the ray's must not light through).
+    let rec = ctx.lights.prepared + e * 4u;
+    let r0 = rec[0];
+    if ((asuint(r0.w) & ray_mask & 0xFFu) == 0u) {
         return float3(0.0);
     }
-    uint g;
-    float3 w0, w1, w2;
-    lightTriangleWorld(ctx, li, e - li.entry_base, g, w0, w1, w2);
-    let lng = cross(w1 - w0, w2 - w0);
+    let e1 = rec[1].xyz;
+    let e2 = rec[2].xyz;
+    let lng = cross(e1, e2);
     let area2 = length(lng);
     if (area2 <= 0.0) {
         return float3(0.0);
     }
     let r = sqrt(max(su, 1.0e-6));
-    let point = w0 * (1.0 - r) + w1 * (r * (1.0 - sv)) + w2 * (r * sv);
+    let point = r0.xyz + e1 * (r * (1.0 - sv)) + e2 * (r * sv);
     let to_light = point - sp;
     dist = length(to_light);
     if (dist <= 1.0e-4) {
@@ -315,15 +334,13 @@ public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, f
     }
     dir = to_light / dist;
     let cos_l = abs(dot(lng / area2, dir));
-    let surf = thinSurface(v, n, ns, dir, mat, lob);
+    let surf = surfaceResponse(cheap, v, n, ns, dir, mat, lob);
     if (cos_l <= 1.0e-4 || all(surf == float3(0.0))) {
         return float3(0.0);
     }
     p_area = p_pick / (0.5 * area2);
     pdf_solid = p_area * dist * dist / cos_l;
-    let emission = float3(li.geom_emission[g * 3u + 0u],
-                          li.geom_emission[g * 3u + 1u],
-                          li.geom_emission[g * 3u + 2u]);
+    let emission = rec[3].xyz;
     return surf * emission * (ctx.emissive_boost * cos_l / (dist * dist));
 }
 
@@ -337,10 +354,8 @@ public float fogPhaseG(float g, float cos_theta) {
 // A surface's material, normals and view from its packed record.
 public void restirSurfaceUnpack(RestirSurface s, out DisneyMaterial mat, out Lobes lob,
                                 out float3 n, out float3 ns, out float3 v) {
-    mat = disneyMaterial(s.albedo, s.metallic, s.roughness);
-    lob.transmission = s.transmission;
-    lob.clearcoat = s.clearcoat;
-    lob.coat_alpha = s.coat_alpha;
+    mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    lob = unpackLobes(s.material);
     n = oct_to_float32x3(unpackHalf2(s.normal_oct));
     ns = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
     v = oct_to_float32x3(unpackHalf2(s.view_oct));
@@ -361,12 +376,31 @@ public float3 restirTarget(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
     p_cdf = lightsEntryPick(ctx, e);
     float pdf_solid;
     var val = lightSampleEval(ctx, e, lightsFindInstance(ctx, e), p_cdf, uv.x, uv.y,
-                              s.position, n, ns, v, mat, lob, s.ray_mask, true,
+                              s.position, n, ns, v, mat, lob, restirRayMask(s), true,
                               p_area_cdf, pdf_solid, dir, dist);
     if (pdf_solid > 0.0) {
         val *= pdf_solid / (pdf_solid + layeredPdf(v, n, dir, mat, lob));
     }
     return val;
+}
+
+// ReSTIR's resampling target for (e, uv) at `s`: the luminance of the unshadowed contribution
+// through cheapSurface, without the MIS weight (the shade applies both exactly). Also the CDF's
+// area pdf and pick probability, as restirTarget.
+public float restirTargetCheap(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
+                               out float p_area_cdf, out float p_cdf) {
+    DisneyMaterial mat;
+    Lobes lob;
+    float3 n, ns, v;
+    restirSurfaceUnpack(s, mat, lob, n, ns, v);
+    let uv = unpackHalf2(uv_pk);
+    p_cdf = lightsEntryPick(ctx, e);
+    float pdf_solid, dist;
+    float3 dir;
+    let val = lightSampleEvalWith(ctx, e, lightsFindInstance(ctx, e), p_cdf, uv.x, uv.y,
+                                  s.position, n, ns, v, mat, lob, restirRayMask(s), true, true,
+                                  p_area_cdf, pdf_solid, dir, dist);
+    return restirLuma(val);
 }
 
 public float restirLuma(float3 c) {

@@ -10,8 +10,9 @@
 //   restir_spatial   merges k random neighbours' reservoirs (same-frame surfaces, rejection
 //                    tested), with a boiling filter against lone hot samples.
 //
-// Every target is restirTarget (light_eval.slang): unshadowed, MIS-weighted against BRDF
-// sampling with the CDF's pdf. The combination is the biased one (no neighbour visibility);
+// Every target is restirTargetCheap (light_eval.slang): the unshadowed contribution through a
+// cheap BSDF, in luminance; `restir_shade` evaluates the exact one (restirTarget: the layered
+// BSDF, MIS-weighted against BRDF sampling) for the winner. The combination is the biased one (no neighbour visibility);
 // the shade pass's shadow ray zeroes occluded winners for next frame (visibility reuse).
 import rt_types;
 import rand;
@@ -43,11 +44,8 @@ float3 entryPosition(LightCtx ctx, uint e) {
         let al = ctx.lights.analytics[e];
         return float3(al.position_x, al.position_y, al.position_z);
     }
-    let li = ctx.lights.linsts[lightsFindInstance(ctx, e)];
-    uint g;
-    float3 w0, w1, w2;
-    lightTriangleWorld(ctx, li, e - li.entry_base, g, w0, w1, w2);
-    return (w0 + w1 + w2) * (1.0 / 3.0);
+    let r = ctx.lights.prepared + e * 4u;
+    return r[0].xyz + (r[1].xyz + r[2].xyz) * (1.0 / 3.0);
 }
 
 // The cell holding `p`, or ~0 outside the grid.
@@ -156,9 +154,8 @@ float targetAt(LightCtx ctx, RestirSurface s, uint e, uint uv_pk, out float dens
     if (e == NO_ENTRY) {
         return 0.0;
     }
-    float p_area_cdf, p_cdf, dist;
-    float3 dir;
-    let phat = restirLuma(restirTarget(ctx, s, e, uv_pk, p_area_cdf, p_cdf, dir, dist));
+    float p_area_cdf, p_cdf;
+    let phat = restirTargetCheap(ctx, s, e, uv_pk, p_area_cdf, p_cdf);
     density = p_cdf > 0.0 ? p_area_cdf / p_cdf : 0.0;
     return phat;
 }
@@ -203,10 +200,8 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
             e = lightsPickEntry(ctx, randf() * ctx.lights.total_power, p_src);
         }
         let uv_pk = packHalf2(float2(randf(), randf()));
-        float p_area_cdf, p_cdf, dist;
-        float3 dir;
-        let val = restirTarget(ctx, s, e, uv_pk, p_area_cdf, p_cdf, dir, dist);
-        let phat = restirLuma(val);
+        float p_area_cdf, p_cdf;
+        let phat = restirTargetCheap(ctx, s, e, uv_pk, p_area_cdf, p_cdf);
         if (phat <= 0.0 || p_cdf <= 0.0 || p_area_cdf <= 0.0) {
             continue;
         }

@@ -199,12 +199,14 @@ impl VulkanAsset for ProceduralMesh {
                     pipelines: [(asset.entry.clone(), asset.fill_pipeline)]
                         .into_iter()
                         .collect(),
+                    heap: false,
                 };
                 let pack = CompiledComputeModule {
                     pipeline_layout: asset.pack_layout,
                     pipelines: [("pack_triangles".to_string(), asset.pack_pipeline)]
                         .into_iter()
                         .collect(),
+                    heap: false,
                 };
                 // The whole push block: header, then the app's parameters.
                 let mut push = [0u8; COMPUTE_PUSH_CONSTANT_SIZE as usize];

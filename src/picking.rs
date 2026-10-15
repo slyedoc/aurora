@@ -197,7 +197,8 @@ impl Picker {
         let rays = self.rays.write();
         if rays.nr_elements < self.capacity as u64 {
             rd.destroyer.destroy_buffer(rays.handle);
-            *rays = rd.create_host_buffer(self.capacity as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
+            *rays =
+                rd.create_host_buffer(self.capacity as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
         }
         rd.map_buffer(rays).as_slice_mut()[..self.staged.len()].copy_from_slice(&self.staged);
         let module = modules
@@ -241,7 +242,16 @@ impl Picker {
             let queue = rd.queue.lock().unwrap();
             self.point = rd
                 .timeline
-                .submit(rd, *queue, std::slice::from_ref(&cmd), &[], &[], &[], vk::Fence::null(), None)
+                .submit(
+                    rd,
+                    *queue,
+                    std::slice::from_ref(&cmd),
+                    &[],
+                    &[],
+                    &[],
+                    vk::Fence::null(),
+                    None,
+                )
                 .unwrap_or_else(|e| {
                     crate::aftermath::note_device_lost(e);
                     panic!("pick submit failed: {e:?}");

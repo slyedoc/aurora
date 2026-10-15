@@ -63,7 +63,7 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in lights.slang and rt_types.slang. 64 bytes.
+/// Must match `LightsHeader` in lights.slang and rt_types.slang. 72 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -81,6 +81,8 @@ struct LightsHeaderGpu {
     analytics: u64,
     /// Per entry, its light instance (0 for analytic entries): the sampler's direct lookup.
     entry_to_linst: u64,
+    /// Per triangle entry, resolved each frame by `light_prepare`: four float4.
+    prepared: u64,
 }
 
 /// `slot_map` values with this bit are a sphere emitter's analytic entry rather than a light
@@ -124,6 +126,21 @@ struct LightPowerParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct LightPrepareParams {
+    linsts: u64,
+    instances: u64,
+    header: u64,
+    entry_to_linst: u64,
+    cdf: u64,
+    prepared: u64,
+    entry_count: u32,
+    analytic_count: u32,
+    base: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct LightScanParams {
     powers: u64,
     header: u64,
@@ -153,6 +170,9 @@ pub struct LightManager {
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
     entry_to_linst: Buffer<u32>,
+    /// Per triangle entry, its world triangle, emission, mask and pick probability, resolved
+    /// every frame (`light_prepare`): what a light sample reads.
+    prepared: Buffer<[f32; 4]>,
     emissions: Buffer<f32>,
     analytics: Buffer<AnalyticLightGpu>,
     /// The analytic lights as last extracted (entry order); re-uploaded when they move.
@@ -189,6 +209,7 @@ impl LightManager {
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
             entry_to_linst: Buffer::default(),
+            prepared: Buffer::default(),
             emissions: Buffer::default(),
             analytics: Buffer::default(),
             analytic_cache: Vec::new(),
@@ -216,6 +237,7 @@ impl LightManager {
             self.slot_map.handle,
             self.cdf.handle,
             self.entry_to_linst.handle,
+            self.prepared.handle,
             self.emissions.handle,
             self.analytics.handle,
         ] {
@@ -226,12 +248,14 @@ impl LightManager {
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
         self.entry_to_linst = Buffer::default();
+        self.prepared = Buffer::default();
         self.emissions = Buffer::default();
         self.analytics = Buffer::default();
     }
 
-    /// Records the weight + CDF kernels into the frame command buffer. Call after
-    /// `TLAS::record` (the instance rows must be gathered) and before the trace.
+    /// Records the weight + CDF kernels (when the light set changed) and every frame the
+    /// prepared triangles into the frame command buffer. Call after `TLAS::record` (the
+    /// instance rows must be gathered) and before the trace.
     pub fn record(
         &mut self,
         rd: &RenderDevice,
@@ -239,9 +263,57 @@ impl LightManager {
         modules: &ComputeModules,
         tlas: &TLAS,
     ) {
-        if !self.needs_power_pass || self.entry_count == 0 {
+        if self.entry_count == 0 {
             return;
         }
+        if self.needs_power_pass {
+            self.record_powers(rd, cmd, modules, tlas);
+        }
+        // Triangles move with their instances: resolved again every frame.
+        if self.needs_power_pass || self.linst_count == 0 || tlas.instances_address() == 0 {
+            return;
+        }
+        let Some(module) = modules.get(&self.module) else {
+            return;
+        };
+        let params = LightPrepareParams {
+            linsts: self.linsts.address,
+            instances: tlas.instances_address(),
+            header: self.header.address,
+            entry_to_linst: self.entry_to_linst.address,
+            cdf: self.cdf.address,
+            prepared: self.prepared.address,
+            entry_count: self.entry_count,
+            analytic_count: self.analytic_cache.len() as u32,
+            base: 0,
+            pad: 0,
+        };
+        record_dispatch(
+            rd,
+            cmd,
+            module,
+            "light_prepare",
+            &params,
+            self.entry_count,
+            Some(std::mem::offset_of!(LightPrepareParams, base)),
+        );
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
+    }
+
+    fn record_powers(
+        &mut self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        modules: &ComputeModules,
+        tlas: &TLAS,
+    ) {
         // Triangle entries read live TLAS rows; analytic-only tables have none to read.
         if self.linst_count > 0 && tlas.instances_address() == 0 {
             return;
@@ -563,6 +635,7 @@ fn prepare_lights(
         entry_to_linst[first..first + li.tri_count as usize].fill(i as u32);
     }
     lights.entry_to_linst = render_device.create_device_buffer(entry_base as u64, storage);
+    lights.prepared = render_device.create_device_buffer(entry_base as u64 * 4, storage);
     lights.header = render_device.create_device_buffer(1, storage);
     lights.emissions = render_device.create_device_buffer(emissions.len().max(1) as u64, storage);
     lights.analytics =
@@ -584,6 +657,7 @@ fn prepare_lights(
         slot_to_linst: lights.slot_map.address,
         analytics: lights.analytics.address,
         entry_to_linst: lights.entry_to_linst.address,
+        prepared: lights.prepared.address,
     };
     render_device.run_transfer_commands_after_frames(|cmd| {
         if !linsts.is_empty() {
@@ -592,6 +666,12 @@ fn prepare_lights(
         upload_slice(&render_device, cmd, &slot_map, &lights.slot_map);
         upload_slice(&render_device, cmd, &entry_to_linst, &lights.entry_to_linst);
         upload_slice(&render_device, cmd, &[header], &lights.header);
+        // Zero (world mask 0: lights nothing) until the first `light_prepare`.
+        unsafe {
+            render_device
+                .device
+                .cmd_fill_buffer(cmd, lights.prepared.handle, 0, vk::WHOLE_SIZE, 0);
+        }
         if !emissions.is_empty() {
             upload_slice(&render_device, cmd, &emissions, &lights.emissions);
         }
@@ -833,7 +913,7 @@ impl Plugin for LightsPlugin {
     fn build(&self, app: &mut App) {
         let asset_server = app.world().resource::<AssetServer>();
         let shader = asset_server.load(aurora_asset("shaders/lights.slang"));
-        let module = asset_server.add(ComputeModule::new(shader, &["light_powers", "light_scan"]));
+        let module = asset_server.add(ComputeModule::new(shader, &["light_powers", "light_scan", "light_prepare"]));
         app.insert_resource(LightManager::new(module));
         // Reflected, so scenes (`.bsn`) can place them.
         app.register_type::<PointLight>();

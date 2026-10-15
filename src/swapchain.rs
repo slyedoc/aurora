@@ -353,11 +353,7 @@ impl Swapchain {
     }
 
     /// Rebuild after a present the compositor called out of date.
-    pub unsafe fn after_present(
-        &mut self,
-        result: ash::VkResult<bool>,
-        window: &RenderWindow,
-    ) {
+    pub unsafe fn after_present(&mut self, result: ash::VkResult<bool>, window: &RenderWindow) {
         unsafe {
             match result {
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => {

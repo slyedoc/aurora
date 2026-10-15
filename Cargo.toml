@@ -38,6 +38,7 @@ blake3 = "1"
 tracy-client = { version = "0.19", optional = true }
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
+libc = "0.2"
 # No default features: this crate is its own renderer, in one world (no render sub-app, no
 # pipelined rendering, no bevy_render/bevy_pbr). The material is `material::AuroraMaterial`.
 # UI is `bevy_feathers_core`: feathers/bevy_ui/bevy_text WITHOUT `bevy_ui_render`,

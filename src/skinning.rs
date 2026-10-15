@@ -594,7 +594,11 @@ impl Skins {
         let fresh: Vec<&SkinnedGpu> = self
             .instances
             .values()
-            .filter_map(|i| i.gpu.as_ref().filter(|g| g.builds == 0 && i.source.node < node_count))
+            .filter_map(|i| {
+                i.gpu
+                    .as_ref()
+                    .filter(|g| g.builds == 0 && i.source.node < node_count)
+            })
             .collect();
         if !fresh.is_empty() {
             memory_barrier(

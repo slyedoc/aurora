@@ -68,14 +68,14 @@ impl Plugin for TransformPlugin {
             ..default()
         })
         .add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())
-            .init_resource::<StaticTransformOptimizations>()
-            .add_systems(
-                PostStartup,
-                sync_simple_transforms.in_set(TransformSystems::Propagate),
-            )
-            .add_systems(
-                PostUpdate,
-                (sync_simple_transforms, sync_child_cameras).in_set(TransformSystems::Propagate),
-            );
+        .init_resource::<StaticTransformOptimizations>()
+        .add_systems(
+            PostStartup,
+            sync_simple_transforms.in_set(TransformSystems::Propagate),
+        )
+        .add_systems(
+            PostUpdate,
+            (sync_simple_transforms, sync_child_cameras).in_set(TransformSystems::Propagate),
+        );
     }
 }

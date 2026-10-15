@@ -821,6 +821,7 @@ dependencies = [
  "glam 0.33.12",
  "gpu-allocator",
  "half",
+ "libc",
  "log",
  "openxr",
  "png 0.17.16",

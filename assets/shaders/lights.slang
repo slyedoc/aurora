@@ -43,6 +43,7 @@ struct LightsHeader {
     uint64_t slot_to_linst;
     uint64_t analytics;
     uint64_t entry_to_linst;
+    uint64_t prepared;
 };
 
 // Must match AnalyticLightGpu in lights.rs. 80 bytes; the
@@ -102,7 +103,17 @@ void light_powers(uint3 gid: SV_DispatchThreadID) {
             hi = mid - 1;
         }
     }
-    let li = p.linsts[lo];
+    float3 w0, w1, w2, emission;
+    uint mask;
+    resolveTriangle(p.linsts[lo], p.instances, e, w0, w1, w2, emission, mask);
+    let area = 0.5 * length(cross(w1 - w0, w2 - w0));
+    p.powers[e] = area * (0.2126 * emission.r + 0.7152 * emission.g + 0.0722 * emission.b);
+}
+
+// Triangle entry `e` of light instance `li` in world space through its live instance row, its
+// emitted radiance and its world mask.
+void resolveTriangle(LightInst li, Instance* instances, uint e, out float3 w0, out float3 w1,
+                     out float3 w2, out float3 emission, out uint mask) {
     let tri = e - li.entry_base;
     // The geometry holding the triangle (prefix offsets, few per mesh).
     uint g = 0;
@@ -117,16 +128,50 @@ void light_powers(uint3 gid: SV_DispatchThreadID) {
     let p0 = vertex_position(li.verts, li.indices[idx + 0]);
     let p1 = vertex_position(li.verts, li.indices[idx + 1]);
     let p2 = vertex_position(li.verts, li.indices[idx + 2]);
-    let inst = p.instances[li.slot];
-    float3 w0 = float3(dot(inst.t0, float4(p0, 1.0)), dot(inst.t1, float4(p0, 1.0)), dot(inst.t2, float4(p0, 1.0)));
-    float3 w1 = float3(dot(inst.t0, float4(p1, 1.0)), dot(inst.t1, float4(p1, 1.0)), dot(inst.t2, float4(p1, 1.0)));
-    float3 w2 = float3(dot(inst.t0, float4(p2, 1.0)), dot(inst.t1, float4(p2, 1.0)), dot(inst.t2, float4(p2, 1.0)));
-    let area = 0.5 * length(cross(w1 - w0, w2 - w0));
-    let em_r = li.geom_emission[g * 3 + 0];
-    let em_g = li.geom_emission[g * 3 + 1];
-    let em_b = li.geom_emission[g * 3 + 2];
-    let lum = 0.2126 * em_r + 0.7152 * em_g + 0.0722 * em_b;
-    p.powers[e] = area * lum;
+    let inst = instances[li.slot];
+    w0 = float3(dot(inst.t0, float4(p0, 1.0)), dot(inst.t1, float4(p0, 1.0)), dot(inst.t2, float4(p0, 1.0)));
+    w1 = float3(dot(inst.t0, float4(p1, 1.0)), dot(inst.t1, float4(p1, 1.0)), dot(inst.t2, float4(p1, 1.0)));
+    w2 = float3(dot(inst.t0, float4(p2, 1.0)), dot(inst.t1, float4(p2, 1.0)), dot(inst.t2, float4(p2, 1.0)));
+    emission = float3(li.geom_emission[g * 3 + 0], li.geom_emission[g * 3 + 1], li.geom_emission[g * 3 + 2]);
+    mask = inst.custom_and_mask >> 24;
+}
+
+struct LightPrepareParams {
+    LightInst* linsts;
+    Instance* instances;
+    LightsHeader* header;
+    uint* entry_to_linst;
+    float* cdf;
+    float4* prepared;
+    uint entry_count;
+    uint analytic_count;
+    uint base;
+    uint pad;
+};
+[[vk::push_constant]] LightPrepareParams prepare_params;
+
+// Every frame, every triangle entry resolved once into four float4 (light_eval.slang reads
+// them): world vertex 0 and world mask, edge 1 and pick probability, edge 2, emission. A
+// sample is then one record instead of a chain of instance, geometry, index and vertex reads.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void light_prepare(uint3 gid: SV_DispatchThreadID) {
+    let p = prepare_params;
+    let e = p.base + gid.x;
+    if (e >= p.entry_count || e < p.analytic_count) {
+        return;
+    }
+    float3 w0, w1, w2, emission;
+    uint mask;
+    resolveTriangle(p.linsts[p.entry_to_linst[e]], p.instances, e, w0, w1, w2, emission, mask);
+    let below = e > 0 ? p.cdf[e - 1] : 0.0;
+    let total = p.header[0].total_power;
+    let p_pick = total > 0.0 ? (p.cdf[e] - below) / total : 0.0;
+    let r = p.prepared + e * 4;
+    r[0] = float4(w0, asfloat(mask));
+    r[1] = float4(w1 - w0, p_pick);
+    r[2] = float4(w2 - w0, 0.0);
+    r[3] = float4(emission, 0.0);
 }
 
 struct LightScanParams {

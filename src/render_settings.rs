@@ -77,6 +77,9 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
+    /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
+    /// under test take their old path at 0 and the new one at 1.
+    pub ab: u32,
     /// The light grid's cell size (m) and samples per cell.
     #[reflect(@0.5..=32.0_f32)]
     pub light_grid_cell: f32,
@@ -131,6 +134,7 @@ impl Default for RenderSettings {
             restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
+            ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
             sharc: true,

@@ -37,8 +37,8 @@ float3 atmosphereSky(float3 d, bool want_sun, uint tex, float3 scale) {
 // table a BRDF-sampled ray is the only way to the sun texel, so its extreme values are
 // clamped RELATIVE to the sky scale (a physically bright sky passes, a 1e5x sun does not);
 // with one, the raygen gathers the sun by next-event estimation and MIS-weights these hits.
-float3 hdrSky(float3 d, EnvironmentGpu env) {
-    var texel = skyResidual(env, d, sampleSky(env.tex, env_dir_to_uv(d)));
+float3 hdrSky(float3 d, EnvironmentGpu* env) {
+    var texel = sampleSky(env.tex, env_dir_to_uv(d));
     if (env.importance == nullptr) {
         texel = min(texel, float3(300.0));
     }
@@ -47,7 +47,7 @@ float3 hdrSky(float3 d, EnvironmentGpu env) {
 
 // The star map behind a generated sky, turned with the night and dimmed into the horizon's
 // haze.
-float3 stars(float3 d, EnvironmentGpu env) {
+float3 stars(float3 d, EnvironmentGpu* env) {
     if (env.stars_nits <= 0.0) {
         return float3(0.0);
     }
@@ -59,7 +59,7 @@ float3 stars(float3 d, EnvironmentGpu env) {
 
 // Zenith / horizon gradient above, horizon / ground below (all nits), with a small aureole
 // around each of the environment's suns.
-float3 gradientSky(float3 d, EnvironmentGpu env) {
+float3 gradientSky(float3 d, EnvironmentGpu* env) {
     let up = d.y;
     var col = up >= 0.0
         ? lerp(env.horizon.rgb, env.zenith.rgb, pow(up, 0.6))
@@ -73,7 +73,7 @@ float3 gradientSky(float3 d, EnvironmentGpu env) {
 // The environment's sun discs, on the paths that may see them directly; every other path
 // gathers the suns by next-event estimation in the raygen. Full inside the radius, fading
 // over its outer fifth.
-float3 sunDiscs(float3 d, EnvironmentGpu env) {
+float3 sunDiscs(float3 d, EnvironmentGpu* env) {
     var col = float3(0.0);
     for (uint i = 0u; i < env.sun_count; i++) {
         let sun = env.suns[i];
@@ -89,7 +89,8 @@ void main(inout HitPayload payload) {
     payload.t = 0.0;
     let d = WorldRayDirection();
     let want_sun = (payload.miss_flags & 1u) != 0u;
-    let env = pc.uniforms.environments[(payload.miss_flags >> 1) & 7u];
+    // By pointer: a copy of the whole entry, its suns indexed in a loop, kept all of them live.
+    let env = pc.uniforms.environments + ((payload.miss_flags >> 1) & 7u);
     float3 sky;
     switch (env.mode) {
     case 1u:

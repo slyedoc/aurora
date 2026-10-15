@@ -84,8 +84,6 @@ pub struct CompiledRaytracingPipeline {
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
-    /// The fog grid's column sums' raygen (fog_grid.rs).
-    pub fog_integrate_handle: RTGroupHandle,
     /// ReSTIR DI's shading raygen (restir.rs).
     pub restir_shade_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
@@ -409,27 +407,6 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
-        // The fog grid's column sums (raygen.slang `fog_integrate`).
-        let fog_integrate_group = shader_group.len();
-        let fog_integrate_stage = shader_stages.len() as u32;
-        shader_stages.push(
-            render_device
-                .load_shader_entry(
-                    raygen_shader.spirv.as_ref().unwrap(),
-                    vk::ShaderStageFlags::RAYGEN_KHR,
-                    c"fog_integrate",
-                )
-                .specialization_info(&spec),
-        );
-        shader_group.push(
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(fog_integrate_stage)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-        );
-
         // ReSTIR DI's shading raygen (raygen.slang `restir_shade`, restir.rs).
         let restir_shade_group = shader_group.len();
         let restir_shade_stage = shader_stages.len() as u32;
@@ -524,6 +501,10 @@ impl VulkanAsset for RaytracingPipeline {
                 set: 1,
                 binding: 200,
             },
+            Mapping::Bindless {
+                set: 1,
+                binding: 201,
+            },
         ]);
         let mapping_info = stage_mapping(&mappings);
         for stage in &mut shader_stages {
@@ -595,7 +576,6 @@ impl VulkanAsset for RaytracingPipeline {
             .chain(handles[OPAQUE_GROUP + 2..fog_grid_group].iter().copied())
             .collect();
         let fog_grid_handle = handles[fog_grid_group];
-        let fog_integrate_handle = handles[fog_integrate_group];
         let restir_shade_handle = handles[restir_shade_group];
         let shadow_miss_handle = handles[shadow_miss_group];
         let shadow_hit_handle = handles[shadow_hit_group];
@@ -620,7 +600,6 @@ impl VulkanAsset for RaytracingPipeline {
             pipeline,
             raygen_handle,
             fog_grid_handle,
-            fog_integrate_handle,
             restir_shade_handle,
             miss_handle,
             shadow_miss_handle,

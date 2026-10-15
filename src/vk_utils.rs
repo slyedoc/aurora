@@ -85,8 +85,8 @@ pub fn get_acceleration_structure_properties(
 ) -> vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'_> {
     let mut acceleration_structure_properties =
         vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
-    let mut properties2 = vk::PhysicalDeviceProperties2KHR::default()
-        .push(&mut acceleration_structure_properties);
+    let mut properties2 =
+        vk::PhysicalDeviceProperties2KHR::default().push(&mut acceleration_structure_properties);
     unsafe {
         device
             .instance

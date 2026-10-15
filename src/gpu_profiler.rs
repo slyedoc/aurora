@@ -120,7 +120,10 @@ impl GpuProfiler {
                 }
                 // Synthetic entries from absolute timestamps across every submit of the frame:
                 // `span` first scope start to last scope end, `idle` the gap since the last frame.
-                let start = (0..count as usize).map(|i| ticks[2 * i]).filter(|&t| t != 0).min();
+                let start = (0..count as usize)
+                    .map(|i| ticks[2 * i])
+                    .filter(|&t| t != 0)
+                    .min();
                 let end = (0..count as usize).map(|i| ticks[2 * i + 1]).max();
                 if let (Some(start), Some(end)) = (start, end) {
                     let ms = |t: u64| t as f64 * self.period_ns / 1.0e6;
@@ -169,16 +172,14 @@ impl GpuProfiler {
 
     /// A smoothed scope time by name.
     pub fn time(&self, name: &str) -> Option<f64> {
-        self.times.iter().find(|(n, _)| *n == name).map(|(_, ms)| *ms)
+        self.times
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ms)| *ms)
     }
 
     /// Opens a scope named `name` on `cmd`.
-    pub fn begin(
-        &self,
-        rd: &RenderDevice,
-        cmd: vk::CommandBuffer,
-        name: &'static str,
-    ) -> GpuScope {
+    pub fn begin(&self, rd: &RenderDevice, cmd: vk::CommandBuffer, name: &'static str) -> GpuScope {
         {
             let mut labels = self.labels.lock().unwrap();
             let label = labels

@@ -3,8 +3,10 @@
 //! A [`ComputeModule`] is one `.slang` file plus the entry points to build pipelines for. Every
 //! kernel shares one pipeline layout: no descriptor sets, just a [`COMPUTE_PUSH_CONSTANT_SIZE`]
 //! push-constant block that carries raw buffer pointers (`SPV_KHR_physical_storage_buffer`) and
-//! a few scalars. Recording is [`record_dispatch`] / [`record_dispatch_indirect`] plus the
-//! barrier helpers; the module reloads with its shader like the ray-tracing pipeline does.
+//! a few scalars. A module made with [`ComputeModule::with_heap`] instead reads the descriptor
+//! heap through its mappings (storage images) and takes the same block as heap push data.
+//! Recording is [`record_dispatch`] / [`record_dispatch_indirect`] plus the barrier helpers; the
+//! module reloads with its shader like the ray-tracing pipeline does.
 
 use std::collections::HashMap;
 
@@ -15,6 +17,7 @@ use bevy::{
 };
 
 use crate::{
+    descriptor_heap::{Mapping, stage_mapping},
     render_device::RenderDevice,
     shader::Shader,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
@@ -35,20 +38,30 @@ pub struct ComputeModule {
     #[dependency]
     pub shader: Handle<Shader>,
     pub entry_points: Vec<String>,
+    /// Descriptor-heap mappings (empty: push constants only, no heap).
+    pub heap: Vec<Mapping>,
 }
 
 impl ComputeModule {
     pub fn new(shader: Handle<Shader>, entry_points: &[&str]) -> Self {
+        Self::with_heap(shader, entry_points, &[])
+    }
+
+    /// Kernels that read the descriptor heap through `heap` (bound and pushed at each dispatch).
+    pub fn with_heap(shader: Handle<Shader>, entry_points: &[&str], heap: &[Mapping]) -> Self {
         Self {
             shader,
             entry_points: entry_points.iter().map(|s| s.to_string()).collect(),
+            heap: heap.to_vec(),
         }
     }
 }
 
 pub struct CompiledComputeModule {
+    /// Null for a heap module.
     pub pipeline_layout: vk::PipelineLayout,
     pub pipelines: HashMap<String, vk::Pipeline>,
+    pub heap: bool,
 }
 
 impl CompiledComputeModule {
@@ -61,7 +74,7 @@ impl CompiledComputeModule {
 }
 
 impl VulkanAsset for ComputeModule {
-    type ExtractedAsset = (Shader, Vec<String>);
+    type ExtractedAsset = (Shader, Vec<String>, Vec<Mapping>);
     type ExtractParam = SRes<Assets<Shader>>;
     type PreparedAsset = CompiledComputeModule;
 
@@ -72,11 +85,11 @@ impl VulkanAsset for ComputeModule {
         let shaders: &Assets<crate::shader::Shader> = &**param;
         let shader = shaders.get(&self.shader)?;
         shader.spirv.as_ref()?;
-        Some((shader.clone(), self.entry_points.clone()))
+        Some((shader.clone(), self.entry_points.clone(), self.heap.clone()))
     }
 
     fn prepare_asset(
-        (shader, entry_points): Self::ExtractedAsset,
+        (shader, entry_points, heap): Self::ExtractedAsset,
         render_device: &RenderDevice,
     ) -> Self::PreparedAsset {
         let spirv = shader.spirv.as_ref().unwrap();
@@ -92,16 +105,28 @@ impl VulkanAsset for ComputeModule {
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(COMPUTE_PUSH_CONSTANT_SIZE);
-        let pipeline_layout = unsafe {
-            render_device
-                .device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
-                    None,
-                )
-                .unwrap()
+        let pipeline_layout = if heap.is_empty() {
+            unsafe {
+                render_device
+                    .device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .push_constant_ranges(std::slice::from_ref(&push_constant_range)),
+                        None,
+                    )
+                    .unwrap()
+            }
+        } else {
+            vk::PipelineLayout::null()
         };
+        let mappings = if heap.is_empty() {
+            Vec::new()
+        } else {
+            render_device.heaps().mappings(&heap)
+        };
+        let mapping_info = stage_mapping(&mappings);
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
 
         let names: Vec<std::ffi::CString> = entry_points
             .iter()
@@ -110,14 +135,19 @@ impl VulkanAsset for ComputeModule {
         let infos: Vec<vk::ComputePipelineCreateInfo> = names
             .iter()
             .map(|name| {
-                vk::ComputePipelineCreateInfo::default()
-                    .stage(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::COMPUTE)
-                            .module(shader_module)
-                            .name(name),
-                    )
-                    .layout(pipeline_layout)
+                let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(shader_module)
+                    .name(name);
+                let info = vk::ComputePipelineCreateInfo::default().layout(pipeline_layout);
+                if heap.is_empty() {
+                    info.stage(stage)
+                } else {
+                    stage.p_next = (&raw const mapping_info).cast();
+                    let mut info = info.stage(stage);
+                    info.p_next = (&raw mut flags2).cast();
+                    info
+                }
             })
             .collect();
         let handles = unsafe {
@@ -142,6 +172,7 @@ impl VulkanAsset for ComputeModule {
         CompiledComputeModule {
             pipeline_layout,
             pipelines: entry_points.into_iter().zip(handles).collect(),
+            heap: !heap.is_empty(),
         }
     }
 
@@ -149,9 +180,11 @@ impl VulkanAsset for ComputeModule {
         for pipeline in prepared.pipelines.values() {
             render_device.destroyer.destroy_pipeline(*pipeline);
         }
-        render_device
-            .destroyer
-            .destroy_pipeline_layout(prepared.pipeline_layout);
+        if prepared.pipeline_layout != vk::PipelineLayout::null() {
+            render_device
+                .destroyer
+                .destroy_pipeline_layout(prepared.pipeline_layout);
+        }
     }
 }
 
@@ -185,17 +218,14 @@ pub fn record_dispatch<P: bytemuck::Pod>(
             vk::PipelineBindPoint::COMPUTE,
             module.pipeline(entry),
         );
+        if module.heap {
+            render_device.heaps().bind(cmd_buffer);
+        }
         while base < threads {
             if let Some(off) = base_offset {
                 bytes[off..off + 4].copy_from_slice(&base.to_le_bytes());
             }
-            render_device.device.cmd_push_constants(
-                cmd_buffer,
-                module.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                &bytes,
-            );
+            push(render_device, cmd_buffer, module, &bytes);
             let n = (threads - base).min(chunk);
             render_device
                 .device
@@ -204,6 +234,23 @@ pub fn record_dispatch<P: bytemuck::Pod>(
             if base_offset.is_none() {
                 break;
             }
+        }
+    }
+}
+
+/// The kernel's parameter block: heap push data for a heap module, push constants otherwise.
+fn push(rd: &RenderDevice, cmd: vk::CommandBuffer, module: &CompiledComputeModule, bytes: &[u8]) {
+    if module.heap {
+        rd.heaps().push_bytes(cmd, bytes);
+    } else {
+        unsafe {
+            rd.device.cmd_push_constants(
+                cmd,
+                module.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes,
+            );
         }
     }
 }
@@ -225,13 +272,10 @@ pub fn record_dispatch_indirect<P: bytemuck::Pod>(
             vk::PipelineBindPoint::COMPUTE,
             module.pipeline(entry),
         );
-        render_device.device.cmd_push_constants(
-            cmd_buffer,
-            module.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytemuck::bytes_of(params),
-        );
+        if module.heap {
+            render_device.heaps().bind(cmd_buffer);
+        }
+        push(render_device, cmd_buffer, module, bytemuck::bytes_of(params));
         render_device
             .device
             .cmd_dispatch_indirect(cmd_buffer, buffer, offset);

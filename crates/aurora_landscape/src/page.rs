@@ -299,7 +299,12 @@ impl LandscapePages {
 
     /// One page's hole texels, row-major (none when no mirror).
     pub fn page_holes(&self, page: IVec2) -> Option<Vec<bool>> {
-        Some(self.material_page(page)?.iter().map(|&t| texel_hole(t)).collect())
+        Some(
+            self.material_page(page)?
+                .iter()
+                .map(|&t| texel_hole(t))
+                .collect(),
+        )
     }
 
     /// The materials of the texel nearest a landscape-local xz.

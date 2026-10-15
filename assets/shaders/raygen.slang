@@ -6,6 +6,7 @@ import rand;
 import disney;
 import atmosphere_rt;
 import light_eval;
+import fog;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
 // primary hit of sample 0.
@@ -21,6 +22,8 @@ import light_eval;
 [[vk::binding(7, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> guide_fog;
 [[vk::binding(100, 0)]] RaytracingAccelerationStructure topLevelAS;
 [[vk::binding(200, 1)]] Sampler2D textures[];
+// The same bindless range read as 3D images (the fog grid's volumes, src/fog_grid.rs).
+[[vk::binding(201, 1)]] Sampler3D volumes[];
 
 static const bool ENABLE_BLUENOISE = true;
 
@@ -129,78 +132,9 @@ float sampleDistanceInFog(EnvironmentGpu* env) {
     return -log(randf()) / env.fog_density;
 }
 
-// Fog extinction at a height: `fog_density` at and below `fog_height`, thinning by 1/e every
-// `fog_falloff` metres above it.
-float fogDensity(EnvironmentGpu* env, float y) {
-    return env.fog_density * exp(-max(0.0, y - env.fog_height) / env.fog_falloff);
-}
-
-// The environment's own fog at a point (uniform or height fog).
-float fogBaseDensity(EnvironmentGpu* env, float3 x) {
-    return env.fog_falloff > 0.0 ? fogDensity(env, x.y) : env.fog_density;
-}
-
-// ---- fog volumes (src/fog_volume.rs) ------------------------------------------------------
-
-float fogHash(float3 p) {
-    var p3 = frac(p * 0.1031);
-    p3 += dot(p3, p3.zyx + 31.32);
-    return frac((p3.x + p3.y) * p3.z);
-}
-
-float fogValueNoise(float3 p) {
-    let i = floor(p);
-    let f = p - i;
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = lerp(lerp(fogHash(i), fogHash(i + float3(1.0, 0.0, 0.0)), u.x),
-                 lerp(fogHash(i + float3(0.0, 1.0, 0.0)), fogHash(i + float3(1.0, 1.0, 0.0)), u.x), u.y);
-    let b = lerp(lerp(fogHash(i + float3(0.0, 0.0, 1.0)), fogHash(i + float3(1.0, 0.0, 1.0)), u.x),
-                 lerp(fogHash(i + float3(0.0, 1.0, 1.0)), fogHash(i + float3(1.0, 1.0, 1.0)), u.x), u.y);
-    return lerp(a, b, u.z);
-}
-
-float3 fogVolumeLocal(FogVolumeGpu v, float4 p) {
-    return float3(dot(v.row0, p), dot(v.row1, p), dot(v.row2, p));
-}
-
-// A volume's density at a world point: full inside, fading over `edge` toward the surface,
-// carved by drifting noise. Never above `density` (the majorant relies on it).
-float fogVolumeDensity(FogVolumeGpu v, float3 x) {
-    let p = fogVolumeLocal(v, float4(x, 1.0));
-    let r = v.shape == 0u ? max(abs(p.x), max(abs(p.y), abs(p.z))) : length(p);
-    if (r >= 1.0) {
-        return 0.0;
-    }
-    var d = v.density * (v.edge > 0.0 ? smoothstep(1.0, 1.0 - v.edge, r) : 1.0);
-    if (v.noise_strength > 0.0) {
-        let q = (x - float3(v.wind_x, v.wind_y, v.wind_z) * pc.uniforms.time) / v.noise_scale;
-        let n = 0.65 * fogValueNoise(q) + 0.35 * fogValueNoise(q * 2.03 + 17.0);
-        d *= lerp(1.0, smoothstep(0.3, 0.7, n), v.noise_strength);
-    }
-    return d;
-}
-
-// Where a ray crosses a volume's bounds, clipped to [0, t_max]; false if it misses them.
-bool fogVolumeSpan(FogVolumeGpu v, float3 o, float3 d, float t_max, out float t0, out float t1) {
-    let lo = fogVolumeLocal(v, float4(o, 1.0));
-    let ld = fogVolumeLocal(v, float4(d, 0.0));
-    let inv = 1.0 / select(abs(ld) < 1.0e-12, float3(1.0e-12), ld);
-    let a = (float3(-1.0) - lo) * inv;
-    let b = (float3(1.0) - lo) * inv;
-    let n = min(a, b);
-    let f = max(a, b);
-    t0 = max(max(n.x, n.y), max(n.z, 0.0));
-    t1 = min(min(f.x, f.y), min(f.z, t_max));
-    return t1 > t0;
-}
-
-// All the fog at a point: the environment's (`base`) and every volume's.
+// All the fog at a point: the environment's (`base`) and every volume's (fog.slang).
 float fogDensityAt(EnvironmentGpu* env, float3 x, bool base) {
-    var d = base ? fogBaseDensity(env, x) : 0.0;
-    for (uint i = 0u; i < pc.uniforms.fog_volume_count; i++) {
-        d += fogVolumeDensity(pc.uniforms.fog_volumes[i], x);
-    }
-    return d;
+    return fogDensityAtU(pc.uniforms, env, x, base);
 }
 
 // The farthest any volume reaches along a ray (0 = it crosses none): how far a camera ray
@@ -246,8 +180,6 @@ bool sampleFogScatter(EnvironmentGpu* env, float3 o, float3 d, float t_max, out 
     return false;
 }
 
-// Height fog: the share of a collision that scatters rather than absorbs (water droplets).
-static const float FOG_ALBEDO = 0.95;
 
 // Henyey-Greenstein phase function, per steradian.
 float fogPhase(EnvironmentGpu* env, float cos_theta) {
@@ -559,7 +491,7 @@ float3 envBRDFApprox2(float3 f0, float alpha, float NoV) {
     return f0 * max(0.0, scale) + max(0.0, bias);
 }
 
-// ---- HDR sky importance sampling (src/sky_importance.rs) ----------------------------------
+// ---- sky importance sampling (src/sky_gen.rs) ---------------------------------------------
 
 // Whether the environment's HDR sky has a sampling table (no table: BRDF sampling only).
 bool skySampled(EnvironmentGpu* env) {
@@ -576,13 +508,15 @@ float skyPdf(EnvironmentGpu* env, float3 d) {
     return env.importance[w * h + 1u + y * w + x];
 }
 
-// Draws a direction from the sky's luminance CDF (binary search, jittered inside the texel);
-// returns its radiance, with the direction and its solid-angle pdf.
+// Draws a direction from the sky's luminance CDF (jittered inside the texel); returns its
+// radiance, with the direction and its solid-angle pdf. The guide table narrows the binary
+// search to the texels under u1's 1/N slice (~2), not all N: 17 dependent loads to ~1.
 float3 skySample(EnvironmentGpu* env, float u1, float u2, float u3, out float3 dir, out float pdf) {
     let w = SKY_IMPORTANCE_W;
     let n = w * SKY_IMPORTANCE_H;
-    uint lo = 0u;
-    uint hi = n;
+    let j = min(uint(u1 * float(n)), n - 1u);
+    uint lo = asuint(env.importance[2u * n + 1u + j]);
+    uint hi = min(asuint(env.importance[2u * n + 2u + j]) + 1u, n);
     while (lo + 1u < hi) {
         let mid = (lo + hi) / 2u;
         if (env.importance[mid] <= u1) {
@@ -597,7 +531,7 @@ float3 skySample(EnvironmentGpu* env, float u1, float u2, float u3, out float3 d
     pdf = env.importance[n + 1u + i];
     // Explicit LOD 0: a ray-tracing stage has no derivatives (glslang emits the same).
     let texel = textures[NonUniformResourceIndex(env.tex)].SampleLevel(uv, 0.0).rgb;
-    return env.color.rgb * skyResidual(*env, dir, texel) * env.sky_brightness;
+    return env.color.rgb * texel * env.sky_brightness;
 }
 
 // ---- ray portals (src/portal.rs) -------------------------------------------------------
@@ -669,51 +603,24 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
 // Most slices the camera ray steps through the grid (lookups, so many more than `fog_steps`).
 static const uint FOG_GRID_STEPS = 32u;
 
-// The grid's cells across, down and deep (src/fog_grid.rs).
 uint3 fogGridSize() {
-    return uint3(pc.uniforms.fog_grid_size_x, pc.uniforms.fog_grid_size_y, pc.uniforms.fog_grid_size_z);
+    return fogGridSizeU(pc.uniforms);
 }
 
-// A world point's cell coordinate in the grid seen through `view_proj` (cell centres at +0.5):
-// screen uv up, slices quadratic in view depth out to `dist`.
-float3 fogGridCoord(float view_proj[16], float3 x, uint3 size, float dist) {
-    let clip = mat4MulVec(view_proj, float4(x, 1.0));
-    let w = max(clip.w, 1.0e-4);
-    let uv = clip.xy / w * 0.5 + 0.5;
-    return float3(uv * float2(size.xy), sqrt(saturate(w / dist)) * float(size.z));
+// A fog grid volume at normalized `uvw`, clamped to its edge texels' centres (the bindless
+// sampler repeats): the texture unit's trilinear filter for eight buffer reads.
+float4 fogVolume(uint tex, float3 uvw, uint3 size) {
+    let lo = 0.5 / float3(size);
+    return volumes[tex].SampleLevel(clamp(uvw, lo, 1.0 - lo), 0.0);
 }
 
-// A grid at a cell coordinate, trilinear; clamped to the grid's edges.
-float4 fogGridSample(float4* grid, uint3 size, float3 g) {
-    let p = g - 0.5;
-    let b = int3(floor(p));
-    let f = p - float3(b);
-    let hi = int3(size) - 1;
-    var r = float4(0.0);
-    for (uint k = 0u; k < 8u; k++) {
-        let o = int3(int(k & 1u), int((k >> 1u) & 1u), int(k >> 2u));
-        let q = clamp(b + o, int3(0), hi);
-        let w = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) * (o.z == 1 ? f.z : 1.0 - f.z);
-        r += w * grid[(uint(q.z) * size.y + uint(q.y)) * size.x + uint(q.x)];
-    }
-    return r;
+// The soft grid at a cell coordinate (fogGridCoord's: centres at +0.5).
+float3 fogGridSoftAt(uint3 size, float3 g) {
+    return fogVolume(pc.uniforms.fog_grid_soft_tex, g / float3(size), size).rgb;
 }
 
-// The grid across two cells (four reads half a cell apart in x and y): each cell's own noise
-// (its light is a few random shadow rays) shared with its neighbours. Composited after Ray
-// Reconstruction, the camera's fog no longer has it to hide a mottle at the cell size.
-float4 fogGridSampleSoft(float4* grid, uint3 size, float3 g) {
-    return 0.25 * (fogGridSample(grid, size, g + float3(-0.5, -0.5, 0.0))
-                 + fogGridSample(grid, size, g + float3(0.5, -0.5, 0.0))
-                 + fogGridSample(grid, size, g + float3(-0.5, 0.5, 0.0))
-                 + fogGridSample(grid, size, g + float3(0.5, 0.5, 0.0)));
-}
-
-// A cell's world point: (uv, slice) in [0, 1) of the grid's own view, unjittered at the centre.
 float3 fogGridPoint(float2 uv, float s, float dist) {
-    let target = mat4MulVec(pc.uniforms.fog_grid_inverse_projection, float4(uv * 2.0 - 1.0, 1.0, 1.0)).xyz;
-    let view = target / max(-target.z, 1.0e-6);
-    return mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(view * (dist * s * s), 1.0)).xyz;
+    return fogGridPointU(pc.uniforms, uv, s, dist);
 }
 
 // One light-table sample at fog point `x`, as the fog scatters it along `d`: RIS over
@@ -767,17 +674,19 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, flo
     return L;
 }
 
-// One thread per grid cell (src/fog_grid.rs), ahead of the views that march it: a random point
-// in the cell lit by the suns, one phase-sampled sky ray and the light table, blended into
-// last frame's value at the cell's reprojected centre.
+// One thread per cell lit this frame (one of every stride x stride block, fogGridPhase;
+// src/fog_grid.rs), after `fog_reproject` carried every cell's history into this frame's grid:
+// a random point in the cell lit by the suns, one phase-sampled sky ray and the light table,
+// blended into that history.
 [shader("raygeneration")]
 void fog_grid() {
     let size = fogGridSize();
-    let id = DispatchRaysIndex();
-    let i = (id.z * size.y + id.y) * size.x + id.x;
-    if (pc.uniforms.fog_grid_cells == 0u || i >= pc.uniforms.fog_grid_cells) {
+    let stride = max(pc.uniforms.fog_grid_stride, 1u);
+    let id = uint3(DispatchRaysIndex().xy * stride + fogGridPhase(pc.uniforms), DispatchRaysIndex().z);
+    if (pc.uniforms.fog_grid_cells == 0u || any(id >= size)) {
         return;
     }
+    let i = (id.z * size.y + id.y) * size.x + id.x;
     HitPayload payload;
     initRandom(uint2(pc.uniforms.fog_grid_cells, 1u), uint2(i, 0u), pc.uniforms.frame);
     let tmax = 1.0e6;
@@ -807,20 +716,7 @@ void fog_grid() {
         L = float3(0.0);
     }
 
-    // Off last frame's grid (past its far slice moving forward, its edges turning) the
-    // nearest edge cell is still the best guess: kept at a quarter of its weight rather than
-    // dropped, which left those cells one raw sample every frame.
-    var prev = float4(0.0);
-    if (pc.uniforms.fog_grid_fresh == 0u) {
-        let g = fogGridCoord(pc.uniforms.fog_grid_prev_view_proj, centre, size, dist);
-        prev = fogGridSample(pc.uniforms.fog_grid_prev, size, g);
-        if (any(g < float3(0.0)) || any(g > grid)) {
-            prev.w = min(prev.w, env.fog_grid_history * 0.25);
-        }
-    }
-    if (any(isnan(prev)) || any(isinf(prev)) || prev.w < 0.0) {
-        prev = float4(0.0);
-    }
+    let prev = pc.uniforms.fog_grid_cur[i];
     // Firefly clamp against the cell's own average: a sky ray through a canopy gap or a lone
     // sunlit sample in shade moves it by a bounded step instead of a flash.
     if (prev.w >= 4.0) {
@@ -870,51 +766,12 @@ void fogMarchGrid(EnvironmentGpu* env, float3 o, float3 d, float seg, bool base,
             continue;
         }
         let step_t = exp(-sigma * dt);
-        let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
-                                   fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, dist)).rgb;
+        let Ls = fogGridSoftAt(size, fogGridCoord(pc.uniforms.fog_grid_view_proj, x, size, dist));
         L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
         T *= step_t;
     }
     acc += mask * L;
     mask *= T;
-}
-
-// One thread per grid column, after `fog_grid`: front to back through its slices (density
-// at each slice's centre, light from this frame's grid as the march reads it), the running
-// in-scatter and transmittance stored per cell at its far side.
-[shader("raygeneration")]
-void fog_integrate() {
-    let size = fogGridSize();
-    let id = DispatchRaysIndex().xy;
-    if (pc.uniforms.fog_grid_cells == 0u || id.x >= size.x || id.y >= size.y) {
-        return;
-    }
-    let env = pc.uniforms.environments + pc.uniforms.environment;
-    let dist = env.fog_grid_distance;
-    let uv = (float2(id) + 0.5) / float2(size.xy);
-    let cam = fogGridPoint(uv, 0.0, dist);
-    // Metres along the column per metre of view depth.
-    let stretch = length(fogGridPoint(uv, 1.0, dist) - cam) / dist;
-    let slices = float(size.z);
-    var T = 1.0;
-    var L = float3(0.0);
-    var prev = 0.0;
-    for (uint k = 0u; k < size.z; k++) {
-        let f = float(k + 1u) / slices;
-        let depth = dist * f * f;
-        let dt = (depth - prev) * stretch;
-        prev = depth;
-        let s = (float(k) + 0.5) / slices;
-        let sigma = fogDensityAt(env, fogGridPoint(uv, s, dist), true);
-        if (sigma > 0.0) {
-            let step_t = exp(-sigma * dt);
-            let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
-                                       float3(float2(id) + 0.5, float(k) + 0.5)).rgb;
-            L += T * FOG_ALBEDO * Ls * (1.0 - step_t);
-            T *= step_t;
-        }
-        pc.uniforms.fog_grid_sum[(k * size.y + id.y) * size.x + id.x] = float4(L, T);
-    }
 }
 
 // The fog from the grid's eye to `x` (in-scatter, transmittance): the column sums, bilinear
@@ -926,32 +783,17 @@ float4 fogGridSumAt(EnvironmentGpu* env, float3 x) {
     let clip = mat4MulVec(pc.uniforms.fog_grid_view_proj, float4(x, 1.0));
     let w = max(clip.w, 1.0e-4);
     let uv = clip.xy / w * 0.5 + 0.5;
+    // Slice 0 of the sums volume is the eye; slice k + 1 the sums through slice k.
     let z = sqrt(saturate(w / dist)) * float(size.z);
-    let k0 = min(uint(z), size.z - 1u);
-    let fz = z - float(k0);
-    let p = uv * float2(size.xy) - 0.5;
-    let b = int2(floor(p));
-    let f = p - float2(b);
-    let hi = int2(size.xy) - 1;
-    var r = float4(0.0);
-    for (uint c = 0u; c < 4u; c++) {
-        let o = int2(int(c & 1u), int(c >> 1u));
-        let q = clamp(b + o, int2(0), hi);
-        let wxy = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
-        let col = uint(q.y) * size.x + uint(q.x);
-        let slice = size.x * size.y;
-        let near = k0 == 0u ? float4(0.0, 0.0, 0.0, 1.0) : pc.uniforms.fog_grid_sum[(k0 - 1u) * slice + col];
-        let far = pc.uniforms.fog_grid_sum[k0 * slice + col];
-        r += wxy * lerp(near, far, fz);
-    }
+    let vsize = uint3(size.xy, size.z + 1u);
+    var r = fogVolume(pc.uniforms.fog_grid_sum_tex, float3(uv, (z + 0.5) / float(vsize.z)), vsize);
     if (clip.w > dist) {
         let cam = mat4MulVec(pc.uniforms.fog_grid_inverse_view, float4(0.0, 0.0, 0.0, 1.0)).xyz;
         let xm = cam + (x - cam) * (0.5 * (dist + clip.w) / clip.w);
         let sigma = fogDensityAt(env, xm, true);
         if (sigma > 0.0) {
             let step_t = exp(-sigma * length(x - cam) * (clip.w - dist) / clip.w);
-            let Ls = fogGridSampleSoft(pc.uniforms.fog_grid_cur, size,
-                                       fogGridCoord(pc.uniforms.fog_grid_view_proj, xm, size, dist)).rgb;
+            let Ls = fogGridSoftAt(size, fogGridCoord(pc.uniforms.fog_grid_view_proj, xm, size, dist));
             r.rgb += r.a * FOG_ALBEDO * Ls * (1.0 - step_t);
             r.a *= step_t;
         }
@@ -997,12 +839,12 @@ void restir_shade() {
         return;
     }
     let ns = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
-    if (!traceVisible(s.ray_mask, leaveSurface(s.position, ns, dir), 0.0, dir,
+    if (!traceVisible(restirRayMask(s), leaveSurface(s.position, ns, dir), 0.0, dir,
                       dist * (1.0 - 1.0e-4))) {
         return;
     }
     let px = int2(launch_id);
-    let add = s.throughput * val * (r.W / float(max(pc.uniforms.samples, 1u)))
+    let add = restirThroughput(s) * val * (r.W / float(max(pc.uniforms.samples, 1u)))
         * pc.ae.input_exposure;
     let prior = dlss_color[px].rgb;
     dlss_color[px] = float4(clamp(prior + add, float3(0.0), float3(65504.0)), 1.0);
@@ -1589,24 +1431,11 @@ void main() {
                 if (RESTIR_ON && bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
                     // ReSTIR DI lights this vertex from the table in its own passes (restir.slang,
                     // then `restir_shade` below): hand it the surface.
-                    RestirSurface rs;
-                    rs.position = origin;
-                    rs.frame = pc.uniforms.frame;
-                    rs.prev_position = payload.prev_world_pos;
-                    rs.depth = mat4MulVec(pc.uniforms.view_proj, float4(origin, 1.0)).w;
-                    rs.albedo = disney_mat.albedo;
-                    rs.metallic = disney_mat.metallic;
-                    rs.throughput = mask;
-                    rs.roughness = disney_mat.roughness;
-                    rs.normal_oct = packHalf2(float32x3_to_oct(world_normal));
-                    rs.geo_normal_oct = packHalf2(float32x3_to_oct(surface_normal));
-                    rs.view_oct = packHalf2(float32x3_to_oct(-direction));
-                    rs.ray_mask = ray_mask;
-                    rs.transmission = lob.transmission;
-                    rs.clearcoat = lob.clearcoat;
-                    rs.coat_alpha = lob.coat_alpha;
-                    rs.pad = 0.0;
-                    pc.restir_surfaces[px.y * int(launch_size.x) + px.x] = rs;
+                    pc.restir_surfaces[px.y * int(launch_size.x) + px.x] = restirSurfacePack(
+                        origin, pc.uniforms.frame, payload.prev_world_pos,
+                        mat4MulVec(pc.uniforms.view_proj, float4(origin, 1.0)).w,
+                        disney_mat.albedo, disney_mat.metallic, disney_mat.roughness, payload.lobes,
+                        mask, ray_mask, world_normal, surface_normal, -direction);
                 } else {
                     // Resampled importance sampling, no reuse: M candidates, each weighted by its
                     // MIS-weighted unshadowed contribution at THIS point over its source pdf; one
@@ -1688,7 +1517,7 @@ void main() {
             }
 
             // Next-event estimation for an HDR environment: one importance-sampled direction
-            // (luminance x sin theta CDF, sky_importance.rs), MIS-weighted against BRDF sampling; the
+            // (luminance x sin theta CDF, sky_gen.rs), MIS-weighted against BRDF sampling; the
             // BRDF-sampled rays that reach the sky take the complementary weight on miss.
             if (skySampled(env)) {
                 float3 l;

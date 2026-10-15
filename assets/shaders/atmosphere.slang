@@ -64,9 +64,9 @@ struct KernelParams {
     AtmosphereParams* atmo;
     uint base;
     uint pad;
-    // The generated sky's kernels only (src/sky_gen.rs).
-    float4* sky;        // SKY_W x SKY_H radiance, the sky image's texels
-    float* table;       // its importance table: cdf[N + 1], then pdf[N]
+    // The sky kernels only (src/sky_gen.rs).
+    float4* sky;        // SKY_W x SKY_H radiance: generated, or an HDR image box-filtered
+    float* table;       // its importance table: cdf[N + 1], pdf[N], guide[N + 1]
     float* rows;        // per-row totals [SKY_H], row offsets [SKY_H], the total
     float4* sun_out;    // the environment table's sun radiance (rgb; a kept)
     float altitude;     // the viewer above the ground (metres)
@@ -460,8 +460,8 @@ void atmo_skyview(uint3 gid: SV_DispatchThreadID) {
 //
 // `sky_render` integrates the sky from the viewer's altitude for every texel of an
 // equirectangular image (rt_types.slang `env_uv_to_dir`), the sun left out: the renderer
-// draws it as an analytic sun. `sky_rows` / `sky_offsets` / `sky_normalize` turn the image
-// into the importance table the raygen samples (sky_importance.rs's layout), and
+// draws it as an analytic sun. `sky_rows` / `sky_offsets` / `sky_normalize` / `sky_guide` turn the image
+// into the importance table the raygen samples (rt_types.slang `importance`), and
 // `sun_tint` writes the sun's radiance through the air into the environment table.
 
 static const uint SKY_W = 512;
@@ -564,6 +564,29 @@ void sky_normalize(uint3 gid: SV_DispatchThreadID) {
     let sin_theta = sin((float(y) + 0.5) / float(SKY_H) * PI);
     let texel = 2.0 * PI * PI / float(n);
     kp.table[n + 1u + idx] = skyWeight(idx) * inv_total / (texel * max(sin_theta, 1.0e-4));
+}
+
+// One thread per guide entry: the last texel whose cdf <= j / N (rt_types.slang `importance`).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_guide(uint3 gid: SV_DispatchThreadID) {
+    let j = gid.x + kp.base;
+    let n = SKY_W * SKY_H;
+    if (j > n) {
+        return;
+    }
+    let u = float(j) / float(n);
+    uint lo = 0u;
+    uint hi = n;
+    while (lo + 1u < hi) {
+        let mid = (lo + hi) / 2u;
+        if (kp.table[mid] <= u) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    kp.table[2u * n + 1u + j] = asfloat(j == n ? n - 1u : lo);
 }
 
 // The sun's disc radiance where the viewer stands: the top of the air's, through it, and

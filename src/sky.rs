@@ -23,10 +23,7 @@ use bevy::{
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::{
-    environment::{InEnvironment, RenderEnvironments, environment_mask},
-    sky_importance::HdrSun,
-};
+use crate::environment::{InEnvironment, RenderEnvironments, environment_mask};
 
 /// Suns per environment the GPU table holds; more are ignored.
 pub const MAX_SUNS: usize = 4;
@@ -88,9 +85,14 @@ pub struct Fog {
     /// Grid depth slices out to `grid_distance` (quadratic, dense near the camera).
     #[reflect(@4..=128_u32)]
     pub grid_slices: u32,
-    /// Frames the grid averages: more is smoother, fewer follows moving shadows sooner.
+    /// Samples each cell averages: more is smoother, fewer follows moving shadows sooner. A
+    /// cell takes one every `grid_stride`^2 frames.
     #[reflect(@1.0..=128.0_f32)]
     pub grid_history: f32,
+    /// The grid's lighting lights one cell of every `grid_stride` x `grid_stride` block per frame,
+    /// turning through the block (1 = every cell every frame); the others carry last frame's.
+    #[reflect(@1..=4_u32)]
+    pub grid_stride: u32,
 }
 
 impl Default for Fog {
@@ -105,6 +107,7 @@ impl Default for Fog {
             grid_tile: 8,
             grid_slices: 64,
             grid_history: 32.0,
+            grid_stride: 2,
         }
     }
 }
@@ -460,16 +463,14 @@ pub struct EnvironmentGpu {
     pub sun_count: u32,
     /// [`SkyBrightness`].
     pub sky_brightness: f32,
-    /// The HDR sky's importance-sampling table (sky_importance.rs), 0 = none.
+    /// The HDR or generated sky's importance-sampling table (sky_gen.rs), 0 = none.
     pub importance: u64,
     /// [`Fog`]: extinction per metre, Henyey-Greenstein g, base height, falloff (0 = uniform).
     pub fog_density: f32,
     pub fog_scatter: f32,
     pub fog_height: f32,
     pub fog_falloff: f32,
-    /// HDR sky with its sun taken out ([`HdrSun`]): the texel luminance the sky is clipped to
-    /// inside a sun's cone (the sun is one of `suns`). 0 = nothing taken out.
-    pub sun_clip: f32,
+    pub pad: u32,
     /// [`Fog::steps`].
     pub fog_steps: u32,
     /// [`Fog::grid_distance`] (0 = off), [`Fog::grid_history`], [`Fog::grid_tile`],
@@ -494,14 +495,13 @@ pub struct EnvironmentGpu {
 
 impl EnvironmentGpu {
     /// `tex` and `space` are the renderer's: the HDR's (or space image's) bindless index,
-    /// and the space image's scale; `importance` the HDR sky's sampling table, and `hdr_sun` the
-    /// sun taken out of it; `stars` the generated sky's star map (bindless, None until loaded).
+    /// and the space image's scale; `importance` the sky's sampling table; `stars` the generated
+    /// sky's star map (bindless, None until loaded).
     pub fn new(
         environment: &EnvironmentSky,
         tex: u32,
         space: Vec4,
         importance: u64,
-        hdr_sun: Option<&HdrSun>,
         stars: Option<u32>,
     ) -> Self {
         let (mode, color) = match &environment.sky {
@@ -518,23 +518,7 @@ impl EnvironmentGpu {
                 radiance: sun.radiance.extend(sun.disc).to_array(),
             };
         }
-        let mut sun_count = environment.suns.len().min(MAX_SUNS);
-        let mut sun_clip = 0.0;
-        // The HDR sky's own sun (core and halo), in nits: the image's units times the sky's scale
-        // and brightness. All of it or none: the clip takes the whole cone out of the sky.
-        if let (Sky::Hdr { scale, .. }, Some(sun)) = (&environment.sky, hdr_sun)
-            && sun_count + sun.discs().count() <= MAX_SUNS
-        {
-            for disc in sun.discs() {
-                let nits = disc.radiance * *scale * environment.sky_brightness;
-                suns[sun_count] = EnvironmentSunGpu {
-                    direction: sun.direction.extend(disc.cos_radius).to_array(),
-                    radiance: nits.extend(1.0).to_array(),
-                };
-                sun_count += 1;
-            }
-            sun_clip = sun.clip;
-        }
+        let sun_count = environment.suns.len().min(MAX_SUNS);
         let fog = environment.fog;
         let (stars_tex, stars_nits) = match (&environment.sky, stars) {
             (Sky::Generated, Some(tex)) => (
@@ -559,7 +543,7 @@ impl EnvironmentGpu {
             fog_scatter: fog.scatter,
             fog_height: fog.height,
             fog_falloff: fog.falloff.max(0.0),
-            sun_clip,
+            pad: 0,
             fog_steps: fog.steps,
             fog_grid_distance: fog.grid_distance.max(0.0),
             fog_grid_history: fog.grid_history.max(1.0),

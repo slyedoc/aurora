@@ -31,7 +31,9 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
-    compute::{CompiledComputeModule, ComputeModule, ComputeModules, memory_barrier, record_dispatch},
+    compute::{
+        CompiledComputeModule, ComputeModule, ComputeModules, memory_barrier, record_dispatch,
+    },
     gpu_transform::{GpuNode, GpuTransforms, NO_NODE, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
@@ -742,8 +744,7 @@ impl TLAS {
         if !self.records.is_empty() {
             let staging = self.staging.write();
             ensure_staging(rd, staging, self.records.len());
-            rd.map_buffer(staging)
-                .copy_from_slice(&self.records);
+            rd.map_buffer(staging).copy_from_slice(&self.records);
             if transfers {
                 memory_barrier(
                     rd,
@@ -824,7 +825,12 @@ impl TLAS {
     /// headroom (the core indirect build that could read this frame's count on the GPU is not
     /// exposed by NVIDIA). A build whose live count reached its size may have dropped the last
     /// slots: the next one reads every row, and the sizing settles again.
-    fn pack(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, module: &CompiledComputeModule) -> u32 {
+    fn pack(
+        &mut self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        module: &CompiledComputeModule,
+    ) -> u32 {
         // This parity's copy was written by the pack before last: finished by now.
         self.pack_parity ^= 1;
         let parity = self.pack_parity;
@@ -833,7 +839,9 @@ impl TLAS {
         let rows = if read_rows == 0 || live >= read_rows {
             self.count
         } else {
-            (live + live / 8 + 2048).next_multiple_of(1024).min(self.count)
+            (live + live / 8 + 2048)
+                .next_multiple_of(1024)
+                .min(self.count)
         };
         self.built_rows[parity] = rows;
 
@@ -971,7 +979,8 @@ impl TLAS {
                 ),
             });
         let rows = self.pack(rd, cmd, module);
-        let build_range = vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(rows);
+        let build_range =
+            vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(rows);
         let build_range_infos = std::slice::from_ref(&build_range);
         unsafe {
             rd.ext_acc_struct.cmd_build_acceleration_structures(
@@ -1368,7 +1377,13 @@ impl Plugin for TLASBuilderPlugin {
         let shader = asset_server.load(aurora_asset("shaders/instances.slang"));
         let module = asset_server.add(ComputeModule::new(
             shader,
-            &["scatter_instances", "gather_instances", "live_count", "live_scan", "live_write"],
+            &[
+                "scatter_instances",
+                "gather_instances",
+                "live_count",
+                "live_scan",
+                "live_write",
+            ],
         ));
 
         app.insert_resource(TLAS::new(module));

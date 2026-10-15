@@ -74,7 +74,12 @@ impl Plugin for DevUIPlugin {
         app.add_systems(Startup, spawn_panel);
         app.add_systems(
             Update,
-            (toggle_panel, update_probe, update_frame_readout, inspect_camera),
+            (
+                toggle_panel,
+                update_probe,
+                update_frame_readout,
+                inspect_camera,
+            ),
         );
     }
 }

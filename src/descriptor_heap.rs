@@ -23,13 +23,20 @@ pub const BINDLESS_SLOTS: u32 = 16536;
 /// Trace guides per view: normal+roughness, diffuse, specular, depth, spec hit, motion,
 /// colour, fog (raygen bindings 0..=7).
 pub const GUIDES: u32 = 8;
+
+/// Storage volumes per view (src/fog_grid.rs: the column sums, the soft grid), written by
+/// heap-mode compute kernels.
+pub const VOLUMES: u32 = 2;
 /// Post-process inputs per target (quad.slang's `test[10]`).
 pub const POST_INPUTS: u32 = 10;
 
 /// What a heap-using pipeline reads: [`DescriptorHeaps::mappings`] turns these into the
 /// create-time mapping of the shader's `(set, binding)` declarations.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Mapping {
+    /// The storage volumes (VOLUMES per view and frame parity) at `(set, binding)`, as one
+    /// array indexed from [`DescriptorHeaps::volume_base`].
+    Volumes { set: u32, binding: u32 },
     /// The bindless texture array at `(set, binding)`: a constant heap range.
     Bindless { set: u32, binding: u32 },
     /// `count` consecutive bindings from `binding`, at the heap block whose index is the u32 at
@@ -112,6 +119,7 @@ pub struct DescriptorHeaps {
     guides: u32,
     post: u32,
     gizmo: u32,
+    volumes: u32,
     /// Every image view the device made, by handle: descriptors are written from these.
     views: Mutex<HashMap<vk::ImageView, ViewDesc>>,
 }
@@ -129,7 +137,9 @@ impl DescriptorHeaps {
                 .get_physical_device_properties2(rd.physical_device, &mut properties)
         };
         let stride = align(
-            props.image_descriptor_size.max(props.buffer_descriptor_size),
+            props
+                .image_descriptor_size
+                .max(props.buffer_descriptor_size),
             props
                 .image_descriptor_alignment
                 .max(props.buffer_descriptor_alignment),
@@ -140,14 +150,23 @@ impl DescriptorHeaps {
         let guides = slot(BINDLESS_SLOTS as u64);
         let post = guides + 2 * crate::MAX_VIEWS as u64 * GUIDES as u64 * stride;
         let gizmo = post + 2 * POST_TARGETS as u64 * POST_INPUTS as u64 * stride;
+        let volumes = gizmo + 2 * crate::MAX_VIEWS as u64 * stride;
         let resource_size = align(
-            gizmo + 2 * crate::MAX_VIEWS as u64 * stride,
+            volumes + 2 * crate::MAX_VIEWS as u64 * VOLUMES as u64 * stride,
             props.resource_heap_alignment,
         );
-        let sampler_stride = align(props.sampler_descriptor_size, props.sampler_descriptor_alignment);
-        let sampler_reserved =
-            align(props.min_sampler_heap_reserved_range, props.sampler_descriptor_alignment);
-        let sampler_size = align(sampler_reserved + sampler_stride, props.sampler_heap_alignment);
+        let sampler_stride = align(
+            props.sampler_descriptor_size,
+            props.sampler_descriptor_alignment,
+        );
+        let sampler_reserved = align(
+            props.min_sampler_heap_reserved_range,
+            props.sampler_descriptor_alignment,
+        );
+        let sampler_size = align(
+            sampler_reserved + sampler_stride,
+            props.sampler_heap_alignment,
+        );
         log::info!(
             "vulkan: descriptor heaps: resource {} KB ({stride} B slots, {} B reserved), sampler {} B, push data {} B",
             resource_size / 1024,
@@ -219,6 +238,7 @@ impl DescriptorHeaps {
             guides: guides as u32,
             post: post as u32,
             gizmo: gizmo as u32,
+            volumes: volumes as u32,
             views: Mutex::new(HashMap::new()),
         };
         let linear = linear_sampler_info();
@@ -227,10 +247,12 @@ impl DescriptorHeaps {
                 .ext
                 .write_sampler_descriptors(
                     std::slice::from_ref(&linear),
-                    &[vk::HostAddressRangeEXT::default().address(std::slice::from_raw_parts_mut(
-                        heaps.sampler_ptr.0.add(heaps.linear_sampler as usize),
-                        sampler_stride as usize,
-                    ))],
+                    &[
+                        vk::HostAddressRangeEXT::default().address(std::slice::from_raw_parts_mut(
+                            heaps.sampler_ptr.0.add(heaps.linear_sampler as usize),
+                            sampler_stride as usize,
+                        )),
+                    ],
                 )
                 .unwrap();
         }
@@ -300,7 +322,10 @@ impl DescriptorHeaps {
 
     /// Pushes `data` at offset 0 of push data (where the shaders' push-constant block sits).
     pub fn push<T: bytemuck::NoUninit>(&self, cmd: vk::CommandBuffer, data: &T) {
-        let bytes = bytemuck::bytes_of(data);
+        self.push_bytes(cmd, bytemuck::bytes_of(data));
+    }
+
+    pub fn push_bytes(&self, cmd: vk::CommandBuffer, bytes: &[u8]) {
         let info = vk::PushDataInfoEXT::default()
             .offset(0)
             .data(vk::HostAddressRangeConstEXT::default().address(bytes));
@@ -317,7 +342,9 @@ impl DescriptorHeaps {
         ty: vk::DescriptorType,
     ) {
         let Some(desc) = self.views.lock().unwrap().get(&view).copied() else {
-            log::warn!("descriptor heap: {view:?} was not made by the device; slot {offset} left as is");
+            log::warn!(
+                "descriptor heap: {view:?} was not made by the device; slot {offset} left as is"
+            );
             return;
         };
         let view_info = desc.info();
@@ -331,10 +358,12 @@ impl DescriptorHeaps {
             self.ext
                 .write_resource_descriptors(
                     std::slice::from_ref(&resource),
-                    &[vk::HostAddressRangeEXT::default().address(std::slice::from_raw_parts_mut(
-                        self.resource_ptr.0.add(offset as usize),
-                        self.stride as usize,
-                    ))],
+                    &[
+                        vk::HostAddressRangeEXT::default().address(std::slice::from_raw_parts_mut(
+                            self.resource_ptr.0.add(offset as usize),
+                            self.stride as usize,
+                        )),
+                    ],
                 )
                 .unwrap();
         }
@@ -342,12 +371,34 @@ impl DescriptorHeaps {
 
     /// Bindless slot `index` samples `view`.
     pub fn write_bindless(&self, index: u32, view: vk::ImageView) {
+        self.write_bindless_in(index, view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /// Bindless slot `index` samples `view`, which lives in `layout`.
+    pub fn write_bindless_in(&self, index: u32, view: vk::ImageView, layout: vk::ImageLayout) {
         self.write_image(
             self.bindless + index * self.stride,
             view,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            layout,
             vk::DescriptorType::SAMPLED_IMAGE,
         );
+    }
+
+    /// The first storage volume of `(parity, view slot)`: its index in [`Mapping::Volumes`].
+    pub fn volume_base(parity: usize, slot: usize) -> u32 {
+        (parity * crate::MAX_VIEWS + slot) as u32 * VOLUMES
+    }
+
+    /// Writes storage volumes (GENERAL) from index `base`.
+    pub fn write_volumes(&self, base: u32, views: &[vk::ImageView]) {
+        for (i, view) in views.iter().enumerate() {
+            self.write_image(
+                self.volumes + (base + i as u32) * self.stride,
+                *view,
+                vk::ImageLayout::GENERAL,
+                vk::DescriptorType::STORAGE_IMAGE,
+            );
+        }
     }
 
     /// The block of guide slots for `(parity, view slot)`: its index in push data.
@@ -409,11 +460,14 @@ impl DescriptorHeaps {
     }
 
     /// The create-time mapping for a pipeline reading `mappings`.
-    pub fn mappings(&self, mappings: &[Mapping]) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
+    pub fn mappings(
+        &self,
+        mappings: &[Mapping],
+    ) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
         mappings
             .iter()
             .map(|m| match *m {
-                Mapping::Bindless { set, binding } => vk::DescriptorSetAndBindingMappingEXT::default()
+                Mapping::Volumes { set, binding } => vk::DescriptorSetAndBindingMappingEXT::default()
                     .descriptor_set(set)
                     .first_binding(binding)
                     .binding_count(1)
@@ -421,11 +475,25 @@ impl DescriptorHeaps {
                     .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
                     .source_data(vk::DescriptorMappingSourceDataEXT {
                         constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default()
+                            .heap_offset(self.volumes)
+                            .heap_array_stride(self.stride),
+                    }),
+                Mapping::Bindless { set, binding } => {
+                    vk::DescriptorSetAndBindingMappingEXT::default()
+                        .descriptor_set(set)
+                        .first_binding(binding)
+                        .binding_count(1)
+                        .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
+                        .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
+                        .source_data(vk::DescriptorMappingSourceDataEXT {
+                            constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default(
+                            )
                             .heap_offset(self.bindless)
                             .heap_array_stride(self.stride)
                             .sampler_heap_offset(self.linear_sampler)
                             .sampler_heap_array_stride(0),
-                    }),
+                        })
+                }
                 Mapping::Indexed {
                     set,
                     binding,

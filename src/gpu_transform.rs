@@ -788,7 +788,16 @@ impl GpuTransforms {
             let queue = rd.queue.lock().unwrap();
             self.readback_point = rd
                 .timeline
-                .submit(rd, *queue, std::slice::from_ref(&cmd), &[], &[], &[], vk::Fence::null(), None)
+                .submit(
+                    rd,
+                    *queue,
+                    std::slice::from_ref(&cmd),
+                    &[],
+                    &[],
+                    &[],
+                    vk::Fence::null(),
+                    None,
+                )
                 .unwrap_or_else(|e| {
                     crate::aftermath::note_device_lost(e);
                     panic!("transform submit failed: {e:?}");

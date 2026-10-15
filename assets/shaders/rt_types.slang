@@ -60,17 +60,16 @@ public struct EnvironmentGpu {
     public uint tex;
     public uint sun_count;
     public float sky_brightness;
-    // The HDR sky's importance-sampling table (src/sky_importance.rs): cdf[N + 1] then the
-    // solid-angle pdf of each texel, N = SKY_IMPORTANCE_W * SKY_IMPORTANCE_H.
+    // The HDR or generated sky's importance-sampling table (src/sky_gen.rs): cdf[N + 1], the
+    // solid-angle pdf of each texel, then the guide (u32 bits) [N + 1]: guide[j] is the last
+    // texel whose cdf <= j / N. N = SKY_IMPORTANCE_W * SKY_IMPORTANCE_H.
     public float* importance;
     // Fog: extinction per metre, Henyey-Greenstein g, base height, falloff (0 = uniform).
     public float fog_density;
     public float fog_scatter;
     public float fog_height;
     public float fog_falloff;
-    // HDR sky with its sun taken out (sky_importance.rs HdrSun): the texel luminance it is
-    // clipped to inside a sun's cone; 0 = nothing taken out.
-    public float sun_clip;
+    public uint pad;
     // Fog: the camera ray's march steps (0 = it scatters at random like a bounce).
     public uint fog_steps;
     // Fog light grid (src/fog_grid.rs): how far it reaches (0 = off), the frames it averages,
@@ -125,23 +124,7 @@ public float3 leaveSurface(float3 p, float3 n, float3 d) {
     return offsetRay(p, dot(d, n) >= 0.0 ? n : -n);
 }
 
-// The HDR sky's texel at `d` without the sun taken out of it: clipped to `sun_clip` inside a
-// sun's cone (the sun renders as one of `suns`). The miss and the sky sampler both read the sky
-// through this, so the sun is counted once.
-public float3 skyResidual(EnvironmentGpu env, float3 d, float3 texel) {
-    if (env.sun_clip <= 0.0) {
-        return texel;
-    }
-    for (uint i = 0u; i < env.sun_count; i++) {
-        if (dot(d, env.suns[i].direction.xyz) >= env.suns[i].direction.w) {
-            let l = dot(texel, float3(0.2126, 0.7152, 0.0722));
-            return l > env.sun_clip ? texel * (env.sun_clip / l) : texel;
-        }
-    }
-    return texel;
-}
-
-// The sampling grid of every importance table (src/sky_importance.rs ENV_W / ENV_H).
+// The sampling grid of every importance table (src/sky_gen.rs SKY_W / SKY_H).
 public static const uint SKY_IMPORTANCE_W = 512;
 public static const uint SKY_IMPORTANCE_H = 256;
 
@@ -232,9 +215,18 @@ public struct UniformData {
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
     // One shadow ray per vertex from this bounce on.
     public uint one_shadow_ray_from;
-    // The grid's columns summed front to back (`fog_integrate`): per cell, the in-scatter and
-    // transmittance from the grid's eye to the cell's far side.
-    public float4* fog_grid_sum;
+    // Bindless 3D images (raygen.slang `volumes`): the grid's columns summed front to back
+    // (`fog_integrate`: per cell, the in-scatter and transmittance from the grid's eye to the
+    // cell's far side, behind a first slice of nothing) and the grid blurred once across x and
+    // y (`fog_soften`). A camera ray's lookups filter them in the texture unit.
+    public uint fog_grid_sum_tex;
+    public uint fog_grid_soft_tex;
+    // The soft grid as a buffer (`fog_integrate` reads it).
+    public float4* fog_grid_soft;
+    // `fog_grid` lights one cell of every stride x stride block per frame (fogGridPhase).
+    public uint fog_grid_stride;
+    // RenderSettings::ab: 0 the old path under test, 1 the new (benches/northshire.rs --ab).
+    public uint ab;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -295,27 +287,75 @@ public struct SharcEntry {
 // One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.
 // The primary vertex as ReSTIR DI sees it (src/restir.rs), written by the raygen at sample 0's
 // first shaded surface; `frame` marks it live (a pixel that hit nothing keeps an old one).
-// Normals and the view are octahedral 2xf16. 96 bytes.
+// 64 bytes, half a cache line: the spatial pass reads neighbours' at random.
 public struct RestirSurface {
     public float3 position;
     public uint frame;
     // Where the surface was last frame (object motion), and its view depth (clip w).
     public float3 prev_position;
     public float depth;
-    public float3 albedo;
-    public float metallic;
-    // The path weight reaching this vertex (alpha pass-through, glass in front).
-    public float3 throughput;
-    public float roughness;
+    // Albedo as rgb8 of its square root (finer steps in the darks) and metallic in the top byte.
+    public uint albedo_metallic;
+    // The hit's lobes word (packLobes: transmission, clear coat, coat roughness) and perceptual
+    // roughness in the top byte.
+    public uint material;
+    // The path weight reaching this vertex (alpha pass-through, glass in front) as f16 rgb, and
+    // the ray's layer mask above blue.
+    public uint throughput_rg;
+    public uint throughput_b_mask;
+    // Octahedral 2xf16.
     public uint normal_oct;
     public uint geo_normal_oct;
     public uint view_oct;
-    public uint ray_mask;
-    public float transmission;
-    public float clearcoat;
-    public float coat_alpha;
-    public float pad;
+    public uint pad;
 };
+
+public uint packUnorm8(float x) {
+    return uint(saturate(x) * 255.0 + 0.5);
+}
+
+public RestirSurface restirSurfacePack(float3 position, uint frame, float3 prev_position, float depth,
+                                       float3 albedo, float metallic, float roughness, uint lobes,
+                                       float3 throughput, uint ray_mask, float3 n, float3 ns, float3 v) {
+    let a = sqrt(saturate(albedo));
+    RestirSurface s;
+    s.position = position;
+    s.frame = frame;
+    s.prev_position = prev_position;
+    s.depth = depth;
+    s.albedo_metallic = packUnorm8(a.r) | (packUnorm8(a.g) << 8) | (packUnorm8(a.b) << 16)
+        | (packUnorm8(metallic) << 24);
+    s.material = (lobes & 0xFFFFFFu) | (packUnorm8(roughness) << 24);
+    s.throughput_rg = packHalf2(throughput.rg);
+    s.throughput_b_mask = (f32tof16(throughput.b) & 0xFFFFu) | ((ray_mask & 0xFFu) << 16);
+    s.normal_oct = packHalf2(float32x3_to_oct(n));
+    s.geo_normal_oct = packHalf2(float32x3_to_oct(ns));
+    s.view_oct = packHalf2(float32x3_to_oct(v));
+    s.pad = 0u;
+    return s;
+}
+
+public float3 restirAlbedo(RestirSurface s) {
+    let a = float3(float(s.albedo_metallic & 0xFFu), float((s.albedo_metallic >> 8) & 0xFFu),
+                   float((s.albedo_metallic >> 16) & 0xFFu)) / 255.0;
+    return a * a;
+}
+
+public float restirMetallic(RestirSurface s) {
+    return float(s.albedo_metallic >> 24) / 255.0;
+}
+
+public float restirRoughness(RestirSurface s) {
+    return float(s.material >> 24) / 255.0;
+}
+
+public float3 restirThroughput(RestirSurface s) {
+    return float3(unpackHalf2(s.throughput_rg), f16tof32(s.throughput_b_mask & 0xFFFFu));
+}
+
+public uint restirRayMask(RestirSurface s) {
+    return (s.throughput_b_mask >> 16) & 0xFFu;
+}
 
 public struct Reservoir {
     // Winning light-table entry and its (su, sv) triangle sample, packed as 2xf16.
@@ -373,6 +413,9 @@ public struct LightsHeader {
     public AnalyticLight* analytics;
     // Per entry, its light instance (0 for analytic entries).
     public uint* entry_to_linst;
+    // Per triangle entry, resolved each frame (lights.slang `light_prepare`): world vertex 0
+    // and world mask, edge 1 and pick probability, edge 2, emission; four float4 each.
+    public float4* prepared;
 };
 
 // Exposure state from the metering (auto_exposure.slang). The raygen applies
@@ -468,6 +511,8 @@ public struct RestirFrame {
     public float emissive_boost;
     public uint grid_candidates;   // R per grid sample
     public uint light_entries;     // 0 = light NEE off
+    public uint ab;                // RenderSettings::ab: 0 the old path under test, 1 the new
+    public uint pad_ab;
 };
 
 // The light-grid cell holding `p`, or ~0 outside the grid.

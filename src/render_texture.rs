@@ -583,7 +583,40 @@ pub fn create_blank_texture(
     width: u32,
     height: u32,
 ) -> RenderTexture {
-    let image_info = vk_init::image_info(width, height, format, usage_flags);
+    create_blank(device, format, usage_flags, desired_layout, width, height, 1)
+}
+
+/// A 3D image of `depth` slices, viewed as 3D (a `Sampler3D` reads it through the bindless
+/// heap, raygen.slang `volumes`).
+pub fn create_blank_volume(
+    device: &RenderDevice,
+    format: vk::Format,
+    usage_flags: vk::ImageUsageFlags,
+    desired_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    depth: u32,
+) -> RenderTexture {
+    create_blank(device, format, usage_flags, desired_layout, width, height, depth)
+}
+
+fn create_blank(
+    device: &RenderDevice,
+    format: vk::Format,
+    usage_flags: vk::ImageUsageFlags,
+    desired_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    depth: u32,
+) -> RenderTexture {
+    let mut image_info = vk_init::image_info(width, height, format, usage_flags);
+    if depth > 1 {
+        image_info = image_info.image_type(vk::ImageType::TYPE_3D).extent(vk::Extent3D {
+            width,
+            height,
+            depth,
+        });
+    }
     let image_handle = unsafe { device.device.create_image(&image_info, None).unwrap() };
 
     let requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image_handle);
@@ -635,7 +668,10 @@ pub fn create_blank_texture(
         );
     });
 
-    let view_info = vk_init::image_view_info(image_handle, format);
+    let mut view_info = vk_init::image_view_info(image_handle, format);
+    if depth > 1 {
+        view_info = view_info.view_type(vk::ImageViewType::TYPE_3D);
+    }
     let view = device.create_view(&view_info);
 
     RenderTexture {

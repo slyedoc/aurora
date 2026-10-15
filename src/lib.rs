@@ -13,11 +13,11 @@
 pub const MAX_VIEWS: usize = 4;
 
 pub mod aftermath;
+pub mod nsight;
 pub mod animclip;
 pub mod assets;
 pub mod atmosphere;
 pub mod auto_exposure;
-pub mod descriptor_heap;
 pub mod blas;
 pub mod bluenoise_plugin;
 pub mod bsn;
@@ -26,6 +26,7 @@ pub mod collision;
 pub mod color_target;
 pub mod compute;
 pub mod debug_view;
+pub mod descriptor_heap;
 pub mod dev_ui;
 pub mod dlss;
 pub mod environment;
@@ -60,7 +61,6 @@ pub mod sharc;
 pub mod skinning;
 pub mod sky;
 pub mod sky_gen;
-pub mod sky_importance;
 pub mod sphere;
 pub mod surface_group;
 pub mod swapchain;
@@ -109,7 +109,6 @@ pub mod prelude {
         render_settings::{AuroraLens, RenderSettings},
         skinning::{SkinJointsByName, Wind, WindSway},
         sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyAir, SkyBrightness},
-        sky_importance::SkyImportance,
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt, VideoExt, VideoRecorder},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
@@ -161,7 +160,6 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::render_settings::RenderSettingsPlugin);
         group = group.add(crate::latency::LatencyPlugin);
         group = group.add(crate::render_env::RenderEnvPlugin);
-        group = group.add(crate::sky_importance::SkyImportancePlugin);
         group = group.add(crate::post_process_filter::PostProcessFilterPlugin);
         group = group.add(crate::raytracing_pipeline::RaytracingPipelinePlugin);
         group = group.add(crate::shader::ShaderPlugin);

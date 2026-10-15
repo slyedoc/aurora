@@ -154,7 +154,10 @@ fn read_report(
             ms
         };
         if latency.present_id % (REPORT_EVERY * 20) == 0 {
-            debug!("reflex: sim start -> present end {:.1} ms", latency.latency_ms);
+            debug!(
+                "reflex: sim start -> present end {:.1} ms",
+                latency.latency_ms
+            );
         }
     }
 }
