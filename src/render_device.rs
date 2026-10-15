@@ -80,6 +80,68 @@ impl Drop for AllocatorState {
     }
 }
 
+/// VK_KHR_pipeline_executable_properties is on: pipelines built with
+/// [`capture_statistics`] report each shader's registers, binary size and stack
+/// ([`log_executable_statistics`]). NVIDIA reports compute pipelines; ray tracing pipelines
+/// return no executables.
+pub static EXECUTABLE_STATISTICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `CAPTURE_STATISTICS_KHR` when the extension is on.
+pub fn capture_statistics() -> vk::PipelineCreateFlags2 {
+    if EXECUTABLE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+        vk::PipelineCreateFlags2::CAPTURE_STATISTICS_KHR
+    } else {
+        vk::PipelineCreateFlags2::empty()
+    }
+}
+
+/// Logs (debug) the driver's statistics for every shader executable of `pipeline` (built with
+/// `CAPTURE_STATISTICS_KHR`): register count, instruction count, local memory and the rest.
+pub fn log_executable_statistics(rd: &RenderDevice, label: &str, pipeline: vk::Pipeline) {
+    if !EXECUTABLE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let ext = ash::khr::pipeline_executable_properties::Device::load(&rd.instance, &rd.device);
+    let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
+    let Ok(n) = (unsafe { ext.get_pipeline_executable_properties_len(&info) }) else {
+        return;
+    };
+    let mut executables = vec![vk::PipelineExecutablePropertiesKHR::default(); n];
+    if unsafe { ext.get_pipeline_executable_properties(&info, &mut executables) }.is_err() {
+        return;
+    }
+    for (index, exe) in executables.iter().enumerate() {
+        let name = exe.name_as_c_str().map_or("?".into(), |n| n.to_string_lossy());
+        let info = vk::PipelineExecutableInfoKHR::default()
+            .pipeline(pipeline)
+            .executable_index(index as u32);
+        let Ok(n) = (unsafe { ext.get_pipeline_executable_statistics_len(&info) }) else {
+            continue;
+        };
+        let mut stats = vec![vk::PipelineExecutableStatisticKHR::default(); n];
+        if unsafe { ext.get_pipeline_executable_statistics(&info, &mut stats) }.is_err() {
+            continue;
+        }
+        let values: Vec<String> = stats
+            .iter()
+            .map(|st| {
+                let n = st.name_as_c_str().map_or("?".into(), |n| n.to_string_lossy());
+                let v = unsafe {
+                    match st.format {
+                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => st.value.b32.to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::INT64 => st.value.i64.to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => st.value.u64.to_string(),
+                        _ => format!("{:.2}", st.value.f64),
+                    }
+                };
+                format!("{n}={v}")
+            })
+            .collect();
+        log::debug!("shader stats {label} [{name}]: {}", values.join(", "));
+    }
+}
+
 pub struct RenderDeviceData {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -936,6 +998,11 @@ unsafe fn create_logical_device(
         device_extensions.push(ash::ext::descriptor_heap::NAME.as_ptr());
         // The raygen times each pixel for the Cost debug view (debug_view.rs).
         device_extensions.push(ash::khr::shader_clock::NAME.as_ptr());
+        let executable_stats = has(ash::khr::pipeline_executable_properties::NAME);
+        if executable_stats {
+            device_extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
+        }
+        EXECUTABLE_STATISTICS.store(executable_stats, std::sync::atomic::Ordering::Relaxed);
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .flags(queue_flags)
             .queue_family_index(queue_family_idx)
@@ -1030,6 +1097,14 @@ unsafe fn create_logical_device(
         let device_info = device_info.push(&mut features_heap);
         let device_info = if micromaps {
             device_info.push(&mut features_micromap)
+        } else {
+            device_info
+        };
+        let mut features_executable =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                .pipeline_executable_info(true);
+        let device_info = if executable_stats {
+            device_info.push(&mut features_executable)
         } else {
             device_info
         };

@@ -27,15 +27,24 @@ import fog;
 
 static const bool ENABLE_BLUENOISE = true;
 
-// Features fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
-// `RenderSettings`): off, their code is gone from the shader, registers and all. Their
-// uniforms still switch them per frame within a build that has them.
+// Settings fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
+// `RenderSettings`; changing one rebuilds it): the driver folds them, so a feature that is off
+// is gone from the shader, registers and all, and loops get constant bounds. SHARC's and
+// ReSTIR's uniforms still switch them per frame within a build that has them.
 [vk::constant_id(0)] const bool SHARC_ON = false;
 [vk::constant_id(1)] const bool RESTIR_ON = false;
 // Some environment's sky is the atmosphere (sky.rs `EnvironmentSkies::atmosphere`).
 [vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
-// Paths per pixel and their maximum length come from the uniforms (`pc.uniforms.samples`
-// / `max_bounces`); the DLSS path runs 1 spp with a short cap.
+// Paths per pixel and their maximum length.
+[vk::constant_id(3)] const uint SAMPLES = 1;
+[vk::constant_id(4)] const uint MAX_BOUNCES = 4;
+// Light candidates resampled per shading point outside ReSTIR (1 = one plain CDF sample).
+[vk::constant_id(5)] const uint LIGHT_CANDIDATES = 4;
+// Perceptual roughness up to which the primary vertex traces a specular hit-distance ray for
+// Ray Reconstruction; rougher surfaces report 0 (0 = no guide rays at all).
+[vk::constant_id(6)] const float SPEC_HIT_ROUGHNESS = 0.3;
+// Russian roulette from this bounce on (0 = off).
+[vk::constant_id(7)] const uint ROULETTE_FROM = 1;
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
 // sky does (rotation only), and still a finite half float.
@@ -329,7 +338,7 @@ float2 TwoBnoiseSamples(uint byteIndex) {
 // Assumed to be called once per sample
 float2 bnoiseBest(uint sampleIdx) {
     // 64 bluenoise slices; the seed advances every frame.
-    let textureIdx = (pc.uniforms.frame * pc.uniforms.samples + sampleIdx) % 64;
+    let textureIdx = (pc.uniforms.frame * SAMPLES + sampleIdx) % 64;
     if (textureIdx >= 64) {
         let a = randf();
         let b = randf();
@@ -624,15 +633,14 @@ float3 fogGridPoint(float2 uv, float s, float dist) {
 }
 
 // One light-table sample at fog point `x`, as the fog scatters it along `d`: RIS over
-// `light_candidates` from the power CDF, one shadow ray for the survivor, clamped.
-float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, float radiance_clamp,
-                     inout HitPayload payload) {
+// LIGHT_CANDIDATES from the power CDF, one shadow ray for the survivor.
+float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, inout HitPayload payload) {
     if (pc.uniforms.light_entries == 0u) {
         return float3(0.0);
     }
     DisneyMaterial mat = {};
     Lobes lob = {};
-    let M = max(1u, pc.uniforms.light_candidates);
+    let M = max(1u, LIGHT_CANDIDATES);
     var wsum = 0.0;
     var sel_val = float3(0.0);
     var sel_phat = 0.0;
@@ -667,11 +675,7 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, flo
     if (!traceVisible(ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4))) {
         return float3(0.0);
     }
-    var L = sel_val * (wsum / (float(M) * sel_phat));
-    if (radiance_clamp > 0.0) {
-        L *= min(1.0, radiance_clamp / max(luma(L), 1.0e-6));
-    }
-    return L;
+    return sel_val * (wsum / (float(M) * sel_phat));
 }
 
 // One thread per cell lit this frame (one of every stride x stride block, fogGridPhase;
@@ -690,7 +694,6 @@ void fog_grid() {
     HitPayload payload;
     initRandom(uint2(pc.uniforms.fog_grid_cells, 1u), uint2(i, 0u), pc.uniforms.frame);
     let tmax = 1.0e6;
-    let radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
     let ray_env = pc.uniforms.environment;
     let ray_mask = pc.uniforms.camera_mask;
     let env = pc.uniforms.environments + ray_env;
@@ -711,7 +714,7 @@ void fog_grid() {
     if (payload.t == 0.0) {
         L += payload.emission;
     }
-    L += fogTableLight(env, ray_mask, x, d, radiance_clamp, payload);
+    L += fogTableLight(env, ray_mask, x, d, payload);
     if (any(isnan(L)) || any(isinf(L))) {
         L = float3(0.0);
     }
@@ -894,7 +897,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         // cutoff the reflection is too wide to have a motion of its own: 0 pins it to
         // the surface and the ray is saved.
         var spec_hit = 0.0;
-        if (g_roughness <= pc.uniforms.spec_hit_roughness) {
+        if (g_roughness <= SPEC_HIT_ROUGHNESS) {
             var mirror = reflect(direction, world_normal);
             if (dot(mirror, surface_normal) <= 0.0) {
                 mirror = reflect(direction, surface_normal);
@@ -992,8 +995,8 @@ void primary() {
     var glass = 0u;
     // The camera chain shares the path's bounce budget (each cutout or portal is a bounce);
     // past the record only the guides follow, a few smooth-glass vertices at most.
-    for (uint bounce = 0u; bounce < pc.uniforms.max_bounces + 4u; bounce++) {
-        if (!recorded && bounce >= pc.uniforms.max_bounces) {
+    for (uint bounce = 0u; bounce < MAX_BOUNCES + 4u; bounce++) {
+        if (!recorded && bounce >= MAX_BOUNCES) {
             rec.state = PRIMARY_ENDED;
             rec.origin = float3(0.0);
             recorded = true;
@@ -1087,8 +1090,7 @@ void primary() {
                     rec.t = t;
                     rec.state = PRIMARY_HIT | (bounce << 2) | ((ray_mask & 0xFFu) << 8) | ((ray_env & 7u) << 16);
                     // ReSTIR DI's surface: its passes run between this pass and the path tracer.
-                    if (RESTIR_ON && pc.restir_surfaces != nullptr && pc.uniforms.restir_candidates > 0u
-                        && pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
+                    if (RESTIR_ON && pc.restir_surfaces != nullptr && pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
                         pc.restir_surfaces[launch_id.y * launch_size.x + launch_id.x] = restirSurfacePack(
                             hit_point, pc.uniforms.frame, payload.prev_world_pos,
                             mat4MulVec(pc.uniforms.view_proj, float4(hit_point, 1.0)).w, payload.color.rgb,
@@ -1154,21 +1156,8 @@ uint packUnorm16(float x) {
 }
 
 // ReSTIR DI's final sample for this pixel at its primary vertex: the exact contribution (layered
-// BSDF, MIS-weighted against BRDF sampling, as restirTarget) times the reservoir weight, when
-// its own shadow ray sees the light.
-float3 restirWinner(uint idx, float3 origin, float3 n, float3 ns, float3 v, DisneyMaterial mat,
-                    Lobes lob, uint ray_mask) {
-    float3 dir;
-    float dist;
-    let c = restirWinnerUnshadowed(idx, origin, n, ns, v, mat, lob, ray_mask, dir, dist);
-    if (restirLuma(c) <= 0.0
-        || !traceVisible(ray_mask, leaveSurface(origin, ns, dir), 0.0, dir, dist * (1.0 - 1.0e-4))) {
-        return float3(0.0);
-    }
-    return c;
-}
-
-// restirWinner without its shadow ray: the contribution, its direction and distance.
+// BSDF, MIS-weighted against BRDF sampling, as restirTarget) times the reservoir weight, its
+// direction and distance; it joins the vertex's one shadow ray.
 float3 restirWinnerUnshadowed(uint idx, float3 origin, float3 n, float3 ns, float3 v,
                               DisneyMaterial mat, Lobes lob, uint ray_mask, out float3 dir,
                               out float dist) {
@@ -1271,13 +1260,6 @@ void main() {
     let prim_at = launch_id.y * launch_size.x + launch_id.x;
 
     var acc = float3(0.0);
-    let SAMPLES = pc.uniforms.samples;
-    let MAX_BOUNCES = pc.uniforms.max_bounces;
-    // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
-    // (0.18 / exposure), so it tracks the scene -- a sky, or a ceiling panel in a closed room.
-    // From the SMOOTH metered exposure, not the held input one: that lags the scene by up to
-    // its deadband, and a clamp that many stops too loose lets every emitter speckle through.
-    let radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
 
     for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
         let offsetR = sqrt(randf());
@@ -1287,10 +1269,6 @@ void main() {
         float3 origin, direction;
         lensRay(lens, launch_id, launch_size, origin, direction);
         var mask = float3(1.0);
-        // Russian roulette's boost so far (1 / the survival odds): the firefly clamp allows for
-        // it, or it would clip back exactly the energy that keeps roulette unbiased (the canopy's
-        // indirect light came out at less than half).
-        var rr_boost = 1.0;
         // The path's flags, one word (PATH_*, each explained where it would have been declared).
         var path = PATH_WANT_SUN | PATH_CAMERA;
         // PATH_WANT_SUN: the camera ray and pure-specular continuations may see the sun disc directly; after a
@@ -1500,11 +1478,6 @@ void main() {
                 if (payload.t == 0.0 && prev_pdf > 0.0 && skySampled(env)) {
                     contribution *= prev_pdf / (prev_pdf + skyPdf(env, direction));
                 }
-                // Firefly suppression: an indirect path that reaches an emitter far brighter than the
-                // sky would take hundreds of frames to average out; clamp its luminance instead.
-                if (bounce_idx > 0 && radiance_clamp > 0.0) {
-                    contribution *= min(1.0, radiance_clamp * rr_boost / max(luma(contribution), 1.0e-6));
-                }
                 acc += contribution;
                 break;
             }
@@ -1646,24 +1619,18 @@ void main() {
             // candidates with an MIS-weighted shadow ray.
             // Positions and areas are read live, so stale CDF weights change variance, never
             // the answer.
-            // From `one_shadow_ray_from` on the strategies below share one shadow ray.
-            let one_ray = bounce_idx >= pc.uniforms.one_shadow_ray_from;
+            // The strategies below share one shadow ray: each proposes its unshadowed
+            // contribution, one is picked by brightness and scaled by 1 / its pick probability.
             ShadowPick pick = {};
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
-                if (RESTIR_ON && pc.uniforms.restir_candidates > 0u && resumed) {
+                if (RESTIR_ON && resumed) {
                     // ReSTIR DI's winner for this vertex: its passes ran between the primary pass
                     // and this one, over the surface the primary pass wrote.
-                    if (one_ray && pc.uniforms.restir_shared_ray != 0u) {
-                        // The winner shares the vertex's one shadow ray.
-                        float3 wdir;
-                        float wdist;
-                        let c = restirWinnerUnshadowed(prim_at, origin, world_normal, surface_normal,
-                                                       -direction, disney_mat, lob, ray_mask, wdir, wdist);
-                        pick.propose(mask * c, wdir, wdist * (1.0 - 1.0e-4));
-                    } else {
-                        acc += mask * restirWinner(prim_at, origin, world_normal, surface_normal,
-                                                   -direction, disney_mat, lob, ray_mask);
-                    }
+                    float3 wdir;
+                    float wdist;
+                    let c = restirWinnerUnshadowed(prim_at, origin, world_normal, surface_normal,
+                                                   -direction, disney_mat, lob, ray_mask, wdir, wdist);
+                    pick.propose(mask * c, wdir, wdist * (1.0 - 1.0e-4));
                 } else {
                     // Resampled importance sampling, no reuse: M candidates, each weighted by its
                     // MIS-weighted unshadowed contribution at THIS point over its source pdf; one
@@ -1676,8 +1643,7 @@ void main() {
                     // (what the emitter-hit side uses), so the two strategies still sum to one;
                     // only the RIS weight takes the grid's source pdf. M = 1 is the plain
                     // estimator.
-                    let M = bounce_idx == 0u ? pc.uniforms.light_candidates
-                                             : max(1u, pc.uniforms.light_candidates / 4u);
+                    let M = bounce_idx == 0u ? LIGHT_CANDIDATES : max(1u, LIGHT_CANDIDATES / 4u);
                     let grid = pc.restir_frame;
                     let cell = grid != nullptr ? gridCell(grid, origin) : 0xFFFFFFFFu;
                     var wsum = 0.0;
@@ -1730,16 +1696,7 @@ void main() {
                         }
                     }
                     if (wsum > 0.0) {
-                        var contribution = mask * sel_scaled * (wsum / float(M));
-                        if (bounce_idx > 0 && radiance_clamp > 0.0) {
-                            contribution *= min(1.0, radiance_clamp * rr_boost / max(luma(contribution), 1.0e-6));
-                        }
-                        if (one_ray) {
-                            pick.propose(contribution, ldir, ldist * (1.0 - 1.0e-4));
-                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, ldir), tmin,
-                                                ldir, ldist * (1.0 - 1.0e-4))) {
-                            acc += contribution;
-                        }
+                        pick.propose(mask * sel_scaled * (wsum / float(M)), ldir, ldist * (1.0 - 1.0e-4));
                     }
                 }
             }
@@ -1763,11 +1720,7 @@ void main() {
                     if (any(f > float3(0.0))) {
                         let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
                         let c = mask * f * abs(NoL) * L * (w / pdf_env);
-                        if (one_ray) {
-                            pick.propose(c, l, tmax);
-                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
-                            acc += c;
-                        }
+                        pick.propose(c, l, tmax);
                     }
                 }
             }
@@ -1805,17 +1758,11 @@ void main() {
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
                         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                         let c = mask * f * abs(NoL) * sun_radiance * solid_angle;
-                        if (one_ray) {
-                            pick.propose(c, l, tmax);
-                        } else if (traceVisible(ray_mask, leaveSurface(origin, surface_normal, l), tmin, l, tmax)) {
-                            acc += c;
-                        }
+                        pick.propose(c, l, tmax);
                     }
                 }
             }
-            if (one_ray) {
-                acc += pick.resolve(ray_mask, origin, surface_normal);
-            }
+            acc += pick.resolve(ray_mask, origin, surface_normal);
 
             // Thin layers before the base: through the surface with probability `transmission`
             // (weight = albedo: a Lambertian lobe drawn by its own cosine), off the coat with
@@ -1903,13 +1850,12 @@ void main() {
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
-            if (pc.uniforms.roulette_from > 0u && bounce_idx + 1u >= pc.uniforms.roulette_from) {
+            if (ROULETTE_FROM > 0u && bounce_idx + 1u >= ROULETTE_FROM) {
                 let q = clamp(max(mask.r, max(mask.g, mask.b)), 0.25, 1.0);
                 if (randf() >= q) {
                     break;
                 }
                 mask /= q;
-                rr_boost /= q;
             }
         }
 

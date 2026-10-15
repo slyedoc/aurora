@@ -126,7 +126,9 @@ impl VulkanAsset for ComputeModule {
         };
         let mapping_info = stage_mapping(&mappings);
         let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT | crate::render_device::capture_statistics());
+        let mut flags2_plain = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(crate::render_device::capture_statistics());
 
         let names: Vec<std::ffi::CString> = entry_points
             .iter()
@@ -141,7 +143,9 @@ impl VulkanAsset for ComputeModule {
                     .name(name);
                 let info = vk::ComputePipelineCreateInfo::default().layout(pipeline_layout);
                 if heap.is_empty() {
-                    info.stage(stage)
+                    let mut info = info.stage(stage);
+                    info.p_next = (&raw mut flags2_plain).cast();
+                    info
                 } else {
                     stage.p_next = (&raw const mapping_info).cast();
                     let mut info = info.stage(stage);
@@ -163,6 +167,9 @@ impl VulkanAsset for ComputeModule {
             shader.path,
             handles.len()
         );
+        for (entry, handle) in entry_points.iter().zip(&handles) {
+            crate::render_device::log_executable_statistics(render_device, entry, *handle);
+        }
         // Pipelines hold no reference to the module once created.
         unsafe {
             render_device

@@ -46,6 +46,12 @@ pub struct PipelineFeatures {
     pub restir: bool,
     /// Some environment's sky is the atmosphere.
     pub atmosphere: bool,
+    pub samples: u32,
+    pub max_bounces: u32,
+    pub light_candidates: u32,
+    /// `spec_hit_roughness`'s bits (the struct compares exactly).
+    pub spec_hit_roughness: u32,
+    pub roulette_from: u32,
 }
 
 impl PipelineFeatures {
@@ -53,10 +59,17 @@ impl PipelineFeatures {
         settings: Option<&crate::render_settings::RenderSettings>,
         skies: Option<&crate::sky::EnvironmentSkies>,
     ) -> Self {
+        let d = crate::render_settings::RenderSettings::default();
+        let s = settings.unwrap_or(&d);
         Self {
             sharc: settings.is_some_and(|s| s.sharc),
             restir: settings.is_some_and(|s| s.restir),
             atmosphere: skies.is_some_and(|s| s.atmosphere.is_some()),
+            samples: s.samples.max(1),
+            max_bounces: s.max_bounces.max(1),
+            light_candidates: s.light_candidates.clamp(1, 32),
+            spec_hit_roughness: s.spec_hit_roughness.to_bits(),
+            roulette_from: s.roulette_from,
         }
     }
 }
@@ -269,27 +282,27 @@ impl VulkanAsset for RaytracingPipeline {
             surface_groups,
             features,
         } = asset;
-        // raygen.slang's `constant_id`s (VkBool32 each): 0 SHARC_ON, 1 RESTIR_ON, 2 ATMOSPHERE_ON
-        // (miss.slang's too).
+        // raygen.slang's `constant_id`s, 4 bytes each: 0 SHARC_ON, 1 RESTIR_ON, 2 ATMOSPHERE_ON
+        // (miss.slang's too), 3 SAMPLES, 4 MAX_BOUNCES, 5 LIGHT_CANDIDATES, 6 SPEC_HIT_ROUGHNESS
+        // (f32), 7 ROULETTE_FROM.
         let spec_data = [
             features.sharc as u32,
             features.restir as u32,
             features.atmosphere as u32,
+            features.samples,
+            features.max_bounces,
+            features.light_candidates,
+            features.spec_hit_roughness,
+            features.roulette_from,
         ];
-        let spec_entries = [
-            vk::SpecializationMapEntry::default()
-                .constant_id(0)
-                .offset(0)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(1)
-                .offset(4)
-                .size(4),
-            vk::SpecializationMapEntry::default()
-                .constant_id(2)
-                .offset(8)
-                .size(4),
-        ];
+        let spec_entries: Vec<_> = (0..spec_data.len() as u32)
+            .map(|id| {
+                vk::SpecializationMapEntry::default()
+                    .constant_id(id)
+                    .offset(id * 4)
+                    .size(4)
+            })
+            .collect();
         let spec = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
             .data(bytemuck::cast_slice(&spec_data));

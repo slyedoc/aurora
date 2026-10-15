@@ -9,7 +9,9 @@ use bevy::prelude::*;
 
 use crate::dlss::{RrPreset, set_jitter_scale};
 
-/// How the frame is traced. Read every frame; edit it from any inspector.
+/// How the frame is traced. Read every frame; edit it from any inspector. `samples`,
+/// `max_bounces`, `light_candidates`, `spec_hit_roughness` and `roulette_from` are built into the
+/// ray tracing pipeline (specialization constants): changing one rebuilds it.
 #[derive(Resource, Reflect, Clone, Debug)]
 #[reflect(Resource, Default)]
 pub struct RenderSettings {
@@ -20,12 +22,6 @@ pub struct RenderSettings {
     /// Maximum path length (Russian roulette ends most paths well before it).
     #[reflect(@1.0..=64.0_f32)]
     pub max_bounces: u32,
-    /// Firefly suppression: indirect contributions are clamped to this many times the
-    /// metered mid-gray luminance (0 = off, the default). Biased: it clipped Russian roulette's
-    /// boosted survivors and took over half the light under the canopy; Ray Reconstruction
-    /// copes without it.
-    #[reflect(@0.0..=64.0_f32)]
-    pub firefly_clamp: f32,
     /// Uniform multiplier on every light's emission, emissive surfaces and analytic lights
     /// alike. Uniform, so NEE stays unbiased.
     #[reflect(@0.0..=100.0_f32)]
@@ -51,12 +47,6 @@ pub struct RenderSettings {
     /// early instead of running to `max_bounces`. Unbiased; 0 = off.
     #[reflect(@0.0..=8.0_f32)]
     pub roulette_from: u32,
-    /// From this bounce on, a vertex traces ONE shadow ray: the suns, the sky and the light table
-    /// each propose their unshadowed contribution, one is picked by brightness and scaled by 1 /
-    /// its pick probability (unbiased). Below it, every strategy traces its own. Past
-    /// `max_bounces` = off.
-    #[reflect(@0.0..=8.0_f32)]
-    pub one_shadow_ray_from: u32,
     /// ReSTIR DI for the light table at the primary vertex: candidates from a world light grid,
     /// temporal and spatial reuse, one shadow ray (restir.rs). On by default: at 1 spp without
     /// it Ray Reconstruction drops the rare paths that find a lamp (Northshire's lamp-lit plaza
@@ -77,10 +67,6 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
-    /// ReSTIR DI's winner shares its vertex's one shadow ray with the sun, sky and light-table
-    /// samples (proposed by brightness) instead of tracing its own: one ray fewer per pixel
-    /// (Northshire trace -15 %), noisier where lamps rather than the sun light a surface.
-    pub restir_shared_ray: bool,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
     /// under test take their old path at 0 and the new one at 1.
     pub ab: u32,
@@ -124,21 +110,18 @@ impl Default for RenderSettings {
         Self {
             samples: 1,
             max_bounces: 4,
-            firefly_clamp: 0.0,
             emissive_boost: 1.0,
             light_nee: true,
             light_candidates: 4,
             texture_lod_bias: -1.0,
             spec_hit_roughness: 0.3,
             roulette_from: 1,
-            one_shadow_ray_from: 0,
             restir: true,
             restir_candidates: 4,
             restir_history: 8.0,
             restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
-            restir_shared_ray: true,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,

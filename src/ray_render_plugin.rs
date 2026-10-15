@@ -56,25 +56,19 @@ pub struct UniformData {
     /// Free-running frame counter: the RNG seed, so every frame's noise is new for the
     /// temporal denoiser.
     frame: u32,
-    /// Indirect path contributions are clamped to this multiple of the metered mid-gray
-    /// luminance (0 = off); the raygen turns it into nits from the exposure state.
-    firefly_clamp: f32,
-    /// Paths per pixel this frame and their maximum length (from [`RenderSettings`]).
-    samples: u32,
-    max_bounces: u32,
+    /// Free: samples, max_bounces and the firefly clamp moved to the pipeline's specialization
+    /// constants or went.
+    pad_paths: [u32; 3],
     /// Post-process vignette strength (0 = off).
     vignette: f32,
     /// Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     light_entries: u32,
-    /// ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
-    restir_candidates: u32,
-    /// Light candidates resampled per shading point outside ReSTIR (1 = one CDF sample).
-    light_candidates: u32,
+    /// Free (restir_candidates, light_candidates).
+    pad_candidates: [u32; 2],
     /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
     lod_bias: f32,
-    /// Perceptual roughness up to which the primary vertex traces a specular hit-distance
-    /// ray for Ray Reconstruction; rougher surfaces report 0.
-    spec_hit_roughness: f32,
+    /// Free (spec_hit_roughness).
+    pad_spec_hit: u32,
     /// Light-table generation; reservoirs from another generation are dropped.
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
@@ -95,8 +89,8 @@ pub struct UniformData {
     primary_hidden: u32,
     /// The mask bits that are environments; a portal ray takes the exit's from these.
     environment_bits: u32,
-    /// Russian roulette from this bounce on (0 = off; `RenderSettings::roulette_from`).
-    roulette_from: u32,
+    /// Free (roulette_from).
+    pad_roulette: u32,
     /// Every environment's sky, suns and fog (sky.rs `EnvironmentGpu`, 8 entries by bit): a
     /// ray reads the entry of the environment it is in.
     environments: u64,
@@ -119,8 +113,8 @@ pub struct UniformData {
     fog_grid_view_proj: [f32; 16],
     fog_grid_prev_view_proj: [f32; 16],
     fog_grid_size: [u32; 3],
-    /// One shadow ray per vertex from this bounce on (`RenderSettings::one_shadow_ray_from`).
-    one_shadow_ray_from: u32,
+    /// Free (one_shadow_ray_from).
+    pad_one_ray: u32,
     /// Bindless 3D images: the grid's columns summed front to back (in-scatter and
     /// transmittance per cell, behind a first slice of nothing) and the grid blurred once
     /// across x and y. A camera ray's lookups filter them in the texture unit.
@@ -132,9 +126,7 @@ pub struct UniformData {
     fog_grid_stride: u32,
     /// [`RenderSettings::ab`].
     ab: u32,
-    /// [`RenderSettings::restir_shared_ray`].
-    restir_shared_ray: u32,
-    pad_shared: u32,
+    pad_shared: [u32; 2],
 }
 
 #[repr(C)]
@@ -1010,28 +1002,21 @@ fn render_frame(
             prev_view_proj: view.last_view_proj.to_cols_array(),
             jitter: view.plan.map_or([0.0; 2], |p| p.jitter),
             frame: *frame_counter,
-            firefly_clamp: settings.firefly_clamp,
-            samples: settings.samples.max(1),
-            max_bounces: settings.max_bounces.max(1),
+            pad_paths: [0; 3],
             vignette: view.lens.vignette,
             light_entries: if settings.light_nee {
                 lights.active_entries
             } else {
                 0
             },
-            restir_candidates: if settings.restir {
-                settings.restir_candidates.clamp(1, 32)
-            } else {
-                0
-            },
-            light_candidates: settings.light_candidates.clamp(1, 32),
+            pad_candidates: [0; 2],
             // DLSS guide 3.5: textures are picked for the OUTPUT resolution, not the trace
             // resolution, so the upscaled image keeps its detail.
             lod_bias: (view.trace_extent.width.max(1) as f32
                 / view.output_extent.width.max(1) as f32)
                 .log2()
                 + settings.texture_lod_bias,
-            spec_hit_roughness: settings.spec_hit_roughness,
+            pad_spec_hit: 0,
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
             sharc: settings.sharc as u32,
@@ -1042,7 +1027,7 @@ fn render_frame(
             camera_mask: view.camera_mask,
             primary_hidden: view.primary_hidden,
             environment_bits: skies.environment_bits as u32,
-            roulette_from: settings.roulette_from,
+            pad_roulette: 0,
             environments: frame.environments.address,
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
@@ -1056,14 +1041,13 @@ fn render_frame(
             fog_grid_view_proj: grid.view_proj.to_cols_array(),
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
-            one_shadow_ray_from: settings.one_shadow_ray_from,
+            pad_one_ray: 0,
             fog_grid_sum_tex: grid.sum_tex,
             fog_grid_soft_tex: grid.soft_tex,
             fog_grid_soft: grid.soft,
             fog_grid_stride: grid.stride,
             ab: settings.ab,
-            restir_shared_ray: settings.restir_shared_ray as u32,
-            pad_shared: 0,
+            pad_shared: [0; 2],
         };
 
         uniform_uploads.push((view.slot, data));
@@ -2504,6 +2488,6 @@ mod tests {
         assert_eq!(offset_of!(U, fog_grid_sum_tex), 752);
         assert_eq!(offset_of!(U, fog_grid_soft), 760);
         assert_eq!(offset_of!(U, fog_grid_stride), 768);
-        assert_eq!(offset_of!(U, restir_shared_ray), 776);
+        assert_eq!(offset_of!(U, pad_shared), 776);
     }
 }

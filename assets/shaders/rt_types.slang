@@ -150,25 +150,17 @@ public struct UniformData {
     public float jitter_x, jitter_y;
     // Free-running frame counter (the RNG seed -- fresh noise every frame for the denoiser).
     public uint frame;
-    // Firefly suppression: indirect path contributions are clamped to this multiple of the
-    // metered mid-gray luminance (0 = off).
-    public float firefly_clamp;
-    // Paths per pixel this frame and their maximum length.
-    public uint samples;
-    public uint max_bounces;
+    // Free: samples, max_bounces and the firefly clamp moved to raygen.slang's specialization
+    // constants or went.
+    public uint pad_paths[3];
     // Post-process vignette strength (0 = off).
     public float vignette;
     // Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     public uint light_entries;
-    // ReSTIR DI initial candidates per pixel (0 = plain 1-sample NEE at the primary vertex).
-    public uint restir_candidates;
-    // Light candidates resampled per shading point outside ReSTIR (1 = one plain CDF sample).
-    public uint light_candidates;
+    public uint pad_candidates[2];
     // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
     public float lod_bias;
-    // Perceptual roughness up to which the primary vertex traces a specular hit-distance ray
-    // for Ray Reconstruction; rougher surfaces report 0 (0 = no guide rays at all).
-    public float spec_hit_roughness;
+    public uint pad_spec_hit;
     // Light-table generation; reservoirs from another generation are dropped.
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
@@ -190,8 +182,7 @@ public struct UniformData {
     public uint primary_hidden;
     // The mask bits that are environments; a portal ray takes the exit's from these.
     public uint environment_bits;
-    // Russian roulette from this bounce on (0 = off).
-    public uint roulette_from;
+    public uint pad_roulette;
     // Every environment's sky, suns and fog, by environment bit.
     public EnvironmentGpu* environments;
     // Fog volumes (src/fog_volume.rs): the table + entry count (0 = none).
@@ -213,8 +204,7 @@ public struct UniformData {
     public float fog_grid_view_proj[16];
     public float fog_grid_prev_view_proj[16];
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
-    // One shadow ray per vertex from this bounce on.
-    public uint one_shadow_ray_from;
+    public uint pad_one_ray;
     // Bindless 3D images (raygen.slang `volumes`): the grid's columns summed front to back
     // (`fog_integrate`: per cell, the in-scatter and transmittance from the grid's eye to the
     // cell's far side, behind a first slice of nothing) and the grid blurred once across x and
@@ -227,9 +217,7 @@ public struct UniformData {
     public uint fog_grid_stride;
     // RenderSettings::ab: 0 the old path under test, 1 the new (benches/northshire.rs --ab).
     public uint ab;
-    // RenderSettings::restir_shared_ray: ReSTIR's winner joins the vertex's one shadow ray.
-    public uint restir_shared_ray;
-    public uint pad_shared;
+    public uint pad_shared[2];
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
