@@ -3,9 +3,9 @@
 //
 //   bloom_prep  bloom at the pyramid's level 1: levels 1-6, each a 9-tap tent a texel apart,
 //               weighted 0.6x per level, into an RGBA16F texture (quad.slang filters it).
-//   key_prep    local tone mapping's surroundings at the pyramid's level 0: the three scales'
-//               smoothed log luminance into an RGBA16F texture's rgb (quad.slang `localGain`
-//               blends them per pixel).
+//   key_prep    local tone mapping's surroundings: a bilateral grid of log luminance (cells of
+//               32 output pixels x 16 one-stop bins) into an RGBA16F texture (quad.slang
+//               `localGain` reads it at each pixel's position and level).
 //   range_prep  at render resolution: the 3x3 texel range (min, max) of the fog veil and of the
 //               sky mask, which clamp the composite's histories.
 
@@ -86,40 +86,83 @@ float pyramidLog(float2 uv, float level, float scale) {
     return log2(max(dot(c, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
 }
 
-// A region's level at pyramid `level`, smoothed: four reads half a texel apart hide the
-// bilinear diamonds of a coarse level.
-float pyramidKey(float2 uv, float level, float scale, float2 size) {
-    let t = exp2(level) / size * 0.5;
-    return 0.25 * (pyramidLog(uv + float2(-t.x, -t.y), level, scale)
-                 + pyramidLog(uv + float2(t.x, -t.y), level, scale)
-                 + pyramidLog(uv + float2(-t.x, t.y), level, scale)
-                 + pyramidLog(uv + float2(t.x, t.y), level, scale));
-}
+// Local tone mapping's surroundings as a bilateral grid (Chen, Paris & Durand 2007; UE's local
+// exposure): per cell of GRID_CELL output pixels and per bin of GRID_STOPS of log luminance, the
+// mean log luminance of the pixels that fall in it, blurred over the 3x3 cells around and the
+// neighbouring bins. The composite reads it at a pixel's position AND its own level, so a wall
+// beside a window averages wall and the window averages window: no halo at the edge (a blur of
+// the image alone pulled the wall down beside the window and lit a rim along it). Laid out as
+// `GRID_BINS` tiles side by side, each `key_width / GRID_BINS` cells across: rg = (mean x
+// density, density), so bilinear filtering blends the two consistently. Matches quad.slang.
+static const uint GRID_CELL = 32;
+static const uint GRID_BINS = 16;
+static const float GRID_LO = -10.0;
+static const float GRID_STOPS = 1.0;
 
-// Level 0 is half the output: the level whose texel spans ~3 % of the height, one 1.5 levels
-// finer, and level 0.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void key_prep(uint3 gid: SV_DispatchThreadID) {
     let i = gid.x + push.base;
-    let w = push.key_width;
-    if (i >= w * push.key_height) {
+    let gw = push.key_width / GRID_BINS;
+    let gh = push.key_height;
+    if (i >= gw * gh) {
         return;
     }
-    let uv = (float2(float(i % w), float(i / w)) + 0.5) / float2(float(w), float(push.key_height));
+    let cell = int2(int(i % gw), int(i / gw));
     uint pw, ph, levels;
     prep_in[0].GetDimensions(0, pw, ph, levels);
-    let pyramid = float2(float(pw), float(ph));
+    // Level 2 of the pyramid (level 0 is half the output): a texel per 8 output pixels, 4 per
+    // cell side.
+    let level = min(2.0, float(levels) - 1.0);
+    let lw = max(int(pw) >> int(level), 1);
+    let lh = max(int(ph) >> int(level), 1);
+    let per = float(lw) / float(gw);
     let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
     let scale = look / max(push.ae.input_exposure, 1.0e-12);
-    let top = float(levels) - 1.0;
-    let coarse = clamp(log2(pyramid.y * 0.03), 0.0, top);
-    var k = float3(0.0);
-    for (int l = 0; l < 3; l++) {
-        let level = l == 0 ? 0.0 : max(coarse - float(2 - l) * 1.5, 0.0);
-        k[l] = pyramidKey(uv, level, scale, pyramid);
+    float sum[GRID_BINS];
+    float wsum[GRID_BINS];
+    for (uint b = 0u; b < GRID_BINS; b++) {
+        sum[b] = 0.0;
+        wsum[b] = 0.0;
     }
-    prep_out[0][uint2(i % w, i / w)] = float4(k, 0.0);
+    let center = (float2(cell) + 0.5) * per;
+    let lo = int2(floor(center - 1.5 * per));
+    let hi = int2(ceil(center + 1.5 * per));
+    for (int y = max(lo.y, 0); y < min(hi.y, lh); y++) {
+        for (int x = max(lo.x, 0); x < min(hi.x, lw); x++) {
+            let t = (float2(float(x), float(y)) + 0.5);
+            // Tent over 1.5 cells: neighbouring cells overlap, so the grid reads smooth.
+            let d = abs(t - center) / (1.5 * per);
+            let ws = max(1.0 - d.x, 0.0) * max(1.0 - d.y, 0.0);
+            if (ws <= 0.0) {
+                continue;
+            }
+            let uv = t / float2(float(lw), float(lh));
+            let v = pyramidLog(uv, level, scale);
+            // Tent over the two nearest bins, and half as much into the next ones out.
+            let p = clamp((v - GRID_LO) / GRID_STOPS - 0.5, 0.0, float(GRID_BINS - 1u));
+            let b0 = int(floor(p));
+            let f = p - float(b0);
+            for (int k = -1; k <= 2; k++) {
+                let b = b0 + k;
+                if (b < 0 || b >= int(GRID_BINS)) {
+                    continue;
+                }
+                let wb = k == 0 ? 1.0 - f : (k == 1 ? f : (k == -1 ? 0.5 * (1.0 - f) : 0.5 * f));
+                sum[b] += ws * wb * v;
+                wsum[b] += ws * wb;
+            }
+        }
+    }
+    var total = 0.0;
+    for (uint b = 0u; b < GRID_BINS; b++) {
+        total += wsum[b];
+    }
+    for (uint b = 0u; b < GRID_BINS; b++) {
+        let density = wsum[b] / max(total, 1.0e-6);
+        let mean = wsum[b] > 0.0 ? sum[b] / wsum[b] : 0.0;
+        prep_out[0][uint2(b * gw + uint(cell.x), uint(cell.y))] = float4(mean * density, density, 0.0, 0.0);
+    }
 }
 
 // quad.slang `skyAt`: the sky exemption (depth guide, faded in from 300 m to 3 km).

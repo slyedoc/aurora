@@ -229,7 +229,7 @@ impl PostPrepState {
             record_dispatch(rd, cmd, module, "bloom_prep", &push, bw * bh, base);
         }
         if inputs.local_tonemap && inputs.auto_exposure != 0 {
-            record_dispatch(rd, cmd, module, "key_prep", &push, kw * kh, base);
+            record_dispatch(rd, cmd, module, "key_prep", &push, kw / 16 * kh, base);
         }
         let texels = frame.range_width * frame.range_height;
         record_dispatch(rd, cmd, module, "range_prep", &push, texels, base);
@@ -290,10 +290,18 @@ impl Plugin for PostPrepPlugin {
     }
 }
 
-/// The keys texture (the pyramid's level 0: half the output) and the bloom texture (level 1).
+/// The keys texture (local tone mapping's bilateral grid: GRID_BINS tiles of one texel per
+/// GRID_CELL output pixels, post_prep.slang) and the bloom texture (the pyramid's level 1).
 fn texture_sizes(output: vk::Extent2D) -> (u32, u32, u32, u32) {
+    const GRID_CELL: u32 = 32;
+    const GRID_BINS: u32 = 16;
+    let cells = |n: u32| n.div_ceil(GRID_CELL).max(1);
     // dlss/renderer.rs `Pyramid`: level 0 is half the output.
-    let half = |n: u32| (n / 2).max(1);
-    let (kw, kh) = (half(output.width), half(output.height));
-    (kw, kh, half(kw), half(kh))
+    let quarter = |n: u32| (n / 4).max(1);
+    (
+        cells(output.width) * GRID_BINS,
+        cells(output.height),
+        quarter(output.width),
+        quarter(output.height),
+    )
 }

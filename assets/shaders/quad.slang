@@ -237,8 +237,27 @@ uint rangeIndex(float2 uv) {
 }
 
 // Local tone mapping's three keys (post_prep.slang `key_prep`), filtered.
-float3 keysRead(float2 uv) {
-    return test[10].SampleLevel(uv, 0.0).rgb;
+// Local tone mapping's bilateral grid (post_prep.slang `key_prep`, same constants): the mean log
+// luminance around `uv` of the pixels near level `own`, bilinear within a bin's tile, linear
+// between the two nearest bins. Where nothing near that level is around, the pixel's own.
+static const uint GRID_BINS = 16;
+static const float GRID_LO = -10.0;
+static const float GRID_STOPS = 1.0;
+float gridKey(float2 uv, float own) {
+    uint tw, th;
+    test[10].GetDimensions(tw, th);
+    let gw = float(tw / GRID_BINS);
+    let p = clamp((own - GRID_LO) / GRID_STOPS - 0.5, 0.0, float(GRID_BINS - 1u));
+    let b0 = floor(p);
+    let b1 = min(b0 + 1.0, float(GRID_BINS - 1u));
+    // Kept half a texel inside the tile: filtering must not reach the next bin's.
+    let x = clamp(uv.x * gw, 0.5, gw - 0.5);
+    let y = uv.y;
+    let s0 = test[10].SampleLevel(float2((b0 * gw + x) / float(tw), y), 0.0).rg;
+    let s1 = test[10].SampleLevel(float2((b1 * gw + x) / float(tw), y), 0.0).rg;
+    let g = lerp(s0, s1, p - b0);
+    let eps = 1.0e-3;
+    return (g.x + eps * own) / (g.y + eps);
 }
 
 // The sky exemption at `uv` (depth guide, faded in from 300 m to 3 km).
@@ -246,8 +265,8 @@ float skyAt(float2 uv) {
     return saturate(log2(test[5].SampleLevel(uv, 0.0).r / 300.0) / log2(10.0));
 }
 
-// Local tone mapping: a region's surroundings (the output's pyramid at the level ~3 % of the
-// height across, read smoothly) against the whole frame's (a 4x4 grid of log reads at a level
+// Local tone mapping: a region's surroundings (a bilateral grid: the pixels around it at about
+// its own level, so the surroundings stop at edges) against the whole frame's (a 4x4 grid of log reads at a level
 // ~1/16 of the height) sets a gain that moves the region `strength` of the way toward the
 // frame's average, clamped to two stops either way. Low frequency only, so texture stays;
 // shade under a canopy lifts, sunlit ground comes down, and a frame dark all over (night) keeps
@@ -272,22 +291,8 @@ float frameLog(float scale, uint h, uint levels) {
 
 float3 localGain(float2 uv, float scale, float strength, Frame f, int2 slots) {
     let own = log2(max(dot(test[0].SampleLevel(uv, 0.0).rgb * scale, float3(0.2125, 0.7154, 0.0721)), 1.0e-4));
-    // Edge-aware surroundings: the three scales blended by how close each is to the pixel's own
-    // level (leaning coarse). Sky beside a canopy reads sky at the finer scales and keeps the
-    // sky's gain -- one coarse level bled the canopy's darkness across the silhouette, a halo.
-    // The three scales (post_prep.slang `key_prep`): level 0, the level whose texel spans ~3 % of
-    // the height, and one 1.5 levels finer.
-    let keys = keysRead(uv);
-    var key = 0.0;
-    var wsum = 0.0;
-    for (int i = 0; i < 3; i++) {
-        let k = keys[i];
-        let d = (own - k) / 0.75;
-        let wi = exp2(float(i)) * exp(-d * d);
-        key += wi * k;
-        wsum += wi;
-    }
-    key /= max(wsum, 1.0e-6);
+    // Edge-aware surroundings: the bilateral grid at this pixel's own level.
+    let key = gridKey(uv, own);
     let stops = clamp((f.frame_log - key) * strength, -2.0, 2.0);
     // The sky keeps its exposure (the depth guide holds 1e7 there; its bilinear blend softens
     // the silhouette): pulled toward a darker frame it went deep blue, and any mismatch of

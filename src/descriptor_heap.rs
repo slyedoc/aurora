@@ -125,8 +125,11 @@ pub struct DescriptorHeaps {
     sampler_reserved: vk::DeviceSize,
     /// Bytes per resource descriptor slot.
     pub stride: u32,
-    /// Byte offset of the linear sampler in the sampler heap.
+    /// Byte offset of the linear sampler in the sampler heap (wraps: material textures).
     linear_sampler: u32,
+    /// The linear sampler clamped to the edge: screen-space reads (the composite, its prepass,
+    /// gizmos), where a tap past one border must not read the opposite one.
+    clamp_sampler: u32,
     /// A descriptor set [`Self::leave`] binds (layout, pipeline layout, pool, set).
     legacy: (
         vk::DescriptorSetLayout,
@@ -185,7 +188,7 @@ impl DescriptorHeaps {
             props.sampler_descriptor_alignment,
         );
         let sampler_size = align(
-            sampler_reserved + sampler_stride,
+            sampler_reserved + 2 * sampler_stride,
             props.sampler_heap_alignment,
         );
         log::info!(
@@ -254,6 +257,7 @@ impl DescriptorHeaps {
             sampler_reserved,
             stride: stride as u32,
             linear_sampler: sampler_reserved as u32,
+            clamp_sampler: (sampler_reserved + sampler_stride) as u32,
             legacy: (set_layout, legacy_layout, pool, legacy_set),
             bindless: bindless as u32,
             guides: guides as u32,
@@ -263,20 +267,30 @@ impl DescriptorHeaps {
             prep: prep as u32,
             views: Mutex::new(HashMap::new()),
         };
-        let linear = linear_sampler_info();
-        unsafe {
-            heaps
-                .ext
-                .write_sampler_descriptors(
-                    std::slice::from_ref(&linear),
-                    &[
-                        vk::HostAddressRangeEXT::default().address(std::slice::from_raw_parts_mut(
-                            heaps.sampler_ptr.0.add(heaps.linear_sampler as usize),
-                            sampler_stride as usize,
-                        )),
-                    ],
-                )
-                .unwrap();
+        let clamp = vk::SamplerCreateInfo {
+            address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            ..linear_sampler_info()
+        };
+        for (info, at) in [
+            (linear_sampler_info(), heaps.linear_sampler),
+            (clamp, heaps.clamp_sampler),
+        ] {
+            unsafe {
+                heaps
+                    .ext
+                    .write_sampler_descriptors(
+                        std::slice::from_ref(&info),
+                        &[vk::HostAddressRangeEXT::default().address(
+                            std::slice::from_raw_parts_mut(
+                                heaps.sampler_ptr.0.add(at as usize),
+                                sampler_stride as usize,
+                            ),
+                        )],
+                    )
+                    .unwrap();
+            }
         }
         heaps
     }
@@ -544,7 +558,7 @@ impl DescriptorHeaps {
                             .push_offset(push_offset)
                             .heap_index_stride(PREP_INPUTS * self.stride)
                             .heap_array_stride(self.stride)
-                            .sampler_heap_offset(self.linear_sampler)
+                            .sampler_heap_offset(self.clamp_sampler)
                             .sampler_push_offset(push_offset)
                             .sampler_heap_index_stride(0)
                             .sampler_heap_array_stride(0),
@@ -598,7 +612,7 @@ impl DescriptorHeaps {
                         .heap_array_stride(self.stride);
                     if combined {
                         push = push
-                            .sampler_heap_offset(self.linear_sampler)
+                            .sampler_heap_offset(self.clamp_sampler)
                             .sampler_push_offset(push_offset)
                             .sampler_heap_index_stride(0)
                             .sampler_heap_array_stride(0);
