@@ -164,8 +164,8 @@ public struct UniformData {
     public uint pad_candidates[2];
     // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
     public float lod_bias;
-    // ReSTIR GI: the perceptual roughness from which a primary vertex and a secondary hit take
-    // part (raygen.slang `main`, restir_gi.slang).
+    // ReSTIR GI: the perceptual roughness from which a secondary hit's sample is shared with
+    // other pixels (raygen.slang `main`, restir_gi.slang).
     public float gi_roughness;
     // Light-table generation; reservoirs from another generation are dropped.
     public uint light_epoch;
@@ -284,7 +284,9 @@ public struct RestirSurface {
     public uint normal_oct;
     public uint geo_normal_oct;
     public uint view_oct;
-    public uint pad;
+    // ReSTIR GI: aerial perspective x cloud transmittance at the vertex (Sky::Atmosphere), RGB9E5,
+    // written by the path tracer for gi_shade.
+    public uint gi_view_t;
 };
 
 // A RestirSurface as four 16-byte stores / loads (the buffers' 64-byte records are 16-byte
@@ -294,7 +296,7 @@ public void restirSurfaceStore(RestirSurface* p, RestirSurface s) {
     storeAligned<16>(d, uint4(asuint(s.position), s.frame));
     storeAligned<16>(d + 1, uint4(asuint(s.prev_position), asuint(s.depth)));
     storeAligned<16>(d + 2, uint4(s.albedo_metallic, s.material, s.throughput_rg, s.throughput_b_mask));
-    storeAligned<16>(d + 3, uint4(s.normal_oct, s.geo_normal_oct, s.view_oct, s.pad));
+    storeAligned<16>(d + 3, uint4(s.normal_oct, s.geo_normal_oct, s.view_oct, s.gi_view_t));
 }
 
 public RestirSurface restirSurfaceLoad(RestirSurface* p) {
@@ -315,7 +317,7 @@ public RestirSurface restirSurfaceLoad(RestirSurface* p) {
     s.normal_oct = e.x;
     s.geo_normal_oct = e.y;
     s.view_oct = e.z;
-    s.pad = e.w;
+    s.gi_view_t = e.w;
     return s;
 }
 
@@ -363,7 +365,8 @@ public float3 unpackRgb9e5(uint p) {
 
 // ReSTIR GI's candidate (src/restir_gi.rs), written by the path tracer per traced pixel whose
 // primary vertex takes part: the secondary hit, the radiance leaving it toward the primary
-// vertex and the direction's pdf there (0 = a null candidate). 32 bytes.
+// vertex and the direction's pdf there (0 = a null candidate). 32 bytes. gi_candidates turns
+// it into a reservoir of one in place: `pdf` becomes W, `phat` is filled.
 public struct GiCandidate {
     public float3 x_s;
     // The secondary hit's geometric normal, toward the primary vertex (oct 2xf16).
@@ -372,8 +375,8 @@ public struct GiCandidate {
     public uint L;
     public float pdf;
     public uint frame;
-    // Aerial perspective x cloud transmittance at the primary vertex (Sky::Atmosphere), RGB9E5.
-    public uint view_t;
+    // Its target at its own vertex (gi_candidates, in place).
+    public float phat;
 };
 
 public GiCandidate giCandidateLoad(GiCandidate* p) {
@@ -386,60 +389,61 @@ public GiCandidate giCandidateLoad(GiCandidate* p) {
     c.L = b.x;
     c.pdf = asfloat(b.y);
     c.frame = b.z;
-    c.view_t = b.w;
+    c.phat = asfloat(b.w);
     return c;
 }
 
-// ReSTIR GI's reservoir, one per traced pixel. 64 bytes.
+// ReSTIR GI's final reservoir, one per traced pixel: the sample gi_shade shades. 32 bytes.
 public struct GiReservoir {
     public float3 x_s;
     public uint n_s_oct;
     public uint L;
-    // Unbiased contribution weight (0 after an occluded visibility ray) and history length.
+    // Unbiased contribution weight (gi_shade zeroes it when the winner is occluded).
     public float W;
-    public float M;
-    // The winner's target at this reservoir's own vertex.
-    public float phat;
-    // The primary vertex it belongs to (the temporal shift's Jacobian) and its view depth.
-    public float3 x_v;
-    public float depth;
-    public uint n_v_oct;
     public uint frame;
     // GI_FRESH: the winner is this frame's own candidate (traced from here: no visibility ray).
     public uint flags;
-    public uint pad;
 };
 
 public static const uint GI_FRESH = 1u;
+
+// AuroraDebugView::GiReuse's codes (gi_shade writes them, quad.slang colours them).
+public static const uint GI_STATE_OFF = 0u;
+public static const uint GI_STATE_EMPTY = 1u;
+public static const uint GI_STATE_OWN_PRIVATE = 2u;
+public static const uint GI_STATE_OWN = 3u;
+public static const uint GI_STATE_NEIGHBOUR = 4u;
+public static const uint GI_STATE_OCCLUDED = 5u;
+
+// A sample's `n_s_oct` low bit: its secondary hit is rough enough (and the radiance it sends close
+// enough to the same in every direction) to reconnect to another pixel's vertex. Without it the
+// sample serves only the pixel that traced it. One ulp of a half, below the normal's precision.
+public uint giPackHitNormal(float3 n, bool shareable) {
+    return (packHalf2(float32x3_to_oct(n)) & ~1u) | (shareable ? 1u : 0u);
+}
+
+public bool giShareable(uint n_s_oct) {
+    return (n_s_oct & 1u) != 0u;
+}
 
 public GiReservoir giReservoirLoad(GiReservoir* p) {
     let d = (uint4*)p;
     let a = loadAligned<16>(d);
     let b = loadAligned<16>(d + 1);
-    let c = loadAligned<16>(d + 2);
-    let e = loadAligned<16>(d + 3);
     GiReservoir r;
     r.x_s = asfloat(a.xyz);
     r.n_s_oct = a.w;
     r.L = b.x;
     r.W = asfloat(b.y);
-    r.M = asfloat(b.z);
-    r.phat = asfloat(b.w);
-    r.x_v = asfloat(c.xyz);
-    r.depth = asfloat(c.w);
-    r.n_v_oct = e.x;
-    r.frame = e.y;
-    r.flags = e.z;
-    r.pad = e.w;
+    r.frame = b.z;
+    r.flags = b.w;
     return r;
 }
 
 public void giReservoirStore(GiReservoir* p, GiReservoir r) {
     let d = (uint4*)p;
     storeAligned<16>(d, uint4(asuint(r.x_s), r.n_s_oct));
-    storeAligned<16>(d + 1, uint4(r.L, asuint(r.W), asuint(r.M), asuint(r.phat)));
-    storeAligned<16>(d + 2, uint4(asuint(r.x_v), asuint(r.depth)));
-    storeAligned<16>(d + 3, uint4(r.n_v_oct, r.frame, r.flags, r.pad));
+    storeAligned<16>(d + 1, uint4(r.L, asuint(r.W), r.frame, r.flags));
 }
 
 // A world position's pixel in a frame with view-projection `m` (column-major) at `width` x
@@ -492,7 +496,7 @@ public RestirSurface restirSurfacePack(float3 position, uint frame, float3 prev_
     s.normal_oct = packHalf2(float32x3_to_oct(n));
     s.geo_normal_oct = packHalf2(float32x3_to_oct(ns));
     s.view_oct = packHalf2(float32x3_to_oct(v));
-    s.pad = 0u;
+    s.gi_view_t = 0u;
     return s;
 }
 
@@ -731,6 +735,9 @@ public struct PushConstants {
     // reservoirs `gi_shade` shades.
     public GiCandidate* gi_candidates;
     public GiReservoir* gi_final;
+    // AuroraDebugView::Gi / GiReuse (null unless shown): two header words, then per traced pixel
+    // i gi_shade's light at 2 + 2i (RGB9E5, pre-exposed) and its state (GI_STATE_*) at 3 + 2i.
+    public uint* gi_debug;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

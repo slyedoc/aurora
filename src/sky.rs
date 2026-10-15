@@ -53,7 +53,8 @@ pub fn ev100_for_lux(lux: f32) -> f32 {
     (lux.max(1.0e-3) * 100.0 / 250.0).log2()
 }
 
-/// An environment's fog. On an environment entity; without one, the default haze.
+/// An environment's fog. On an environment entity; without one, no fog (`Fog::default()` is
+/// a light haze, 0.001 per metre).
 #[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
 #[reflect(Component, Default)]
 pub struct Fog {
@@ -93,6 +94,16 @@ pub struct Fog {
     /// turning through the block (1 = every cell every frame); the others carry last frame's.
     #[reflect(@1..=4_u32)]
     pub grid_stride: u32,
+}
+
+impl Fog {
+    /// No fog: what an environment without a [`Fog`] has.
+    pub fn off() -> Self {
+        Self {
+            density: 0.0,
+            ..default()
+        }
+    }
 }
 
 impl Default for Fog {
@@ -323,7 +334,7 @@ impl Default for EnvironmentSky {
             gradient: GradientSky::default(),
             suns: Vec::new(),
             ev100: DEFAULT_EV100,
-            fog: Fog::default(),
+            fog: Fog::off(),
             sky_brightness: 1.0,
             air: SkyAir::default(),
         }
@@ -399,7 +410,7 @@ fn gather_skies(
         let entry = &mut out.environments[bit as usize];
         entry.sky = sky;
         entry.gradient = gradient.cloned().unwrap_or_default();
-        entry.fog = fog.copied().unwrap_or_default();
+        entry.fog = fog.copied().unwrap_or_else(Fog::off);
         entry.sky_brightness = brightness.copied().unwrap_or_default().0;
         match air {
             Some(air) => entry.air.clone_from(air),

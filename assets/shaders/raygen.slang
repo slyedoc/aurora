@@ -46,6 +46,15 @@ static const bool ENABLE_BLUENOISE = true;
 [vk::constant_id(7)] const uint ROULETTE_FROM = 1;
 // ReSTIR GI (restir_gi.rs): sample 0's first indirect bounce goes to reservoirs and `gi_shade`.
 [vk::constant_id(8)] const bool GI_ON = false;
+// The glossiest primary vertex GI takes (perceptual roughness): below it the lobe is narrower
+// than the precision the reuse passes rebuild the vertex with (half-float octahedral normal and
+// view), and the mixture weight would no longer match the sampler.
+static const float GI_MIN_ROUGHNESS = 0.1;
+// A secondary hit closer to its primary vertex than this share of the vertex's camera distance
+// (~20 pixel footprints) is not shared (ReSTIR PT's reconnection criterion): there the camera's
+// sub-pixel jitter alone swings the reconnection Jacobian, and reused samples in corners and at
+// contacts ran hot (bright and coloured flecks) or failed their centimetre-long visibility ray.
+static const float GI_RECONNECT_MIN = 0.03;
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
 // sky does (rotation only), and still a finite half float.
@@ -1061,6 +1070,11 @@ void gi_shade() {
         return;
     }
     let r = giReservoirLoad(pc.gi_final + idx);
+    let debug = pc.gi_debug;
+    if (debug != nullptr) {
+        debug[2u + 2u * idx] = 0u;
+        debug[3u + 2u * idx] = r.frame == pc.uniforms.frame ? GI_STATE_EMPTY : GI_STATE_OFF;
+    }
     if (r.frame != pc.uniforms.frame || !(r.W > 0.0 && r.W < 1.0e20)) {
         return;
     }
@@ -1084,6 +1098,9 @@ void gi_shade() {
         }
         if (!traceVisible(restirRayMask(s), start, 0.0, (to - start) / dist, dist * 0.999)) {
             pc.gi_final[idx].W = 0.0;
+            if (debug != nullptr) {
+                debug[3u + 2u * idx] = GI_STATE_OCCLUDED;
+            }
             return;
         }
     }
@@ -1092,11 +1109,16 @@ void gi_shade() {
         return;
     }
     if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
-        gi *= unpackRgb9e5(pc.gi_candidates[idx].view_t);
+        gi *= unpackRgb9e5(s.gi_view_t);
     }
     let px = int2(launch_id);
     let col = dlss_color[px];
     dlss_color[px] = float4(min(col.rgb + gi * pc.ae.input_exposure, float3(65504.0)), col.a);
+    if (debug != nullptr) {
+        debug[2u + 2u * idx] = packRgb9e5(gi * pc.ae.input_exposure);
+        debug[3u + 2u * idx] = (r.flags & GI_FRESH) == 0u ? GI_STATE_NEIGHBOUR
+            : giShareable(r.n_s_oct) ? GI_STATE_OWN : GI_STATE_OWN_PRIVATE;
+    }
     // The meter as `main` writes it: the surface's light through the fog over its albedo.
     if (pc.lum != nullptr) {
         let meter_albedo = pc.primary_hits[idx].meter_albedo;
@@ -1434,25 +1456,30 @@ void main() {
             }
             path &= ~PATH_CAMERA;
 
-            // ReSTIR GI. The primary vertex takes part when it is rough and not glass: its
+            // ReSTIR GI. The primary vertex takes part unless it is near-mirror or glass: its
             // first bounce's light reflected at the secondary hit becomes the candidate. The
             // secondary hit (the next accepted surface: no fog scatter, portal or emitter on the
-            // way) takes part when rough and not glass; its position and the direction's pdf go
-            // to memory now, its radiance at the path's end. Either test failing leaves the light
-            // in the path (a null candidate).
+            // way) takes part unless it is glass; its position and the direction's pdf go to
+            // memory now, its radiance at the path's end. Only a rough secondary hit's sample is
+            // shared with other pixels (giShareable); a glossy one's radiance depends on where it
+            // is seen from, so it serves its own pixel. Either test failing leaves the light in
+            // the path (a null candidate).
             if (GI_ON && (path & PATH_GI_SEGMENT) != 0u) {
                 path &= ~PATH_GI_SEGMENT;
-                if (roughness >= pc.uniforms.gi_roughness && transmission <= 0.0) {
+                if (transmission <= 0.0) {
                     path |= PATH_GI_LIVE;
                     gi_acc = acc;
                     let ns = dot(surface_normal, direction) > 0.0 ? -surface_normal : surface_normal;
                     let cand = (uint4*)(pc.gi_candidates + prim_at);
-                    storeAligned<16>(cand, uint4(asuint(origin), packHalf2(float32x3_to_oct(ns))));
+                    let x_v = asfloat(loadAligned<16>((uint4*)(pc.restir_surfaces + prim_at)).xyz);
+                    let far = length(origin - x_v) > GI_RECONNECT_MIN * length(x_v - cameraOrigin());
+                    storeAligned<16>(cand, uint4(asuint(origin),
+                                                 giPackHitNormal(ns, far && roughness >= pc.uniforms.gi_roughness)));
                     pc.gi_candidates[prim_at].pdf = prev_pdf;
                 }
             }
             if (GI_ON && resumed && sample_idx == 0u && pc.gi_candidates != nullptr
-                && roughness >= pc.uniforms.gi_roughness && transmission <= 0.0) {
+                && roughness >= GI_MIN_ROUGHNESS && transmission <= 0.0) {
                 path |= PATH_GI_VERTEX;
                 gi_mask = mask;
             }
@@ -1837,7 +1864,7 @@ void main() {
                               atmoBayer(px), mean, surface_t);
         // gi_shade's light reaches the camera through the same air.
         if (GI_ON && pc.gi_candidates != nullptr) {
-            pc.gi_candidates[prim_at].view_t = packRgb9e5(surface_t);
+            pc.restir_surfaces[prim_at].gi_view_t = packRgb9e5(surface_t);
         }
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

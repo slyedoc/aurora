@@ -51,7 +51,8 @@ struct QuadPush {
     float4* fog_prev;
     float4* fog_cur;
     uint history_reset;
-    uint pad_history;
+    // 0: the exposed image shown linearly, clipped (RenderSettings::tonemap off); else ACES.
+    uint tonemap;
     // `PrepFrame` in post_prep.rs, filled by post_prep.slang (null = none): the fog veil's 3x3
     // range (half4 min, max) and the sky mask's (half min, max) per render pixel; `prep_textures`
     // = 1 when slots 10 and 11 hold the keys and bloom textures.
@@ -210,6 +211,17 @@ int2 historySlots(float2 uv, float2 output) {
     }
     return int2(int(p.y * size.x + p.x), prev);
 }
+
+// rt_types.slang's unpackRgb9e5 and GI_STATE_* codes (gi_shade writes them).
+float3 unpackRgb9e5(uint p) {
+    let m = float3(float(p & 511u), float((p >> 9) & 511u), float((p >> 18) & 511u));
+    return m * exp2(float(int(p >> 27) - 24));
+}
+static const uint GI_STATE_EMPTY = 1u;
+static const uint GI_STATE_OWN_PRIVATE = 2u;
+static const uint GI_STATE_OWN = 3u;
+static const uint GI_STATE_NEIGHBOUR = 4u;
+static const uint GI_STATE_OCCLUDED = 5u;
 
 float2 unpackHalf2(uint q) {
     return float2(f16tof32(q & 0xFFFFu), f16tof32(q >> 16));
@@ -377,6 +389,32 @@ float4 fragment(VertexOut v) : SV_Target0 {
         let mean = total / float(size.x * size.y);
         return float4(costFalseColor(log2(max(ns, 1.0) / max(mean, 1.0))), 1.0);
     }
+    // GI: gi_shade's light alone, exposed and tonemapped like the colour view. GI reuse: its
+    // state (debug_view.rs `GiReuse`). Both from the Cost view's buffer, two words per pixel.
+    if (view == 11u || view == 12u) {
+        if (push.cost == nullptr || any(uv < 0.0) || any(uv >= 1.0)) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        let size = uint2(push.lum_width, push.lum_height);
+        let r = min(uint2(uv * float2(size)), size - 1u);
+        let at = 2u + 2u * (r.y * size.x + r.x);
+        if (view == 11u) {
+            let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
+            let pre = unpackRgb9e5(push.cost[at]);
+            return float4(clamp(acesFilm(pre * (look / max(push.ae.input_exposure, 1.0e-12))),
+                                float3(0.0), float3(1.0)), 1.0);
+        }
+        float3 c;
+        switch (push.cost[at + 1u]) {
+            case GI_STATE_EMPTY: c = float3(0.0); break;
+            case GI_STATE_OWN_PRIVATE: c = float3(0.1, 0.2, 1.0); break;
+            case GI_STATE_OWN: c = float3(0.0, 0.8, 0.8); break;
+            case GI_STATE_NEIGHBOUR: c = float3(0.1, 0.9, 0.1); break;
+            case GI_STATE_OCCLUDED: c = float3(1.0, 0.1, 0.1); break;
+            default: c = float3(0.25); break;
+        }
+        return float4(c, 1.0);
+    }
     if (view == 9u) {
         let pre = test[1].Sample(uv).rgb;
         let nits = dot(pre, float3(0.2126, 0.7152, 0.0722)) / max(push.ae.input_exposure, 1.0e-12);
@@ -449,7 +487,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
     if (push.bloom > 0.0 && view == 0u && push.fog != 0u && push.prep_textures != 0u) {
         exposed = lerp(exposed, bloomRead(uv) * (look / input), push.bloom);
     }
-    var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));
+    var color = clamp(push.tonemap != 0u ? acesFilm(exposed) : exposed, float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT], frame.output);
     return float4(color, 1.0);
 }

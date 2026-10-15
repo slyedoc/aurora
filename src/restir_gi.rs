@@ -6,15 +6,17 @@
 //! radiance the rest of the path gathered there toward the vertex, and the direction's pdf; that
 //! light leaves its colour. Per view, after the trace:
 //!
-//! 1. `gi_temporal` (compute): the candidate as a reservoir, merged with last frame's final one
-//!    near the reprojected pixel when `restir_gi_history` > 0 (reconnection shift, weighted by
-//!    its Jacobian from the stored primary vertex).
-//! 2. `gi_spatial` (compute): pairwise MIS over random neighbours' temporal reservoirs.
+//! 1. `gi_candidates` (compute): each candidate completed in place as a reservoir of one; without
+//!    spatial reuse (the default) that is the final reservoir.
+//! 2. `gi_spatial` (compute, `restir_gi_spatial_samples` > 0): pairwise MIS over random
+//!    neighbours' candidates (reconnection shift, Jacobian-weighted).
 //! 3. `gi_shade` (raygen.slang): the winner's light at the vertex through one visibility ray,
 //!    added to the noisy colour and the exposure meter.
 //!
-//! Buffers live at trace resolution per view and exist only while GI is on. GI uses ReSTIR DI's
-//! surface buffer when DI runs, else a surface buffer of its own.
+//! No temporal reuse: samples held across frames read to Ray Reconstruction as detail and boil.
+//! Buffers live at trace resolution per view and exist only while GI is on: the candidates and
+//! the final reservoirs (64 B/px). GI uses ReSTIR DI's surface buffer when DI runs, else a
+//! surface buffer of its own.
 
 use ash::vk;
 use bevy::prelude::*;
@@ -32,7 +34,7 @@ use crate::{
 
 /// `GiCandidate`, `GiReservoir` and `RestirSurface` in rt_types.slang.
 const CANDIDATE_BYTES: u64 = 32;
-const RESERVOIR_BYTES: u64 = 64;
+const RESERVOIR_BYTES: u64 = 32;
 const SURFACE_BYTES: u64 = 64;
 
 /// `GiFrame` in restir_gi.slang.
@@ -41,19 +43,15 @@ const SURFACE_BYTES: u64 = 64;
 struct GiFrameGpu {
     candidates: u64,
     surfaces: u64,
-    prev: u64,
-    temporal: u64,
     final_: u64,
     pad_ptr: u64,
-    prev_view_proj: [f32; 16],
     width: u32,
     height: u32,
     frame: u32,
-    m_cap: f32,
     spatial_samples: u32,
     spatial_radius: f32,
     boiling: f32,
-    pad: u32,
+    pad: [u32; 2],
 }
 
 /// `GiPush` in restir_gi.slang.
@@ -70,7 +68,6 @@ pub struct GiInput<'a> {
     pub extent: vk::Extent2D,
     pub frame: u32,
     pub slot: usize,
-    pub prev_view_proj: Mat4,
     /// ReSTIR DI's surface buffer this frame (0: GI keeps its own).
     pub di_surfaces: u64,
     pub settings: &'a RenderSettings,
@@ -91,8 +88,7 @@ pub struct GiAddresses {
 #[derive(Default)]
 struct GiView {
     candidates: Buffer<u8>,
-    /// Final reservoirs, ping-pong by frame parity, then the temporal pass's scratch.
-    reservoirs: [Buffer<u8>; 3],
+    reservoirs: Buffer<u8>,
     /// Only while ReSTIR DI is off.
     surfaces: Buffer<u8>,
     frame: Buffer<GiFrameGpu>,
@@ -105,9 +101,7 @@ impl GiView {
     fn release(&mut self, rd: &RenderDevice) {
         for handle in [
             self.candidates.handle,
-            self.reservoirs[0].handle,
-            self.reservoirs[1].handle,
-            self.reservoirs[2].handle,
+            self.reservoirs.handle,
             self.surfaces.handle,
             self.frame.handle,
         ] {
@@ -143,8 +137,7 @@ impl RestirGiState {
         if fresh {
             view.release(rd);
             view.candidates = rd.create_device_buffer(pixels * CANDIDATE_BYTES, usage);
-            view.reservoirs =
-                std::array::from_fn(|_| rd.create_device_buffer(pixels * RESERVOIR_BYTES, usage));
+            view.reservoirs = rd.create_device_buffer(pixels * RESERVOIR_BYTES, usage);
             view.frame = rd.create_device_buffer(1, usage);
             view.pixels = pixels;
             log::debug!(
@@ -152,7 +145,7 @@ impl RestirGiState {
                 input.slot,
                 input.extent.width,
                 input.extent.height,
-                pixels * (CANDIDATE_BYTES + 3 * RESERVOIR_BYTES) / (1024 * 1024)
+                pixels * (CANDIDATE_BYTES + RESERVOIR_BYTES) / (1024 * 1024)
             );
         }
         let surfaces_made = own_surfaces && view.surfaces.handle == vk::Buffer::null();
@@ -166,7 +159,7 @@ impl RestirGiState {
             let mut handles = Vec::with_capacity(5);
             if fresh {
                 handles.push(view.candidates.handle);
-                handles.extend(view.reservoirs.iter().map(|b| b.handle));
+                handles.push(view.reservoirs.handle);
             }
             if surfaces_made {
                 handles.push(view.surfaces.handle);
@@ -190,32 +183,21 @@ impl RestirGiState {
         } else {
             input.di_surfaces
         };
-        let cur = (input.frame & 1) as usize;
-        let prev = view.reservoirs[cur ^ 1].address;
-        let final_ = view.reservoirs[cur].address;
+        let final_ = view.reservoirs.address;
         view.spatial = settings.restir_gi_spatial_samples > 0;
-        let temporal = if view.spatial {
-            view.reservoirs[2].address
-        } else {
-            final_
-        };
         view.threads = pixels as u32;
         let gpu = GiFrameGpu {
             candidates: view.candidates.address,
             surfaces,
-            prev,
-            temporal,
             final_,
             pad_ptr: 0,
-            prev_view_proj: input.prev_view_proj.to_cols_array(),
             width: input.extent.width,
             height: input.extent.height,
             frame: input.frame,
-            m_cap: settings.restir_gi_history.max(0.0),
             spatial_samples: settings.restir_gi_spatial_samples.min(16),
             spatial_radius: settings.restir_gi_spatial_radius.max(1.0),
             boiling: settings.restir_boiling.clamp(0.0, 1.0),
-            pad: 0,
+            pad: [0; 2],
         };
         // Recorded, not written through a mapping: the previous frame may still read it.
         unsafe {
@@ -238,8 +220,8 @@ impl RestirGiState {
         }
     }
 
-    /// Records the reuse passes (temporal, spatial) for view `slot`, after the path tracer wrote
-    /// its candidates and before `gi_shade` shades the winners.
+    /// Records the candidate pass and (when on) the spatial pass for view `slot`, after the path
+    /// tracer wrote its candidates and before `gi_shade` shades the winners.
     pub fn record_passes(
         &self,
         rd: &RenderDevice,
@@ -272,10 +254,10 @@ impl RestirGiState {
                 vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
             );
         };
-        // The trace's candidates (and last frame's shaded reservoirs) to compute.
+        // The trace's candidates to compute.
         barrier(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR);
-        let scope = prof.begin(rd, cmd, "gi temporal");
-        record_dispatch(rd, cmd, module, "gi_temporal", &push, view.threads, base);
+        let scope = prof.begin(rd, cmd, "gi candidates");
+        record_dispatch(rd, cmd, module, "gi_candidates", &push, view.threads, base);
         prof.end(rd, cmd, scope);
         barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
         if view.spatial {
@@ -307,7 +289,7 @@ impl Plugin for RestirGiPlugin {
     fn build(&self, app: &mut App) {
         let asset_server = app.world().resource::<AssetServer>();
         let shader = asset_server.load(aurora_asset("shaders/restir_gi.slang"));
-        let module = asset_server.add(ComputeModule::new(shader, &["gi_temporal", "gi_spatial"]));
+        let module = asset_server.add(ComputeModule::new(shader, &["gi_candidates", "gi_spatial"]));
         app.insert_resource(RestirGiState {
             module,
             views: std::array::from_fn(|_| GiView::default()),
@@ -323,8 +305,7 @@ mod tests {
     #[test]
     fn gi_frame_layout() {
         use core::mem::offset_of;
-        assert_eq!(offset_of!(GiFrameGpu, prev_view_proj), 48);
-        assert_eq!(offset_of!(GiFrameGpu, width), 112);
-        assert_eq!(std::mem::size_of::<GiFrameGpu>(), 144);
+        assert_eq!(offset_of!(GiFrameGpu, width), 32);
+        assert_eq!(std::mem::size_of::<GiFrameGpu>(), 64);
     }
 }

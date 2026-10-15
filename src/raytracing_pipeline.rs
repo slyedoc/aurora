@@ -174,6 +174,8 @@ pub struct RaytracingPushConstants {
     /// ReSTIR GI's candidates and final reservoirs (`restir_gi`; 0 when off).
     pub gi_candidates: u64,
     pub gi_final: u64,
+    /// The GI debug views' buffer (the Cost view's, one word per traced pixel; 0 unless shown).
+    pub gi_debug: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to

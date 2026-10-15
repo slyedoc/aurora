@@ -70,6 +70,70 @@ Plan: `restir-gi.html`. Notes kept while implementing; newest last.
 
 - 2026-10-15: tested in XR by the user (defaults: GI spatial-only, SHaRC deleted): works.
 
+- 2026-10-15: memory and cost. Without temporal reuse (the default) only the candidates and one
+  final reservoir exist: gi_temporal writes each candidate's W and target into it in place, and
+  gi_spatial reads candidates as its samples (`GiFrame::in_place`); the atmosphere multiplier
+  moved to the surface record's spare word (`RestirSurface::gi_view_t`). 224 -> 96 B/px (1107x578:
+  136 -> 58 MB; ~180 MB less per view at 3840x1080 Balanced). Temporal reuse allocates its two
+  reservoirs again when on. gi_spatial hashes neighbours with PCG instead of two 16-round TEAs and
+  keeps the usable ones as a bit mask (a register; the second walk skips the test's loads).
+  3840x1080: gi temporal 0.141 -> 0.104, gi spatial 0.279 -> 0.219, gi shade 0.169 -> 0.166 ms
+  (0.589 -> 0.489 ms); abbey ratio 0.97-0.98, error 0.049-0.053 as before.
+
+- 2026-10-15: eligibility split from sharing (D1 revised). Every primary vertex takes part but
+  near-mirrors (perceptual roughness < 0.1, `GI_MIN_ROUGHNESS`: below it the lobe is narrower than
+  the half-float normal and view the passes rebuild it with) and glass; every secondary hit but
+  glass and emitters gives a candidate. `restir_gi_roughness` now only decides whether a sample is
+  shared: a glossy hit's radiance depends on where it is seen from, so its sample (n_s_oct low
+  bit clear, `giShareable`) serves its own pixel; the temporal pass skips such history, the
+  spatial pass never shifts such a sample to or from a neighbour. Abbey 4 spp GI vs reference
+  1.004 / 0.013 (no bias); abbey and canopy at 1 spp unchanged (mostly rough). New test scene
+  `examples/many_lights.rs` (bevy's solari many_lights ported; `--no-gi`, `--no-restir`,
+  `--samples N`): vs 4 spp reference GI 0.999 / 0.012, no GI 0.998 / 0.012; boil 0.20 -> 0.12.
+
+- 2026-10-15: GI debug views (`AuroraDebugView::Gi`: gi_shade's light alone; `GiReuse`: per
+  pixel not taking part / nothing to add / own private / own / neighbour / occluded), written by
+  gi_shade into the Cost view's buffer (two words per pixel) through `PushConstants::gi_debug`.
+  New `examples/sun_room.rs`: a closed room lit only through one window (flags `--no-gi`,
+  `--no-restir`, `--samples`, `--ev100`, `--gi-history`, `--gi-spatial`, `--boiling`).
+  Verified there (EV 8 pinned, vs 16 spp without GI or reuse):
+
+  | sun room                | ratio | error | boil |
+  |-------------------------|-------|-------|------|
+  | reference 16 spp        | 1.000 | 0.004 | 0.40 |
+  | no GI                   | 1.027 | 0.059 | 0.68 |
+  | GI spatial 3 (default)  | 0.998 | 0.061 | 0.78 |
+  | GI own candidate only   | 1.003 | 0.063 | 0.65 |
+  | GI temporal 8           | 0.959 | 0.078 | 0.94 |
+  | no GI 4 spp             | 1.024 | 0.038 | 0.56 |
+  | GI 4 spp                | 1.003 | 0.029 | 0.51 |
+
+  GI fixes the brightness (RR reads the plain path 2.5 % bright at any spp) and at 4 spp the
+  error; at 1 spp the local error is unchanged and spatial reuse adds boil: the GiReuse view is
+  mostly "nothing to add" -- most bounces land on unlit wall, whose radiance is one more random
+  path that rarely finds the sunlit patch, and reuse spreads the rare bright ones. SHaRC is no
+  answer here: the pre-GI build in this room reads 0.712 / 0.478 against its own reference (no
+  cache 1.024 / 0.057). The boiling filter took 21 % of GI's light here. What would help is a
+  better radiance at the secondary hit (path reuse past the first bounce, ReSTIR PT).
+  Procedural spheres are never resumed from the primary pass, so neither ReSTIR DI nor GI reaches
+  them (GiReuse grey). The earlier many_lights numbers were auto-exposed (ratios normalised).
+
+- 2026-10-15: distance rule for sharing: a secondary hit closer to its vertex than 3 % of the
+  vertex's camera distance is not shared (`GI_RECONNECT_MIN`, ReSTIR PT's reconnection criterion);
+  temporal reuse's bright and coloured flecks in corners and at contacts went (sun room, history
+  8: error 0.078 -> 0.041).
+- 2026-10-15: frozen as the baseline ReSTIR PT will replace. Spatial reuse off by default: in the
+  noisy input it bunches bright samples into clumps that move each frame, which Ray
+  Reconstruction shows as blotches (sun room: never lower error, always more boil; radius 8 far
+  worse), while each pixel's own candidate gives the plain path's noise with the right brightness.
+  Temporal reuse deleted (it boiled in every scene); with it went last frame's reservoirs, the
+  stored vertex and the in-place/temporal layouts: the final reservoir is 32 B, GI 64 B/px.
+  Still a setting: `restir_gi_spatial_samples`. Raw view (`RenderSettings::tonemap`, examples'
+  `--raw`) and fog off by default (an environment needs `Fog`) added while judging it. A still
+  camera still drifts through Ray Reconstruction (sparse 1 spp input in a bounce-lit room; 4 spp
+  cuts it ~37 %): the next step is an RR-off accumulation reference to tell the tracer's faults
+  from RR's.
+
 ## Deviations
 
 - D5: `gi_shade` is a raygen (traceVisible), not a compute kernel with a ray query: the

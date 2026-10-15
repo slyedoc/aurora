@@ -67,7 +67,7 @@ pub struct UniformData {
     pad_candidates: [u32; 2],
     /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
     lod_bias: f32,
-    /// ReSTIR GI's roughness threshold (`RenderSettings::restir_gi_roughness`).
+    /// ReSTIR GI's sharing threshold (`RenderSettings::restir_gi_roughness`).
     gi_roughness: f32,
     /// Light-table generation; reservoirs from another generation are dropped.
     light_epoch: u32,
@@ -578,6 +578,7 @@ fn render_frame(
     let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
     let local_tonemap = settings.as_ref().map_or(0.0, |s| s.local_tonemap);
     let bloom = settings.as_ref().map_or(0.0, |s| s.bloom);
+    let tonemap = settings.as_ref().is_none_or(|s| s.tonemap);
     let settings = settings
         .map(|settings| settings.clone())
         .unwrap_or_default();
@@ -804,13 +805,22 @@ fn render_frame(
         }
     }
 
-    // The Cost view's buffers, at their view's trace size.
+    // The Cost and GI views' buffers (one word per traced pixel), at their view's trace size.
     for view in &mut views {
-        if view.debug_view != crate::debug_view::AuroraDebugView::Cost.shader_index() {
+        use crate::debug_view::AuroraDebugView;
+        if ![
+            AuroraDebugView::Cost,
+            AuroraDebugView::Gi,
+            AuroraDebugView::GiReuse,
+        ]
+        .iter()
+        .any(|v| v.shader_index() == view.debug_view)
+        {
             continue;
         }
         let buffer = &mut frame.cost_buffers[view.slot];
-        let len = 2 + view.trace_extent.width as u64 * view.trace_extent.height as u64;
+        // Two words per pixel: the GI views' light and state (the Cost view uses the first half).
+        let len = 2 + 2 * view.trace_extent.width as u64 * view.trace_extent.height as u64;
         if buffer.nr_elements != len {
             render_device.destroyer.destroy_buffer(buffer.handle);
             *buffer = render_device.create_device_buffer(
@@ -1437,7 +1447,6 @@ fn render_frame(
                             extent: view.trace_extent,
                             frame: *frame_counter,
                             slot: view.slot,
-                            prev_view_proj: view.last_view_proj,
                             di_surfaces: if di_on { di_addresses.surfaces } else { 0 },
                             settings,
                         },
@@ -1499,11 +1508,18 @@ fn render_frame(
                         crate::restir_gi::GiAddresses::default()
                     };
                     fog_grid.record_clear(&render_device, cmd.get(), view.slot);
-                    // The Cost view's frame total, summed into by the raygen.
+                    // The Cost view's frame total, summed into by the raygen; the GI views'
+                    // whole buffer (a frame without GI shows nothing, not a stale one).
                     if view.cost.1 != 0 {
-                        render_device
-                            .device
-                            .cmd_fill_buffer(cmd.get(), view.cost.0, 0, 8, 0);
+                        let gi_view = view.debug_view
+                            >= crate::debug_view::AuroraDebugView::Gi.shader_index();
+                        render_device.device.cmd_fill_buffer(
+                            cmd.get(),
+                            view.cost.0,
+                            0,
+                            if gi_view { vk::WHOLE_SIZE } else { 8 },
+                            0,
+                        );
                         crate::compute::memory_barrier(
                             &render_device,
                             cmd.get(),
@@ -1533,10 +1549,23 @@ fn render_frame(
                         atmo: atmo_address,
                         restir_frame: restir_addresses.frame,
                         instance_slots: tlas.instance_slots,
-                        cost: view.cost.1,
+                        cost: if view.debug_view
+                            == crate::debug_view::AuroraDebugView::Cost.shader_index()
+                        {
+                            view.cost.1
+                        } else {
+                            0
+                        },
                         primary_hits: view.primary_hits,
                         gi_candidates: gi_addresses.candidates,
                         gi_final: gi_addresses.final_,
+                        gi_debug: if view.debug_view
+                            >= crate::debug_view::AuroraDebugView::Gi.shader_index()
+                        {
+                            view.cost.1
+                        } else {
+                            0
+                        },
                     };
 
                     push_trace(push_constants);
@@ -1846,7 +1875,7 @@ fn render_frame(
                                 cost: views[eye].cost.1,
                                 history: views[eye].history.0,
                                 history_reset: views[eye].history.1,
-                                pad: 0,
+                                tonemap: tonemap as u32,
                                 prep: views[eye].prep,
                             },
                         );
@@ -1936,7 +1965,7 @@ fn render_frame(
                             cost: view.cost.1,
                             history: view.history.0,
                             history_reset: view.history.1,
-                            pad: 0,
+                            tonemap: tonemap as u32,
                             prep: view.prep,
                         },
                     );
@@ -2124,7 +2153,7 @@ fn render_frame(
                                 cost: view.cost.1,
                                 history: view.history.0,
                                 history_reset: view.history.1,
-                                pad: 0,
+                                tonemap: tonemap as u32,
                                 prep: view.prep,
                             },
                         );

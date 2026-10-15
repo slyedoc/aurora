@@ -76,16 +76,14 @@ pub struct RenderSettings {
     /// 3840x1080. It replaced a radiance cache (SHaRC), which held the brightness but with more
     /// local error (8.8 %) and bias.
     pub restir_gi: bool,
-    /// Perceptual roughness from which a primary vertex and a secondary hit take part; glossier
-    /// surfaces and glass keep their indirect light in the path.
+    /// Perceptual roughness from which a secondary hit's sample is shared with other pixels
+    /// (reconnection); a glossier hit's sample serves only its own pixel. Every primary vertex
+    /// but near-mirrors (perceptual roughness < 0.1) and glass takes part.
     #[reflect(@0.0..=1.0_f32)]
     pub restir_gi_roughness: f32,
-    /// GI's temporal history cap, in frames (0 = no temporal reuse, the default: reused across
-    /// frames, its samples stay correlated long enough for Ray Reconstruction to keep them as
-    /// detail, and the image boils -- 2.2 against 0.46 outdoors at 8, 1.3 at 1).
-    #[reflect(@0.0..=64.0_f32)]
-    pub restir_gi_history: f32,
-    /// Neighbours merged by GI's spatial pass (0 = temporal only) and their disc (pixels).
+    /// Neighbours merged by GI's spatial pass (0 = none, the default) and their disc (pixels).
+    /// Spatial reuse spreads bright samples into clumps that Ray Reconstruction turns into moving
+    /// blotches; each pixel's own candidate alone gives the plain path's noise.
     #[reflect(@0.0..=16.0_f32)]
     pub restir_gi_spatial_samples: u32,
     #[reflect(@1.0..=64.0_f32)]
@@ -119,6 +117,9 @@ pub struct RenderSettings {
     /// brightens overall. 0 = off.
     #[reflect(@0.0..=0.3_f32)]
     pub bloom: f32,
+    /// ACES filmic tone mapping in the composite; off shows the exposed image linearly, clipped
+    /// at white (for judging the render itself).
+    pub tonemap: bool,
 }
 
 impl Default for RenderSettings {
@@ -140,8 +141,7 @@ impl Default for RenderSettings {
             restir_boiling: 0.0,
             restir_gi: true,
             restir_gi_roughness: 0.35,
-            restir_gi_history: 0.0,
-            restir_gi_spatial_samples: 3,
+            restir_gi_spatial_samples: 0,
             restir_gi_spatial_radius: 30.0,
             ab: 0,
             light_grid_cell: 4.0,
@@ -152,6 +152,7 @@ impl Default for RenderSettings {
             jitter_scale: 1.0,
             local_tonemap: 0.4,
             bloom: 0.06,
+            tonemap: true,
         }
     }
 }

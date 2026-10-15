@@ -41,6 +41,14 @@ pub enum AuroraDebugView {
     /// Raygen time per pixel (VK_KHR_shader_clock) in stops against the frame's mean: blue
     /// under it, green at it, yellow/orange/red over it, white at 16x. Where the trace's time goes.
     Cost,
+    /// ReSTIR GI's light alone (what `gi_shade` added to the noisy colour), exposed like the
+    /// colour view: where GI acts and how much; leaks and spatial blotches stand out.
+    Gi,
+    /// ReSTIR GI's state per pixel: grey = not taking part (near-mirror or glass: the path keeps
+    /// the light), black = taking part with nothing to add, blue = its own candidate won and is
+    /// not shareable (glossy secondary hit), cyan = its own candidate won, green = a neighbour's
+    /// sample won, red = the winner was occluded (its visibility ray failed).
+    GiReuse,
 }
 
 impl AuroraDebugView {
@@ -56,6 +64,8 @@ impl AuroraDebugView {
         Self::Motion,
         Self::Luminance,
         Self::Cost,
+        Self::Gi,
+        Self::GiReuse,
     ];
 
     /// The value quad.slang switches on.
@@ -64,7 +74,7 @@ impl AuroraDebugView {
     }
 
     /// `$AURORA_DEBUG_VIEW`
-    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost`),
+    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost|gi|gi-reuse`),
     /// else the normal render: lets a headless run capture a guide view.
     pub fn from_env() -> Self {
         match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
@@ -78,6 +88,8 @@ impl AuroraDebugView {
             Some("motion") => Self::Motion,
             Some("luminance") | Some("nits") => Self::Luminance,
             Some("cost") => Self::Cost,
+            Some("gi") => Self::Gi,
+            Some("gi-reuse") => Self::GiReuse,
             _ => Self::None,
         }
     }

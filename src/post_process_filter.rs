@@ -36,7 +36,8 @@ pub struct PostProcessPushConstants {
     pub history: [u64; 4],
     /// 1: last frame's histories are invalid (just made or resized).
     pub history_reset: u32,
-    pub pad: u32,
+    /// 0: show the exposed image linearly, clipped (RenderSettings::tonemap off); else ACES.
+    pub tonemap: u32,
     /// The view's prepass outputs (bloom, local tone mapping's keys, the histories' ranges).
     pub prep: crate::post_prep::PrepFrame,
 }
