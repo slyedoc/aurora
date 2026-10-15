@@ -1255,6 +1255,7 @@ fn render_frame(
                 &modules,
                 &transforms,
                 world_changed || skinned,
+                true,
             );
             prof.end(&render_device, scene_cmd, scope);
             drop(section);

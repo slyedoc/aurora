@@ -236,6 +236,10 @@ pub fn scatter_species(
     // A disturbed field re-grows every frame, so plants spring back as it decays.
     let field = field.address(time.elapsed_secs_f64());
     let mut jobs: Vec<(vk::Buffer, SpeciesTables, ScatterPush)> = Vec::new();
+    // Plants appear or vanish (the window moved, the pages or the species changed): the TLAS
+    // rebuilds. Wind and the interaction field only bend them (rows moved, poses swapped): a
+    // refit.
+    let mut structural = false;
     for (spec, child_of, slots, mut state) in &mut species {
         let Some((landscape, pages, transform)) = std::iter::once(child_of.parent())
             .chain(parents.iter_ancestors(child_of.parent()))
@@ -263,6 +267,7 @@ pub fn scatter_species(
         if !(windy || field != 0 || moved || spec.is_changed() || pages.is_changed()) {
             continue;
         }
+        structural |= moved || spec.is_changed() || pages.is_changed();
         let mut tables = SpeciesTables::zeroed();
         for &(id, f) in &spec.grows_on {
             tables.factors[id as usize] = (f * spec.density).clamp(0.0, 1.0);
@@ -334,7 +339,11 @@ pub fn scatter_species(
             record_dispatch(rd, cmd, module, "scatter", job, job.width * job.width, None);
         }
     });
-    tlas.request_rebuild();
+    if structural {
+        tlas.request_rebuild();
+    } else {
+        tlas.request_refit();
+    }
 }
 
 pub fn on_state_removed(

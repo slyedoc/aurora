@@ -382,6 +382,9 @@ pub struct InstanceOverride {
     pub hit_offset: Option<u32>,
 }
 
+/// Refits between full TLAS builds.
+const REFIT_FRAMES: u32 = 60;
+
 #[derive(Resource)]
 pub struct TLAS {
     module: Handle<ComputeModule>,
@@ -414,6 +417,13 @@ pub struct TLAS {
     /// Instance records for the scatter kernel, read in place: one copy per frame in flight.
     staging: Flip<Buffer<InstanceRecord>>,
     rebuild: bool,
+    /// The structure may be refit (built with ALLOW_UPDATE over the same rows): frames where
+    /// only transforms moved (skinned bounds, animated nodes) update it in place instead of
+    /// rebuilding, with a full build every `REFIT_FRAMES` to keep the tree tight.
+    refittable: bool,
+    refit_requested: bool,
+    refit_rows: u32,
+    refits: u32,
     /// The TLAS's input: the live rows packed in slot order (instances.slang `live_*`), each
     /// packed row's slot, the per-block counts / offsets, and the live count.
     packed_buf: Buffer<u8>,
@@ -460,6 +470,10 @@ impl TLAS {
             instance_node_buf: Buffer::default(),
             staging: Flip::default(),
             rebuild: false,
+            refittable: false,
+            refit_requested: false,
+            refit_rows: 0,
+            refits: 0,
             packed_buf: Buffer::default(),
             slots_buf: Buffer::default(),
             blocks_buf: Buffer::default(),
@@ -500,6 +514,12 @@ impl TLAS {
     /// Rows were written outside the instance table's own passes: rebuild the TLAS this frame.
     pub fn request_rebuild(&mut self) {
         self.rebuild = true;
+    }
+
+    /// Rows were rewritten in place outside the instance table's own passes (transforms, a
+    /// BLAS swapped for another; no instance appearing or vanishing): refit the TLAS this frame.
+    pub fn request_refit(&mut self) {
+        self.refit_requested = true;
     }
 
     /// Device address of the packed material buffer (`custom_index` indexes it).
@@ -708,6 +728,7 @@ impl TLAS {
         modules: &ComputeModules,
         transforms: &GpuTransforms,
         world_changed: bool,
+        allow_refit: bool,
     ) {
         if self.count == 0 {
             return;
@@ -785,10 +806,13 @@ impl TLAS {
             self.rebuild = true;
         }
 
-        if !(self.rebuild || world_changed) {
+        if !(self.rebuild || self.refit_requested || world_changed) {
             return;
         }
+        // Rows scattered (instances spawned, despawned, re-meshed, hidden): a full build.
+        let structural = self.rebuild;
         self.rebuild = false;
+        self.refit_requested = false;
 
         let params = GatherInstancesParams {
             instance_node: self.instance_node_buf.address,
@@ -817,7 +841,7 @@ impl TLAS {
                 | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
         );
-        self.build(rd, cmd, module);
+        self.build(rd, cmd, module, !structural && allow_refit);
     }
 
     /// Packs the live rows (instances.slang `live_count`, `live_scan`, `live_write`) and
@@ -896,7 +920,13 @@ impl TLAS {
         rows
     }
 
-    fn build(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer, module: &CompiledComputeModule) {
+    fn build(
+        &mut self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        module: &CompiledComputeModule,
+        refit: bool,
+    ) {
         if self.scratch_alignment == 0 {
             self.scratch_alignment = vk_utils::get_acceleration_structure_properties(rd)
                 .min_acceleration_structure_scratch_offset_alignment
@@ -912,7 +942,8 @@ impl TLAS {
                         device_address: self.packed_buf.address,
                     }),
             });
-        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
         // Sized for every slot (no reallocation as the live count moves), built from the rows
         // `pack` hands it.
         let primitive_count = self.count;
@@ -952,6 +983,7 @@ impl TLAS {
             .unwrap();
             self.handle_size = build_size.acceleration_structure_size;
             self.handle_count = primitive_count;
+            self.refittable = false;
             self.acceleration_structure.address = unsafe {
                 rd.ext_acc_struct.get_acceleration_structure_device_address(
                     &vk::AccelerationStructureDeviceAddressInfoKHR::default()
@@ -959,18 +991,38 @@ impl TLAS {
                 )
             };
         }
-        let scratch_size = build_size.build_scratch_size + self.scratch_alignment;
+        let scratch_size =
+            build_size.build_scratch_size.max(build_size.update_scratch_size) + self.scratch_alignment;
         if scratch_size > self.scratch_buffer.nr_elements {
             rd.destroyer.destroy_buffer(self.scratch_buffer.handle);
             self.scratch_buffer =
                 rd.create_device_buffer(scratch_size, vk::BufferUsageFlags::STORAGE_BUFFER);
         }
 
+        let rows = self.pack(rd, cmd, module);
+        // A refit keeps the source build's rows: same count, same order (no row scattered).
+        let refit = refit
+            && self.refittable
+            && rows == self.refit_rows
+            && self.refits < REFIT_FRAMES;
+        if refit {
+            self.refits += 1;
+        } else {
+            self.refits = 0;
+            self.refit_rows = rows;
+            self.refittable = true;
+        }
+        let handle = self.acceleration_structure.handle;
         let build_geometry = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
             .flags(flags)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .dst_acceleration_structure(self.acceleration_structure.handle)
+            .mode(if refit {
+                vk::BuildAccelerationStructureModeKHR::UPDATE
+            } else {
+                vk::BuildAccelerationStructureModeKHR::BUILD
+            })
+            .src_acceleration_structure(if refit { handle } else { vk::AccelerationStructureKHR::null() })
+            .dst_acceleration_structure(handle)
             .geometries(std::slice::from_ref(&geometry))
             .scratch_data(vk::DeviceOrHostAddressKHR {
                 device_address: vk_utils::aligned_size(
@@ -978,7 +1030,6 @@ impl TLAS {
                     self.scratch_alignment,
                 ),
             });
-        let rows = self.pack(rd, cmd, module);
         let build_range =
             vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(rows);
         let build_range_infos = std::slice::from_ref(&build_range);
