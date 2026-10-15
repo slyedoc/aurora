@@ -148,7 +148,6 @@ impl CompiledRaytracingPipeline {
 pub struct RaytracingPushConstants {
     pub uniform_buffer: u64,
     pub material_buffer: u64,
-    pub bluenoise_buffer2: u64,
     pub focus_buffer: u64,
     /// ReSTIR DI's primary surfaces (`restir`; 0 when off).
     pub restir_surfaces: u64,

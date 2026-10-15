@@ -25,7 +25,6 @@ import fog;
 // The same bindless range read as 3D images (the fog grid's volumes, src/fog_grid.rs).
 [[vk::binding(201, 1)]] Sampler3D volumes[];
 
-static const bool ENABLE_BLUENOISE = true;
 
 // Settings fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
 // `RenderSettings`; changing one rebuilds it): the driver folds them, so a feature that is off
@@ -330,31 +329,6 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
     return Ls;
 }
 
-// Extracts either the first two or second two bytes from the uint
-// encoded byte buffer. As a result, byteIndex must be an even number
-// for this to work.
-float2 TwoBnoiseSamples(uint byteIndex) {
-    let uintIndex = byteIndex / 4;
-    let packedUInt = pc.bluenoise[uintIndex];
-
-    // Calculate the shift amount based on the byte index modulo 4
-    let shiftAmount = (byteIndex % 4) * 8;
-
-    // Extract the two bytes at positions byteIndex and byteIndex+1 (next byte)
-    let res = uint2((packedUInt >> shiftAmount), (packedUInt >> (shiftAmount + 8)));
-
-    return float2(float(res.x & 0xFF) / 255.0, float(res.y & 0xFF) / 255.0);
-}
-
-// Two blue-noise values for this pixel and sample, from slice `offset` slices on (64 slices; the
-// seed advances every frame): two different offsets give two independent pairs.
-float2 bnoiseBest(uint sampleIdx, uint offset) {
-    let textureIdx = (pc.uniforms.frame * SAMPLES + sampleIdx + offset) % 64;
-    let x = DispatchRaysIndex().x % 128;
-    let y = DispatchRaysIndex().y % 128;
-    let byteIndex = 128 * 128 * 2 * textureIdx + 128 * 2 * y + 2 * x;
-    return TwoBnoiseSamples(byteIndex);
-}
 
 
 
@@ -1950,30 +1924,13 @@ void main() {
                 }
             }
 
-            float4 noise;
-            if (ENABLE_BLUENOISE && bounce_idx == 0) {
-                // Blue noise on the first bounce: one pair for the diffuse direction, an
-                // independent pair (half the slices on) for the specular half vector. One pair
-                // copied into both tied the two lobes' samples together.
-                noise = float4(bnoiseBest(sample_idx, 0u), bnoiseBest(sample_idx, 32u));
-            } else {
-                let n0 = randf();
-                let n1 = randf();
-                let n2 = randf();
-                let n3 = randf();
-                noise = float4(n0, n1, n2, n3);
-            }
-
-            // stratified sampling on the second bounce
-            // doing it on multiple bounces like this is invalid because
-            // they will become correlated.
-            // This also increases raytracing performances because
-            // the rays are more uniform, increasing coherence of memory
-            // accesses! (effect is about 1% on fps @3 spp)
-            if (bounce_idx == 0) {
-                noise.x = noise.x / float(SAMPLES) + float(sample_idx) / float(SAMPLES);
-                noise.z = noise.z / float(SAMPLES) + float(sample_idx) / float(SAMPLES);
-            }
+            // White noise from the PCG stream: Ray Reconstruction assumes independent samples,
+            // no pattern shared across the screen (DLSS-RR Integration Guide 3.5).
+            let n0 = randf();
+            let n1 = randf();
+            let n2 = randf();
+            let n3 = randf();
+            let noise = float4(n0, n1, n2, n3);
 
             let brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
             path &= ~PATH_WANT_SUN;

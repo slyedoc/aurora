@@ -53,3 +53,12 @@ Plan: `reference-mode.html`. Newest last.
 
 - Northshire through zero (it needs the same few lines in its examples).
 - `ReferenceDiff` view by eye.
+
+- 2026-10-15: blue noise removed from the path tracer (BlueNoisePlugin, the STBN textures, the
+  push-constant field); every dimension is the PCG stream. Two bugs it caused: each pixel repeated
+  the same 64 first-bounce directions (grain stuck), and its bytes put every pixel on one shared
+  256x256 direction lattice, which projected the window onto the sun room's west wall (a CPU
+  render of the flat-sky, one-bounce room has no such patch). The DLSS-RR Integration Guide (3.5)
+  asks for white noise from a good hash and no pattern shared across the screen. Sun room
+  1920x1080: reference unchanged (ratio 1.000, block error 0.007); RR output ratio 0.58 -> 0.67,
+  block error 0.22 -> 0.15, frame-to-frame change 0.058 -> 0.038.

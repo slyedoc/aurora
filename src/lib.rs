@@ -18,7 +18,6 @@ pub mod assets;
 pub mod atmosphere;
 pub mod auto_exposure;
 pub mod blas;
-pub mod bluenoise_plugin;
 pub mod bsn;
 pub mod camera_target;
 pub mod collision;
@@ -207,7 +206,6 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::camera_target::CameraTargetPlugin);
         // Draws bevy_gizmos lines (add `bevy::gizmos::GizmoPlugin` yourself to switch them on).
         group = group.add(crate::gizmo_render::GizmoRenderPlugin);
-        group = group.add(crate::bluenoise_plugin::BlueNoisePlugin);
         group = group.add(crate::bsn::BsnPlugin);
         group = group.add(crate::animclip::AnimClipPlugin);
 

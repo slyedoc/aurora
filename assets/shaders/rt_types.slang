@@ -719,8 +719,6 @@ public struct PushConstants {
     public UniformData* uniforms;
     // Not void*: slangc lowers it to the uint* type, which then loses its ArrayStride.
     public uint64_t materials;
-    // 64 bluenoise slices of 128x128 byte pairs.
-    public uint* bluenoise;
     public float* focus;
     // ReSTIR DI's primary surfaces (one per traced pixel; restir.rs).
     public RestirSurface* restir_surfaces;

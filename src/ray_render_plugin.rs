@@ -16,7 +16,6 @@ use crate::descriptor_heap::DescriptorHeaps;
 use crate::sky::{EnvironmentGpu, EnvironmentSkies, Sky};
 use crate::{
     atmosphere::{Atmosphere, AtmosphereState, CloudLayer},
-    bluenoise_plugin::BlueNoiseBuffer,
     post_process_filter::PostProcessFilter,
     raytracing_pipeline::{RaytracingPipeline, RaytracingPushConstants, RaytracingPushData},
     render_buffer::{Buffer, BufferProvider},
@@ -481,7 +480,6 @@ fn render_frame(
     rtx_pipelines: Res<VulkanAssets<RaytracingPipeline>>,
     textures: Res<VulkanAssets<bevy::prelude::Image>>,
     postprocess_filters: Res<VulkanAssets<PostProcessFilter>>,
-    bluenoise_buffer: Res<BlueNoiseBuffer>,
     mut tlas: ResMut<TLAS>,
     gpu: (
         ResMut<crate::gpu_transform::GpuTransforms>,
@@ -1588,7 +1586,6 @@ fn render_frame(
                     let push_constants = RaytracingPushConstants {
                         uniform_buffer: frame.uniform_buffers[view.slot].address,
                         material_buffer: tlas.materials,
-                        bluenoise_buffer2: bluenoise_buffer.0.address,
                         focus_buffer: frame.focus_data.address,
                         restir_surfaces: if restir_addresses.surfaces != 0 {
                             restir_addresses.surfaces

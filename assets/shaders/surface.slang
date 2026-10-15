@@ -57,7 +57,6 @@ public struct PushConstants {
     public Material* materials;
     // Not void*: slangc lowers it to the uint* type, which then loses its ArrayStride (and
     // instance_slots is a uint*).
-    public uint64_t bluenoise;
     public uint64_t focus;
     public uint pad0, pad1;
     public float4* prev_instances;

@@ -89,6 +89,11 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             "--no-gi" => settings.restir_gi = false,
             "--no-restir" => settings.restir = false,
             "--no-sharc" => settings.sharc = false,
+            "--bounces" => {
+                if let Some(n) = args.get(i + 1).and_then(|n| n.parse().ok()) {
+                    settings.max_bounces = n;
+                }
+            }
             "--ab" => {
                 if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
                     settings.ab = v;
@@ -158,6 +163,18 @@ fn pin_exposure(
     }
 }
 
+fn camera_position() -> Vec3 {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == "--camera")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| {
+            let c: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            (c.len() == 3).then(|| Vec3::new(c[0], c[1], c[2]))
+        })
+        .unwrap_or(Vec3::new(3.4, 1.6, 2.5))
+}
+
 fn setup(
     mut commands: Commands,
     mut materials: ResMut<Assets<AuroraMaterial>>,
@@ -167,22 +184,34 @@ fn setup(
         .spawn((
             Name::new("Environment"),
             Environment::default(),
-            Sky::Generated,
+            // `--flat-sky`: a uniform sky (6000 nits) instead of the generated one.
+            if std::env::args().any(|a| a == "--flat-sky") {
+                Sky::Color {
+                    radiance: Vec3::splat(6000.0),
+                }
+            } else {
+                Sky::Generated
+            },
         ))
         .id();
 
     // The sun, high in the south, its beam through the window onto the floor.
-    commands.spawn((
-        ChildOf(environment),
-        DirectionalLight::default(),
-        Transform::default().looking_to(Vec3::new(0.3, -0.64, 1.0), Vec3::Y),
-    ));
+    // `--no-sun`: none (the sky alone lights the room).
+    if !std::env::args().any(|a| a == "--no-sun") {
+        commands.spawn((
+            ChildOf(environment),
+            DirectionalLight::default(),
+            Transform::default().looking_to(Vec3::new(0.3, -0.64, 1.0), Vec3::Y),
+        ));
+    }
 
     commands.spawn((
         ChildOf(environment),
         Camera3d::default(),
         FreeCamera::default(),
-        Transform::from_xyz(3.4, 1.6, 2.5).looking_at(Vec3::new(-1.0, 0.7, -1.4), Vec3::Y),
+        // `--camera x,y,z`: another eye point, looking at the same spot.
+        Transform::from_translation(camera_position())
+            .looking_at(Vec3::new(-1.0, 0.7, -1.4), Vec3::Y),
     ));
 
     let cube = meshes.add(AuroraMesh::from_shape(Cuboid::default()));
@@ -213,13 +242,15 @@ fn setup(
     });
     let (x0, x1, z0, z1) = (-HALF_X - WALL, HALF_X + WALL, -HALF_Z - WALL, HALF_Z + WALL);
 
-    // Outside: ground around the house, just under its floor.
-    block(
-        &mut commands,
-        ground,
-        Vec3::new(-60.0, -0.3, -60.0),
-        Vec3::new(60.0, -0.01, 60.0),
-    );
+    // Outside: ground around the house, just under its floor (`--no-ground`: none).
+    if !std::env::args().any(|a| a == "--no-ground") {
+        block(
+            &mut commands,
+            ground,
+            Vec3::new(-60.0, -0.3, -60.0),
+            Vec3::new(60.0, -0.01, 60.0),
+        );
+    }
     // Floor and ceiling.
     block(
         &mut commands,
