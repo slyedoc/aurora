@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReSTIR PT Plan</title>
+<style>
+  :root { --fg:#1d1f23; --muted:#5b6170; --bg:#fbfbfa; --card:#fff; --line:#e3e3df; --accent:#2f5bd3; --warn:#a4570a; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --fg:#e6e6e3; --muted:#a2a6b0; --bg:#15161a; --card:#1d1f24; --line:#2d3038; --accent:#8aa8ff; --warn:#e3a35a; } }
+  :root[data-theme="dark"] { --fg:#e6e6e3; --muted:#a2a6b0; --bg:#15161a; --card:#1d1f24; --line:#2d3038; --accent:#8aa8ff; --warn:#e3a35a; }
+  body { font: 15px/1.55 system-ui, sans-serif; color:var(--fg); background:var(--bg); max-width: 980px; margin: 2rem auto; padding: 0 16px; }
+  h2 { margin-top:2rem; border-bottom:1px solid var(--line); padding-bottom:.3rem } .sub { color:var(--muted) }
+  code, pre { font: 13px/1.45 ui-monospace, monospace } pre { background:var(--card); border:1px solid var(--line); padding:.8rem; overflow-x:auto; border-radius:6px }
+  table { border-collapse: collapse; width:100%; font-size:14px; margin:.5rem 0 } th, td { border:1px solid var(--line); padding:.35rem .5rem; vertical-align:top; text-align:left }
+  .decision { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); padding:.6rem .9rem; margin:.9rem 0; border-radius:4px }
+  .decision h3 { margin:.1rem 0 .4rem } .tweak { color:var(--warn); font-weight:600 }
+</style></head><body>
+<h1>ReSTIR PT</h1>
+<p class="sub">aurora, 2026-10-15. Notes: restir-pt-notes.md. Base: 7c35182 (reference mode; SHaRC on; ReSTIR GI frozen,
+spatial off). Supersedes ReSTIR GI (restir-gi.html), which it replaces in phase 4.</p>
+
+<h2>Why, in numbers</h2>
+<p>Measured with the reference mode (reference-mode.html) in <code>examples/sun_room.rs</code>, a room lit through one
+window, DLAA 1920x1080:</p>
+<table>
+<tr><th>finding</th><th>number</th></tr>
+<tr><td>the tracer converges at 1/sqrt(N), blue or white noise</td><td>error vs 4096 frames: 0.194 / 0.100 / 0.042 at 64 / 256 / 1024</td></tr>
+<tr><td>the light is heavy-tailed: on a wall, the top 1 % of samples carry 97 % of it (bounces that land on the sunlit patch, ~1 % of them)</td><td>90 % of wall samples are 0; max 750x the mean</td></tr>
+<tr><td>so 2048 frames still grain ~20 %; 1 % grain would take ~1M samples</td><td>grain ~ 1/sqrt(patch hits)</td></tr>
+<tr><td>Ray Reconstruction on that input loses energy and drifts; fed the converged image it is faithful</td><td>noisy: 0.58-0.85 of the reference (worse at higher resolution), 17 % change/frame; fed: 0.99, 0.5 %</td></tr>
+<tr><td>a mirror sphere: sharp in the reference and through RR when fed; on noisy input reflected bounce-lit objects vanish</td><td>mirror 0.77, glossy 0.87 of the reference</td></tr>
+<tr><td>SHaRC is unbiased and densifies the input</td><td>black pixels 95 -> 61 %</td></tr>
+<tr><td>ReSTIR GI: unbiased, fixes brightness, but its one-bounce reconnection cannot share near or glossy hits, and its spatial reuse clumped noise RR turned to blotches</td><td>see restir-gi-notes.md</td></tr>
+</table>
+<p>The noise floor is the input's: the light is found by chance. ReSTIR PT (Lin et al. 2022, generalized resampled
+importance sampling) reuses whole paths, including ones whose first bounces are near or glossy, so the rare paths that
+find the patch, the window or a lamp are shared across pixels and frames instead of averaged away. The goal is RR's
+input closer to the fed case: brightness within a few % of the reference and drift a fraction of today's.</p>
+
+<h2>Decisions you are most likely to tweak</h2>
+
+<div class="decision"><h3>D1. What a PT sample is, and what PT covers <span class="tweak">(scope)</span></h3>
+<p>PT owns the indirect light at sample 0's primary vertex, exactly the integral ReSTIR GI owns today (D1 of the GI
+plan: eligibility at the vertex, emission and DI left where they are). ReSTIR DI keeps the direct light. A sample is the
+path from the primary vertex on: the random seed its prefix was drawn with, the index k of its reconnection vertex, that
+vertex's position and normal, the radiance the path carries back from it (everything gathered past it, SHaRC answers
+included), and the prefix's pdfs needed for the shift's Jacobian.</p>
+<p>Eligibility drops GI's thresholds: every primary vertex but glass and true mirrors takes part; a path with no
+reconnectable vertex is still a sample (replay-only), shared through random replay.</p>
+</div>
+
+<div class="decision"><h3>D2. The shift: hybrid random replay + reconnection <span class="tweak">(core algorithm)</span></h3>
+<p>To move a sample to another pixel's vertex: replay its random numbers from the new vertex (re-tracing the prefix
+through the new geometry) up to vertex k, then reconnect to k's stored position. k is the first vertex that is rough
+(perceptual roughness >= 0.35) at both k-1 and k and far enough from k-1 (> 3 % of the camera distance: the rule ReSTIR
+GI's corner flecks taught). The Jacobian is the replayed prefix's pdf ratio times the reconnection's geometry term;
+exact pdfs are therefore required (D3). Replay that diverges (hits something else, a different lobe) makes the shift
+fail: zero target, counted in the MIS.</p>
+<p>Cost: replay traces up to k-1 rays per shift (most paths reconnect at k = 1 or 2).</p>
+</div>
+
+<div class="decision"><h3>D3. Exact sampling pdfs first <span class="tweak">(prerequisite)</span></h3>
+<p><code>sampleDisneyBRDF</code> picks its lobe by Fresnel at a random VNDF half vector, so the density of a sampled
+direction cannot be evaluated exactly (GI lived with <code>layeredPdf</code>'s approximation). Replay needs the true pdf.
+Change: lobe selection by a probability that depends only on the vertex (Fresnel at n.v, or albedo/metal weights),
+evaluated identically in <code>layeredPdf</code>. Verified per material against references (ratio 1.000 to the noise floor,
+furnace-style uniformly lit spheres).</p>
+</div>
+
+<div class="decision"><h3>D4. Reuse, and RR, from day one <span class="tweak">(quality vs. denoiser)</span></h3>
+<p>Temporal then spatial reuse, pairwise MIS (as DI and GI). Ray Reconstruction punished correlated input (GI's spatial
+clumps, GI's temporal boil), so decorrelation is part of the design, not a fix later: small M caps, a spatial radius
+chosen by measurement, a limit on how many pixels may take the same sample in a frame (a per-sample duplication count),
+and every phase judged both in the reference (bias) and through RR (ratio, drift, the spheres) with the capture tool.
+Temporal reuse ships only if it passes the RR gate (D7).</p>
+</div>
+
+<div class="decision"><h3>D5. Where the passes run <span class="tweak">(frame order, cost)</span></h3>
+<p>The shift traces rays (replay), so the reuse passes are raygens (one SBT region each, like <code>gi_shade</code>: the
+shadow any-hit alpha test, glass pass-through and analytic spheres come for free), not compute. Order in the view lane's
+back half: trace (writes candidates) -> pt_temporal -> pt_spatial -> pt_shade -> accumulate -> DLSS.</p>
+</div>
+
+<div class="decision"><h3>D6. Data <span class="tweak">(memory)</span></h3>
+<pre>PtSample (candidate and reservoir payload), 48 B:
+  float3 x_k; uint n_k_oct;          // reconnection vertex (or the last vertex for replay-only)
+  uint L;                            // radiance back from x_k, RGB9E5
+  uint seed;                         // the prefix's RNG seed
+  uint k_flags;                      // k, lobe choices needed by replay, replay-only bit
+  float prefix_pdf;                  // solid-angle pdf product of the prefix (Jacobian)
+reservoir: sample + W, M, phat, frame  -> 64 B; candidate + final (+ last frame's when temporal)</pre>
+<p>~128-192 B/px; XR doubles it.</p>
+</div>
+
+<div class="decision"><h3>D7. Gates, measured with the capture tool <span class="tweak">(definition of done)</span></h3>
+<table>
+<tr><th>gate</th><th>measured by</th></tr>
+<tr><td>unbiased: PT's reference against the no-PT reference within the noise floor (block error ~0.02)</td><td><code>refcmp.py A B</code></td></tr>
+<tr><td>input: sun room left wall, the share of light in the top 1 % of samples well below 97 %; black pixels well below 61 %</td><td>noisy frames</td></tr>
+<tr><td>RR: output within ~5 % of the reference (today 0.58-0.85), drift a fraction of today's 17 %/frame, at DLAA and Balanced, 1080p and up</td><td>output frames</td></tr>
+<tr><td>spheres: the mirror keeps the reflected sphere and cabinet through RR</td><td>the spheres comparison image</td></tr>
+<tr><td>cost within budget (to set after phase 1's first numbers)</td><td>bench</td></tr>
+</table>
+</div>
+
+<h2>Phases</h2>
+<table>
+<tr><th>phase</th><th>done when</th></tr>
+<tr><td>0. Exact BSDF pdf (D3); procedural spheres recorded by the primary pass (so DI/GI/PT reach them)</td><td>references unchanged (ratio 1.000), per-material checks pass</td></tr>
+<tr><td>1. PT candidates: GI's candidate extended with seed, k and prefix pdf; own-candidate shading (no reuse)</td><td>reference equals GI own-candidate's; candidates' k distribution logged</td></tr>
+<tr><td>2. Hybrid shift + spatial reuse with decorrelation</td><td>D7's bias, input and RR gates in the sun room; abbey and canopy checked</td></tr>
+<tr><td>3. Temporal reuse (if it passes RR); tuning; cost</td><td>D7 in full; XR checked</td></tr>
+<tr><td>4. Remove ReSTIR GI</td><td>builds; PT covers its scenes at least as well</td></tr>
+</table>
+
+<h2>Risks</h2>
+<ul>
+<li>RR and correlation: the central risk (GI's lesson). Measured every phase; if reuse cannot pass RR's gate, the fallback
+is PT at fewer neighbours with duplication limits, and SHaRC carrying more.</li>
+<li>Replay cost: up to k-1 rays per shift; capped by the reconnection rule (most k = 1-2).</li>
+<li>Exact pdfs and layered materials (coat, translucency): each lobe's selection must be reproducible on replay.</li>
+<li>RR's energy loss growing with resolution (0.83 at 557x313 trace, 0.58 at 1920x1080): measured as PT lands; may need
+input density targets per resolution.</li>
+</ul>
+
+<h2>Mechanical work</h2>
+<table>
+<tr><th>file</th><th>change</th></tr>
+<tr><td><code>assets/shaders/disney.slang</code></td><td>exact lobe selection; <code>layeredPdf</code> matching it</td></tr>
+<tr><td><code>assets/shaders/raygen.slang</code></td><td>primary pass records procedural spheres; candidate seed/k/prefix pdf; replay helper; pt_temporal, pt_spatial, pt_shade raygens</td></tr>
+<tr><td><code>assets/shaders/rt_types.slang</code></td><td>PtSample, reservoir, load/store</td></tr>
+<tr><td><code>src/restir_pt.rs</code> (new)</td><td>buffers per view, passes, plugin (restir_gi.rs's shape)</td></tr>
+<tr><td><code>src/raytracing_pipeline.rs</code>, <code>src/sbt.rs</code></td><td>three raygen groups and regions; PT_ON constant</td></tr>
+<tr><td><code>src/render_settings.rs</code></td><td><code>restir_pt</code> and its few knobs; GI's go in phase 4</td></tr>
+<tr><td><code>examples/sun_room.rs</code></td><td><code>--no-pt</code>; the spheres comparison image script</td></tr>
+</table>
+</body></html>

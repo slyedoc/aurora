@@ -90,9 +90,12 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         .iter(app.world())
         .next()
         .expect("a Camera3d to capture");
-    app.world_mut()
-        .entity_mut(camera)
-        .insert(RenderTarget::Image(target.into()));
+    // DLAA: Ray Reconstruction at the trace's own resolution, so the reference, the noisy input
+    // and RR's output are the same pixels (no upscale in the comparison).
+    app.world_mut().entity_mut(camera).insert((
+        RenderTarget::Image(target.into()),
+        crate::dlss::AuroraDlss::Dlaa,
+    ));
     app.world_mut().resource_mut::<ReferenceState>().capture = true;
     for _ in 0..args.settle {
         app.update();

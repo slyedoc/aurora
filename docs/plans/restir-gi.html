@@ -19,7 +19,7 @@
 <body>
 <h1>aurora ReSTIR GI</h1>
 <p class="sub">Reservoir resampling of the first indirect bounce at sample 0's primary vertex (Ouyang et al. 2021, "ReSTIR GI"), as passes beside ReSTIR DI. Written 2026-10-15. Implementation notes: <code>restir-gi-notes.md</code>.</p>
-<p class="sub"><b>Status 2026-10-15: implemented, phases 0-4: on by default (spatial reuse; temporal off), SHaRC deleted. Measurements, decisions and deviations (gi_shade as a raygen, the 64-byte reservoir with the stored vertex, the array-free spatial pass) in restir-gi-notes.md.</b></p>
+<p class="sub"><b>Status 2026-10-15: superseded by ReSTIR PT (restir-pt.html). Implemented through phase 4, then frozen as the baseline PT replaces: on by default with each pixel's own candidate (spatial reuse off: it clumped the noise Ray Reconstruction turned to blotches), temporal reuse deleted, SHaRC kept (measured unbiased). Notes and measurements in restir-gi-notes.md.</b></p>
 
 <p><b>Why.</b> ReSTIR DI fixed the direct term from the light table at 1 spp; the indirect term is still one BRDF ray per pixel, with SHaRC answering past the first bounce. That one ray decides the look of every interior lit by bounce light (the abbey, sun through a doorway, a lamp around a corner), and at 1 spp Ray Reconstruction throws away its rare bright samples as fireflies, the same failure ReSTIR DI fixed for lamps. Reusing the secondary hit and its radiance across pixels and frames gives each pixel many effective indirect samples for one ray plus reuse passes.</p>
 
