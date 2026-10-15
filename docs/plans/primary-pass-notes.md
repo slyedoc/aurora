@@ -89,3 +89,8 @@ Plan: `primary-pass.html`. Notes kept while implementing; newest last.
 Next levers (phase 4 candidates): the primary pass's L2 traffic (64 B record -> 32 B; keep the
 fog veil in registers and write it once instead of three read-modify-writes), its own pipeline
 (occupancy), D6b shared shadow ray (judge in the abbey).
+
+- 2026-10-15: D6b judged by the user (abbey, the emissive example and others): no visible
+  difference on or off. `restir_shared_ray` now defaults to true.
+  A/B on vs off (Northshire 3840x1080, noon): busy 6.127 vs 6.337 ms (-3.3 %, +-0.9),
+  trace 1.721 vs 2.026 ms (-15.0 %, +-0.8).

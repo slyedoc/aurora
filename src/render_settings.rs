@@ -138,7 +138,7 @@ impl Default for RenderSettings {
             restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
-            restir_shared_ray: false,
+            restir_shared_ray: true,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
