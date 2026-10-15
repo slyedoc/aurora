@@ -2,9 +2,10 @@
 // quad.slang would otherwise gather at every output pixel, once at a coarser grid.
 //
 //   bloom_prep  bloom at the pyramid's level 1: levels 1-6, each a 9-tap tent a texel apart,
-//               weighted 0.6x per level (quad.slang `bloomRead` upsamples it bilinearly).
+//               weighted 0.6x per level, into an RGBA16F texture (quad.slang filters it).
 //   key_prep    local tone mapping's surroundings at the pyramid's level 0: the three scales'
-//               smoothed log luminance (quad.slang `localGain` blends them per pixel).
+//               smoothed log luminance into an RGBA16F texture's rgb (quad.slang `localGain`
+//               blends them per pixel).
 //   range_prep  at render resolution: the 3x3 texel range (min, max) of the fog veil and of the
 //               sky mask, which clamp the composite's histories.
 
@@ -17,18 +18,16 @@ struct AeData {
 };
 
 struct PrepPush {
-    uint2* bloom;
     uint bloom_width;
     uint bloom_height;
     uint base;
     uint inputs;
-    uint2* keys;
     uint key_width;
     uint key_height;
-    uint4* fog_range;
-    uint* sky_range;
     uint range_width;
     uint range_height;
+    uint4* fog_range;
+    uint* sky_range;
     AeData* ae;
     // As QuadPush::display_exposure: 0 = the metered exposure.
     float display_exposure;
@@ -38,10 +37,8 @@ struct PrepPush {
 
 // 0: the output's mip pyramid; 1 the camera ray's fog; 2 the depth guide.
 [[vk::binding(0, 0)]] Sampler2D prep_in[3];
-
-uint2 packHalf4(float3 c) {
-    return uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b));
-}
+// 0: local tone mapping's keys; 1: bloom (GENERAL; the composite samples them).
+[[vk::binding(1, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> prep_out[2];
 
 // Bloom: the lens scattering a share of every pixel's light over its surroundings. Each level a
 // 9-tap tent a texel apart so the box-filtered levels upsample round and smooth, weighted 0.6x
@@ -76,7 +73,7 @@ void bloom_prep(uint3 gid: SV_DispatchThreadID) {
         sum += min(s / 16.0, float3(65504.0)) * wl;
         n += wl;
     }
-    push.bloom[i] = packHalf4(n > 0.0 ? sum / n : float3(0.0));
+    prep_out[1][uint2(i % w, i / w)] = float4(n > 0.0 ? sum / n : float3(0.0), 1.0);
 }
 
 uint packHalf2(float a, float b) {
@@ -122,7 +119,7 @@ void key_prep(uint3 gid: SV_DispatchThreadID) {
         let level = l == 0 ? 0.0 : max(coarse - float(2 - l) * 1.5, 0.0);
         k[l] = pyramidKey(uv, level, scale, pyramid);
     }
-    push.keys[i] = uint2(packHalf2(k.x, k.y), packHalf2(k.z, 0.0));
+    prep_out[0][uint2(i % w, i / w)] = float4(k, 0.0);
 }
 
 // quad.slang `skyAt`: the sky exemption (depth guide, faded in from 300 m to 3 km).

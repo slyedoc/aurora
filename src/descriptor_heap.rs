@@ -27,11 +27,14 @@ pub const GUIDES: u32 = 8;
 /// Storage volumes per view (src/fog_grid.rs: the column sums, the soft grid), written by
 /// heap-mode compute kernels.
 pub const VOLUMES: u32 = 2;
-/// Post-process inputs per target (quad.slang's `test[10]`).
-pub const POST_INPUTS: u32 = 10;
-/// The composite's prepass inputs per view (post_prep.slang's `prep_in`): the output's pyramid,
-/// the fog guide, the depth guide.
-pub const PREP_INPUTS: u32 = 3;
+/// Post-process inputs per target (quad.slang's `test[12]`).
+pub const POST_INPUTS: u32 = 12;
+/// The composite's prepass slots per view: its sampled inputs (post_prep.slang's `prep_in`: the
+/// output's pyramid, the fog guide, the depth guide), then its storage outputs (`prep_out`:
+/// local tone mapping's keys, bloom).
+pub const PREP_INPUTS: u32 = 5;
+/// The first storage slot in a prepass block.
+pub const PREP_OUTPUTS_AT: u32 = 3;
 
 /// What a heap-using pipeline reads: [`DescriptorHeaps::mappings`] turns these into the
 /// create-time mapping of the shader's `(set, binding)` declarations.
@@ -40,9 +43,15 @@ pub enum Mapping {
     /// The storage volumes (VOLUMES per view and frame parity) at `(set, binding)`, as one
     /// array indexed from [`DescriptorHeaps::volume_base`].
     Volumes { set: u32, binding: u32 },
-    /// The composite prepass's inputs (PREP_INPUTS combined image samplers) at `(set, binding)`,
-    /// at the block whose index is the u32 at `push_offset` ([`DescriptorHeaps::prep_block`]).
+    /// The composite prepass's sampled inputs (combined image samplers) at `(set, binding)`, at
+    /// the block whose index is the u32 at `push_offset` ([`DescriptorHeaps::prep_block`]).
     Prep {
+        set: u32,
+        binding: u32,
+        push_offset: u32,
+    },
+    /// The same block's storage outputs (from [`PREP_OUTPUTS_AT`]) at `(set, binding)`.
+    PrepOutputs {
         set: u32,
         binding: u32,
         push_offset: u32,
@@ -462,6 +471,16 @@ impl DescriptorHeaps {
         );
     }
 
+    /// Writes prepass output `i` of `block` (a storage image, GENERAL).
+    pub fn write_prep_output(&self, block: u32, i: u32, view: vk::ImageView) {
+        self.write_image(
+            self.prep + (block * PREP_INPUTS + PREP_OUTPUTS_AT + i) * self.stride,
+            view,
+            vk::ImageLayout::GENERAL,
+            vk::DescriptorType::STORAGE_IMAGE,
+        );
+    }
+
     /// The gizmo depth slot for `(parity, view slot)`.
     pub fn gizmo_slot(parity: usize, slot: usize) -> u32 {
         (parity * crate::MAX_VIEWS + slot) as u32
@@ -529,6 +548,23 @@ impl DescriptorHeaps {
                             .sampler_push_offset(push_offset)
                             .sampler_heap_index_stride(0)
                             .sampler_heap_array_stride(0),
+                    }),
+                Mapping::PrepOutputs {
+                    set,
+                    binding,
+                    push_offset,
+                } => vk::DescriptorSetAndBindingMappingEXT::default()
+                    .descriptor_set(set)
+                    .first_binding(binding)
+                    .binding_count(1)
+                    .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
+                    .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_PUSH_INDEX)
+                    .source_data(vk::DescriptorMappingSourceDataEXT {
+                        push_index: vk::DescriptorMappingSourcePushIndexEXT::default()
+                            .heap_offset(self.prep + PREP_OUTPUTS_AT * self.stride)
+                            .push_offset(push_offset)
+                            .heap_index_stride(PREP_INPUTS * self.stride)
+                            .heap_array_stride(self.stride),
                     }),
                 Mapping::Bindless { set, binding } => {
                     vk::DescriptorSetAndBindingMappingEXT::default()

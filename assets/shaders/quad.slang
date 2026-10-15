@@ -52,26 +52,23 @@ struct QuadPush {
     float4* fog_cur;
     uint history_reset;
     uint pad_history;
-    // `PrepFrame` in post_prep.rs, filled by post_prep.slang (null = none). Bloom, half4 per
-    // texel at the pyramid's level 1; local tone mapping's three keys (half) at its level 0; the
-    // fog veil's 3x3 range (half4 min, max) and the sky mask's (half min, max) per render pixel.
-    uint2* bloom_buf;
-    uint bloom_width;
-    uint bloom_height;
-    uint2* keys;
-    uint key_width;
-    uint key_height;
+    // `PrepFrame` in post_prep.rs, filled by post_prep.slang (null = none): the fog veil's 3x3
+    // range (half4 min, max) and the sky mask's (half min, max) per render pixel; `prep_textures`
+    // = 1 when slots 10 and 11 hold the keys and bloom textures.
     uint4* fog_range;
     uint* sky_range;
     uint range_width;
     uint range_height;
+    uint prep_textures;
+    uint pad_prep;
 };
 [[vk::push_constant]] ConstantBuffer<QuadPush> push;
 
 // 0: the DLSS output; 1..=7 the guide images (colour, normals+roughness, diffuse, specular,
 // depth, specular hit distance, motion) for the debug views; 8 the camera ray's fog; 9 the
-// output's mip pyramid (local tone mapping). Slots the renderer cannot fill yet alias the output.
-[[vk::binding(0, 0)]] Sampler2D test[10];
+// output's mip pyramid (local tone mapping); 10 local tone mapping's keys and 11 bloom
+// (post_prep.slang). Slots the renderer cannot fill yet alias the output.
+[[vk::binding(0, 0)]] Sampler2D test[12];
 
 // What is the same for every pixel, worked out by the three vertices instead of each pixel (the
 // pass is texture-throughput bound): the pyramid's size and level count, the fog image's and
@@ -225,22 +222,9 @@ uint rangeIndex(float2 uv) {
     return p.y * size.x + p.x;
 }
 
-// Local tone mapping's three keys (post_prep.slang `key_prep`), read bilinearly.
-float3 keysTexel(int2 p) {
-    let q = push.keys[uint(p.y) * push.key_width + uint(p.x)];
-    return float3(unpackHalf2(q.x), unpackHalf2(q.y).x);
-}
-
+// Local tone mapping's three keys (post_prep.slang `key_prep`), filtered.
 float3 keysRead(float2 uv) {
-    let size = int2(int(push.key_width), int(push.key_height));
-    let x = uv * float2(size) - 0.5;
-    let p = int2(floor(x));
-    let f = x - float2(p);
-    let a = clamp(p, int2(0), size - 1);
-    let b = clamp(p + 1, int2(0), size - 1);
-    let top = lerp(keysTexel(a), keysTexel(int2(b.x, a.y)), f.x);
-    let bottom = lerp(keysTexel(int2(a.x, b.y)), keysTexel(b), f.x);
-    return lerp(top, bottom, f.y);
+    return test[10].SampleLevel(uv, 0.0).rgb;
 }
 
 // The sky exemption at `uv` (depth guide, faded in from 300 m to 3 km).
@@ -345,22 +329,9 @@ void meterResolved(float2 uv, float3 src, float through, float3 veil, float inpu
     push.lum[i + 1u] = surface + fog;
 }
 
-// Bloom (post_prep.slang `bloom_prep`), upsampled bilinearly from the pyramid's level 1.
-float3 bloomTexel(int2 p) {
-    let q = push.bloom_buf[uint(p.y) * push.bloom_width + uint(p.x)];
-    return float3(f16tof32(q.x & 0xFFFFu), f16tof32(q.x >> 16), f16tof32(q.y & 0xFFFFu));
-}
-
+// Bloom (post_prep.slang `bloom_prep`), filtered up from the pyramid's level 1.
 float3 bloomRead(float2 uv) {
-    let size = int2(int(push.bloom_width), int(push.bloom_height));
-    let x = uv * float2(size) - 0.5;
-    let p = int2(floor(x));
-    let f = x - float2(p);
-    let a = clamp(p, int2(0), size - 1);
-    let b = clamp(p + 1, int2(0), size - 1);
-    let top = lerp(bloomTexel(a), bloomTexel(int2(b.x, a.y)), f.x);
-    let bottom = lerp(bloomTexel(int2(a.x, b.y)), bloomTexel(b), f.x);
-    return lerp(top, bottom, f.y);
+    return test[11].SampleLevel(uv, 0.0).rgb;
 }
 
 float3 acesFilm(float3 x) {
@@ -471,11 +442,11 @@ float4 fragment(VertexOut v) : SV_Target0 {
         meterResolved(uv, src, through, veil, input);
     }
     var surface = src * through;
-    if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u && push.keys != nullptr) {
+    if (push.local_tonemap > 0.0 && view == 0u && push.fog != 0u && push.prep_textures != 0u) {
         surface *= localGain(uv, look / input, push.local_tonemap, frame, slots);
     }
     var exposed = (surface + veil) * (look / input);
-    if (push.bloom > 0.0 && view == 0u && push.fog != 0u && push.bloom_buf != nullptr) {
+    if (push.bloom > 0.0 && view == 0u && push.fog != 0u && push.prep_textures != 0u) {
         exposed = lerp(exposed, bloomRead(uv) * (look / input), push.bloom);
     }
     var color = clamp(acesFilm(exposed), float3(0.0), float3(1.0));

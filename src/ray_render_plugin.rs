@@ -206,6 +206,7 @@ struct ViewFrame {
     history: ([u64; 4], u32),
     /// The composite prepass's outputs (src/post_prep.rs).
     prep: crate::post_prep::PrepFrame,
+    prep_textures: Option<crate::post_prep::PrepTextures>,
 }
 
 /// Where a view's composited image lands.
@@ -786,6 +787,7 @@ fn render_frame(
                 primary_hits: 0,
                 history: ([0; 4], 1),
                 prep: Default::default(),
+                prep_textures: None,
             }
         })
         .collect();
@@ -866,12 +868,14 @@ fn render_frame(
     }
 
     for view in &mut views {
-        view.prep = post_prep.ensure(
+        let (prep, textures) = post_prep.ensure(
             &render_device,
             view.slot,
             view.output_extent,
             view.trace_extent,
         );
+        view.prep = prep;
+        view.prep_textures = Some(textures);
     }
 
     // Ensure the focus_data buffer exists
@@ -1692,13 +1696,17 @@ fn render_frame(
                             delta_secs * 1000.0,
                         );
                         prof.end(&render_device, cmd.get(), scope);
-                        if let Some(guides) = renderer.guide_views(view.slot) {
+                        if let (Some(guides), Some(textures)) =
+                            (renderer.guide_views(view.slot), view.prep_textures.as_ref())
+                        {
                             let scope = prof.begin(&render_device, cmd.get(), "post prep");
                             post_prep.record(
                                 &render_device,
                                 cmd.get(),
                                 &modules,
                                 &view.prep,
+                                textures,
+                                view.output_extent,
                                 DescriptorHeaps::prep_block(parity, view.slot),
                                 &crate::post_prep::PrepInputs {
                                     pyramid: guides.pyramid,
@@ -1787,6 +1795,7 @@ fn render_frame(
                             DescriptorHeaps::post_block(parity, eye),
                             source_view,
                             dlss_outputs[eye].1,
+                            views[eye].prep_textures,
                             &crate::post_process_filter::PostProcessPushConstants {
                                 uniforms: frame.uniform_buffers[eye].address,
                                 auto_exposure: views[eye].ae.1,
@@ -1876,6 +1885,7 @@ fn render_frame(
                         DescriptorHeaps::post_block(parity, view.slot),
                         source_view,
                         dlss_outputs[view.slot].1,
+                        view.prep_textures,
                         &crate::post_process_filter::PostProcessPushConstants {
                             uniforms: frame.uniform_buffers[view.slot].address,
                             auto_exposure: view.ae.1,
@@ -2063,6 +2073,7 @@ fn render_frame(
                             DescriptorHeaps::post_block(parity, target),
                             source_view,
                             dlss_outputs[view.slot].1,
+                        view.prep_textures,
                             &crate::post_process_filter::PostProcessPushConstants {
                                 uniforms: frame.uniform_buffers[view.slot].address,
                                 auto_exposure: view.ae.1,
@@ -2509,18 +2520,26 @@ unsafe fn record_post_draw(
     block: u32,
     source_view: vk::ImageView,
     guides: Option<crate::dlss::GuideViews>,
+    prep: Option<crate::post_prep::PrepTextures>,
     push_constants: &crate::post_process_filter::PostProcessPushConstants,
 ) {
     let Some(format_pipeline) = pipeline.pipelines.get(kind.format()) else {
         return;
     };
-    let constants = crate::post_process_filter::PostProcessPushConstants {
+    let prep = prep.filter(|_| guides.is_some());
+    let mut constants = crate::post_process_filter::PostProcessPushConstants {
         scene_radiance: (kind == TargetKind::SceneRadiance) as u32,
         fog: guides.is_some() as u32,
         ..*push_constants
     };
+    constants.prep.textures = prep.is_some() as u32;
     let heaps = render_device.heaps();
-    let mut inputs = [(source_view, vk::ImageLayout::GENERAL); 10];
+    let mut inputs =
+        [(source_view, vk::ImageLayout::GENERAL); crate::descriptor_heap::POST_INPUTS as usize];
+    if let Some(p) = prep {
+        inputs[10] = (p.keys, vk::ImageLayout::GENERAL);
+        inputs[11] = (p.bloom, vk::ImageLayout::GENERAL);
+    }
     if let Some(g) = guides {
         for (slot, view) in [
             (1, g.color),
