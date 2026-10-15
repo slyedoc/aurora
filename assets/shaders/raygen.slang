@@ -1895,11 +1895,14 @@ void main() {
     // The incident meter: the surface's light over its albedo, the fog's as is (it reflects
     // nothing; it is light in the air).
     let fog_nits = dot(float3(0.2125, 0.7154, 0.0721), fog_out);
-    pc.lum[lum_at] = meter_albedo < 0.0 ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
-    // The pair's second slot: the albedo the meter divides by (< 0 = not metered), for the
-    // post-process pass, which re-meters from Ray Reconstruction's output (quad.slang) and
-    // leaves the raw nits there.
-    pc.lum[lum_at + 1u] = meter_albedo < 0.0 ? -1.0 : max(meter_albedo, 0.04);
+    // Null for a camera's second view (a headset's right eye): one view per camera meters.
+    if (pc.lum != nullptr) {
+        pc.lum[lum_at] = meter_albedo < 0.0 ? -1.0 : (lum_nits - fog_nits) / max(meter_albedo, 0.04) + fog_nits;
+        // The pair's second slot: the albedo the meter divides by (< 0 = not metered), for the
+        // post-process pass, which re-meters from Ray Reconstruction's output (quad.slang) and
+        // leaves the raw nits there.
+        pc.lum[lum_at + 1u] = meter_albedo < 0.0 ? -1.0 : max(meter_albedo, 0.04);
+    }
     // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
     // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
     // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the

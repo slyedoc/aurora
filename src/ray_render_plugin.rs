@@ -193,6 +193,10 @@ struct ViewFrame {
     lens: crate::render_settings::AuroraLens,
     /// This camera's (luminance, exposure state) addresses, set when its metering records.
     ae: (u64, u64),
+    /// The camera's first view, the one that writes and resolves its meter (`ae.0`): a
+    /// headset's two eyes share one, and a second resolve re-read the first one's output as
+    /// albedo -- the meter read ~1 nit and the exposure opened up all the way.
+    meters: bool,
     /// The Cost view's buffer (handle, address); null unless this view shows it.
     cost: (vk::Buffer, u64),
     /// The primary pass's hit records (`Frame::primary_hits`).
@@ -777,6 +781,7 @@ fn render_frame(
                 exposure,
                 lens,
                 ae: (0, 0),
+                meters: true,
                 cost: (vk::Buffer::null(), 0),
                 primary_hits: 0,
                 history: ([0; 4], 1),
@@ -1204,6 +1209,7 @@ fn render_frame(
         for view in &mut views {
             if let Some((_, addresses)) = metered.iter().find(|(c, _)| *c == view.camera) {
                 view.ae = *addresses;
+                view.meters = false;
                 continue;
             }
             view.ae = ae.record(
@@ -1520,7 +1526,7 @@ fn render_frame(
                         reservoirs_prev: restir_addresses.prev,
                         reservoirs_cur: restir_addresses.final_,
                         sharc: sharc_address,
-                        lum_buffer: view.ae.0,
+                        lum_buffer: if view.meters { view.ae.0 } else { 0 },
                         auto_exposure: view.ae.1,
                         atmo: atmo_address,
                         restir_frame: restir_addresses.frame,
@@ -1790,7 +1796,7 @@ fn render_frame(
                                 fog: 0,
                                 local_tonemap,
                                 bloom,
-                                lum: views[eye].ae.0,
+                                lum: if views[eye].meters { views[eye].ae.0 } else { 0 },
                                 lum_width: views[eye].trace_extent.width,
                                 lum_height: views[eye].trace_extent.height,
                                 cost: views[eye].cost.1,
@@ -1879,7 +1885,7 @@ fn render_frame(
                             fog: 0,
                             local_tonemap,
                             bloom,
-                            lum: view.ae.0,
+                            lum: if view.meters { view.ae.0 } else { 0 },
                             lum_width: view.trace_extent.width,
                             lum_height: view.trace_extent.height,
                             cost: view.cost.1,
@@ -2066,7 +2072,7 @@ fn render_frame(
                                 fog: 0,
                                 local_tonemap,
                                 bloom,
-                                lum: view.ae.0,
+                                lum: if view.meters { view.ae.0 } else { 0 },
                                 lum_width: view.trace_extent.width,
                                 lum_height: view.trace_extent.height,
                                 cost: view.cost.1,
