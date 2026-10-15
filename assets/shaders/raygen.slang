@@ -1933,7 +1933,11 @@ void main() {
             let noise = float4(n0, n1, n2, n3);
 
             let brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
-            path &= ~PATH_WANT_SUN;
+            // A mirror bounce still sees the sun disc: its delta lobe is no part of next-event
+            // estimation (evalDisneyBRDF leaves it out), so the disc is how the sun reaches it.
+            if (brdf.a != 0.0) {
+                path &= ~PATH_WANT_SUN;
+            }
             // A failed sample (direction under the surface) carries nothing: the path ends.
             if (brdf.a < 0.0) {
                 break;

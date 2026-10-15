@@ -17,6 +17,9 @@ module surface;
 __exported import hit_payload;
 
 // `RTXMaterial` (104 bytes, scalar).
+// The flat normal map every material without one points at (render_env.rs DEFAULT_NORMAL_TEXTURE_IDX).
+public static const uint DEFAULT_NORMAL_TEXTURE = 1u;
+
 public struct Material {
     public float base_color_r, base_color_g, base_color_b, base_color_a;
     public float emissive_r, emissive_g, emissive_b, emissive_a;
@@ -197,6 +200,16 @@ public float3 objectToWorldDir(float3 v) {
     return mul(ObjectToWorld3x4(), float4(v, 0.0));
 }
 
+// An object-space normal in world space: the inverse transpose (WorldToObject's 3x3,
+// transposed). The plain transform tilts normals under non-uniform scale -- a floor scaled
+// 8.4 x 0.2 x 6.4 turned a 0.3 degree tilt into 9.
+public float3 objectToWorldNormal(float3 n) {
+    let m = WorldToObject3x4();
+    return float3(dot(n, float3(m[0][0], m[1][0], m[2][0])),
+                  dot(n, float3(m[0][1], m[1][1], m[2][1])),
+                  dot(n, float3(m[0][2], m[1][2], m[2][2])));
+}
+
 // The ray cone's width at the hit (raygen -> hit, payload.cone), never zero.
 public float coneWidth(HitPayload payload) {
     return max(payload.cone.x + payload.cone.y * RayTCurrent(), 1.0e-7);
@@ -219,7 +232,7 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
     if (hit.inside) {
         hit.object_normal = -hit.object_normal;
     }
-    hit.surface_normal = normalize(objectToWorldDir(hit.object_normal));
+    hit.surface_normal = normalize(objectToWorldNormal(hit.object_normal));
     // From the BLAS's own positions (position fetch): world-space edges.
     let e1 = objectToWorldDir(HitTriangleVertexPosition(1) - HitTriangleVertexPosition(0));
     let e2 = objectToWorldDir(HitTriangleVertexPosition(2) - HitTriangleVertexPosition(0));
@@ -235,16 +248,26 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
     return hit;
 }
 
-// A tangent-space normal map sample turned into a world normal.
+// A tangent-space normal map sample turned into a world normal: the frame is built in world
+// space (the normal by the inverse transpose, the tangent as a direction, re-orthogonalised).
 public float3 surfaceWorldNormal(SurfaceHit hit, float3 texture_normal) {
-    let bitangent = cross(hit.object_normal, hit.tangent);
-    let object = hit.tangent * texture_normal.x + bitangent * texture_normal.y
-        + hit.object_normal * texture_normal.z;
-    return normalize(objectToWorldDir(object));
+    let n = hit.surface_normal;
+    var t = objectToWorldDir(hit.tangent);
+    t = t - n * dot(t, n);
+    let tl = length(t);
+    if (tl < 1.0e-6) {
+        return n;
+    }
+    t /= tl;
+    return normalize(t * texture_normal.x + cross(n, t) * texture_normal.y + n * texture_normal.z);
 }
 
-// The material's own normal map, or the geometric normal when it has none.
+// The material's own normal map, or the geometric normal when it has none (exactly: the flat
+// default texel, 128/255, decodes 0.4 % off axis).
 public float3 surfaceShadingNormal(SurfaceHit hit) {
+    if (hit.material.normal_texture == DEFAULT_NORMAL_TEXTURE) {
+        return hit.surface_normal;
+    }
     return surfaceWorldNormal(
         hit, normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base)));
 }

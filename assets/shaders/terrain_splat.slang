@@ -278,7 +278,7 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             let reference = abs(n.x) > 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
             let t = normalize(reference - n * dot(reference, n));
             let tn = normalize(a.normal * inv_total);
-            normal = normalize(objectToWorldDir(t * tn.x + cross(t, n) * tn.y + n * tn.z));
+            normal = normalize(objectToWorldNormal(t * tn.x + cross(t, n) * tn.y + n * tn.z));
         }
     }
 

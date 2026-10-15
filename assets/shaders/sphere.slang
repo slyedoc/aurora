@@ -37,7 +37,7 @@ void intersection() {
 [shader("closesthit")]
 void closesthit(inout HitPayload payload, SphereAttributes attribs) {
     let material = pc.materials[InstanceID()];
-    var surface_normal = normalize(objectToWorldDir(normalize(attribs.point)));
+    var surface_normal = normalize(objectToWorldNormal(normalize(attribs.point)));
     let inside = dot(surface_normal, WorldRayDirection()) > 0.0;
     if (inside) {
         surface_normal = -surface_normal;

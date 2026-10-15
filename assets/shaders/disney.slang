@@ -140,83 +140,58 @@ float3 evalDisneySpecular(DisneyMaterial mat, float3 F, float NoH, float NoV, fl
     return spec;
 }
 
-// Below this alpha the lobe is a delta: sampled as a mirror with weight F and pdf 0.
+// Below this alpha the lobe is a delta: sampled as a mirror with weight F and pdf 0, and left out
+// of evalDisneyBRDF / pdfDisneyBRDF (a delta has no density; its light comes from the sampled
+// direction alone, the sun disc included).
 static const float DELTA_ALPHA = 1.0e-3;
 
-// Returns (weight * NoL, lobe-weighted pdf). `a == 0` is a delta (mirror) bounce: apply
-// the weight as is. `a < 0` is a failed sample (the direction is under the surface):
-// the path carries nothing and must end.
+// The probability the base sampler draws its specular lobe: Fresnel at n.v against the diffuse
+// share. A function of the vertex only, so the density of any direction is exact
+// (pdfDisneyBRDF): replay and every MIS weight see the pdf that drew it.
+float specularProbability(DisneyMaterial mat, float NoV) {
+    let f0 = lerp(float3(0.04), mat.albedo, mat.metallic);
+    let s = luma(F_Schlick(f0, saturate(NoV)));
+    let d = 1.0 - mat.metallic;
+    return s / max(s + d, 1.0e-6);
+}
+
+// Returns (f * NoL, pdf): f the whole base BRDF and pdf the mixture's density at the drawn
+// direction (one-sample MIS over the two lobes). `a == 0` is a delta (mirror) bounce: apply the
+// weight as is. `a < 0` is a failed sample (the direction is under the surface): the path
+// carries nothing and must end.
 static const float4 BRDF_SAMPLE_FAILED = float4(0.0, 0.0, 0.0, -1.0);
 
 public float4 sampleDisneyBRDF(float4 noise, float3 v, float3 n, DisneyMaterial mat, inout float3 l) {
-    let roughness = pow(mat.roughness, 2.);
-
-    // sample microfacet normal
-    float3 t, b;
-    basis(n, t, b);
-    let V = toLocal(t, b, n, v);
-    var h = SampleGGXVNDF(V, roughness, roughness, noise.z, noise.w);
-    if (h.z < 0.0) {
-        h = -h;
+    let alpha = mat.roughness * mat.roughness;
+    let NoV = dot(n, v);
+    if (NoV <= 0.0) {
+        return BRDF_SAMPLE_FAILED;
     }
-    h = toWorld(t, b, n, h);
-
-    // fresnel
-    let f0 = lerp(float3(0.04), mat.albedo, mat.metallic);
-    let F = F_Schlick(f0, dot(v, h));
-
-    // lobe weight probability
-    var diffW = (1. - mat.metallic);
-    var specW = luma(F);
-    let invW = 1. / (diffW + specW);
-    diffW *= invW;
-    specW *= invW;
-
-    var brdf = float4(0.);
-    let rnd = randf();
-    if (rnd < diffW) { // diffuse
-        l = cosineSampleHemisphere(n, noise.x, noise.y);
-        h = normalize(l + v);
-
-        let NoL = dot(n, l);
-        let NoV = dot(n, v);
-        if (NoL <= 0. || NoV <= 0.) {
-            return BRDF_SAMPLE_FAILED;
-        }
-        let LoH = dot(l, h);
-        let pdf = NoL / PI;
-
-        let diff = evalDisneyDiffuse(mat, NoL, NoV, LoH, roughness) * (1. - F);
-        brdf.rgb = diff * NoL;
-        brdf.a = diffW * pdf;
-    } else { // specular
-        l = reflect(-v, h);
-
-        let NoL = dot(n, l);
-        let NoV = dot(n, v);
-        if (NoL <= 0. || NoV <= 0.) {
-            return BRDF_SAMPLE_FAILED;
-        }
-        if (roughness < DELTA_ALPHA) {
+    let p_spec = specularProbability(mat, NoV);
+    if (randf() < p_spec) {
+        if (alpha < DELTA_ALPHA) {
             // Mirror: h == n, so F is the weight and there is no pdf to divide by.
-            brdf.rgb = F / specW;
-            brdf.a = 0.0;
-            return brdf;
+            l = reflect(-v, n);
+            let f0 = lerp(float3(0.04), mat.albedo, mat.metallic);
+            return float4(F_Schlick(f0, NoV) / p_spec, 0.0);
         }
-        let NoH = min(dot(n, h), .99);
-        let pdf = GGXVNDFPdf(NoH, NoV, roughness);
-
-        let spec = evalDisneySpecular(mat, F, NoH, NoV, NoL);
-        brdf.rgb = spec * NoL;
-        brdf.a = specW * pdf;
+        float3 t, b;
+        basis(n, t, b);
+        let h = toWorld(t, b, n, SampleGGXVNDF(toLocal(t, b, n, v), alpha, alpha, noise.z, noise.w));
+        l = reflect(-v, h);
+    } else {
+        l = cosineSampleHemisphere(n, noise.x, noise.y);
     }
-
-    return brdf;
+    let NoL = dot(n, l);
+    if (NoL <= 0.0) {
+        return BRDF_SAMPLE_FAILED;
+    }
+    return float4(evalDisneyBRDF(v, n, l, mat) * NoL, pdfDisneyBRDF(v, n, l, mat));
 }
 
-// The BRDF that sampleDisneyBRDF implicitly integrates, evaluated for a given light direction
-// (no cosine): Disney diffuse scaled by (1 - F) and (1 - metallic), plus the GGX specular lobe.
-// Next-event estimation (the sun) uses this so its estimate matches BRDF sampling.
+// The BRDF sampleDisneyBRDF integrates, for a given light direction (no cosine): Disney diffuse
+// scaled by (1 - F) and (1 - metallic), plus the GGX specular lobe (none for a delta).
+// Next-event estimation uses this, so its estimate and BRDF sampling's agree.
 public float3 evalDisneyBRDF(float3 v, float3 n, float3 l, DisneyMaterial mat) {
     let NoL = dot(n, l);
     let NoV = dot(n, v);
@@ -224,35 +199,34 @@ public float3 evalDisneyBRDF(float3 v, float3 n, float3 l, DisneyMaterial mat) {
         return float3(0.0);
     }
     let h = normalize(l + v);
-    let NoH = min(dot(n, h), 0.99);
+    let NoH = saturate(dot(n, h));
     let LoH = dot(l, h);
-    let roughness = pow(mat.roughness, 2.);
+    let alpha = mat.roughness * mat.roughness;
     let f0 = lerp(float3(0.04), mat.albedo, mat.metallic);
-    let F = F_Schlick(f0, dot(v, h));
-    let diff = evalDisneyDiffuse(mat, NoL, NoV, LoH, roughness) * (1. - F) * (1. - mat.metallic);
-    let spec = evalDisneySpecular(mat, F, NoH, NoV, NoL);
-    return diff + spec;
+    let F = F_Schlick(f0, saturate(dot(v, h)));
+    let diff = evalDisneyDiffuse(mat, NoL, NoV, LoH, alpha) * (1. - F) * (1. - mat.metallic);
+    if (alpha < DELTA_ALPHA) {
+        return diff;
+    }
+    return diff + evalDisneySpecular(mat, F, NoH, NoV, NoL);
 }
 
-// The solid-angle pdf sampleDisneyBRDF draws directions from (lobe-weighted cosine +
-// GGX VNDF), for MIS against light sampling.
+// The solid-angle density sampleDisneyBRDF draws `l` with: the lobe probabilities times the
+// cosine and GGX VNDF densities (a delta lobe has none).
 public float pdfDisneyBRDF(float3 v, float3 n, float3 l, DisneyMaterial mat) {
     let NoL = dot(n, l);
     let NoV = dot(n, v);
     if (NoL <= 0.0 || NoV <= 0.0) {
         return 0.0;
     }
-    let h = normalize(l + v);
-    let NoH = min(dot(n, h), 0.99);
-    let roughness = pow(mat.roughness, 2.);
-    let f0 = lerp(float3(0.04), mat.albedo, mat.metallic);
-    let F = F_Schlick(f0, dot(v, h));
-    var diffW = 1. - mat.metallic;
-    var specW = luma(F);
-    let invW = 1. / (diffW + specW);
-    diffW *= invW;
-    specW *= invW;
-    return diffW * (NoL / PI) + specW * GGXVNDFPdf(NoH, NoV, roughness);
+    let alpha = mat.roughness * mat.roughness;
+    let p_spec = specularProbability(mat, NoV);
+    var pdf = (1.0 - p_spec) * NoL / PI;
+    if (alpha >= DELTA_ALPHA) {
+        let NoH = saturate(dot(n, normalize(l + v)));
+        pdf += p_spec * GGXVNDFPdf(NoH, NoV, alpha);
+    }
+    return pdf;
 }
 
 // Uniform direction inside the cone of half-angle acos(cos_r) around `dir`; pdf = 1 / solid angle.
