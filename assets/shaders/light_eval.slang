@@ -37,9 +37,19 @@ public float lightsEntryPick(LightCtx ctx, uint e) {
     return (ctx.lights.cdf[e] - below) / ctx.lights.total_power;
 }
 
-// Entry from the power CDF at cumulative value x, and its pick probability.
+// Entry from the power CDF at cumulative value x, and its pick probability. The guide table
+// narrows the search to x's bin: the answer lies between its first entry and the next bin's,
+// widened by one each way for x rounding into a neighbouring bin at a boundary.
 public uint lightsPickEntry(LightCtx ctx, float x, out float p_pick) {
-    uint lo = 0u, hi = ctx.lights.entry_count - 1u;
+    let last = ctx.lights.entry_count - 1u;
+    uint lo = 0u, hi = last;
+    let bins = ctx.lights.guide_bins;
+    if (bins > 0u) {
+        let j = min(uint(x / ctx.lights.total_power * float(bins)), bins - 1u);
+        lo = ctx.lights.guide[j];
+        lo = lo > 0u ? lo - 1u : 0u;
+        hi = min(max(ctx.lights.guide[j + 1u], lo) + 1u, last);
+    }
     while (lo < hi) {
         let mid = (lo + hi) / 2u;
         if (ctx.lights.cdf[mid] < x) {

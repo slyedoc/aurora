@@ -37,13 +37,14 @@ struct LightsHeader {
     float total_power;
     uint slot_map_count;
     uint analytic_count;
-    uint pad1;
+    uint guide_bins;
     uint64_t cdf;
     uint64_t linsts;
     uint64_t slot_to_linst;
     uint64_t analytics;
     uint64_t entry_to_linst;
     uint64_t prepared;
+    uint64_t guide;
 };
 
 // Must match AnalyticLightGpu in lights.rs. 80 bytes; the
@@ -177,8 +178,9 @@ void light_prepare(uint3 gid: SV_DispatchThreadID) {
 struct LightScanParams {
     float* powers;
     LightsHeader* header;
+    uint* guide;
     uint entry_count;
-    uint pad;
+    uint guide_bins;
 };
 [[vk::push_constant]] LightScanParams scan_params;
 
@@ -197,4 +199,15 @@ void light_scan(uint3 gid: SV_DispatchThreadID) {
         p.powers[i] = sum;
     }
     p.header[0].total_power = sum;
+    // The guide table (light_eval.slang `lightsPickEntry`): bin j's first entry whose
+    // cumulative power reaches j / bins of the total; the last bin ends at the last entry.
+    uint i = 0;
+    for (uint j = 0; j < p.guide_bins; j++) {
+        let target = sum * (float(j) / float(p.guide_bins));
+        while (i + 1 < p.entry_count && p.powers[i] < target) {
+            i++;
+        }
+        p.guide[j] = i;
+    }
+    p.guide[p.guide_bins] = p.entry_count - 1;
 }

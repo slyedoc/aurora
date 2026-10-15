@@ -430,7 +430,8 @@ public struct LightsHeader {
     public uint slot_map_count;
     // Entries [0, analytic_count) are analytic lights; the rest are emissive triangles.
     public uint analytic_count;
-    public uint pad1;
+    // Bins in `guide` (light_eval.slang `lightsPickEntry`).
+    public uint guide_bins;
     public float* cdf;
     public LightInstance* linsts;
     public uint* slot_to_linst;
@@ -440,6 +441,9 @@ public struct LightsHeader {
     // Per triangle entry, resolved each frame (lights.slang `light_prepare`): world vertex 0
     // and world mask, edge 1 and pick probability, edge 2, emission; four float4 each.
     public float4* prepared;
+    // The CDF's guide table, guide_bins + 1 entries (lights.slang `light_scan`): bin j's first
+    // entry whose cumulative power reaches j / guide_bins of the total.
+    public uint* guide;
 };
 
 // Exposure state from the metering (auto_exposure.slang). The raygen applies

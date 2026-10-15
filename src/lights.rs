@@ -63,7 +63,7 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in lights.slang and rt_types.slang. 72 bytes.
+/// Must match `LightsHeader` in lights.slang and rt_types.slang. 80 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -74,7 +74,8 @@ struct LightsHeaderGpu {
     slot_map_count: u32,
     /// Entries `[0, analytic_count)` are analytic lights; the rest triangles.
     analytic_count: u32,
-    pad1: u32,
+    /// Bins in `guide` (0 = none: the pick searches the whole CDF).
+    guide_bins: u32,
     cdf: u64,
     linsts: u64,
     slot_to_linst: u64,
@@ -83,6 +84,15 @@ struct LightsHeaderGpu {
     entry_to_linst: u64,
     /// Per triangle entry, resolved each frame by `light_prepare`: four float4.
     prepared: u64,
+    /// The CDF's guide table, `guide_bins + 1` entries written by `light_scan`: bin `j`'s first
+    /// entry whose cumulative power reaches `j / guide_bins` of the total, so a pick searches
+    /// one bin's entries, not the whole CDF.
+    guide: u64,
+}
+
+/// The guide table's bins for `entries` light-table entries.
+fn guide_bins(entries: u32) -> u32 {
+    entries.clamp(1, 1 << 16)
 }
 
 /// `slot_map` values with this bit are a sphere emitter's analytic entry rather than a light
@@ -144,8 +154,9 @@ struct LightPrepareParams {
 struct LightScanParams {
     powers: u64,
     header: u64,
+    guide: u64,
     entry_count: u32,
-    pad: u32,
+    guide_bins: u32,
 }
 
 /// An emissive instance: its mesh and its [`AuroraMaterial`] (one emission for every
@@ -169,6 +180,7 @@ pub struct LightManager {
     linsts: Buffer<LightInstGpu>,
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
+    guide: Buffer<u32>,
     entry_to_linst: Buffer<u32>,
     /// Per triangle entry, its world triangle, emission, mask and pick probability, resolved
     /// every frame (`light_prepare`): what a light sample reads.
@@ -208,6 +220,7 @@ impl LightManager {
             linsts: Buffer::default(),
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
+            guide: Buffer::default(),
             entry_to_linst: Buffer::default(),
             prepared: Buffer::default(),
             emissions: Buffer::default(),
@@ -236,6 +249,7 @@ impl LightManager {
             self.linsts.handle,
             self.slot_map.handle,
             self.cdf.handle,
+            self.guide.handle,
             self.entry_to_linst.handle,
             self.prepared.handle,
             self.emissions.handle,
@@ -247,6 +261,7 @@ impl LightManager {
         self.linsts = Buffer::default();
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
+        self.guide = Buffer::default();
         self.entry_to_linst = Buffer::default();
         self.prepared = Buffer::default();
         self.emissions = Buffer::default();
@@ -371,8 +386,9 @@ impl LightManager {
         let scan = LightScanParams {
             powers: self.cdf.address,
             header: self.header.address,
+            guide: self.guide.address,
             entry_count: self.entry_count,
-            pad: 0,
+            guide_bins: guide_bins(self.entry_count),
         };
         record_dispatch(rd, cmd, module, "light_scan", &scan, 1, None);
         memory_barrier(
@@ -630,6 +646,7 @@ fn prepare_lights(
     lights.linsts = render_device.create_device_buffer(linsts.len().max(1) as u64, storage);
     lights.slot_map = render_device.create_device_buffer(slot_map.len() as u64, storage);
     lights.cdf = render_device.create_device_buffer(entry_base as u64, storage);
+    lights.guide = render_device.create_device_buffer(guide_bins(entry_base) as u64 + 1, storage);
     let mut entry_to_linst = vec![0u32; entry_base as usize];
     for (i, li) in linsts.iter().enumerate() {
         let first = li.entry_base as usize;
@@ -652,13 +669,14 @@ fn prepare_lights(
         total_power: 0.0,
         slot_map_count: slot_map.len() as u32,
         analytic_count,
-        pad1: 0,
+        guide_bins: guide_bins(entry_base),
         cdf: lights.cdf.address,
         linsts: lights.linsts.address,
         slot_to_linst: lights.slot_map.address,
         analytics: lights.analytics.address,
         entry_to_linst: lights.entry_to_linst.address,
         prepared: lights.prepared.address,
+        guide: lights.guide.address,
     };
     render_device.run_transfer_commands_after_frames(|cmd| {
         if !linsts.is_empty() {
