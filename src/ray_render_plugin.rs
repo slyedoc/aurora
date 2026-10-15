@@ -73,8 +73,10 @@ pub struct UniformData {
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
-    /// Free (the radiance cache went: ReSTIR GI does its job).
-    pad_cache: [u32; 2],
+    /// Radiance cache: 0 = off (also while accumulating).
+    sharc: u32,
+    /// Base cache voxel size (meters) at the camera.
+    sharc_voxel: f32,
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -87,8 +89,9 @@ pub struct UniformData {
     primary_hidden: u32,
     /// The mask bits that are environments; a portal ray takes the exit's from these.
     environment_bits: u32,
-    /// Free (roulette_from).
-    pad_roulette: u32,
+    /// 1: the reference accumulation is written back into the colour Ray Reconstruction reads
+    /// (`ReferenceState::feed`, src/reference.rs).
+    reference_feed: u32,
     /// Every environment's sky, suns and fog (sky.rs `EnvironmentGpu`, 8 entries by bit): a
     /// ray reads the entry of the environment it is in.
     environments: u64,
@@ -205,6 +208,8 @@ struct ViewFrame {
     /// The composite prepass's outputs (src/post_prep.rs).
     prep: crate::post_prep::PrepFrame,
     prep_textures: Option<crate::post_prep::PrepTextures>,
+    /// The reference accumulation this frame (src/reference.rs; off unless shown or captured).
+    reference: crate::reference::ReferenceFrame,
 }
 
 /// Where a view's composited image lands.
@@ -494,6 +499,7 @@ fn render_frame(
         Res<crate::fog_volume::FogVolumeTable>,
         ResMut<crate::fog_grid::FogGridState>,
         ResMut<crate::compute::FrameCommands>,
+        ResMut<crate::sharc::SharcState>,
     ),
     camera: Query<
         (
@@ -526,6 +532,7 @@ fn render_frame(
         ResMut<crate::util::video::VideoRecorder>,
         ResMut<crate::post_prep::PostPrepState>,
         ResMut<crate::restir_gi::RestirGiState>,
+        ResMut<crate::reference::ReferenceState>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -563,6 +570,7 @@ fn render_frame(
         fog_volumes,
         mut fog_grid,
         mut frame_commands,
+        mut sharc,
     ) = gpu;
     let (
         mut dlss,
@@ -573,6 +581,7 @@ fn render_frame(
         mut video,
         mut post_prep,
         mut restir_gi,
+        mut reference,
     ) = dlss_stuff;
 
     let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
@@ -787,6 +796,7 @@ fn render_frame(
                 history: ([0; 4], 1),
                 prep: Default::default(),
                 prep_textures: None,
+                reference: crate::reference::ReferenceFrame::default(),
             }
         })
         .collect();
@@ -1036,14 +1046,15 @@ fn render_frame(
             gi_roughness: settings.restir_gi_roughness.clamp(0.0, 1.0),
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
-            pad_cache: [0; 2],
+            sharc: settings.sharc as u32,
+            sharc_voxel: settings.sharc_voxel.max(0.01),
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
             camera_mask: view.camera_mask,
             primary_hidden: view.primary_hidden,
             environment_bits: skies.environment_bits as u32,
-            pad_roulette: 0,
+            reference_feed: reference.feed as u32,
             environments: frame.environments.address,
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
@@ -1150,6 +1161,36 @@ fn render_frame(
         // `GlobalTransform` at the next `First` (gpu_transform.rs).
         let section = info_span!("submit_transforms").entered();
         let world_changed = transforms.submit(&render_device, &modules);
+        // The reference accumulations: on while shown (or captured), reset when the image's
+        // inputs change. The composite reads the buffer through the Cost view's slot.
+        for view in &mut views {
+            use crate::debug_view::AuroraDebugView;
+            let shown = view.debug_view == AuroraDebugView::Reference.shader_index()
+                || view.debug_view == AuroraDebugView::ReferenceDiff.shader_index();
+            let key = if shown || (reference.capture && view.slot == 0) {
+                crate::reference::ReferenceKey {
+                    view_proj: view.view_proj.to_cols_array(),
+                    trace: (view.trace_extent.width, view.trace_extent.height),
+                    settings: format!("{settings:?}"),
+                    skies: format!("{:?}", skies.environments),
+                    light_epoch: lights.epoch,
+                }
+            } else {
+                crate::reference::ReferenceKey::default()
+            };
+            view.reference = reference.prepare(
+                &render_device,
+                view.slot,
+                shown,
+                view.trace_extent,
+                view.output_extent,
+                key,
+                world_changed || dlss_reset,
+            );
+            if shown {
+                view.cost = view.reference.accum;
+            }
+        }
         drop(section);
         // With rays to pick, the instance table and TLAS go into their own command buffer,
         // submitted ahead of the rest with the pick at its end (picking.rs).
@@ -1251,6 +1292,7 @@ fn render_frame(
         let light_entries = lights.active_entries;
         let light_epoch = lights.epoch;
         let light_header = lights.header_address();
+        let sharc_address = sharc.address();
         let atmo_address = atmo.address();
         let rtx_pipeline = rtx_pipelines.get(&render_config.rtx_pipeline);
         let sbt_ready = sbt.data().address != 0;
@@ -1323,6 +1365,18 @@ fn render_frame(
             let scope = prof.begin(&render_device, skin_cmd, "skins");
             let skinned = skins.record(&render_device, skin_cmd, &modules, &transforms);
             prof.end(&render_device, skin_cmd, scope);
+            drop(section);
+            let section = info_span!("record_sharc").entered();
+            let sharc_cmd = compute_cmd.unwrap_or(cmd_buffer);
+            let scope = prof.begin(&render_device, sharc_cmd, "sharc");
+            sharc.record(
+                &render_device,
+                sharc_cmd,
+                &modules,
+                *frame_counter,
+                settings.sharc,
+            );
+            prof.end(&render_device, sharc_cmd, scope);
             drop(section);
             if let Some(compute) = compute_cmd {
                 render_device.end_command_buffer(compute).unwrap();
@@ -1510,9 +1564,11 @@ fn render_frame(
                     fog_grid.record_clear(&render_device, cmd.get(), view.slot);
                     // The Cost view's frame total, summed into by the raygen; the GI views'
                     // whole buffer (a frame without GI shows nothing, not a stale one).
-                    if view.cost.1 != 0 {
+                    if view.cost.1 != 0 && view.cost.1 != view.reference.accum.1 {
                         let gi_view = view.debug_view
-                            >= crate::debug_view::AuroraDebugView::Gi.shader_index();
+                            == crate::debug_view::AuroraDebugView::Gi.shader_index()
+                            || view.debug_view
+                                == crate::debug_view::AuroraDebugView::GiReuse.shader_index();
                         render_device.device.cmd_fill_buffer(
                             cmd.get(),
                             view.cost.0,
@@ -1560,12 +1616,16 @@ fn render_frame(
                         gi_candidates: gi_addresses.candidates,
                         gi_final: gi_addresses.final_,
                         gi_debug: if view.debug_view
-                            >= crate::debug_view::AuroraDebugView::Gi.shader_index()
+                            == crate::debug_view::AuroraDebugView::Gi.shader_index()
+                            || view.debug_view
+                                == crate::debug_view::AuroraDebugView::GiReuse.shader_index()
                         {
                             view.cost.1
                         } else {
                             0
                         },
+                        reference: view.reference.accum.1,
+                        sharc: sharc_address,
                     };
 
                     push_trace(push_constants);
@@ -1742,6 +1802,44 @@ fn render_frame(
                             );
                             prof.end(&render_device, cmd.get(), scope);
                         }
+                        // The reference: this frame's colour added to the accumulation.
+                        if view.reference.accum.1 != 0 && view.reference.add {
+                            if view.reference.reset {
+                                render_device.device.cmd_fill_buffer(
+                                    cmd.get(),
+                                    view.reference.accum.0,
+                                    0,
+                                    vk::WHOLE_SIZE,
+                                    0,
+                                );
+                            }
+                            crate::compute::memory_barrier(
+                                &render_device,
+                                cmd.get(),
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                                    | vk::PipelineStageFlags2::ALL_TRANSFER,
+                                vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                            );
+                            push_trace(trace_constants);
+                            render_device
+                                .ext_rtx_pipeline
+                                .cmd_set_ray_tracing_pipeline_stack_size(
+                                    cmd.get(),
+                                    rtx_pipeline.stack_accumulate,
+                                );
+                            render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                cmd.get(),
+                                &sbt.accumulate_region,
+                                &sbt.miss_region,
+                                &sbt.hit_region,
+                                &vk::StridedDeviceAddressRegionKHR::default(),
+                                plan.render.width,
+                                plan.render.height,
+                                1,
+                            );
+                        }
                         // NGX knows nothing of heaps (descriptor_heap.rs `leave`).
                         heaps.leave(&render_device, cmd.get());
                         let scope = prof.begin(&render_device, cmd.get(), "dlss");
@@ -1876,6 +1974,7 @@ fn render_frame(
                                 history: views[eye].history.0,
                                 history_reset: views[eye].history.1,
                                 tonemap: tonemap as u32,
+                                capture: views[eye].reference.output,
                                 prep: views[eye].prep,
                             },
                         );
@@ -1966,6 +2065,7 @@ fn render_frame(
                             history: view.history.0,
                             history_reset: view.history.1,
                             tonemap: tonemap as u32,
+                            capture: view.reference.output,
                             prep: view.prep,
                         },
                     );
@@ -2154,6 +2254,7 @@ fn render_frame(
                                 history: view.history.0,
                                 history_reset: view.history.1,
                                 tonemap: tonemap as u32,
+                                capture: view.reference.output,
                                 prep: view.prep,
                             },
                         );
@@ -2774,7 +2875,7 @@ mod tests {
         assert_eq!(offset_of!(U, view), 144);
         assert_eq!(offset_of!(U, prev_view_proj), 272);
         assert_eq!(offset_of!(U, frame), 344);
-        assert_eq!(offset_of!(U, pad_cache), 392);
+        assert_eq!(offset_of!(U, sharc_voxel), 396);
         assert_eq!(offset_of!(U, portals), 400);
         assert_eq!(offset_of!(U, camera_mask), 416);
         assert_eq!(offset_of!(U, primary_hidden), 420);

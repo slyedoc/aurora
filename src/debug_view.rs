@@ -49,6 +49,13 @@ pub enum AuroraDebugView {
     /// not shareable (glossy secondary hit), cyan = its own candidate won, green = a neighbour's
     /// sample won, red = the winner was occluded (its visibility ray failed).
     GiReuse,
+    /// The reference: the traced image accumulated over frames with Ray Reconstruction out of
+    /// the loop (src/reference.rs), exposed and tonemapped like the output. It starts over
+    /// whenever the camera, settings or scene change.
+    Reference,
+    /// Ray Reconstruction's output against the reference, in stops: blue darker, red brighter,
+    /// white the same (where RR, not the tracer, is wrong).
+    ReferenceDiff,
 }
 
 impl AuroraDebugView {
@@ -66,6 +73,8 @@ impl AuroraDebugView {
         Self::Cost,
         Self::Gi,
         Self::GiReuse,
+        Self::Reference,
+        Self::ReferenceDiff,
     ];
 
     /// The value quad.slang switches on.
@@ -74,7 +83,7 @@ impl AuroraDebugView {
     }
 
     /// `$AURORA_DEBUG_VIEW`
-    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost|gi|gi-reuse`),
+    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost|gi|gi-reuse|reference|reference-diff`),
     /// else the normal render: lets a headless run capture a guide view.
     pub fn from_env() -> Self {
         match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
@@ -90,6 +99,8 @@ impl AuroraDebugView {
             Some("cost") => Self::Cost,
             Some("gi") => Self::Gi,
             Some("gi-reuse") => Self::GiReuse,
+            Some("reference") => Self::Reference,
+            Some("reference-diff") => Self::ReferenceDiff,
             _ => Self::None,
         }
     }

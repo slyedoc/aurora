@@ -96,6 +96,14 @@ pub struct RenderSettings {
     pub light_grid_cell: f32,
     #[reflect(@1.0..=64.0_f32)]
     pub light_grid_samples: u32,
+    /// Radiance cache (SHaRC-style): indirect paths end in converged voxels from the first bounce
+    /// on (a few train it to the end). Its accumulated image matches the uncached one (sun room:
+    /// ratio 0.998) while the 1-spp input Ray Reconstruction gets is far denser (black pixels 95 %
+    /// -> 61 %, RR's local error 12.4 % -> 8.4 %): docs/plans/reference-mode-notes.md.
+    pub sharc: bool,
+    /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
+    #[reflect(@0.05..=2.0_f32)]
+    pub sharc_voxel: f32,
     /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = any-hit alpha test).
     pub omm: bool,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
@@ -146,6 +154,8 @@ impl Default for RenderSettings {
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
+            sharc: true,
+            sharc_voxel: 0.25,
             omm: true,
             rr_preset: RrPreset::current(),
             low_latency: crate::latency::LowLatency::On,

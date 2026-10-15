@@ -1,5 +1,6 @@
 //! Small app-level helpers shared by aurora tools, examples, and games.
 
+pub mod capture;
 pub mod screenshot;
 pub mod timeout;
 pub mod video;

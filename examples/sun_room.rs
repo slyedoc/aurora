@@ -4,6 +4,7 @@
 //! sphere for a glossy primary vertex.
 //!
 //!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--bloom B] [--local-tonemap T]
 //!
 //! The flags change `RenderSettings` at startup (and pin the exposure), for comparing against a
@@ -12,6 +13,7 @@
 use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     prelude::*,
+    winit::WinitPlugin,
 };
 use bevy_aurora::{
     AuroraDefaultPlugins,
@@ -23,7 +25,10 @@ use bevy_aurora::{
     render_settings::RenderSettings,
     sky::Sky,
     sphere::Sphere,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::{
+        ScreenshotExt, TimeoutAppExt,
+        capture::{self, CaptureArgs},
+    },
 };
 
 /// The room's inside: x in [-HALF_X, HALF_X], z in [-HALF_Z, HALF_Z], floor at 0.
@@ -36,8 +41,14 @@ const WINDOW_HALF: f32 = 0.6;
 const WINDOW_Y: (f32, f32) = (1.0, 2.2);
 
 fn main() {
-    App::new()
-        .add_plugins((
+    let mut app = App::new();
+    // `--capture DIR ...`: windowless into a fixed-size image, a reference capture, then exit
+    // (bevy_aurora::util::capture).
+    let capture = CaptureArgs::from_args();
+    if capture.is_some() {
+        app.add_plugins(AuroraDefaultPlugins.build().disable::<WinitPlugin>());
+    } else {
+        app.add_plugins((
             // `--fullscreen`: borderless on the primary monitor, so every run has its size (a
             // tiling compositor gives a window whatever space is left).
             AuroraDefaultPlugins.set(WindowPlugin {
@@ -57,11 +68,17 @@ fn main() {
             DevUIPlugin,
             FreeCameraPlugin,
         ))
-        .add_systems(Startup, (setup, apply_flags))
-        .add_systems(Update, pin_exposure)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
-        .run();
+        .add_timeout_exit(None, 12.0);
+    }
+    app.add_systems(Startup, (setup, apply_flags))
+        .add_systems(Update, pin_exposure);
+    match capture {
+        Some(args) => capture::run(&mut app, &args),
+        None => {
+            app.run();
+        }
+    }
 }
 
 /// `--no-gi`, `--no-restir`, `--samples N`, `--gi-spatial N`.
@@ -71,6 +88,12 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
         match arg.as_str() {
             "--no-gi" => settings.restir_gi = false,
             "--no-restir" => settings.restir = false,
+            "--sharc" => settings.sharc = true,
+            "--ab" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    settings.ab = v;
+                }
+            }
             // No post-processing: the traced image exposed and shown linearly (fog is off
             // anyway: these environments have no `Fog`).
             "--raw" => {

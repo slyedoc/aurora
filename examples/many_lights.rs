@@ -3,6 +3,7 @@
 //! judging ReSTIR DI and GI (no sun or sky to hide the indirect).
 //!
 //!   cargo run --release --example many_lights [-- --no-gi] [--no-restir] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!       [--capture DIR --size WxH --frames N --noisy K]
 //!
 //! The flags change `RenderSettings` at startup, for comparing against a reference (e.g.
 //! `--no-gi --no-restir --samples 4`).
@@ -10,6 +11,7 @@
 use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     prelude::*,
+    winit::WinitPlugin,
 };
 use bevy_aurora::{
     AuroraDefaultPlugins,
@@ -22,7 +24,10 @@ use bevy_aurora::{
     render_settings::RenderSettings,
     sky::Sky,
     sphere::Sphere,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::{
+        ScreenshotExt, TimeoutAppExt,
+        capture::{self, CaptureArgs},
+    },
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -31,8 +36,14 @@ use rand_chacha::ChaCha8Rng;
 const LAMP_NITS: f32 = 60_000.0;
 
 fn main() {
-    App::new()
-        .add_plugins((
+    let mut app = App::new();
+    // `--capture DIR ...`: windowless into a fixed-size image, a reference capture, then exit
+    // (bevy_aurora::util::capture).
+    let capture = CaptureArgs::from_args();
+    if capture.is_some() {
+        app.add_plugins(AuroraDefaultPlugins.build().disable::<WinitPlugin>());
+    } else {
+        app.add_plugins((
             // `--fullscreen`: borderless on the primary monitor, so every run has its size (a
             // tiling compositor gives a window whatever space is left).
             AuroraDefaultPlugins.set(WindowPlugin {
@@ -52,11 +63,17 @@ fn main() {
             DevUIPlugin,
             FreeCameraPlugin,
         ))
-        .add_systems(Startup, (setup, apply_flags))
-        .add_systems(Update, pin_exposure)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
-        .run();
+        .add_timeout_exit(None, 12.0);
+    }
+    app.add_systems(Startup, (setup, apply_flags))
+        .add_systems(Update, pin_exposure);
+    match capture {
+        Some(args) => capture::run(&mut app, &args),
+        None => {
+            app.run();
+        }
+    }
 }
 
 /// `--ev100 E`: a fixed exposure on every camera, so variants compare at one brightness.

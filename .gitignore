@@ -10,3 +10,4 @@
 
 crash-dumps/
 .cargo/local.toml
+__pycache__/

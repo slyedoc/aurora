@@ -53,6 +53,8 @@ struct QuadPush {
     uint history_reset;
     // 0: the exposed image shown linearly, clipped (RenderSettings::tonemap off); else ACES.
     uint tonemap;
+    // reference.rs: when set, RR's output in nits per output pixel (before exposure and tonemap).
+    float4* capture;
     // `PrepFrame` in post_prep.rs, filled by post_prep.slang (null = none): the fog veil's 3x3
     // range (half4 min, max) and the sky mask's (half min, max) per render pixel; `prep_textures`
     // = 1 when slots 10 and 11 hold the keys and bloom textures.
@@ -389,6 +391,29 @@ float4 fragment(VertexOut v) : SV_Target0 {
         let mean = total / float(size.x * size.y);
         return float4(costFalseColor(log2(max(ns, 1.0) / max(mean, 1.0))), 1.0);
     }
+    // Reference: the accumulation (reference.rs), nits per traced pixel, exposed and tonemapped
+    // like the output. Reference diff: RR's output against it, in stops (blue darker, red
+    // brighter). The buffer comes through the Cost view's slot.
+    if (view == 13u || view == 14u) {
+        if (push.cost == nullptr || any(uv < 0.0) || any(uv >= 1.0)) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        let size = uint2(push.lum_width, push.lum_height);
+        let r = min(uint2(uv * float2(size)), size - 1u);
+        let acc = ((float4*)push.cost)[r.y * size.x + r.x];
+        let nits = acc.rgb / max(acc.a, 1.0);
+        let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
+        if (view == 13u) {
+            let exposed = nits * look;
+            return float4(clamp(push.tonemap != 0u ? acesFilm(exposed) : exposed, float3(0.0),
+                                float3(1.0)), 1.0);
+        }
+        let rr = test[0].Sample(uv).rgb / max(push.ae.input_exposure, 1.0e-12);
+        let w = float3(0.2126, 0.7152, 0.0722);
+        let stops = log2(max(dot(rr, w), 1.0e-6) / max(dot(nits, w), 1.0e-6));
+        let t = clamp(stops, -1.0, 1.0);
+        return float4(t > 0.0 ? float3(1.0, 1.0 - t, 1.0 - t) : float3(1.0 + t, 1.0 + t, 1.0), 1.0);
+    }
     // GI: gi_shade's light alone, exposed and tonemapped like the colour view. GI reuse: its
     // state (debug_view.rs `GiReuse`). Both from the Cost view's buffer, two words per pixel.
     if (view == 11u || view == 12u) {
@@ -471,6 +496,11 @@ float4 fragment(VertexOut v) : SV_Target0 {
         }
         veil = f.rgb;
         through = f.a;
+    }
+    if (push.capture != nullptr && view == 0u) {
+        let size = uint2(frame.output);
+        let p = min(uint2(uv * frame.output), size - 1u);
+        push.capture[p.y * size.x + p.x] = float4((src * through + veil) / input, 1.0);
     }
     if (push.scene_radiance != 0u) {
         return float4((src * through + veil) / input, 1.0);

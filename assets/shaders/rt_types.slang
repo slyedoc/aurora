@@ -171,8 +171,10 @@ public struct UniformData {
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
     public float restir_m_clamp;
-    // Free (the radiance cache went: ReSTIR GI does its job).
-    public uint pad_cache[2];
+    // Radiance cache: 0 = off; else paths may terminate into it.
+    public uint sharc;
+    // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
+    public float sharc_voxel;
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -186,7 +188,8 @@ public struct UniformData {
     public uint primary_hidden;
     // The mask bits that are environments; a portal ray takes the exit's from these.
     public uint environment_bits;
-    public uint pad_roulette;
+    // 1: the reference accumulation is written back into the noisy colour (reference.rs `feed`).
+    public uint reference_feed;
     // Every environment's sky, suns and fog, by environment bit.
     public EnvironmentGpu* environments;
     // Fog volumes (src/fog_volume.rs): the table + entry count (0 = none).
@@ -363,6 +366,23 @@ public float3 unpackRgb9e5(uint p) {
     return m * exp2(float(int(p >> 27) - 24));
 }
 
+// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 32 bytes; resolved
+// values are packed f16 pairs.
+public struct SharcEntry {
+    public uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
+    public uint frame;    // Last frame the entry was deposited into or queried.
+    // Radiance accumulated this frame, fixed point at SHARC_UNIT (1/65536 nit): 64-bit so a
+    // moonlit voxel keeps its precision and a sunlit one cannot overflow.
+    public uint64_t acc_r;
+    public uint64_t acc_g;
+    public uint64_t acc_b;
+    public uint acc_n;    // Samples accumulated this frame.
+    public float conf;    // Samples folded into the resolved value.
+    public float res_r;   // Resolved outgoing radiance (nits).
+    public float res_g;
+    public float res_b;
+    public uint pad;
+};
 // ReSTIR GI's candidate (src/restir_gi.rs), written by the path tracer per traced pixel whose
 // primary vertex takes part: the secondary hit, the radiance leaving it toward the primary
 // vertex and the direction's pdf there (0 = a null candidate). 32 bytes. gi_candidates turns
@@ -738,6 +758,11 @@ public struct PushConstants {
     // AuroraDebugView::Gi / GiReuse (null unless shown): two header words, then per traced pixel
     // i gi_shade's light at 2 + 2i (RGB9E5, pre-exposed) and its state (GI_STATE_*) at 3 + 2i.
     public uint* gi_debug;
+    // The reference accumulation (reference.rs; null unless on): per traced pixel the summed
+    // radiance (nits) and the frame count.
+    public float4* reference;
+    // Radiance-cache entries (valid whenever uniforms.sharc != 0).
+    public SharcEntry* sharc;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

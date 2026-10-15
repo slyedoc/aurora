@@ -38,6 +38,9 @@ pub struct PostProcessPushConstants {
     pub history_reset: u32,
     /// 0: show the exposed image linearly, clipped (RenderSettings::tonemap off); else ACES.
     pub tonemap: u32,
+    /// The reference capture's buffer for RR's output (nits, one per output pixel; 0 = none):
+    /// `reference.rs`.
+    pub capture: u64,
     /// The view's prepass outputs (bloom, local tone mapping's keys, the histories' ranges).
     pub prep: crate::post_prep::PrepFrame,
 }
