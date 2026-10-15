@@ -77,6 +77,10 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
+    /// ReSTIR DI's winner shares its vertex's one shadow ray with the sun, sky and light-table
+    /// samples (proposed by brightness) instead of tracing its own: one ray fewer per pixel
+    /// (Northshire trace -15 %), noisier where lamps rather than the sun light a surface.
+    pub restir_shared_ray: bool,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
     /// under test take their old path at 0 and the new one at 1.
     pub ab: u32,
@@ -129,11 +133,12 @@ impl Default for RenderSettings {
             roulette_from: 1,
             one_shadow_ray_from: 0,
             restir: true,
-            restir_candidates: 8,
+            restir_candidates: 4,
             restir_history: 8.0,
             restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
+            restir_shared_ray: false,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,

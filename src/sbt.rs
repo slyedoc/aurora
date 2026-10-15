@@ -63,8 +63,8 @@ pub struct SBT {
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
     /// The fog grid update's raygen record, right after the main one (fog_grid.rs).
     pub fog_grid_region: vk::StridedDeviceAddressRegionKHR,
-    /// ReSTIR DI's shading raygen record, after the fog grid's (restir.rs).
-    pub restir_shade_region: vk::StridedDeviceAddressRegionKHR,
+    /// The primary pass's raygen record, after the fog grid's.
+    pub primary_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
     /// One table per frame parity: the frame being recorded writes its own while the previous
@@ -138,8 +138,8 @@ fn update_sbt(
     sbt.raygen_region.size = sbt.raygen_region.stride;
     sbt.fog_grid_region.stride = sbt.raygen_region.stride;
     sbt.fog_grid_region.size = sbt.raygen_region.stride;
-    sbt.restir_shade_region.stride = sbt.raygen_region.stride;
-    sbt.restir_shade_region.size = sbt.raygen_region.stride;
+    sbt.primary_region.stride = sbt.raygen_region.stride;
+    sbt.primary_region.size = sbt.raygen_region.stride;
 
     sbt.miss_region.stride =
         vk_utils::aligned_size(handle_size_aligned, aligments.shader_group_base_alignment);
@@ -159,7 +159,7 @@ fn update_sbt(
 
     let total_size = sbt.raygen_region.size
         + sbt.fog_grid_region.size
-        + sbt.restir_shade_region.size
+        + sbt.primary_region.size
         + sbt.miss_region.size
         + sbt.hit_region.size;
 
@@ -204,9 +204,9 @@ fn update_sbt(
             });
             dst = dst.add(sbt.fog_grid_region.size as usize);
             (dst as *mut SBTRegionRaygen).write(SBTRegionRaygen {
-                handle: rtx_pipeline.restir_shade_handle,
+                handle: rtx_pipeline.primary_handle,
             });
-            dst = dst.add(sbt.restir_shade_region.size as usize);
+            dst = dst.add(sbt.primary_region.size as usize);
 
             // miss region (also only a hanlde, comes after the raygen region)
             (dst as *mut SBTRegionMiss).write(SBTRegionMiss {
@@ -314,10 +314,10 @@ fn update_sbt(
 
     sbt.raygen_region.device_address = sbt.buffers[current].address;
     sbt.fog_grid_region.device_address = sbt.buffers[current].address + sbt.raygen_region.size;
-    sbt.restir_shade_region.device_address =
+    sbt.primary_region.device_address =
         sbt.fog_grid_region.device_address + sbt.fog_grid_region.size;
     sbt.miss_region.device_address =
-        sbt.restir_shade_region.device_address + sbt.restir_shade_region.size;
+        sbt.primary_region.device_address + sbt.primary_region.size;
     sbt.hit_region.device_address = sbt.miss_region.device_address + sbt.miss_region.size;
 }
 

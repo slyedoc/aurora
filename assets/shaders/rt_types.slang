@@ -227,6 +227,9 @@ public struct UniformData {
     public uint fog_grid_stride;
     // RenderSettings::ab: 0 the old path under test, 1 the new (benches/northshire.rs --ab).
     public uint ab;
+    // RenderSettings::restir_shared_ray: ReSTIR's winner joins the vertex's one shadow ray.
+    public uint restir_shared_ray;
+    public uint pad_shared;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -309,6 +312,39 @@ public struct RestirSurface {
     public uint view_oct;
     public uint pad;
 };
+
+// Where the path tracer resumes sample 0 (docs/plans/primary-pass.html), written by the
+// primary pass per traced pixel. 64 bytes.
+public struct PrimaryHit {
+    // The last camera-chain segment (after pass-through and portals): its start and direction.
+    public float3 origin;
+    // kind (bits 0-1) | bounces the chain used (2-7) | ray mask (8-15) | environment (16-18).
+    public uint state;
+    public float3 direction;
+    // Hit distance along that segment.
+    public float t;
+    // TLAS instance index, geometry and primitive index, barycentrics as 2x unorm16.
+    public uint instance;
+    public uint geometry;
+    public uint primitive;
+    public uint bary;
+    // The ray cone's width at the hit; the exposure meter's divisor (< 0: not metered); the
+    // first hit distance (0 = sky) for the atmosphere composite; the hit's face.
+    public float cone_width;
+    public float meter_albedo;
+    public float primary_t;
+    public uint hit_kind;
+};
+
+// PrimaryHit kinds: the path tracer traces from the camera as before; rebuilds the hit and
+// shades it; adds the radiance in `origin` and ends.
+public static const uint PRIMARY_RETRACE = 0u;
+public static const uint PRIMARY_HIT = 1u;
+public static const uint PRIMARY_ENDED = 2u;
+
+public uint primaryKind(PrimaryHit h) {
+    return h.state & 3u;
+}
 
 public uint packUnorm8(float x) {
     return uint(saturate(x) * 255.0 + 0.5);
@@ -562,6 +598,8 @@ public struct PushConstants {
     // The Cost debug view (null unless shown): words 0-1 the frame's total ns (u64), then
     // each traced pixel's raygen time in ns (VK_KHR_shader_clock).
     public uint* cost;
+    // The primary pass's hit records (null while the old frame runs).
+    public PrimaryHit* primary_hits;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

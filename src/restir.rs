@@ -1,18 +1,18 @@
 //! ReSTIR DI for the light table at the primary vertex, as passes of its own (RTXDI's shape).
 //!
-//! The main raygen writes each pixel's first shaded surface ([`RestirSurface`] in
-//! rt_types.slang) and leaves the light table's direct light there to this module. Then, per
-//! view, in the frame's command buffer:
+//! The primary pass (raygen.slang `primary`) writes each pixel's first shaded surface
+//! ([`RestirSurface`] in rt_types.slang); the path tracer leaves the light table's direct light
+//! there to this module and shades the winner. Per view, in the frame's command buffer:
 //!
-//! 1. `restir_grid` (compute, BEFORE the main trace): a world grid of cells around the camera,
+//! 1. `restir_grid` (compute, before the primary pass): a world grid of cells around the camera,
 //!    each holding K light samples resampled from the power CDF by power / distance² at the
 //!    cell (ReGIR), so a pixel's candidates are mostly lamps that can reach it. The trace's own
 //!    path vertices past the primary draw their light candidates from it too.
 //! 2. `restir_temporal` (compute): N candidates from the pixel's cell, RIS folded to one sample,
 //!    merged with last frame's final reservoir at the reprojected pixel.
 //! 3. `restir_spatial` (compute): merges random neighbours' reservoirs, with a boiling filter.
-//! 4. `restir_shade` (a raygen of the RT pipeline): one shadow ray; visible, the contribution goes
-//!    into the noisy colour; occluded, the weight is zeroed for next frame's reuse.
+//! 4. The path tracer (raygen.slang `main`, `restirWinner`) at its primary vertex: the final
+//!    sample's exact contribution, one shadow ray.
 //!
 //! Buffers live at trace resolution per view (each eye its own) and exist only while ReSTIR is on;
 //! they are zero-filled on (re)creation, which also drops history on a resize.
@@ -333,8 +333,8 @@ impl RestirState {
         true
     }
 
-    /// Records the reuse passes (temporal, spatial) for view `slot`, after the main trace wrote
-    /// its surfaces (the grid is already built); the caller then traces `restir_shade`.
+    /// Records the reuse passes (temporal, spatial) for view `slot`, after the primary pass wrote
+    /// its surfaces (the grid is already built) and before the path tracer shades the winners.
     pub fn record_passes(
         &self,
         rd: &RenderDevice,

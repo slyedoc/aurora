@@ -132,6 +132,9 @@ pub struct UniformData {
     fog_grid_stride: u32,
     /// [`RenderSettings::ab`].
     ab: u32,
+    /// [`RenderSettings::restir_shared_ray`].
+    restir_shared_ray: u32,
+    pad_shared: u32,
 }
 
 #[repr(C)]
@@ -200,6 +203,8 @@ struct ViewFrame {
     ae: (u64, u64),
     /// The Cost view's buffer (handle, address); null unless this view shows it.
     cost: (vk::Buffer, u64),
+    /// The primary pass's hit records (`Frame::primary_hits`).
+    primary_hits: u64,
     /// The composite's histories (`Frame::histories`): last frame's and this frame's sky mask,
     /// last frame's and this frame's fog veil, and whether last frame's are invalid.
     history: ([u64; 4], u32),
@@ -440,6 +445,9 @@ pub struct Frame {
     /// Per view slot, the Cost debug view's buffer: the frame's total ns (two words), then
     /// each traced pixel's. Made the first time a view shows it.
     pub cost_buffers: [Buffer<u32>; crate::MAX_VIEWS],
+    /// Per view slot, the primary pass's hit record per traced pixel (`PrimaryHit` in
+    /// rt_types.slang, 64 bytes): where the path tracer resumes sample 0.
+    pub primary_hits: [Buffer<[u32; 16]>; crate::MAX_VIEWS],
     /// Per view slot, by frame parity, the composite's running averages at output resolution:
     /// local tone mapping's sky mask and the camera ray's fog veil. Each frame reads the other
     /// parity's (reprojected) and writes its own.
@@ -774,6 +782,7 @@ fn render_frame(
                 lens,
                 ae: (0, 0),
                 cost: (vk::Buffer::null(), 0),
+                primary_hits: 0,
                 history: ([0; 4], 1),
             }
         })
@@ -808,6 +817,17 @@ fn render_frame(
             );
         }
         view.cost = (buffer.handle, buffer.address);
+    }
+
+    // The primary pass's hit records, at each view's trace size (docs/plans/primary-pass.html).
+    for view in &mut views {
+        let buffer = &mut frame.primary_hits[view.slot];
+        let len = view.trace_extent.width as u64 * view.trace_extent.height as u64;
+        if buffer.nr_elements != len {
+            render_device.destroyer.destroy_buffer(buffer.handle);
+            *buffer = render_device.create_device_buffer(len, vk::BufferUsageFlags::STORAGE_BUFFER);
+        }
+        view.primary_hits = buffer.address;
     }
 
     // The composite's histories, at each view's output size.
@@ -1028,6 +1048,8 @@ fn render_frame(
             fog_grid_soft: grid.soft,
             fog_grid_stride: grid.stride,
             ab: settings.ab,
+            restir_shared_ray: settings.restir_shared_ray as u32,
+            pad_shared: 0,
         };
 
         uniform_uploads.push((view.slot, data));
@@ -1371,6 +1393,7 @@ fn render_frame(
                         restir_frame: restir_addresses.frame,
                         instance_slots: tlas.instance_slots,
                         cost: view.cost.1,
+                        primary_hits: view.primary_hits,
                     };
 
                     push_trace(push_constants);
@@ -1399,6 +1422,11 @@ fn render_frame(
                         ) {
                             push_trace(push_constants);
                             let stride = grid.stride.max(1);
+                            // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
+                            render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
+                                view_cmd,
+                                rtx_pipeline.stack_fog_grid,
+                            );
                             render_device.ext_rtx_pipeline.cmd_trace_rays(
                                 view_cmd,
                                 &sbt.fog_grid_region,
@@ -1433,46 +1461,31 @@ fn render_frame(
                                 view.slot,
                                 prof,
                             );
+                        // A grid that did not build leaves the vertices on the power CDF.
+                        let trace_constants = RaytracingPushConstants {
+                            restir_frame: if grid_built {
+                                push_constants.restir_frame
+                            } else {
+                                0
+                            },
+                            ..push_constants
+                        };
                         if restir_on {
-                            // The grid's compute dispatches disturbed the push constants; a grid
-                            // that did not build leaves the vertices on the power CDF.
-                            push_trace(RaytracingPushConstants {
-                                restir_frame: if grid_built {
-                                    push_constants.restir_frame
-                                } else {
-                                    0
-                                },
-                                ..push_constants
-                            });
+                            // The grid's compute dispatches disturbed the push constants.
+                            push_trace(trace_constants);
                         }
-                        let scope = prof.begin(&render_device, view_cmd, "trace");
-                        render_device.ext_rtx_pipeline.cmd_trace_rays(
-                            view_cmd,
-                            &sbt.raygen_region,
-                            &sbt.miss_region,
-                            &sbt.hit_region,
-                            &vk::StridedDeviceAddressRegionKHR::default(),
-                            plan.render.width,
-                            plan.render.height,
-                            1,
-                        );
-                        prof.end(&render_device, view_cmd, scope);
-                        // ReSTIR DI: its compute passes over the surfaces the trace just wrote,
-                        // then one shadow ray per pixel into the colour (restir.rs).
-                        if restir_on
-                            && restir.record_passes(
-                                &render_device,
+                        // The primary pass: sample 0's camera chain and its hit record, which the
+                        // trace resumes from (docs/plans/primary-pass.html).
+                        if view.primary_hits != 0 {
+                            let scope = prof.begin(&render_device, view_cmd, "primary");
+                            // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
+                            render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
                                 view_cmd,
-                                &modules,
-                                view.slot,
-                                prof,
-                            )
-                        {
-                            push_trace(push_constants);
-                            let scope = prof.begin(&render_device, view_cmd, "restir shade");
+                                rtx_pipeline.stack_primary,
+                            );
                             render_device.ext_rtx_pipeline.cmd_trace_rays(
                                 view_cmd,
-                                &sbt.restir_shade_region,
+                                &sbt.primary_region,
                                 &sbt.miss_region,
                                 &sbt.hit_region,
                                 &vk::StridedDeviceAddressRegionKHR::default(),
@@ -1486,10 +1499,41 @@ fn render_frame(
                                 view_cmd,
                                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                                 vk::AccessFlags2::SHADER_WRITE,
-                                vk::PipelineStageFlags2::ALL_COMMANDS,
-                                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                                    | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                             );
+                            // ReSTIR DI between the two: its passes over the primary pass's
+                            // surfaces; the trace shades the winners.
+                            if restir_on
+                                && restir.record_passes(
+                                    &render_device,
+                                    view_cmd,
+                                    &modules,
+                                    view.slot,
+                                    prof,
+                                )
+                            {
+                                push_trace(trace_constants);
+                            }
                         }
+                        let scope = prof.begin(&render_device, view_cmd, "trace");
+                        // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
+                        render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
+                            view_cmd,
+                            rtx_pipeline.stack_main,
+                        );
+                        render_device.ext_rtx_pipeline.cmd_trace_rays(
+                            view_cmd,
+                            &sbt.raygen_region,
+                            &sbt.miss_region,
+                            &sbt.hit_region,
+                            &vk::StridedDeviceAddressRegionKHR::default(),
+                            plan.render.width,
+                            plan.render.height,
+                            1,
+                        );
+                        prof.end(&render_device, view_cmd, scope);
                         // NGX knows nothing of heaps (descriptor_heap.rs `leave`).
                         heaps.leave(&render_device, view_cmd);
                         let scope = prof.begin(&render_device, view_cmd, "dlss");
@@ -2290,6 +2334,7 @@ pub fn on_shutdown(world: &mut World) {
 
     for buffer in (frame.uniform_buffers.iter().map(|b| b.handle))
         .chain(frame.cost_buffers.iter().map(|b| b.handle))
+        .chain(frame.primary_hits.iter().map(|b| b.handle))
         .chain(frame.sky_masks.iter().flatten().map(|b| b.handle))
         .chain(frame.fog_veils.iter().flatten().map(|b| b.handle))
     {
@@ -2421,5 +2466,6 @@ mod tests {
         assert_eq!(offset_of!(U, fog_grid_sum_tex), 752);
         assert_eq!(offset_of!(U, fog_grid_soft), 760);
         assert_eq!(offset_of!(U, fog_grid_stride), 768);
+        assert_eq!(offset_of!(U, restir_shared_ray), 776);
     }
 }

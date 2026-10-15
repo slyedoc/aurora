@@ -81,11 +81,17 @@ pub type RTGroupHandle = [u8; 32];
 
 pub struct CompiledRaytracingPipeline {
     pub pipeline: vk::Pipeline,
+    /// Ray stack bytes per thread for each raygen's dispatch (its own stack plus the deepest
+    /// hit or miss shader, recursion depth 1), set as dynamic state: the driver's default sizes
+    /// every dispatch for the largest raygen (`main`), which the slim ones pay for in occupancy.
+    pub stack_main: u32,
+    pub stack_fog_grid: u32,
+    pub stack_primary: u32,
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
-    /// ReSTIR DI's shading raygen (restir.rs).
-    pub restir_shade_handle: RTGroupHandle,
+    /// The primary pass's raygen (docs/plans/primary-pass.html).
+    pub primary_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
     /// Miss index 1: shadow rays.
     pub shadow_miss_handle: RTGroupHandle,
@@ -149,6 +155,8 @@ pub struct RaytracingPushConstants {
     /// The Cost debug view's buffer (0 unless shown): the frame's total ns (u64), then each traced
     /// pixel's raygen ns.
     pub cost: u64,
+    /// The primary pass's hit records (`Frame::primary_hits`; 0 while the old frame runs).
+    pub primary_hits: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to
@@ -407,22 +415,22 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
-        // ReSTIR DI's shading raygen (raygen.slang `restir_shade`, restir.rs).
-        let restir_shade_group = shader_group.len();
-        let restir_shade_stage = shader_stages.len() as u32;
+        // The primary pass (raygen.slang `primary`).
+        let primary_group = shader_group.len();
+        let primary_stage = shader_stages.len() as u32;
         shader_stages.push(
             render_device
                 .load_shader_entry(
                     raygen_shader.spirv.as_ref().unwrap(),
                     vk::ShaderStageFlags::RAYGEN_KHR,
-                    c"restir_shade",
+                    c"primary",
                 )
                 .specialization_info(&spec),
         );
         shader_group.push(
             vk::RayTracingShaderGroupCreateInfoKHR::default()
                 .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(restir_shade_stage)
+                .general_shader(primary_stage)
                 .closest_hit_shader(vk::SHADER_UNUSED_KHR)
                 .any_hit_shader(vk::SHADER_UNUSED_KHR)
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
@@ -514,10 +522,13 @@ impl VulkanAsset for RaytracingPipeline {
             vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT
                 | vk::PipelineCreateFlags2::from_raw(flags.as_raw() as u64),
         );
+        let dynamic_states = [vk::DynamicState::RAY_TRACING_PIPELINE_STACK_SIZE_KHR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
             .stages(&shader_stages)
             .groups(&shader_group)
             .max_pipeline_ray_recursion_depth(1)
+            .dynamic_state(&dynamic)
             .push(&mut flags2);
 
         let pipeline = unsafe {
@@ -576,31 +587,66 @@ impl VulkanAsset for RaytracingPipeline {
             .chain(handles[OPAQUE_GROUP + 2..fog_grid_group].iter().copied())
             .collect();
         let fog_grid_handle = handles[fog_grid_group];
-        let restir_shade_handle = handles[restir_shade_group];
+        let primary_handle = handles[primary_group];
         let shadow_miss_handle = handles[shadow_miss_group];
         let shadow_hit_handle = handles[shadow_hit_group];
         let shadow_empty_handle = handles[shadow_empty_group];
 
-        let raygen_stack = unsafe {
+        let group_stack = |group: usize, shader: vk::ShaderGroupShaderKHR| unsafe {
             render_device
                 .ext_rtx_pipeline
-                .get_ray_tracing_shader_group_stack_size(
-                    pipeline,
-                    0,
-                    vk::ShaderGroupShaderKHR::GENERAL,
-                )
+                .get_ray_tracing_shader_group_stack_size(pipeline, group as u32, shader)
+                as u32
         };
+        // Only shaders a group has may be queried (VUID-vkGetRayTracingShaderGroupStackSizeKHR).
+        let mut callee = 0u32;
+        for (g, info) in shader_group.iter().enumerate() {
+            let has = |s: u32| s != vk::SHADER_UNUSED_KHR;
+            match info.ty {
+                vk::RayTracingShaderGroupTypeKHR::GENERAL => {
+                    if g == 1 || g == shadow_miss_group {
+                        callee = callee.max(group_stack(g, vk::ShaderGroupShaderKHR::GENERAL));
+                    }
+                }
+                _ => {
+                    let chit = if has(info.closest_hit_shader) {
+                        group_stack(g, vk::ShaderGroupShaderKHR::CLOSEST_HIT)
+                    } else {
+                        0
+                    };
+                    let ahit = if has(info.any_hit_shader) {
+                        group_stack(g, vk::ShaderGroupShaderKHR::ANY_HIT)
+                    } else {
+                        0
+                    };
+                    let isect = if has(info.intersection_shader) {
+                        group_stack(g, vk::ShaderGroupShaderKHR::INTERSECTION)
+                    } else {
+                        0
+                    };
+                    callee = callee.max(chit).max(isect + ahit);
+                }
+            }
+        }
+        let raygen_stack = group_stack(0, vk::ShaderGroupShaderKHR::GENERAL);
+        let stack_main = raygen_stack + callee;
+        let stack_fog_grid = group_stack(fog_grid_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
+        let stack_primary = group_stack(primary_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         log::debug!(
-            "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B",
+            "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B; per thread: main \
+             {stack_main}, fog grid {stack_fog_grid}, primary {stack_primary} B",
             start.elapsed()
         );
         render_device.save_pipeline_cache();
 
         CompiledRaytracingPipeline {
             pipeline,
+            stack_main,
+            stack_fog_grid,
+            stack_primary,
             raygen_handle,
             fog_grid_handle,
-            restir_shade_handle,
+            primary_handle,
             miss_handle,
             shadow_miss_handle,
             shadow_hit_handle,

@@ -1,4 +1,4 @@
-// ReSTIR DI's compute passes (src/restir.rs), between the main trace and `restir_shade`:
+// ReSTIR DI's compute passes (src/restir.rs), between the primary pass and the path tracer:
 //
 //   restir_grid      ReGIR: every cell of a world grid around the camera keeps K light samples,
 //                    resampled from the power CDF by power / distance^2 at the cell. The target
@@ -11,9 +11,9 @@
 //                    tested), with a boiling filter against lone hot samples.
 //
 // Every target is restirTargetCheap (light_eval.slang): the unshadowed contribution through a
-// cheap BSDF, in luminance; `restir_shade` evaluates the exact one (restirTarget: the layered
-// BSDF, MIS-weighted against BRDF sampling) for the winner. The combination is the biased one (no neighbour visibility);
-// the shade pass's shadow ray zeroes occluded winners for next frame (visibility reuse).
+// cheap BSDF, in luminance; the path tracer evaluates the exact one (raygen.slang `restirWinner`:
+// the layered BSDF, MIS-weighted against BRDF sampling) for the winner. The combination is the
+// biased one (no neighbour visibility).
 import rt_types;
 import rand;
 import disney;

@@ -245,7 +245,6 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
     if (depth <= 1.0e-6) {
         return;
     }
-    HitPayload payload = {};
     let n = clamp(uint(ceil(depth / FOG_STEP_DEPTH)), 1u, env.fog_steps);
     let jitter = randf();
     let sky_step = min(uint(randf() * float(n)), n - 1u);
@@ -264,10 +263,12 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
             continue;
         }
         let step_t = exp(-sigma * dt);
-        var Ls = fogSunLight(env, ray_mask, tmax, x, d, payload);
+        var Ls = fogSunLight(env, ray_mask, tmax, x, d);
         if (i == sky_step) {
-            // Phase-sampled, so the phase over its pdf is 1; one step in n carries it.
+            // Phase-sampled, so the phase over its pdf is 1; one step in n carries it. Its own
+            // payload: one held across the march's sun rays doubled the caller's stack.
             let w = sampleFogScatterDirection(env, d);
+            HitPayload payload = {};
             payload.t = -1.0;
             payload.miss_flags = ray_env << 1;
             trace(FLAGS_SHADOW, ray_mask, x, 0.0, w, tmax, payload);
@@ -284,8 +285,7 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
 
 // The suns' light at fog point `x`, as the fog scatters it along `d`. The HDR sky's sun is
 // two discs (core, halo) on one direction: one shadow ray serves every disc that shares it.
-float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, float3 d,
-                   inout HitPayload payload) {
+float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, float3 d) {
     var Ls = float3(0.0);
     var visible = false;
     var l = float3(0.0);
@@ -703,7 +703,7 @@ void fog_grid() {
     let centre = fogGridPoint((cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
     let d = normalize(centre - cam);
 
-    var L = fogSunLight(env, ray_mask, tmax, x, d, payload);
+    var L = fogSunLight(env, ray_mask, tmax, x, d);
     let w = sampleFogScatterDirection(env, d);
     payload.t = -1.0;
     payload.miss_flags = ray_env << 1;
@@ -815,40 +815,400 @@ void fogGridSegment(EnvironmentGpu* env, float3 o, float3 d, float seg,
     mask *= saturate(b.a / ta);
 }
 
-// ReSTIR DI's shading (src/restir.rs), after its compute passes: the pixel's final reservoir
-// gets one shadow ray; visible, its contribution goes into the noisy colour (pre-exposed like
-// the main pass's). An occluded winner is NOT zeroed for reuse: carried forward, the zero
-// counted shadow twice (history, then this ray) and the result came out ~15 % dark.
+// The DLSS guides at this pixel's guide vertex (sample 0's first accepted surface, or the sky)
+// and the exposure meter's divisor there (< 0: not metered). `guide_dist`: how far the camera
+// ray ran before this segment (smooth glass in front: the guides sit at a virtual point along it).
+float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, float3 world_normal,
+                  float3 surface_normal, float2 lens, uint2 launch_id, uint2 launch_size,
+                  float guide_dist, uint ray_mask, uint ray_env, float cone_width, float cone_spread) {
+    let tmin = 0.0;
+    let tmax = 1.0e6;
+    var meter_albedo = 1.0;
+    if (payload.t == 0.0) {
+        meter_albedo = -1.0;
+        guide_normal_roughness[px] = float4(0.0, 0.0, 0.0, 1.0);
+        guide_diffuse[px] = float4(0.0);
+        guide_specular[px] = float4(0.5, 0.5, 0.5, 1.0); // sky: RR guide 3.4.2
+        // Linear view depth (Depth_Type_Linear): 0 is the CAMERA plane, so the sky
+        // must sit at the far clamp -- 0 here reads as a surface on the lens and the
+        // sky/mesh silhouette boils.
+        guide_depth[px] = float4(1.0e7, 0.0, 0.0, 0.0);
+        // Sky motion: reproject the ray direction at infinity (w = 0 cancels the
+        // translation -- infinitely far points only parallax under rotation). Zero
+        // here pins the sky to the screen and it smears whenever the camera turns.
+        let sky_cur = mat4MulVec(pc.uniforms.view_proj, float4(direction, 0.0));
+        let sky_prev = mat4MulVec(pc.uniforms.prev_view_proj, float4(direction, 0.0));
+        var sky_motion = float2(0.0);
+        if (sky_cur.w > 1.0e-4 && sky_prev.w > 1.0e-4) {
+            let cuv = (sky_cur.xy / sky_cur.w) * float2(0.5, -0.5);
+            let puv = (sky_prev.xy / sky_prev.w) * float2(0.5, -0.5);
+            sky_motion = clamp(cuv - puv, float2(-2.0), float2(2.0));
+        }
+        guide_motion[px] = float4(sky_motion, 0.0, 0.0);
+        guide_spec_hit[px] = float4(0.0);
+    } else {
+        let g_roughness = hitPayloadGetRoughness(payload);
+        let g_metallic = hitPayloadGetMetallic(payload);
+        let hit_pos = origin + direction * payload.t;
+        // The end of the (possibly refracted) chain laid out along the primary ray at
+        // the accumulated distance. No glass in between => exactly hit_pos.
+        float3 cam_origin, cam_dir;
+        lensRay(lens, launch_id, launch_size, cam_origin, cam_dir);
+        let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t);
+        let view_pos = mat4MulVec(pc.uniforms.view, float4(virtual_pos, 1.0));
+        let linear_depth = max(-view_pos.z, 1.0e-4);
+        let albedo = clamp(payload.color.rgb, float3(0.0), float3(1.0));
+        // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
+        let linear_roughness = clamp(g_roughness * g_roughness, 0.0, 1.0);
+        guide_normal_roughness[px] = float4(world_normal, linear_roughness);
+        // NOTE: emissive is deliberately NOT folded into this guide. A render-res albedo
+        // guide carrying emissive-texture text aliases under the DLSS jitter, and RR's
+        // history churns it into mush whenever the camera rests (tried 2026-09-02).
+        guide_diffuse[px] = float4(albedo * (1.0 - g_metallic), 1.0);
+        let g_f0 = lerp(float3(0.04), albedo, g_metallic);
+        let g_NoV = dot(world_normal, -direction);
+        let g_spec = envBRDFApprox2(g_f0, linear_roughness, g_NoV);
+        guide_specular[px] = float4(g_spec, 1.0);
+        meter_albedo = any(payload.emission != float3(0.0))
+            ? -1.0
+            : dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
+        guide_depth[px] = float4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0);
+        // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
+        let cur_clip = mat4MulVec(pc.uniforms.view_proj, float4(virtual_pos, 1.0));
+        // The end vertex's own frame-to-frame motion, applied to the virtual point
+        // (identical to prev_world_pos when no glass was traversed).
+        let prev_clip = mat4MulVec(pc.uniforms.prev_view_proj,
+                                   float4(virtual_pos - (hit_pos - payload.prev_world_pos), 1.0));
+        var motion = float2(0.0);
+        if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
+            let cur_uv = (cur_clip.xy / cur_clip.w) * float2(0.5, -0.5);
+            let prev_uv = (prev_clip.xy / prev_clip.w) * float2(0.5, -0.5);
+            motion = clamp(cur_uv - prev_uv, float2(-2.0), float2(2.0));
+        }
+        guide_motion[px] = float4(motion, 0.0, 0.0);
+        // Specular hit distance (RR guide 3.4.9): how far the REFLECTION sits behind
+        // the surface, which RR turns into the reflection's own motion. It comes from a
+        // dedicated ray along the lobe's mirror direction, never from the path: the
+        // path leaves a dielectric on its diffuse lobe nine times in ten, and a
+        // hemisphere ray's length is per-pixel static. Past the panel's roughness
+        // cutoff the reflection is too wide to have a motion of its own: 0 pins it to
+        // the surface and the ray is saved.
+        var spec_hit = 0.0;
+        if (g_roughness <= pc.uniforms.spec_hit_roughness) {
+            var mirror = reflect(direction, world_normal);
+            if (dot(mirror, surface_normal) <= 0.0) {
+                mirror = reflect(direction, surface_normal);
+            }
+            // Its own payload: the vertex's stays put instead of riding the trace.
+            HitPayload probe = {};
+            probe.miss_flags = ray_env << 1;
+            probe.cone = float2(cone_width, cone_spread);
+            traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, probe);
+            spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t, SPEC_HIT_FAR);
+        }
+        guide_spec_hit[px] = float4(spec_hit, 0.0, 0.0, 0.0);
+    }
+    return meter_albedo;
+}
+
+// The camera ray's fog over one segment into `veil` (pre-exposed by `fog_scale`, through the
+// transmittance so far), and that transmittance on. The surface behind reaches Ray
+// Reconstruction unveiled; the composite applies both (`guide_fog`).
+void cameraFog(EnvironmentGpu* env, uint ray_env, uint ray_mask, float3 origin, float3 direction,
+               float hit_t, float3 mask, bool in_view, float fog_scale, inout float3 veil,
+               inout float fog_t) {
+    let tmax = 1.0e6;
+    // The camera ray marches its fog (the shafts, without the noise of one random
+    // scatter); a ray to the sky marches only as far as the volumes reach.
+    let seg = hit_t > 0.0 ? hit_t : fogVolumesReach(origin, direction);
+    var fog_mask = mask;
+    var fog_acc = float3(0.0);
+    if (seg > 0.0 && in_view && pc.uniforms.fog_grid_cells > 0u
+        && pc.uniforms.fog_grid_fresh == 0u) {
+        // A surface's segment takes the column sums; one to the sky only its
+        // volumes, which the sums (environment fog included) cannot leave out.
+        if (hit_t > 0.0) {
+            fogGridSegment(env, origin, direction, seg, fog_mask, fog_acc);
+        } else {
+            fogMarchGrid(env, origin, direction, seg, false, fog_mask, fog_acc);
+        }
+    } else if (seg > 0.0) {
+        fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
+                 hit_t > 0.0, fog_mask, fog_acc);
+    }
+    // The surface behind reaches RR unveiled; the composite applies both.
+    let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
+    veil += fog_t * fog_acc * fog_scale;
+    fog_t *= seg_t;
+}
+
+// The primary pass (docs/plans/primary-pass.html), one thread per traced pixel, ahead of ReSTIR
+// and the path tracer: sample 0's camera ray through alpha cutouts and portals to its first
+// accepted surface, which it records (PrimaryHit) for the path tracer to resume from; on the
+// way the DLSS guides, the camera ray's fog and the exposure meter. Behind smooth glass the
+// guides follow the dominant Fresnel lobe to the first surface that is not (RTXPT's stable
+// planes), every frame; the radiance path makes its own lobe choice.
 [shader("raygeneration")]
-void restir_shade() {
+void primary() {
     let launch_id = DispatchRaysIndex().xy;
     let launch_size = DispatchRaysDimensions().xy;
-    let idx = launch_id.y * launch_size.x + launch_id.x;
-    let s = pc.restir_surfaces[idx];
-    if (s.frame != pc.uniforms.frame) {
-        return;
-    }
-    var r = pc.reservoirs_cur[idx];
-    if (r.y == 0xFFFFFFFFu || r.W <= 0.0) {
-        return;
-    }
-    float p_area_cdf, p_cdf, dist;
-    float3 dir;
-    let val = restirTarget(lightCtx(), s, r.y, r.uv_pk, p_area_cdf, p_cdf, dir, dist);
-    if (restirLuma(val) <= 0.0) {
-        return;
-    }
-    let ns = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
-    if (!traceVisible(restirRayMask(s), leaveSurface(s.position, ns, dir), 0.0, dir,
-                      dist * (1.0 - 1.0e-4))) {
-        return;
-    }
     let px = int2(launch_id);
-    let add = restirThroughput(s) * val * (r.W / float(max(pc.uniforms.samples, 1u)))
-        * pc.ae.input_exposure;
-    let prior = dlss_color[px].rgb;
-    dlss_color[px] = float4(clamp(prior + add, float3(0.0), float3(65504.0)), 1.0);
+    let tmin = 0.0;
+    let tmax = 1.0e6;
+    initRandom(launch_size, launch_id, pc.uniforms.frame * 7u + 5u);
+
+    if (pc.uniforms.pull_focus_x == launch_id.x && pc.uniforms.pull_focus_y == launch_id.y) {
+        HitPayload focus = {};
+        trace(FLAGS_OPAQUE, 0xFF, cameraOrigin(), tmin, pixelDirection(launch_id, launch_size), tmax,
+              focus);
+        if (focus.t != 0.0) {
+            pc.focus[0] = focus.t;
+        }
+    }
+
+    let fog_scale = pc.ae.input_exposure;
+    var veil = float3(0.0);
+    let offsetR = sqrt(randf());
+    let offsetA = randf() * 2.0 * PI;
+    let lens = pc.uniforms.aperture * float2(offsetR * cos(offsetA), offsetR * sin(offsetA));
+    float3 origin, direction;
+    lensRay(lens, launch_id, launch_size, origin, direction);
+    let mask = float3(1.0);
+    var surf_n = float3(0.0);
+    var ray_mask = pc.uniforms.camera_mask;
+    var ray_env = pc.uniforms.environment;
+    var in_view = true;
+    var guides_written = false;
+    var guide_dist = 0.0;
+    var fog_t = 1.0;
+    var cone_width = 0.0;
+    let cone_spread = 2.0 * pc.uniforms.inverse_projection[5] / float(launch_size.y);
+    var meter_albedo = 1.0;
+    var primary_t = 0.0;
+    // The record goes to memory field by field as it is decided, never held across a trace.
+    let rec = pc.primary_hits + (launch_id.y * launch_size.x + launch_id.x);
+    rec.state = PRIMARY_RETRACE;
+    var recorded = false;
+    var glass = 0u;
+    // The camera chain shares the path's bounce budget (each cutout or portal is a bounce);
+    // past the record only the guides follow, a few smooth-glass vertices at most.
+    for (uint bounce = 0u; bounce < pc.uniforms.max_bounces + 4u; bounce++) {
+        if (!recorded && bounce >= pc.uniforms.max_bounces) {
+            rec.state = PRIMARY_ENDED;
+            rec.origin = float3(0.0);
+            recorded = true;
+            break;
+        }
+        HitPayload payload = {};
+        payload.miss_flags = (recorded ? 0u : 1u) | (ray_env << 1);
+        payload.cone = float2(cone_width, cone_spread);
+        let trace_mask = recorded ? ray_mask : (ray_mask & ~pc.uniforms.primary_hidden);
+        RayDesc ray;
+        ray.Origin = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
+        ray.Direction = direction;
+        ray.TMin = tmin;
+        ray.TMax = tmax;
+        // No reorder: camera rays are coherent already (the sort cost a third of the pass).
+        HitObject hit = HitObject::TraceRay(topLevelAS, FLAGS_OPAQUE, trace_mask, 0, 0, 0, ray, payload);
+        // The hit's identity, written before it is shaded so the hit object dies here: whether
+        // this segment is the one recorded is only known after shading.
+        if (!recorded) {
+            let kind = hit.GetHitKind();
+            let triangle = hit.IsHit() && (kind == HIT_KIND_TRIANGLE_FRONT_FACE || kind == HIT_KIND_TRIANGLE_BACK_FACE);
+            rec.hit_kind = triangle ? kind : 0u;
+            if (triangle) {
+                let a = hit.GetAttributes<BuiltInTriangleIntersectionAttributes>();
+                rec.origin = ray.Origin;
+                rec.direction = direction;
+                rec.instance = hit.GetInstanceIndex();
+                rec.geometry = hit.GetGeometryIndex();
+                rec.primitive = hit.GetPrimitiveIndex();
+                rec.bary = packUnorm16(a.barycentrics.x) | (packUnorm16(a.barycentrics.y) << 16);
+                rec.cone_width = cone_width;
+            }
+        }
+        HitObject::Invoke(topLevelAS, hit, payload);
+        if (bounce == 0u) {
+            primary_t = payload.t;
+        }
+        cone_width += cone_spread * payload.t;
+        let surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
+        let world_normal = bendTowardViewer(
+            oct_to_float32x3(payload.surface_and_world_normal.zw), -direction);
+
+        if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
+            var p_origin = origin;
+            var p_dir = direction;
+            if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask, ray_env)) {
+                if (!guides_written) {
+                    guide_dist += payload.t;
+                }
+                origin = p_origin;
+                surf_n = float3(0.0);
+                direction = p_dir;
+                in_view = false;
+                continue;
+            }
+        }
+
+        // Alpha-cutout pass-through, as the path tracer decides it (masked materials only).
+        var pass_through = false;
+        if (payload.t != 0.0 && all(payload.emission == float3(0.0)) && hitPayloadGetMasked(payload)) {
+            if (all(payload.color.rgb == float3(0.0))) {
+                pass_through = true;
+            } else if (payload.color.a < 1.0) {
+                pass_through = randf() < 1.0 - payload.color.a;
+            }
+        }
+        let guide_defer = payload.t != 0.0
+            && hitPayloadGetTransmission(payload) > 0.5
+            && hitPayloadGetRoughness(payload) < 0.1;
+        let t = payload.t;
+        let ends = any(payload.emission != float3(0.0)) || t == 0.0;
+        let hit_point = origin + direction * t;
+        let env = pc.uniforms.environments + ray_env;
+        let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
+        let camera_segment = !recorded;
+        // The record and ReSTIR's surface first, while the payload is at hand: what follows
+        // traces (the spec probe, the fog's shadow rays), and the payload must not live across.
+        if (!recorded) {
+            if (env.fog_steps == 0u && fog_any) {
+                // Random-scatter fog: the camera segment itself may scatter, which only the path
+                // tracer can decide. It traces from the camera (the guides are written here).
+                rec.state = PRIMARY_RETRACE;
+                recorded = true;
+            } else if (ends) {
+                rec.state = PRIMARY_ENDED;
+                rec.origin = mask * payload.emission;
+                recorded = true;
+            } else if (!pass_through) {
+                recorded = true;
+                if (rec.hit_kind != 0u) {
+                    rec.t = t;
+                    rec.state = PRIMARY_HIT | (bounce << 2) | ((ray_mask & 0xFFu) << 8) | ((ray_env & 7u) << 16);
+                    // ReSTIR DI's surface: its passes run between this pass and the path tracer.
+                    if (RESTIR_ON && pc.restir_surfaces != nullptr && pc.uniforms.restir_candidates > 0u
+                        && pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
+                        pc.restir_surfaces[launch_id.y * launch_size.x + launch_id.x] = restirSurfacePack(
+                            hit_point, pc.uniforms.frame, payload.prev_world_pos,
+                            mat4MulVec(pc.uniforms.view_proj, float4(hit_point, 1.0)).w, payload.color.rgb,
+                            hitPayloadGetMetallic(payload), hitPayloadGetRoughness(payload), payload.lobes,
+                            mask, ray_mask, world_normal, surface_normal, -direction);
+                    }
+                }
+            }
+        }
+        let inside = hitPayloadGetInside(payload);
+        let refract_index = payload.refract_index;
+        // The payload's last use: the guides (their spec probe traces after reading it).
+        if (!guides_written && !pass_through && !guide_defer) {
+            guides_written = true;
+            meter_albedo = writeGuides(px, payload, origin, direction, world_normal, surface_normal,
+                                       lens, launch_id, launch_size, guide_dist, ray_mask, ray_env,
+                                       cone_width, cone_spread);
+        }
+        if (!guides_written) {
+            guide_dist += t;
+        }
+        if (camera_segment && env.fog_steps > 0u && fog_any) {
+            cameraFog(env, ray_env, ray_mask, origin, direction, t, mask, in_view, fog_scale, veil,
+                      fog_t);
+        }
+        if (ends) {
+            break;
+        }
+        if (pass_through) {
+            origin = hit_point;
+            surf_n = surface_normal;
+            continue;
+        }
+        if (guides_written || !guide_defer || ++glass > 4u) {
+            break;
+        }
+        // The guides go on through the glass along its dominant Fresnel lobe.
+        let n1 = inside ? refract_index : 1.0;
+        let n2 = inside ? 1.0 : refract_index;
+        let eta = n1 / n2;
+        let costi = dot(world_normal, -direction);
+        let k = 1.0 - eta * eta * (1.0 - costi * costi);
+        var p_reflect = 1.0;
+        if (k >= 0.0 && costi > 0.0) {
+            let costt = sqrt(k);
+            let spol = (n1 * costi - n2 * costt) / (n1 * costi + n2 * costt);
+            let ppol = (n1 * costt - n2 * costi) / (n1 * costt + n2 * costi);
+            p_reflect = 0.5 * (spol * spol + ppol * ppol);
+        }
+        direction = p_reflect > 0.5
+            ? reflect(direction, world_normal)
+            : normalize(eta * direction + world_normal * (eta * costi - sqrt(max(k, 0.0))));
+        origin = hit_point;
+        surf_n = surface_normal;
+    }
+    rec.meter_albedo = meter_albedo;
+    rec.primary_t = primary_t;
+    guide_fog[px] = float4(min(veil, float3(65504.0)), fog_t);
 }
+
+uint packUnorm16(float x) {
+    return uint(saturate(x) * 65535.0 + 0.5);
+}
+
+// ReSTIR DI's final sample for this pixel at its primary vertex: the exact contribution (layered
+// BSDF, MIS-weighted against BRDF sampling, as restirTarget) times the reservoir weight, when
+// its own shadow ray sees the light.
+float3 restirWinner(uint idx, float3 origin, float3 n, float3 ns, float3 v, DisneyMaterial mat,
+                    Lobes lob, uint ray_mask) {
+    float3 dir;
+    float dist;
+    let c = restirWinnerUnshadowed(idx, origin, n, ns, v, mat, lob, ray_mask, dir, dist);
+    if (restirLuma(c) <= 0.0
+        || !traceVisible(ray_mask, leaveSurface(origin, ns, dir), 0.0, dir, dist * (1.0 - 1.0e-4))) {
+        return float3(0.0);
+    }
+    return c;
+}
+
+// restirWinner without its shadow ray: the contribution, its direction and distance.
+float3 restirWinnerUnshadowed(uint idx, float3 origin, float3 n, float3 ns, float3 v,
+                              DisneyMaterial mat, Lobes lob, uint ray_mask, out float3 dir,
+                              out float dist) {
+    dir = float3(0.0, 1.0, 0.0);
+    dist = 0.0;
+    if (pc.reservoirs_cur == nullptr) {
+        return float3(0.0);
+    }
+    let r = pc.reservoirs_cur[idx];
+    if (r.y == 0xFFFFFFFFu || r.W <= 0.0) {
+        return float3(0.0);
+    }
+    let ctx = lightCtx();
+    let uv = unpackHalf2(r.uv_pk);
+    let p_cdf = lightsEntryPick(ctx, r.y);
+    float p_area, pdf_solid;
+    var val = lightSampleEval(ctx, r.y, lightsFindInstance(ctx, r.y), p_cdf, uv.x, uv.y, origin, n, ns,
+                              v, mat, lob, ray_mask, true, p_area, pdf_solid, dir, dist);
+    if (pdf_solid > 0.0) {
+        val *= pdf_solid / (pdf_solid + layeredPdf(v, n, dir, mat, lob));
+    }
+    return val * r.W;
+}
+
+// The recorded hit rebuilt (no traversal) and shaded into `payload`.
+void resumeHit(PrimaryHit rec, inout HitPayload payload) {
+    RayDesc ray;
+    ray.Origin = rec.origin;
+    ray.Direction = rec.direction;
+    ray.TMin = 0.0;
+    ray.TMax = rec.t;
+    BuiltInTriangleIntersectionAttributes a;
+    a.barycentrics = float2(float(rec.bary & 0xFFFFu), float(rec.bary >> 16)) / 65535.0;
+    // No reorder: the records come in screen order, as coherent as the camera rays that made
+    // them (sorting them cost the trace 8.6 %).
+    HitObject hit = HitObject::MakeHit(topLevelAS, rec.instance, rec.geometry, rec.primitive,
+                                       rec.hit_kind, 0, 0, ray, a);
+    HitObject::Invoke(topLevelAS, hit, payload);
+}
+
 
 // The camera's position: the inverse view's translation. The camera values are recomputed
 // where they are used rather than held: anything held is live through the whole path.
@@ -881,12 +1241,9 @@ void lensRay(float2 lens, uint2 launch_id, uint2 launch_size, out float3 origin,
 // The camera path's flags (main's `path`).
 static const uint PATH_WANT_SUN = 1u;
 static const uint PATH_CAMERA = 2u;
-static const uint PATH_IN_VIEW = 4u;
 static const uint PATH_SHARC_TRAIN = 8u;
 static const uint PATH_FROM_ROUGH = 16u;
 static const uint PATH_CACHE_BLIND = 32u;
-static const uint PATH_GUIDES_WRITTEN = 64u;
-static const uint PATH_GUIDE_LIVE = 128u;
 
 [shader("raygeneration")]
 void main() {
@@ -908,34 +1265,19 @@ void main() {
     // Far range: the sim-scale sky domes sit kilometers out, a planet's horizon tens of km.
     let tmax = 1.0e6;
 
-    if (pc.uniforms.pull_focus_x == launch_id.x && pc.uniforms.pull_focus_y == launch_id.y) {
-        payload.cone = float2(0.0);
-        trace(FLAGS_OPAQUE, 0xFF, cameraOrigin(), tmin, pixelDirection(launch_id, launch_size), tmax,
-              payload);
-        if (payload.t != 0.0) {
-            pc.focus[0] = payload.t;
-        }
-    }
+    // The primary pass (docs/plans/primary-pass.html) walked sample 0's camera chain: its hit
+    // record, the guides, the camera ray's fog, the meter's divisor and the focus pull. The
+    // record is read where needed, never held: 16 words live across every trace would spill.
+    let prim_at = launch_id.y * launch_size.x + launch_id.x;
 
     var acc = float3(0.0);
-    // The camera ray's fog for the composite, averaged over the samples, gathers in `guide_fog`
-    // itself (pre-exposed light, transmittance): kept in registers it was live across every
-    // trace, and the raygen's stack is what the trace's time follows. None: nothing over the
-    // colour.
-    guide_fog[px] = float4(0.0);
     let SAMPLES = pc.uniforms.samples;
-    let fog_scale = pc.ae.input_exposure / float(SAMPLES);
     let MAX_BOUNCES = pc.uniforms.max_bounces;
     // Firefly clamp in nits: a multiple of the luminance the metering puts at 18% gray
     // (0.18 / exposure), so it tracks the scene -- a sky, or a ceiling panel in a closed room.
     // From the SMOOTH metered exposure, not the held input one: that lags the scene by up to
     // its deadband, and a clamp that many stops too loose lets every emitter speckle through.
     let radiance_clamp = pc.uniforms.firefly_clamp * 0.18 / max(pc.ae.exposure, 1.0e-20);
-    // The camera ray's first hit distance (0 = sky), for the atmosphere composite below.
-    var primary_t = 0.0;
-    // Auto-exposure meters incident light: radiance over sample 0's guide-vertex albedo. Sky
-    // and emitters seen directly are left out of the meter (negative: skipped).
-    var meter_albedo = 1.0;
 
     for (uint sample_idx = 0; sample_idx < SAMPLES; sample_idx += 1) {
         let offsetR = sqrt(randf());
@@ -950,7 +1292,7 @@ void main() {
         // indirect light came out at less than half).
         var rr_boost = 1.0;
         // The path's flags, one word (PATH_*, each explained where it would have been declared).
-        var path = PATH_WANT_SUN | PATH_CAMERA | PATH_IN_VIEW | PATH_GUIDE_LIVE;
+        var path = PATH_WANT_SUN | PATH_CAMERA;
         // PATH_WANT_SUN: the camera ray and pure-specular continuations may see the sun disc directly; after a
         // BRDF-sampled bounce the sun comes from next-event estimation only.
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
@@ -965,7 +1307,6 @@ void main() {
         var surf_n = float3(0.0);
         // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
-        // PATH_IN_VIEW: still in the view's own frustum (no portal yet): the fog grid lights only that.
         // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
         // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
         // once the path ends.
@@ -983,28 +1324,37 @@ void main() {
         // PATH_CACHE_BLIND: the camera ray met the back of a solid surface first: the camera is inside geometry
         // (a wall it clipped through). Such a path sees unlit insides and must not teach the
         // cache -- it poisoned the voxels of the room side, which glowed until washed out.
-        // PATH_GUIDES_WRITTEN: DLSS guides come from sample 0's first ACCEPTED vertex (a primary ray may pass through
-        // alpha-cutout edges first).
-        // The camera ray's fog transmittance so far; its light goes to `guide_fog`.
-        var fog_t = 1.0;
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
         // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
         var cone_width = 0.0;
         // inverse_projection[1][1] (column 1, row 1).
         var cone_spread = 2.0 * pc.uniforms.inverse_projection[5] / float(launch_size.y);
-        // PATH_GUIDE_LIVE: stable guides (RTXPT "stable planes"): the guide chain follows the analytically
-        // DOMINANT Fresnel lobe through glass. When the radiance path rolls the minority lobe
-        // instead, this frame's guide writes are abandoned (the images keep last frame's
-        // dominant-branch values), so the guides never flicker between the reflected and the
-        // refracted world -- per-pixel-random branch choices are exactly what RR cannot
-        // share history across (see PathTracerStablePlanes.hlsli's seam note).
-        // PSR-lite: when guides defer through smooth-transmission (glass) vertices, the first
-        // non-delta vertex writes them at a VIRTUAL point this far along the camera ray (rebuilt
-        // from `lens` there).
-        var guide_dist = 0.0;
 
-        for (uint bounce_idx = 0; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
+        // Sample 0 starts where the primary pass's chain stopped: the recorded hit, the radiance
+        // it ended on, or the camera again.
+        var first_bounce = 0u;
+        var resume = false;
+        {
+            if (sample_idx == 0u) {
+                let prim = pc.primary_hits[prim_at];
+                let kind = primaryKind(prim);
+                if (kind == PRIMARY_ENDED) {
+                    acc += prim.origin;
+                    first_bounce = MAX_BOUNCES;
+                } else if (kind == PRIMARY_HIT) {
+                    origin = prim.origin;
+                    direction = prim.direction;
+                    ray_mask = (prim.state >> 8) & 0xFFu;
+                    ray_env = (prim.state >> 16) & 7u;
+                    cone_width = prim.cone_width;
+                    first_bounce = (prim.state >> 2) & 63u;
+                    resume = true;
+                }
+            }
+        }
+
+        for (uint bounce_idx = first_bounce; bounce_idx < MAX_BOUNCES; bounce_idx += 1) {
             // A fresh payload every trace: a miss writes only t and the sky, and every hit
             // read-modify-writes the flags word, so a payload carried over was an input to the
             // next trace -- all of it live in registers through the whole loop.
@@ -1015,9 +1365,13 @@ void main() {
             payload.cone = float2(cone_width, cone_spread);
             let trace_mask = ((path & PATH_CAMERA) != 0u) ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
             let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
-            traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
-            if (sample_idx == 0u && bounce_idx == 0u) {
-                primary_t = payload.t;
+            // The recorded hit is rebuilt, not traced: the primary pass already found it.
+            let resumed = resume;
+            if (resume) {
+                resume = false;
+                resumeHit(pc.primary_hits[prim_at], payload);
+            } else {
+                traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             }
             cone_width += cone_spread * payload.t;
 
@@ -1034,18 +1388,14 @@ void main() {
             // teleport, not a scatter: guides stay deferred (the far side writes them at the
             // virtual distance, PSR-style) and the next emissive hit is taken at full weight
             // (NEE cannot sample lights through a portal, so MIS must not discount them).
-            if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
+            if (!resumed && payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
                 var p_origin = origin;
                 var p_dir = direction;
                 if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask, ray_env)) {
-                    if ((path & PATH_GUIDES_WRITTEN) == 0u) {
-                        guide_dist += payload.t;
-                    }
                     origin = p_origin;
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
-                    path &= ~PATH_IN_VIEW;
                     continue;
                 }
             }
@@ -1059,7 +1409,7 @@ void main() {
             // smeared foliage whenever something bright sits behind it.
             // (Spelled out as ifs: the coin is only drawn where GLSL's short-circuit draws it.)
             var pass_through = false;
-            if (payload.t != 0.0 && all(payload.emission == float3(0.0))
+            if (!resumed && payload.t != 0.0 && all(payload.emission == float3(0.0))
                 && hitPayloadGetMasked(payload)) {
                 if (all(payload.color.rgb == float3(0.0))) {
                     pass_through = true;
@@ -1068,106 +1418,6 @@ void main() {
                 }
             }
 
-            // PSR-lite: a smooth transmissive hit (glass) shows the REFRACTED world, and RR has
-            // no refraction guide -- writing the glass surface here pins that content to the
-            // wrong depth/motion and RR blurs it to frost. Defer: the chain's first non-delta
-            // vertex writes the guides instead, at a virtual point along the camera ray.
-            let guide_defer = payload.t != 0.0
-                && hitPayloadGetTransmission(payload) > 0.5
-                && hitPayloadGetRoughness(payload) < 0.1;
-
-            if (sample_idx == 0 && ((path & PATH_GUIDE_LIVE) != 0u)) {
-                if ((path & PATH_GUIDES_WRITTEN) == 0u && !pass_through && !guide_defer) {
-                    path |= PATH_GUIDES_WRITTEN;
-                    if (payload.t == 0.0) {
-                        meter_albedo = -1.0;
-                        guide_normal_roughness[px] = float4(0.0, 0.0, 0.0, 1.0);
-                        guide_diffuse[px] = float4(0.0);
-                        guide_specular[px] = float4(0.5, 0.5, 0.5, 1.0); // sky: RR guide 3.4.2
-                        // Linear view depth (Depth_Type_Linear): 0 is the CAMERA plane, so the sky
-                        // must sit at the far clamp -- 0 here reads as a surface on the lens and the
-                        // sky/mesh silhouette boils.
-                        guide_depth[px] = float4(1.0e7, 0.0, 0.0, 0.0);
-                        // Sky motion: reproject the ray direction at infinity (w = 0 cancels the
-                        // translation -- infinitely far points only parallax under rotation). Zero
-                        // here pins the sky to the screen and it smears whenever the camera turns.
-                        let sky_cur = mat4MulVec(pc.uniforms.view_proj, float4(direction, 0.0));
-                        let sky_prev = mat4MulVec(pc.uniforms.prev_view_proj, float4(direction, 0.0));
-                        var sky_motion = float2(0.0);
-                        if (sky_cur.w > 1.0e-4 && sky_prev.w > 1.0e-4) {
-                            let cuv = (sky_cur.xy / sky_cur.w) * float2(0.5, -0.5);
-                            let puv = (sky_prev.xy / sky_prev.w) * float2(0.5, -0.5);
-                            sky_motion = clamp(cuv - puv, float2(-2.0), float2(2.0));
-                        }
-                        guide_motion[px] = float4(sky_motion, 0.0, 0.0);
-                        guide_spec_hit[px] = float4(0.0);
-                    } else {
-                        let g_roughness = hitPayloadGetRoughness(payload);
-                        let g_metallic = hitPayloadGetMetallic(payload);
-                        let hit_pos = origin + direction * payload.t;
-                        // The end of the (possibly refracted) chain laid out along the primary ray at
-                        // the accumulated distance. No glass in between => exactly hit_pos.
-                        float3 cam_origin, cam_dir;
-                        lensRay(lens, launch_id, launch_size, cam_origin, cam_dir);
-                        let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t);
-                        let view_pos = mat4MulVec(pc.uniforms.view, float4(virtual_pos, 1.0));
-                        let linear_depth = max(-view_pos.z, 1.0e-4);
-                        let albedo = clamp(payload.color.rgb, float3(0.0), float3(1.0));
-                        // Ray Reconstruction wants LINEAR roughness; the material's is perceptual.
-                        let linear_roughness = clamp(g_roughness * g_roughness, 0.0, 1.0);
-                        guide_normal_roughness[px] = float4(world_normal, linear_roughness);
-                        // NOTE: emissive is deliberately NOT folded into this guide. A render-res albedo
-                        // guide carrying emissive-texture text aliases under the DLSS jitter, and RR's
-                        // history churns it into mush whenever the camera rests (tried 2026-09-02).
-                        guide_diffuse[px] = float4(albedo * (1.0 - g_metallic), 1.0);
-                        let g_f0 = lerp(float3(0.04), albedo, g_metallic);
-                        let g_NoV = dot(world_normal, -direction);
-                        let g_spec = envBRDFApprox2(g_f0, linear_roughness, g_NoV);
-                        guide_specular[px] = float4(g_spec, 1.0);
-                        meter_albedo = any(payload.emission != float3(0.0))
-                            ? -1.0
-                            : dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
-                        guide_depth[px] = float4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0);
-                        // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
-                        let cur_clip = mat4MulVec(pc.uniforms.view_proj, float4(virtual_pos, 1.0));
-                        // The end vertex's own frame-to-frame motion, applied to the virtual point
-                        // (identical to prev_world_pos when no glass was traversed).
-                        let prev_clip = mat4MulVec(pc.uniforms.prev_view_proj,
-                                                   float4(virtual_pos - (hit_pos - payload.prev_world_pos), 1.0));
-                        var motion = float2(0.0);
-                        if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
-                            let cur_uv = (cur_clip.xy / cur_clip.w) * float2(0.5, -0.5);
-                            let prev_uv = (prev_clip.xy / prev_clip.w) * float2(0.5, -0.5);
-                            motion = clamp(cur_uv - prev_uv, float2(-2.0), float2(2.0));
-                        }
-                        guide_motion[px] = float4(motion, 0.0, 0.0);
-                        // Specular hit distance (RR guide 3.4.9): how far the REFLECTION sits behind
-                        // the surface, which RR turns into the reflection's own motion. It comes from a
-                        // dedicated ray along the lobe's mirror direction, never from the path: the
-                        // path leaves a dielectric on its diffuse lobe nine times in ten, and a
-                        // hemisphere ray's length is per-pixel static. Past the panel's roughness
-                        // cutoff the reflection is too wide to have a motion of its own: 0 pins it to
-                        // the surface and the ray is saved.
-                        var spec_hit = 0.0;
-                        if (g_roughness <= pc.uniforms.spec_hit_roughness) {
-                            var mirror = reflect(direction, world_normal);
-                            if (dot(mirror, surface_normal) <= 0.0) {
-                                mirror = reflect(direction, surface_normal);
-                            }
-                            // Its own payload: the vertex's stays put instead of riding the trace.
-                            HitPayload probe = {};
-                            probe.miss_flags = ray_env << 1;
-                            probe.cone = float2(cone_width, cone_spread);
-                            traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, probe);
-                            spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t, SPEC_HIT_FAR);
-                        }
-                        guide_spec_hit[px] = float4(spec_hit, 0.0, 0.0, 0.0);
-                    }
-                }
-            }
-            if ((path & PATH_GUIDES_WRITTEN) == 0u) {
-                guide_dist += payload.t;
-            }
             let roughness = hitPayloadGetRoughness(payload);
             let metallic = hitPayloadGetMetallic(payload);
             let transmission = hitPayloadGetTransmission(payload);
@@ -1183,33 +1433,10 @@ void main() {
             float fogDistance;
             let env = pc.uniforms.environments + ray_env;
             let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
-            if (((path & PATH_CAMERA) != 0u) && env.fog_steps > 0u && fog_any) {
-                // The camera ray marches its fog (the shafts, without the noise of one random
-                // scatter); a ray to the sky marches only as far as the volumes reach.
-                let seg = payload.t > 0.0 ? payload.t : fogVolumesReach(origin, direction);
-                var fog_mask = mask;
-                var fog_acc = float3(0.0);
-                if (seg > 0.0 && ((path & PATH_IN_VIEW) != 0u) && pc.uniforms.fog_grid_cells > 0u
-                    && pc.uniforms.fog_grid_fresh == 0u) {
-                    // A surface's segment takes the column sums; one to the sky only its
-                    // volumes, which the sums (environment fog included) cannot leave out.
-                    if (payload.t > 0.0) {
-                        fogGridSegment(env, origin, direction, seg, fog_mask, fog_acc);
-                    } else {
-                        fogMarchGrid(env, origin, direction, seg, false, fog_mask, fog_acc);
-                    }
-                } else if (seg > 0.0) {
-                    fogMarch(env, ray_env, ray_mask, tmax, origin, direction, seg,
-                             payload.t > 0.0, fog_mask, fog_acc);
-                }
-                // The surface behind reaches RR unveiled; the composite applies both.
-                let seg_t = luma(mask) > 0.0 ? luma(fog_mask) / luma(mask) : 1.0;
-                if (any(fog_acc > float3(0.0))) {
-                    let g = guide_fog[px];
-                    guide_fog[px] = float4(min(g.rgb + fog_t * fog_acc * fog_scale, float3(65504.0)), g.a);
-                }
-                fog_t *= seg_t;
-            } else if (sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
+            // A camera ray in marched fog: the primary pass took its veil. Without marching steps
+            // the camera ray scatters at random like every other ray.
+            let camera_fog = ((path & PATH_CAMERA) != 0u) && env.fog_steps > 0u && fog_any;
+            if (!camera_fog && sampleFogScatter(env, origin, direction, payload.t, fogDistance)) {
                 origin = origin + direction * fogDistance;
                 surf_n = float3(0.0);
                 // The distance was drawn from the fog's own density (exponential, or delta
@@ -1334,11 +1561,6 @@ void main() {
                 }
 
                 let lobe_reflect = randf() <= pReflect;
-                // Minority Fresnel lobe on the guide chain: stop writing guides this frame (see
-                // `guide_live` above). The radiance stays unbiased -- only the guides sit out.
-                if (sample_idx == 0 && (path & PATH_GUIDES_WRITTEN) == 0u && lobe_reflect != (pReflect > 0.5)) {
-                    path &= ~PATH_GUIDE_LIVE;
-                }
                 float3 new_dir;
                 if (lobe_reflect) {
                     new_dir = reflect(direction, H);
@@ -1428,14 +1650,20 @@ void main() {
             let one_ray = bounce_idx >= pc.uniforms.one_shadow_ray_from;
             ShadowPick pick = {};
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
-                if (RESTIR_ON && bounce_idx == 0 && sample_idx == 0 && pc.uniforms.restir_candidates > 0u) {
-                    // ReSTIR DI lights this vertex from the table in its own passes (restir.slang,
-                    // then `restir_shade` below): hand it the surface.
-                    pc.restir_surfaces[px.y * int(launch_size.x) + px.x] = restirSurfacePack(
-                        origin, pc.uniforms.frame, payload.prev_world_pos,
-                        mat4MulVec(pc.uniforms.view_proj, float4(origin, 1.0)).w,
-                        disney_mat.albedo, disney_mat.metallic, disney_mat.roughness, payload.lobes,
-                        mask, ray_mask, world_normal, surface_normal, -direction);
+                if (RESTIR_ON && pc.uniforms.restir_candidates > 0u && resumed) {
+                    // ReSTIR DI's winner for this vertex: its passes ran between the primary pass
+                    // and this one, over the surface the primary pass wrote.
+                    if (one_ray && pc.uniforms.restir_shared_ray != 0u) {
+                        // The winner shares the vertex's one shadow ray.
+                        float3 wdir;
+                        float wdist;
+                        let c = restirWinnerUnshadowed(prim_at, origin, world_normal, surface_normal,
+                                                       -direction, disney_mat, lob, ray_mask, wdir, wdist);
+                        pick.propose(mask * c, wdir, wdist * (1.0 - 1.0e-4));
+                    } else {
+                        acc += mask * restirWinner(prim_at, origin, world_normal, surface_normal,
+                                                   -direction, disney_mat, lob, ray_mask);
+                    }
                 } else {
                     // Resampled importance sampling, no reuse: M candidates, each weighted by its
                     // MIS-weighted unshadowed contribution at THIS point over its source pdf; one
@@ -1685,12 +1913,6 @@ void main() {
             }
         }
 
-        // Averaged over the samples, like the colour.
-        {
-            let g = guide_fog[px];
-            guide_fog[px] = float4(g.rgb, g.a + fog_t / float(SAMPLES));
-        }
-
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
         // darkness is learned too).
@@ -1708,13 +1930,17 @@ void main() {
     // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
     // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
     if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
-        mean = atmoComposite(cameraOrigin(), pixelDirection(launch_id, launch_size), primary_t,
+        mean = atmoComposite(cameraOrigin(), pixelDirection(launch_id, launch_size),
+                             pc.primary_hits[prim_at].primary_t,
                              atmoBayer(px), mean);
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =
     // skipped) and the raw nits for the panel readout.
     // Meter what is seen: the surface through the fog plus the fog (composited after Ray
     // Reconstruction; metered without it, the exposure ignored the veil and it blew out).
+    // Auto-exposure meters incident light: radiance over sample 0's guide-vertex albedo (the
+    // primary pass's; < 0: the sky or an emitter, not metered).
+    let meter_albedo = pc.primary_hits[prim_at].meter_albedo;
     let fog = guide_fog[px];
     let fog_out = fog.rgb / max(pc.ae.input_exposure, 1.0e-20);
     let fog_out_t = fog.a;
