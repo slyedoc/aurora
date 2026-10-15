@@ -107,6 +107,9 @@ pub struct RestirAddresses {
     pub final_: u64,
     /// The parameter block (`RestirFrame`), for the raygen's light-grid lookups.
     pub frame: u64,
+    /// The buffers were (re)made and cleared by this call: with the clears on the async compute
+    /// queue, the frame runs without ReSTIR (the primary pass would race them).
+    pub fresh: bool,
 }
 
 #[derive(Default)]
@@ -164,7 +167,8 @@ impl RestirState {
         let pixels = input.extent.width as u64 * input.extent.height as u64;
         let k = settings.light_grid_samples.clamp(1, 64);
         let grid_len = (GRID[0] * GRID[1] * GRID[2] * k) as u64;
-        if pixels != view.pixels || grid_len != view.grid_len {
+        let fresh = pixels != view.pixels || grid_len != view.grid_len;
+        if fresh {
             view.release(rd);
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
             view.surfaces = rd.create_device_buffer(pixels * SURFACE_BYTES, usage);
@@ -269,6 +273,7 @@ impl RestirState {
             prev,
             final_,
             frame: view.frame.address,
+            fresh,
         }
     }
 

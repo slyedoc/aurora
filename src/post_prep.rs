@@ -140,7 +140,10 @@ impl PostPrepState {
             return false;
         }
         let heaps = rd.heaps();
-        for (i, view) in [inputs.pyramid, inputs.fog, inputs.depth].into_iter().enumerate() {
+        for (i, view) in [inputs.pyramid, inputs.fog, inputs.depth]
+            .into_iter()
+            .enumerate()
+        {
             heaps.write_prep(block, i as u32, view);
         }
         // The pyramid's blits before the reads; last frame's composite reads before the writes.
@@ -196,8 +199,12 @@ fn cleanup_post_prep(mut state: ResMut<PostPrepState>, render_device: Res<Render
     for view in &mut state.views {
         render_device.destroyer.destroy_buffer(view.bloom.handle);
         render_device.destroyer.destroy_buffer(view.keys.handle);
-        render_device.destroyer.destroy_buffer(view.fog_range.handle);
-        render_device.destroyer.destroy_buffer(view.sky_range.handle);
+        render_device
+            .destroyer
+            .destroy_buffer(view.fog_range.handle);
+        render_device
+            .destroyer
+            .destroy_buffer(view.sky_range.handle);
         *view = PrepView::default();
     }
 }

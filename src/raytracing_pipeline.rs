@@ -643,7 +643,8 @@ impl VulkanAsset for RaytracingPipeline {
         }
         let raygen_stack = group_stack(0, vk::ShaderGroupShaderKHR::GENERAL);
         let stack_main = raygen_stack + callee;
-        let stack_fog_grid = group_stack(fog_grid_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
+        let stack_fog_grid =
+            group_stack(fog_grid_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         let stack_primary = group_stack(primary_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         log::debug!(
             "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B; per thread: main \

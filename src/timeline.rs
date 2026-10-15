@@ -54,6 +54,36 @@ impl GpuTimeline {
         fence: vk::Fence,
         present_id: Option<u64>,
     ) -> Result<SubmitPoint, vk::Result> {
+        unsafe {
+            self.submit_with(
+                device,
+                queue,
+                cmds,
+                waits,
+                &[],
+                binary_waits,
+                binary_signals,
+                fence,
+                present_id,
+            )
+        }
+    }
+
+    /// [`Self::submit`], also waiting on other timelines: `(semaphore, value, stage)` -- the
+    /// other queue's points (async compute), each at the stage that first reads its results.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn submit_with(
+        &self,
+        device: &ash::Device,
+        queue: vk::Queue,
+        cmds: &[vk::CommandBuffer],
+        waits: &[SubmitPoint],
+        timeline_waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)],
+        binary_waits: &[(vk::Semaphore, vk::PipelineStageFlags2)],
+        binary_signals: &[vk::Semaphore],
+        fence: vk::Fence,
+        present_id: Option<u64>,
+    ) -> Result<SubmitPoint, vk::Result> {
         let point = SubmitPoint(self.last.fetch_add(1, Ordering::AcqRel) + 1);
         let commands: Vec<vk::CommandBufferSubmitInfo> = cmds
             .iter()
@@ -67,6 +97,16 @@ impl GpuTimeline {
                     .stage_mask(stage)
             })
             .collect();
+        for &(semaphore, value, stage) in timeline_waits {
+            if value > 0 {
+                wait_infos.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(semaphore)
+                        .value(value)
+                        .stage_mask(stage),
+                );
+            }
+        }
         if let Some(&latest) = waits.iter().max() {
             wait_infos.push(
                 vk::SemaphoreSubmitInfo::default()

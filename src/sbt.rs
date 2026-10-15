@@ -316,8 +316,7 @@ fn update_sbt(
     sbt.fog_grid_region.device_address = sbt.buffers[current].address + sbt.raygen_region.size;
     sbt.primary_region.device_address =
         sbt.fog_grid_region.device_address + sbt.fog_grid_region.size;
-    sbt.miss_region.device_address =
-        sbt.primary_region.device_address + sbt.primary_region.size;
+    sbt.miss_region.device_address = sbt.primary_region.device_address + sbt.primary_region.size;
     sbt.hit_region.device_address = sbt.miss_region.device_address + sbt.miss_region.size;
 }
 

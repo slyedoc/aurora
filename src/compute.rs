@@ -125,8 +125,10 @@ impl VulkanAsset for ComputeModule {
             render_device.heaps().mappings(&heap)
         };
         let mapping_info = stage_mapping(&mappings);
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT | crate::render_device::capture_statistics());
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
+            vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT
+                | crate::render_device::capture_statistics(),
+        );
         let mut flags2_plain = vk::PipelineCreateFlags2CreateInfo::default()
             .flags(crate::render_device::capture_statistics());
 
@@ -282,7 +284,12 @@ pub fn record_dispatch_indirect<P: bytemuck::Pod>(
         if module.heap {
             render_device.heaps().bind(cmd_buffer);
         }
-        push(render_device, cmd_buffer, module, bytemuck::bytes_of(params));
+        push(
+            render_device,
+            cmd_buffer,
+            module,
+            bytemuck::bytes_of(params),
+        );
         render_device
             .device
             .cmd_dispatch_indirect(cmd_buffer, buffer, offset);

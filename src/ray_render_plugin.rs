@@ -1089,6 +1089,8 @@ fn render_frame(
         let cmd_buffer = render_device.command_buffers[parity];
         let view_cmd = render_device.lanes[0].1[parity];
         let present_cmd = render_device.lanes[1].1[parity];
+        let tlas_cmd = render_device.lanes[2].1[parity];
+        let view_back_cmd = render_device.lanes[3].1[parity];
 
         if let Some((image, view, _, _)) = presenting {
             frame.swapchain_image = image;
@@ -1096,7 +1098,7 @@ fn render_frame(
         }
         let record = info_span!("record_frame").entered();
 
-        for cmd in [cmd_buffer, view_cmd, present_cmd] {
+        for cmd in [cmd_buffer, view_cmd, present_cmd, tlas_cmd, view_back_cmd] {
             render_device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -1112,6 +1114,16 @@ fn render_frame(
 
         // Offscreen UI surfaces (world panels) render first, so this frame's trace samples
         // this frame's UI.
+        // Submitted ahead of the CPU's wait for the previous frame: nothing here starts before
+        // that frame is done on the queue (uniforms, the radiance cache, the guides are shared).
+        crate::compute::memory_barrier(
+            &render_device,
+            cmd_buffer,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
         let frame_scope = prof.begin(&render_device, cmd_buffer, "frame");
         let section = info_span!("record_ui_surfaces").entered();
         let scope = prof.begin(&render_device, cmd_buffer, "ui surfaces");
@@ -1126,14 +1138,68 @@ fn render_frame(
         // With rays to pick, the instance table and TLAS go into their own command buffer,
         // submitted ahead of the rest with the pick at its end (picking.rs).
         let pick = picker.active(&modules, &tlas);
+        // Async compute (docs/plans/async-compute.html): skins with their BLAS refits and the
+        // radiance cache resolve run on the compute queue beside the frame commands; the TLAS,
+        // lights and everything after wait for them. A pick submits the TLAS ahead of the frame,
+        // so with one everything stays on the graphics queue.
+        let compute_cmd = render_device
+            .compute
+            .as_ref()
+            .map(|c| c.command_buffers[parity]);
+        if let Some(cmd) = compute_cmd {
+            render_device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            render_device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+        }
+        // ReSTIR's light grids on the compute queue, beside the first view's primary pass.
+        let grid_cmd = render_device
+            .compute
+            .as_ref()
+            .map(|c| c.grid_buffers[parity]);
+        if let Some(cmd) = grid_cmd {
+            render_device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            render_device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+        }
+        // The scene lane's second half: after the async compute when there is one.
+        let after_compute = if compute_cmd.is_some() {
+            tlas_cmd
+        } else {
+            cmd_buffer
+        };
         // The radiance cache's first-use allocation, before the view lane reads its address.
-        sharc.ensure(&render_device, cmd_buffer, settings.sharc);
+        sharc.ensure(
+            &render_device,
+            compute_cmd.unwrap_or(cmd_buffer),
+            settings.sharc,
+        );
 
         // Exposure: each camera meters its own last frame into this frame's exposure (the
         // raygen reads it). A headset's two eyes are one camera and share one meter. Recorded
         // here, at the head of the view lane, because the present lane needs the addresses.
         let section = info_span!("record_exposure_atmo").entered();
-        let scope = prof.begin(&render_device, view_cmd, "exposure+atmosphere");
+        let exposure_cmd = compute_cmd.unwrap_or(view_cmd);
+        let readers = if compute_cmd.is_some() {
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+        } else {
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::FRAGMENT_SHADER
+        };
+        let scope = prof.begin(&render_device, exposure_cmd, "exposure");
         let mut metered: Vec<(Entity, (u64, u64))> = Vec::new();
         for view in &mut views {
             if let Some((_, addresses)) = metered.iter().find(|(c, _)| *c == view.camera) {
@@ -1142,15 +1208,18 @@ fn render_frame(
             }
             view.ae = ae.record(
                 &render_device,
-                view_cmd,
+                exposure_cmd,
                 &modules,
                 view.camera,
                 view.trace_extent,
                 &view.exposure,
                 time.delta_secs(),
+                readers,
             );
             metered.push((view.camera, view.ae));
         }
+        prof.end(&render_device, exposure_cmd, scope);
+        let scope = prof.begin(&render_device, view_cmd, "atmosphere");
         ae.set_primary(views.first().map(|v| v.camera));
         ae.retain(&render_device, |e| camera_entities.contains(&e));
         // The atmosphere's LUTs for this frame's camera altitude and sun (the raygen and
@@ -1241,10 +1310,44 @@ fn render_frame(
             drop(section);
             crate::gpu_transform::world_barrier(&render_device, scene_cmd);
             let section = info_span!("record_skins").entered();
-            let scope = prof.begin(&render_device, scene_cmd, "skins");
-            let skinned = skins.record(&render_device, scene_cmd, &modules, &transforms);
-            prof.end(&render_device, scene_cmd, scope);
+            let skin_cmd = compute_cmd.unwrap_or(scene_cmd);
+            let scope = prof.begin(&render_device, skin_cmd, "skins");
+            let skinned = skins.record(&render_device, skin_cmd, &modules, &transforms);
+            prof.end(&render_device, skin_cmd, scope);
             drop(section);
+            let section = info_span!("record_sharc").entered();
+            let sharc_cmd = compute_cmd.unwrap_or(cmd_buffer);
+            if compute_cmd.is_some() {
+                let scope = prof.begin(&render_device, sharc_cmd, "sharc");
+                sharc.record(
+                    &render_device,
+                    sharc_cmd,
+                    &modules,
+                    *frame_counter,
+                    settings.sharc,
+                );
+                prof.end(&render_device, sharc_cmd, scope);
+                render_device.end_command_buffer(sharc_cmd).unwrap();
+            }
+            drop(section);
+            // With a pick the early submit splits: its head (frame commands) beside the compute
+            // work, its tail (TLAS, pick) after it. Without one the frame's own submits do.
+            let mut compute_wait = Vec::new();
+            let scene_cmd = match compute_cmd {
+                Some(compute) if pick => {
+                    let before = render_device.timeline.last_submitted();
+                    let tail = picker.split(&render_device, scene_cmd, frame_count);
+                    let point = render_device.submit_compute(compute, before);
+                    compute_wait.push((
+                        render_device.compute.as_ref().unwrap().timeline.semaphore,
+                        point,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                    ));
+                    tail
+                }
+                Some(_) => after_compute,
+                None => scene_cmd,
+            };
             let section = info_span!("record_tlas").entered();
             let scope = prof.begin(&render_device, scene_cmd, "tlas");
             tlas.record(
@@ -1259,39 +1362,89 @@ fn render_frame(
             drop(section);
             if pick {
                 let _submit = info_span!("submit_pick").entered();
-                picker.submit(&render_device, scene_cmd, &modules, tlas);
+                picker.submit(&render_device, scene_cmd, &modules, tlas, &compute_wait);
             }
             // The light table's weight/CDF kernels, whenever the light set changed (they read
             // the instance rows the gather above wrote).
             let section = info_span!("record_lights").entered();
-            let scope = prof.begin(&render_device, cmd_buffer, "lights");
-            lights.record(&render_device, cmd_buffer, &modules, tlas);
-            prof.end(&render_device, cmd_buffer, scope);
+            let scope = prof.begin(&render_device, after_compute, "lights");
+            lights.record(&render_device, after_compute, &modules, tlas);
+            prof.end(&render_device, after_compute, scope);
             drop(section);
-            let section = info_span!("record_sharc").entered();
-            let scope = prof.begin(&render_device, cmd_buffer, "sharc");
-            sharc.record(
-                &render_device,
-                cmd_buffer,
-                &modules,
-                *frame_counter,
-                settings.sharc,
-            );
-            prof.end(&render_device, cmd_buffer, scope);
-            drop(section);
+            if compute_cmd.is_none() {
+                let section = info_span!("record_sharc").entered();
+                let scope = prof.begin(&render_device, cmd_buffer, "sharc");
+                sharc.record(
+                    &render_device,
+                    cmd_buffer,
+                    &modules,
+                    *frame_counter,
+                    settings.sharc,
+                );
+                prof.end(&render_device, cmd_buffer, scope);
+                drop(section);
+            }
             render_device.end_command_buffer(cmd_buffer).unwrap();
+            render_device.end_command_buffer(tlas_cmd).unwrap();
         };
 
         // The view lane: each view's guide descriptors, ReSTIR, fog grid, trace and DLSS.
         // Returns the cameras whose trace filled their luminance buffer.
-        let mut view_lane = |tlas: TlasRefs| -> Vec<Entity> {
+        let mut view_lane = |tlas: TlasRefs| -> (Vec<Entity>, bool) {
             let _lane = info_span!("record_trace_dlss").entered();
             let mut traced = Vec::new();
+            // The view lane's command buffer: its front half until the first view's primary
+            // pass, then the back half that waits on the light grids (async compute).
+            let cmd = std::cell::Cell::new(view_cmd);
+            let mut grid_split = false;
             if let (Some(rtx_pipeline), true) = (rtx_pipeline, tlas.traceable) {
                 static TRACED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::info!("first frame traced");
+                }
+                // ReSTIR DI's buffers, parameters and light grid, every view's first: on the async
+                // compute queue (a submit of its own, beside the first view's fog grid and primary
+                // pass) when there is one. A view whose buffers were just made runs without ReSTIR
+                // this frame there: their clears would race the primary pass's writes.
+                let mut restir_views =
+                    [(false, crate::restir::RestirAddresses::default(), false); crate::MAX_VIEWS];
+                for view in views {
+                    let restir_on = settings.restir
+                        && settings.light_nee
+                        && light_entries > 0
+                        && view.plan.is_some();
+                    if !restir_on {
+                        restir.release(&render_device, view.slot);
+                        continue;
+                    }
+                    let addresses = restir.prepare(
+                        &render_device,
+                        grid_cmd.unwrap_or(view_cmd),
+                        &crate::restir::RestirInput {
+                            extent: view.trace_extent,
+                            frame: *frame_counter,
+                            slot: view.slot,
+                            prev_view_proj: view.last_view_proj,
+                            camera: view.inverse_view.w_axis.truncate(),
+                            epoch: light_epoch,
+                            lights: light_header,
+                            instances: tlas.instances,
+                            light_entries,
+                            settings,
+                        },
+                    );
+                    grid_split |= grid_cmd.is_some();
+                    let on = !(addresses.fresh && grid_cmd.is_some());
+                    let built = on
+                        && restir.record_grid(
+                            &render_device,
+                            grid_cmd.unwrap_or(view_cmd),
+                            &modules,
+                            view.slot,
+                            prof,
+                        );
+                    restir_views[view.slot] = (on, addresses, built);
                 }
                 render_device.cmd_bind_pipeline(
                     view_cmd,
@@ -1321,9 +1474,9 @@ fn render_frame(
                     // Heaps and push data, again after anything that cleared them (compute
                     // dispatches push constants; NGX binds its own sets).
                     let push_trace = |constants: RaytracingPushConstants| {
-                        heaps.bind(view_cmd);
+                        heaps.bind(cmd.get());
                         heaps.push(
-                            view_cmd,
+                            cmd.get(),
                             &RaytracingPushData {
                                 constants,
                                 tlas: tlas.address,
@@ -1334,40 +1487,21 @@ fn render_frame(
                     };
 
                     // ReSTIR DI's buffers and this frame's parameters (none while it is off).
-                    let restir_on = settings.restir
-                        && settings.light_nee
-                        && light_entries > 0
-                        && view.plan.is_some();
+                    let (restir_on, restir_addresses, grid_built) = restir_views[view.slot];
                     let restir_addresses = if restir_on {
-                        restir.prepare(
-                            &render_device,
-                            view_cmd,
-                            &crate::restir::RestirInput {
-                                extent: view.trace_extent,
-                                frame: *frame_counter,
-                                slot: view.slot,
-                                prev_view_proj: view.last_view_proj,
-                                camera: view.inverse_view.w_axis.truncate(),
-                                epoch: light_epoch,
-                                lights: light_header,
-                                instances: tlas.instances,
-                                light_entries,
-                                settings,
-                            },
-                        )
+                        restir_addresses
                     } else {
-                        restir.release(&render_device, view.slot);
                         crate::restir::RestirAddresses::default()
                     };
-                    fog_grid.record_clear(&render_device, view_cmd, view.slot);
+                    fog_grid.record_clear(&render_device, cmd.get(), view.slot);
                     // The Cost view's frame total, summed into by the raygen.
                     if view.cost.1 != 0 {
                         render_device
                             .device
-                            .cmd_fill_buffer(view_cmd, view.cost.0, 0, 8, 0);
+                            .cmd_fill_buffer(cmd.get(), view.cost.0, 0, 8, 0);
                         crate::compute::memory_barrier(
                             &render_device,
-                            view_cmd,
+                            cmd.get(),
                             vk::PipelineStageFlags2::ALL_TRANSFER,
                             vk::AccessFlags2::TRANSFER_WRITE,
                             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
@@ -1400,7 +1534,7 @@ fn render_frame(
                     // Guides into GENERAL before the first dispatch: the fog grid runs with
                     // this set bound, so validation checks their layout there too.
                     if let (Some(_), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
-                        renderer.record_pre_trace(&render_device, view_cmd, view.slot);
+                        renderer.record_pre_trace(&render_device, cmd.get(), view.slot);
                     }
 
                     // The camera's fog grid, by the first of its views: lit before any of them
@@ -1411,10 +1545,10 @@ fn render_frame(
                         .find(|(owner, _, grid)| *owner == view.slot && grid.cells > 0)
                     {
                         let uniforms = frame.uniform_buffers[view.slot].address;
-                        let scope = prof.begin(&render_device, view_cmd, "fog grid");
+                        let scope = prof.begin(&render_device, cmd.get(), "fog grid");
                         if fog_grid.record_reproject(
                             &render_device,
-                            view_cmd,
+                            cmd.get(),
                             &modules,
                             uniforms,
                             grid,
@@ -1422,12 +1556,14 @@ fn render_frame(
                             push_trace(push_constants);
                             let stride = grid.stride.max(1);
                             // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
-                            render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
-                                view_cmd,
-                                rtx_pipeline.stack_fog_grid,
-                            );
+                            render_device
+                                .ext_rtx_pipeline
+                                .cmd_set_ray_tracing_pipeline_stack_size(
+                                    cmd.get(),
+                                    rtx_pipeline.stack_fog_grid,
+                                );
                             render_device.ext_rtx_pipeline.cmd_trace_rays(
-                                view_cmd,
+                                cmd.get(),
                                 &sbt.fog_grid_region,
                                 &sbt.miss_region,
                                 &sbt.hit_region,
@@ -1438,7 +1574,7 @@ fn render_frame(
                             );
                             fog_grid.record_integrate(
                                 &render_device,
-                                view_cmd,
+                                cmd.get(),
                                 &modules,
                                 uniforms,
                                 grid,
@@ -1446,20 +1582,12 @@ fn render_frame(
                             );
                             push_trace(push_constants);
                         }
-                        prof.end(&render_device, view_cmd, scope);
+                        prof.end(&render_device, cmd.get(), scope);
                     }
 
                     if let (Some(plan), Some(renderer)) = (view.plan, dlss.renderer.as_mut()) {
                         // The light grid the trace's path vertices (and ReSTIR's passes) draw
                         // from; without it the vertices keep the power CDF.
-                        let grid_built = restir_on
-                            && restir.record_grid(
-                                &render_device,
-                                view_cmd,
-                                &modules,
-                                view.slot,
-                                prof,
-                            );
                         // A grid that did not build leaves the vertices on the power CDF.
                         let trace_constants = RaytracingPushConstants {
                             restir_frame: if grid_built {
@@ -1469,21 +1597,20 @@ fn render_frame(
                             },
                             ..push_constants
                         };
-                        if restir_on {
-                            // The grid's compute dispatches disturbed the push constants.
-                            push_trace(trace_constants);
-                        }
+                        push_trace(trace_constants);
                         // The primary pass: sample 0's camera chain and its hit record, which the
                         // trace resumes from (docs/plans/primary-pass.html).
                         if view.primary_hits != 0 {
-                            let scope = prof.begin(&render_device, view_cmd, "primary");
+                            let scope = prof.begin(&render_device, cmd.get(), "primary");
                             // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
-                            render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
-                                view_cmd,
-                                rtx_pipeline.stack_primary,
-                            );
+                            render_device
+                                .ext_rtx_pipeline
+                                .cmd_set_ray_tracing_pipeline_stack_size(
+                                    cmd.get(),
+                                    rtx_pipeline.stack_primary,
+                                );
                             render_device.ext_rtx_pipeline.cmd_trace_rays(
-                                view_cmd,
+                                cmd.get(),
                                 &sbt.primary_region,
                                 &sbt.miss_region,
                                 &sbt.hit_region,
@@ -1492,22 +1619,32 @@ fn render_frame(
                                 plan.render.height,
                                 1,
                             );
-                            prof.end(&render_device, view_cmd, scope);
+                            prof.end(&render_device, cmd.get(), scope);
                             crate::compute::memory_barrier(
                                 &render_device,
-                                view_cmd,
+                                cmd.get(),
                                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
                                 vk::AccessFlags2::SHADER_WRITE,
                                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
                                     | vk::PipelineStageFlags2::COMPUTE_SHADER,
                                 vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                             );
+                            // The rest waits on the light grids (async compute): the back half.
+                            if grid_split && cmd.get() == view_cmd {
+                                cmd.set(view_back_cmd);
+                                render_device.cmd_bind_pipeline(
+                                    view_back_cmd,
+                                    vk::PipelineBindPoint::RAY_TRACING_KHR,
+                                    rtx_pipeline.pipeline,
+                                );
+                                push_trace(trace_constants);
+                            }
                             // ReSTIR DI between the two: its passes over the primary pass's
                             // surfaces; the trace shades the winners.
                             if restir_on
                                 && restir.record_passes(
                                     &render_device,
-                                    view_cmd,
+                                    cmd.get(),
                                     &modules,
                                     view.slot,
                                     prof,
@@ -1516,14 +1653,16 @@ fn render_frame(
                                 push_trace(trace_constants);
                             }
                         }
-                        let scope = prof.begin(&render_device, view_cmd, "trace");
+                        let scope = prof.begin(&render_device, cmd.get(), "trace");
                         // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
-                        render_device.ext_rtx_pipeline.cmd_set_ray_tracing_pipeline_stack_size(
-                            view_cmd,
-                            rtx_pipeline.stack_main,
-                        );
+                        render_device
+                            .ext_rtx_pipeline
+                            .cmd_set_ray_tracing_pipeline_stack_size(
+                                cmd.get(),
+                                rtx_pipeline.stack_main,
+                            );
                         render_device.ext_rtx_pipeline.cmd_trace_rays(
-                            view_cmd,
+                            cmd.get(),
                             &sbt.raygen_region,
                             &sbt.miss_region,
                             &sbt.hit_region,
@@ -1532,13 +1671,13 @@ fn render_frame(
                             plan.render.height,
                             1,
                         );
-                        prof.end(&render_device, view_cmd, scope);
+                        prof.end(&render_device, cmd.get(), scope);
                         // NGX knows nothing of heaps (descriptor_heap.rs `leave`).
-                        heaps.leave(&render_device, view_cmd);
-                        let scope = prof.begin(&render_device, view_cmd, "dlss");
+                        heaps.leave(&render_device, cmd.get());
+                        let scope = prof.begin(&render_device, cmd.get(), "dlss");
                         renderer.record_evaluate(
                             &render_device,
-                            view_cmd,
+                            cmd.get(),
                             view.slot,
                             view.view_matrix,
                             view.projection,
@@ -1546,12 +1685,12 @@ fn render_frame(
                             dlss_reset,
                             delta_secs * 1000.0,
                         );
-                        prof.end(&render_device, view_cmd, scope);
+                        prof.end(&render_device, cmd.get(), scope);
                         if let Some(guides) = renderer.guide_views(view.slot) {
-                            let scope = prof.begin(&render_device, view_cmd, "post prep");
+                            let scope = prof.begin(&render_device, cmd.get(), "post prep");
                             post_prep.record(
                                 &render_device,
-                                view_cmd,
+                                cmd.get(),
                                 &modules,
                                 &view.prep,
                                 DescriptorHeaps::prep_block(parity, view.slot),
@@ -1565,15 +1704,19 @@ fn render_frame(
                                     local_tonemap: local_tonemap > 0.0,
                                 },
                             );
-                            prof.end(&render_device, view_cmd, scope);
+                            prof.end(&render_device, cmd.get(), scope);
                         }
                         // The raygen just filled the luminance buffer at this size.
                         traced.push(view.camera);
                     }
                 }
             }
+            if let Some(grid) = grid_cmd {
+                render_device.end_command_buffer(grid).unwrap();
+            }
             render_device.end_command_buffer(view_cmd).unwrap();
-            traced
+            render_device.end_command_buffer(view_back_cmd).unwrap();
+            (traced, grid_split)
         };
 
         // The present lane: the XR eyes, offscreen camera targets and the window (composite,
@@ -2064,7 +2207,7 @@ fn render_frame(
                 && views.iter().any(|v| v.plan.is_some())
         };
         let pool = ComputeTaskPool::get_or_init(TaskPool::default);
-        let mut traced = Vec::new();
+        let mut traced = (Vec::new(), false);
         let dlss_ran;
         if tlas.stable() {
             let refs = TlasRefs::of(&tlas, sbt_ready);
@@ -2086,23 +2229,19 @@ fn render_frame(
                 s.spawn_on_scope(async move { present_lane(dlss_ran) });
             });
         }
+        let (traced, grid_split) = traced;
         for camera in traced {
             ae.mark_traced(camera);
         }
         drop(record);
         let prof = &mut *profiler;
-        // The previous frame: wait for it, then latch what this frame computes from its results
-        // (written into memory the commands recorded above pick up).
-        sync.wait();
+        // The frame is submitted before the CPU waits for the previous one: its commands start
+        // the moment that frame ends (a barrier at its head keeps the two from overlapping), with
+        // no CPU latency between. What needs the previous frame's results -- the readbacks, the
+        // exposure latch the NEXT frame copies, the destroyer -- comes after the wait, below.
+        let previous = sync.last_frame;
+        let done = sync.frame_count.checked_sub(1);
         let waited = std::time::Instant::now();
-        render_device.destroyer.tick();
-        prof.read_previous(&render_device, time.elapsed_secs_f64());
-        ae.latch(&render_device);
-        // The previous frame's screenshot and video copies have landed: off to their encoders.
-        if let Some(done) = sync.frame_count.checked_sub(1) {
-            screenshots.collect(&render_device, done);
-            video.latch(&render_device, done);
-        }
         {
             let mut waits = Vec::new();
             let mut signals = Vec::new();
@@ -2120,10 +2259,72 @@ fn render_frame(
             let queue = render_device.queue.lock().unwrap();
             drop(queue_lock);
             let traced = crate::nsight::begin_frame(*queue);
+            // The frame's submits on the graphics queue, with the async compute between them
+            // (docs/plans/async-compute.html): without a pick, the scene lane's first half beside
+            // skins and the radiance cache resolve; then the TLAS and lights; the light grids
+            // (compute) beside the first view's fog grid and primary pass; the rest after them.
+            // The last submit waits (directly or through an earlier one) on every compute submit,
+            // so the frame's point covers them all.
+            let graphics =
+                |cmds: &[vk::CommandBuffer],
+                 points: &[crate::timeline::SubmitPoint],
+                 timeline_waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)]| {
+                    render_device
+                        .timeline
+                        .submit_with(
+                            &render_device,
+                            *queue,
+                            cmds,
+                            points,
+                            timeline_waits,
+                            &[],
+                            &[],
+                            vk::Fence::null(),
+                            None,
+                        )
+                        .unwrap_or_else(|e| {
+                            crate::aftermath::note_device_lost(e);
+                            panic!("frame submit failed: {e:?}");
+                        })
+                };
+            let compute_wait = |point: u64| {
+                let semaphore = render_device.compute.as_ref().unwrap().timeline.semaphore;
+                vec![(semaphore, point, vk::PipelineStageFlags2::ALL_COMMANDS)]
+            };
+            let mut head = Vec::new();
+            let mut head_points = points.clone();
+            let mut head_waits = Vec::new();
+            match compute_cmd {
+                Some(compute_cmd) if !pick => {
+                    let before = render_device.timeline.last_submitted();
+                    graphics(&[cmd_buffer], &head_points, &[]);
+                    head_points.clear();
+                    head_waits = compute_wait(render_device.submit_compute(compute_cmd, before));
+                }
+                _ => head.push(cmd_buffer),
+            }
+            head.push(tlas_cmd);
+            let (tail, tail_points, tail_waits) = match grid_cmd.filter(|_| grid_split) {
+                Some(grid_cmd) => {
+                    let lights = graphics(&head, &head_points, &head_waits);
+                    let grids = render_device.submit_compute(grid_cmd, lights);
+                    graphics(&[view_cmd], &[], &[]);
+                    (
+                        vec![view_back_cmd, present_cmd],
+                        Vec::new(),
+                        compute_wait(grids),
+                    )
+                }
+                None => {
+                    head.extend([view_cmd, view_back_cmd, present_cmd]);
+                    (head, head_points, head_waits)
+                }
+            };
             sync.submit(
                 *queue,
-                &[cmd_buffer, view_cmd, present_cmd],
-                &points,
+                &tail,
+                &tail_points,
+                &tail_waits,
                 &waits,
                 &signals,
                 present_id,
@@ -2162,6 +2363,17 @@ fn render_frame(
         // The XR side of the submit: release the image and hand the compositor its layer.
         if let (Some(xr_state), Some(xr_frame)) = (xr.as_deref_mut(), xr_frame) {
             xr_state.end_frame(&render_device, xr_frame);
+        }
+        // The previous frame: wait for it, then latch what the next frame computes from its
+        // results (auto_exposure.rs double-buffers what both touch).
+        sync.wait_for(previous);
+        render_device.destroyer.tick();
+        prof.read_previous(&render_device, time.elapsed_secs_f64());
+        ae.latch(&render_device);
+        // The previous frame's screenshot and video copies have landed: off to their encoders.
+        if let Some(done) = done {
+            screenshots.collect(&render_device, done);
+            video.latch(&render_device, done);
         }
         // Whole-device drains take the queue lock: the asset workers submit their builds
         // through the same VkQueue, and a drain racing a submit is a threading violation.

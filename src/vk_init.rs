@@ -19,7 +19,8 @@ pub fn image_info<'a>(
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .sharing_mode(crate::render_device::sharing().0)
+        .queue_family_indices(crate::render_device::sharing().1)
         .initial_layout(vk::ImageLayout::UNDEFINED)
 }
 

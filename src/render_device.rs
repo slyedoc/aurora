@@ -112,7 +112,9 @@ pub fn log_executable_statistics(rd: &RenderDevice, label: &str, pipeline: vk::P
         return;
     }
     for (index, exe) in executables.iter().enumerate() {
-        let name = exe.name_as_c_str().map_or("?".into(), |n| n.to_string_lossy());
+        let name = exe
+            .name_as_c_str()
+            .map_or("?".into(), |n| n.to_string_lossy());
         let info = vk::PipelineExecutableInfoKHR::default()
             .pipeline(pipeline)
             .executable_index(index as u32);
@@ -126,12 +128,18 @@ pub fn log_executable_statistics(rd: &RenderDevice, label: &str, pipeline: vk::P
         let values: Vec<String> = stats
             .iter()
             .map(|st| {
-                let n = st.name_as_c_str().map_or("?".into(), |n| n.to_string_lossy());
+                let n = st
+                    .name_as_c_str()
+                    .map_or("?".into(), |n| n.to_string_lossy());
                 let v = unsafe {
                     match st.format {
-                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => st.value.b32.to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => {
+                            st.value.b32.to_string()
+                        }
                         vk::PipelineExecutableStatisticFormatKHR::INT64 => st.value.i64.to_string(),
-                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => st.value.u64.to_string(),
+                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => {
+                            st.value.u64.to_string()
+                        }
                         _ => format!("{:.2}", st.value.f64),
                     }
                 };
@@ -140,6 +148,35 @@ pub fn log_executable_statistics(rd: &RenderDevice, label: &str, pipeline: vk::P
             .collect();
         log::debug!("shader stats {label} [{name}]: {}", values.join(", "));
     }
+}
+
+/// The queue families buffers and images are shared between (graphics, then the compute-only
+/// family when the device has one; async compute, docs/plans/async-compute.html). Set once, when
+/// the device is made.
+static SHARING_FAMILIES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// The sharing mode and families for a buffer or image both queues may touch: CONCURRENT over
+/// the graphics and compute families, or EXCLUSIVE with one queue.
+pub fn sharing() -> (vk::SharingMode, &'static [u32]) {
+    match SHARING_FAMILIES.get().map(Vec::as_slice) {
+        Some(families) if families.len() > 1 => (vk::SharingMode::CONCURRENT, families),
+        _ => (vk::SharingMode::EXCLUSIVE, &[]),
+    }
+}
+
+/// The compute-only queue (async compute): its family, the queue, the frame's command buffers
+/// per parity, and the timeline its submits signal. Every frame's last graphics submit waits on
+/// its last compute submit, so the main timeline stays the retirement clock.
+pub struct ComputeQueue {
+    pub family: u32,
+    pub queue: Mutex<vk::Queue>,
+    pub pool: vk::CommandPool,
+    pub command_buffers: [vk::CommandBuffer; 2],
+    /// The second compute submit per frame (ReSTIR's light grids, beside the primary pass),
+    /// from a pool of its own: the view lane records it while the scene lane records the first.
+    pub grid_pool: vk::CommandPool,
+    pub grid_buffers: [vk::CommandBuffer; 2],
+    pub timeline: crate::timeline::GpuTimeline,
 }
 
 pub struct RenderDeviceData {
@@ -165,11 +202,16 @@ pub struct RenderDeviceData {
     heaps: std::sync::OnceLock<crate::descriptor_heap::DescriptorHeaps>,
     pub transfer_command_pool: Mutex<vk::CommandPool>,
     pub command_buffers: [vk::CommandBuffer; 2],
-    /// The frame's other recorders (render_frame: the view and present lanes), each with its
-    /// own pool so they record on their own threads; `command_pool` is the scene lane's.
-    pub lanes: [(vk::CommandPool, [vk::CommandBuffer; 2]); 2],
+    /// The frame's other recorders (render_frame: the view and present lanes, the scene lane's
+    /// second half -- TLAS, lights -- submitted after the async compute it waits on, and the view
+    /// lane's back half -- after the first view's primary pass, waiting on the light grids), each
+    /// with its own pool so they record on their own threads; `command_pool` is the scene lane's.
+    /// The view lane's two halves share lane 0's thread, so lane 3 is recorded on it.
+    pub lanes: [(vk::CommandPool, [vk::CommandBuffer; 2]); 4],
     /// Every submit on the queue signals the next point on it (timeline.rs).
     pub timeline: crate::timeline::GpuTimeline,
+    /// The compute-only queue, when the device has one.
+    pub compute: Option<ComputeQueue>,
     /// Every pipeline compiles through this; seeded from and saved to disk
     /// ([`RenderDevice::save_pipeline_cache`]) so a relaunch skips the driver's compile.
     pub pipeline_cache: vk::PipelineCache,
@@ -202,6 +244,9 @@ pub struct BindlessMap {
     /// Slots released while a frame that may sample them could still run: reusable once the
     /// timeline passes the point.
     pub retired: Vec<(crate::timeline::SubmitPoint, u32)>,
+    /// Slots released since the last frame submit: the next frame submit's point retires them
+    /// ([`RenderDevice::retire_released`]), however many earlier submits that frame makes.
+    pub released: Vec<u32>,
     pub next: u32,
 }
 
@@ -212,6 +257,43 @@ impl Clone for RenderDevice {
 }
 
 impl RenderDevice {
+    /// Submits `cmd` on the async compute queue after the main timeline reaches `after` (the
+    /// earlier submits its work reads, and the previous frame's); returns the compute timeline
+    /// value it signals, which the graphics submit reading its results waits on.
+    pub fn submit_compute(
+        &self,
+        cmd: vk::CommandBuffer,
+        after: crate::timeline::SubmitPoint,
+    ) -> u64 {
+        let compute = self
+            .compute
+            .as_ref()
+            .expect("submit_compute without a compute queue");
+        let queue = compute.queue.lock().unwrap();
+        unsafe {
+            compute.timeline.submit_with(
+                self,
+                *queue,
+                std::slice::from_ref(&cmd),
+                &[],
+                &[(
+                    self.timeline.semaphore,
+                    after.0,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                )],
+                &[],
+                &[],
+                vk::Fence::null(),
+                None,
+            )
+        }
+        .unwrap_or_else(|e| {
+            crate::aftermath::note_device_lost(e);
+            panic!("compute submit failed: {e:?}");
+        })
+        .0
+    }
+
     /// The device, with the window system's surface support when `display_handle` is some; a
     /// windowless device (no surface or swapchain extensions) renders only to image targets.
     pub unsafe fn from_display(
@@ -225,14 +307,28 @@ impl RenderDevice {
             let (instance, debug_messenger) = create_instance(display_handle, &entry, xr);
             let ext_surface = surface::Instance::load(&entry, &instance);
             let (physical_device, queue_family_idx) = pick_physical_device(&instance, xr);
-            let (device, queue, micromaps, low_latency) = create_logical_device(
+            let compute_family = instance
+                .get_physical_device_queue_family_properties(physical_device)
+                .iter()
+                .position(|p| {
+                    p.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                        && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                        && p.timestamp_valid_bits > 0
+                })
+                .map(|i| i as u32);
+            let (device, queue, compute_queue, micromaps, low_latency) = create_logical_device(
                 &entry,
                 &instance,
                 physical_device,
                 queue_family_idx,
+                compute_family,
                 xr,
                 display_handle.is_some(),
             );
+            let mut families = vec![queue_family_idx];
+            families.extend(compute_family);
+            let _ = SHARING_FAMILIES.set(families);
+            log::info!("vulkan: async compute queue family: {compute_family:?}");
             let ext_swapchain = swapchain::Device::load(&instance, &device);
             let ext_rtx_pipeline = ray_tracing_pipeline::Device::load(&instance, &device);
             let ext_acc_struct = acceleration_structure::Device::load(&instance, &device);
@@ -270,6 +366,19 @@ impl RenderDevice {
                 spawn_destroy_thread(instance.clone(), device.clone(), allocator_state.clone());
 
             let timeline = crate::timeline::GpuTimeline::new(&device);
+            let compute = compute_family.zip(compute_queue).map(|(family, queue)| {
+                let pool = create_command_pool(&device, family);
+                let grid_pool = create_command_pool(&device, family);
+                ComputeQueue {
+                    family,
+                    queue,
+                    pool,
+                    command_buffers: create_command_buffers(&device, pool),
+                    grid_pool,
+                    grid_buffers: create_command_buffers(&device, grid_pool),
+                    timeline: crate::timeline::GpuTimeline::new(&device),
+                }
+            });
             let ret = RenderDevice(Arc::new(RenderDeviceData {
                 entry,
                 instance,
@@ -290,6 +399,7 @@ impl RenderDevice {
                 command_buffers,
                 lanes,
                 timeline,
+                compute,
                 pipeline_cache,
                 ext_debug_utils,
                 destroyer,
@@ -395,10 +505,16 @@ impl RenderDevice {
         let mut map = self.bindless_descriptor_map.lock().unwrap();
         if let Some(index) = map.by_view.remove(&texture.image_view) {
             // The frame being recorded may already use it and has not been submitted yet.
-            let last = self.timeline.last_submitted();
-            map.retired
-                .push((crate::timeline::SubmitPoint(last.0 + 2), index));
+            map.released.push(index);
         }
+    }
+
+    /// After a frame submit at `point`: the slots released before it are free once it is done.
+    pub fn retire_released(&self, point: crate::timeline::SubmitPoint) {
+        let mut map = self.bindless_descriptor_map.lock().unwrap();
+        let map = &mut *map;
+        map.retired
+            .extend(map.released.drain(..).map(|index| (point, index)));
     }
 
     /// The descriptor heaps (descriptor_heap.rs).
@@ -582,6 +698,11 @@ impl Drop for RenderDeviceData {
                 self.destroy_command_pool(pool, None);
             }
             self.timeline.destroy(&self.device);
+            if let Some(compute) = &self.compute {
+                self.destroy_command_pool(compute.pool, None);
+                self.destroy_command_pool(compute.grid_pool, None);
+                compute.timeline.destroy(&self.device);
+            }
             self.device.destroy_device(None);
             if let Some((debug_utils, messenger)) = &self.debug_messenger {
                 debug_utils.destroy_debug_utils_messenger(*messenger, None);
@@ -877,9 +998,16 @@ unsafe fn create_logical_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_idx: u32,
+    compute_family: Option<u32>,
     xr: Option<&XrContext>,
     windowed: bool,
-) -> (ash::Device, Mutex<vk::Queue>, bool, bool) {
+) -> (
+    ash::Device,
+    Mutex<vk::Queue>,
+    Option<Mutex<vk::Queue>>,
+    bool,
+    bool,
+) {
     unsafe {
         let mut device_extensions = vec![
             acceleration_structure::NAME.as_ptr(),
@@ -1003,10 +1131,20 @@ unsafe fn create_logical_device(
             device_extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
         }
         EXECUTABLE_STATISTICS.store(executable_stats, std::sync::atomic::Ordering::Relaxed);
-        let queue_info = vk::DeviceQueueCreateInfo::default()
-            .flags(queue_flags)
-            .queue_family_index(queue_family_idx)
-            .queue_priorities(&[1.0]);
+        let mut queue_infos = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .flags(queue_flags)
+                .queue_family_index(queue_family_idx)
+                .queue_priorities(&[1.0]),
+        ];
+        if let Some(family) = compute_family {
+            queue_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .flags(queue_flags)
+                    .queue_family_index(family)
+                    .queue_priorities(&[1.0]),
+            );
+        }
 
         // gpu_profiler.rs resets its timestamps from the host after reading them. 16-bit
         // arithmetic: Slang's f16tof32 / f32tof16 lower through 16-bit integer ops (core
@@ -1081,7 +1219,7 @@ unsafe fn create_logical_device(
 
         let device_info = vk::DeviceCreateInfo::default()
             .enabled_features(&core_features)
-            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)
             .push(&mut features_12)
             .push(&mut features_13)
@@ -1146,7 +1284,24 @@ unsafe fn create_logical_device(
                 .queue_index(0),
         );
 
-        (device, Mutex::new(queue), micromaps, low_latency)
+        let compute_queue = compute_family.map(|family| {
+            Mutex::new(
+                device.get_device_queue2(
+                    &vk::DeviceQueueInfo2::default()
+                        .flags(queue_flags)
+                        .queue_family_index(family)
+                        .queue_index(0),
+                ),
+            )
+        });
+
+        (
+            device,
+            Mutex::new(queue),
+            compute_queue,
+            micromaps,
+            low_latency,
+        )
     }
 }
 

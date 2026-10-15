@@ -67,7 +67,8 @@ fn api() -> Option<&'static Api> {
 
 #[cfg(unix)]
 fn load() -> Option<Api> {
-    let open = |name: &CStr| unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
+    let open =
+        |name: &CStr| unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
     // The injection library marks the activity as injected; the target library holds the API.
     if open(c"libWarpViz.Injection.so").is_null() {
         return None;

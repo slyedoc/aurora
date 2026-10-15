@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async compute</title>
+<style>
+:root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6862; --line:#e3e0d8; --accent:#2f5d8a; --card:#ffffff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#16171a; --fg:#e8e6e1; --muted:#9a978f; --line:#2c2d31; --accent:#8ab4e0; --card:#1d1e22; } }
+:root[data-theme="dark"] { --bg:#16171a; --fg:#e8e6e1; --muted:#9a978f; --line:#2c2d31; --accent:#8ab4e0; --card:#1d1e22; }
+body { background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, sans-serif; margin:0; padding:24px 16px 64px; }
+main { max-width:860px; margin:0 auto; }
+h1 { font-size:26px; margin:0 0 4px; } h2 { font-size:19px; margin:36px 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+h3 { font-size:16px; margin:22px 0 6px; } p, li { color:var(--fg); } .muted { color:var(--muted); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin:12px 0; }
+.tag { display:inline-block; font-size:12px; padding:1px 7px; border-radius:10px; border:1px solid var(--accent); color:var(--accent); margin-right:6px; }
+table { border-collapse:collapse; width:100%; font-size:14px; margin:8px 0; } th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code { font:13px ui-monospace, monospace; } pre { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:10px 12px; overflow-x:auto; font-size:13px; }
+.scroll { overflow-x:auto; }
+</style>
+</head>
+<body><main>
+<h1>Async compute</h1>
+<p class="muted">aurora, 2026-10-15. In-frame overlap only: one frame on the GPU at a time, as now. Cross-frame pipelining is out of scope.</p>
+
+<div class="card">
+<b>Why.</b> GPU Trace of Northshire (3840x1080, Balanced, aurora a62fe19): the frame averages 26 % SM throughput and 21 warps per SM. The scene lane (frame commands 0.225, skins 0.236, tlas 0.135 ms) runs at 0.4-7 % SM; skins is the skinned BLAS refits, fixed-function work with 0.9 warps/SM. The primary pass and the trace hold 18 warps/SM (126-register raygens). Everything is serial on one queue. Work that does not depend on what runs beside it can fill those SMs from a second, compute-only queue (family 2: 8 queues, 64-bit timestamps).
+</div>
+
+<h2>Decisions</h2>
+
+<h3>D1. A compute-only queue; buffers and images shared CONCURRENT</h3>
+<p>One queue from the compute-only family (2 on NVIDIA). Every buffer and storage/sampled image is created <code>CONCURRENT</code> over the graphics and compute families (one place each: <code>create_buffer</code>, <code>vk_init::image_info</code>), so no ownership transfers are needed; NVIDIA has no cost for concurrent sharing. The swapchain stays EXCLUSIVE (graphics only). Without a compute-only family everything stays on the one queue, in the same order.</p>
+<p class="muted">Alternative: EXCLUSIVE with release/acquire barriers per crossing. More barriers and more to get wrong; no gain on NVIDIA.</p>
+
+<h3>D2. The existing timeline stays the retirement clock</h3>
+<p>Today one timeline orders everything, and "point N reached" means every earlier submit finished; the destroyer, GPU retire and bindless slot reuse rely on it. That stays true if every frame's last graphics submit waits on the frame's last compute submit: reaching a graphics point then implies the compute work before it finished too. A second timeline semaphore orders the compute submits within a frame (graphics waits on it, compute waits on graphics points). Nothing that retires resources changes.</p>
+<p class="muted">Alternative: a timeline per queue and retirement over both. More general (compute work could outlive a frame), but every retirement site changes; not needed while compute work never ends a frame.</p>
+
+<h3>D3. The frame as three graphics submits and two compute submits</h3>
+<div class="scroll"><table>
+<tr><th>graphics queue</th><th>compute queue</th></tr>
+<tr><td><b>G1</b> uniform/environment upload, frame commands (scatter)</td><td><b>C1</b> waits G1's upload: skins + skinned BLAS refits, exposure, atmosphere LUTs, SHaRC resolve, fog reproject</td></tr>
+<tr><td><b>G2</b> waits C1: TLAS, lights, fog grid (RT light, soften, integrate), primary</td><td><b>C2</b> waits G2's lights: ReSTIR grid (overlaps the fog grid and the primary pass)</td></tr>
+<tr><td><b>G3</b> waits C2: ReSTIR temporal + spatial, trace, DLSS, post prep, present</td><td></td></tr>
+</table></div>
+<p>Semaphore waits at the exact stage that reads (not <code>ALL_COMMANDS</code>). The groups are a first cut from the code; phase 1 audits every read and write before anything moves, and a pass whose inputs turn out to cross a boundary stays where it is.</p>
+
+<h3>D4. The bench measures the frame's span, not the sum of its scopes</h3>
+<p><code>busy</code> sums the scopes, which counts overlapped work twice. With two queues the measure is <code>span</code>: first to last timestamp across both queues (one device clock). The profiler gets a query pool on the compute queue. A/B on <code>span</code> and the trace's own scope.</p>
+
+<h3>D5. NGX, XR and present stay on the graphics queue</h3>
+<p>DLSS evaluate, the XR compositor's submits and the swapchain present are untouched.</p>
+
+<h2>Expected</h2>
+<p>Overlappable under the scene lane: skins + BLAS 0.24, exposure + atmosphere 0.04, SHaRC resolve 0.05, fog reproject ~0.02 ms. Under the primary pass: ReSTIR grid 0.06 ms. Ceiling about 0.35-0.4 ms of a 5.5 ms frame; realistic 0.2-0.3, less what the extra submits and semaphores cost.</p>
+
+<h2>Phases</h2>
+<ol>
+<li><b>Measure.</b> Bench and profiler report <code>span</code>; baseline taken.</li>
+<li><b>Plumbing, nothing moved.</b> Compute queue and command pools, the compute timeline, CONCURRENT sharing, profiler queries on the compute queue, the frame split into its submits with everything still on graphics. Shots identical; span unchanged within noise. Validation clean.</li>
+<li><b>C1.</b> Dependency audit of the scene-lane group, then move it. A/B span; shots; XR.</li>
+<li><b>C2.</b> ReSTIR grid under the primary pass.</li>
+<li><b>Barrier audit.</b> Narrow the <code>ALL_COMMANDS</code> barriers that serialise same-queue work, now that the timeline shows what waits on what.</li>
+</ol>
+
+<h2>Mechanical notes</h2>
+<ul>
+<li><code>render_device.rs</code>: pick the compute family, create the queue (internally synchronized like the main one), a command pool and per-parity command buffers for it.</li>
+<li><code>timeline.rs</code>: a compute timeline beside the main one; submits take waits on either (value + stage mask).</li>
+<li><code>render_buffer.rs</code> / render targets: queue family indices on creation (CONCURRENT).</li>
+<li><code>gpu_profiler.rs</code>: a second query pool; scopes tagged by queue; <code>span</code> across both.</li>
+<li><code>ray_render_plugin.rs</code>: lanes record into the submit they belong to; submits in order G1, C1, G2, C2, G3 with their waits.</li>
+<li>Test: Northshire bench A/B on span, shots, 90 s validation, XR (two views), a skinned character on screen.</li>
+</ul>
+</main></body>
+</html>

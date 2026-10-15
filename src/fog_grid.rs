@@ -326,8 +326,14 @@ impl FogGridState {
             &volumes,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::GENERAL,
-            (vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::NONE),
-            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE),
+            (
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::NONE,
+            ),
+            (
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+            ),
         );
         record_dispatch(rd, cmd, module, "fog_soften", &push, grid.cells, base);
         compute_to_trace(rd, cmd);
@@ -347,8 +353,14 @@ impl FogGridState {
             &volumes,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE),
-            (vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::SHADER_READ),
+            (
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+            ),
+            (
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags2::SHADER_READ,
+            ),
         );
     }
 
@@ -383,7 +395,8 @@ impl FogGridState {
             cmd,
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
         );
         if let Some(volumes) = view.volumes {
@@ -393,8 +406,14 @@ impl FogGridState {
                 &volumes,
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                (vk::PipelineStageFlags2::CLEAR, vk::AccessFlags2::TRANSFER_WRITE),
-                (vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::SHADER_READ),
+                (
+                    vk::PipelineStageFlags2::CLEAR,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+                (
+                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                    vk::AccessFlags2::SHADER_READ,
+                ),
             );
         }
     }

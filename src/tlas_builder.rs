@@ -991,8 +991,10 @@ impl TLAS {
                 )
             };
         }
-        let scratch_size =
-            build_size.build_scratch_size.max(build_size.update_scratch_size) + self.scratch_alignment;
+        let scratch_size = build_size
+            .build_scratch_size
+            .max(build_size.update_scratch_size)
+            + self.scratch_alignment;
         if scratch_size > self.scratch_buffer.nr_elements {
             rd.destroyer.destroy_buffer(self.scratch_buffer.handle);
             self.scratch_buffer =
@@ -1001,10 +1003,8 @@ impl TLAS {
 
         let rows = self.pack(rd, cmd, module);
         // A refit keeps the source build's rows: same count, same order (no row scattered).
-        let refit = refit
-            && self.refittable
-            && rows == self.refit_rows
-            && self.refits < REFIT_FRAMES;
+        let refit =
+            refit && self.refittable && rows == self.refit_rows && self.refits < REFIT_FRAMES;
         if refit {
             self.refits += 1;
         } else {
@@ -1021,7 +1021,11 @@ impl TLAS {
             } else {
                 vk::BuildAccelerationStructureModeKHR::BUILD
             })
-            .src_acceleration_structure(if refit { handle } else { vk::AccelerationStructureKHR::null() })
+            .src_acceleration_structure(if refit {
+                handle
+            } else {
+                vk::AccelerationStructureKHR::null()
+            })
             .dst_acceleration_structure(handle)
             .geometries(std::slice::from_ref(&geometry))
             .scratch_data(vk::DeviceOrHostAddressKHR {

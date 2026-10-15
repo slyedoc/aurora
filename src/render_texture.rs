@@ -404,7 +404,8 @@ pub fn load_texture_levels(
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | usage_flags)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .sharing_mode(crate::render_device::sharing().0)
+        .queue_family_indices(crate::render_device::sharing().1)
         .initial_layout(vk::ImageLayout::UNDEFINED);
 
     let image_handle = unsafe { device.device.create_image(&image_info, None).unwrap() };
@@ -583,7 +584,15 @@ pub fn create_blank_texture(
     width: u32,
     height: u32,
 ) -> RenderTexture {
-    create_blank(device, format, usage_flags, desired_layout, width, height, 1)
+    create_blank(
+        device,
+        format,
+        usage_flags,
+        desired_layout,
+        width,
+        height,
+        1,
+    )
 }
 
 /// A 3D image of `depth` slices, viewed as 3D (a `Sampler3D` reads it through the bindless
@@ -597,7 +606,15 @@ pub fn create_blank_volume(
     height: u32,
     depth: u32,
 ) -> RenderTexture {
-    create_blank(device, format, usage_flags, desired_layout, width, height, depth)
+    create_blank(
+        device,
+        format,
+        usage_flags,
+        desired_layout,
+        width,
+        height,
+        depth,
+    )
 }
 
 fn create_blank(
@@ -611,11 +628,13 @@ fn create_blank(
 ) -> RenderTexture {
     let mut image_info = vk_init::image_info(width, height, format, usage_flags);
     if depth > 1 {
-        image_info = image_info.image_type(vk::ImageType::TYPE_3D).extent(vk::Extent3D {
-            width,
-            height,
-            depth,
-        });
+        image_info = image_info
+            .image_type(vk::ImageType::TYPE_3D)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth,
+            });
     }
     let image_handle = unsafe { device.device.create_image(&image_info, None).unwrap() };
 

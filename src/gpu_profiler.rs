@@ -37,6 +37,9 @@ pub struct GpuProfiler {
     pub times: Vec<(&'static str, f64)>,
     /// The last frame read back, unsmoothed (scopes of one name summed).
     pub last_frame: Vec<(&'static str, f64)>,
+    /// The last frame read's scopes as (name, start, end) in ms from its first timestamp: which
+    /// ran beside which across the queues (logged at debug with the smoothed times).
+    pub last_timeline: Vec<(&'static str, f64, f64)>,
     /// Frames read back so far; `last_frame` changes when this does.
     pub frames_read: u64,
     /// The last frame's final timestamp: the next frame's first one minus this is how long the
@@ -78,6 +81,7 @@ impl GpuProfiler {
             labels: Mutex::new(HashMap::new()),
             times: Vec::new(),
             last_frame: Vec::new(),
+            last_timeline: Vec::new(),
             frames_read: 0,
             last_end: None,
             cpu_record: 0.0,
@@ -127,6 +131,14 @@ impl GpuProfiler {
                 let end = (0..count as usize).map(|i| ticks[2 * i + 1]).max();
                 if let (Some(start), Some(end)) = (start, end) {
                     let ms = |t: u64| t as f64 * self.period_ns / 1.0e6;
+                    self.last_timeline = recorded
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let at = |t: u64| ms(t.saturating_sub(start));
+                            (*name, at(ticks[2 * i]), at(ticks[2 * i + 1]))
+                        })
+                        .collect();
                     frame.push(("span", ms(end.saturating_sub(start))));
                     if let Some(last) = self.last_end {
                         frame.push(("idle", ms(start.saturating_sub(last))));
@@ -158,6 +170,12 @@ impl GpuProfiler {
                 .map(|(name, ms)| format!("{name} {ms:.2}"))
                 .collect();
             debug!("gpu ms: {}", line.join(", "));
+            let timeline: Vec<String> = self
+                .last_timeline
+                .iter()
+                .map(|(name, a, b)| format!("{name} {a:.3}-{b:.3}"))
+                .collect();
+            debug!("gpu timeline: {}", timeline.join(", "));
         }
     }
 

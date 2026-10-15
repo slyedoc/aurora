@@ -123,9 +123,12 @@ impl BufferProvider for RenderDevice {
                 marker: std::marker::PhantomData,
             };
         }
+        let (sharing_mode, families) = crate::render_device::sharing();
         let buffer_info = vk::BufferCreateInfo::default()
             .size(nr_elements * std::mem::size_of::<T>() as u64)
-            .usage(usage);
+            .usage(usage)
+            .sharing_mode(sharing_mode)
+            .queue_family_indices(families);
 
         let handle = unsafe { self.device.create_buffer(&buffer_info, None).unwrap() };
         let requirements_info = vk::BufferMemoryRequirementsInfo2::default().buffer(handle);

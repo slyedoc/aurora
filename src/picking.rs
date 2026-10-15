@@ -120,6 +120,9 @@ pub struct Picker {
     /// Casters whose hits the submitted pick is writing.
     in_flight: Vec<Entity>,
     command_buffers: [vk::CommandBuffer; 2],
+    /// With async compute the early work splits in two submits: the head (uploads, frame
+    /// commands) beside the compute queue, and this tail (TLAS, pick) after it.
+    tail_buffers: [vk::CommandBuffer; 2],
     /// The pick submit\'s point on the timeline, while hits are in flight.
     pub point: crate::timeline::SubmitPoint,
 }
@@ -131,7 +134,7 @@ impl Picker {
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(rd.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(2),
+                    .command_buffer_count(4),
             )
         }
         .unwrap();
@@ -144,6 +147,7 @@ impl Picker {
             staged: Vec::new(),
             in_flight: Vec::new(),
             command_buffers: [command_buffers[0], command_buffers[1]],
+            tail_buffers: [command_buffers[2], command_buffers[3]],
             point: crate::timeline::SubmitPoint::default(),
         }
     }
@@ -181,14 +185,55 @@ impl Picker {
         cmd
     }
 
+    /// Ends `head` and submits it, then starts the tail command buffer the TLAS and pick record
+    /// into (async compute runs between the two).
+    pub fn split(
+        &self,
+        rd: &RenderDevice,
+        head: vk::CommandBuffer,
+        frame: usize,
+    ) -> vk::CommandBuffer {
+        let tail = self.tail_buffers[frame % 2];
+        unsafe {
+            rd.end_command_buffer(head).unwrap();
+            let queue = rd.queue.lock().unwrap();
+            rd.timeline
+                .submit(
+                    rd,
+                    *queue,
+                    std::slice::from_ref(&head),
+                    &[],
+                    &[],
+                    &[],
+                    vk::Fence::null(),
+                    None,
+                )
+                .unwrap_or_else(|e| {
+                    crate::aftermath::note_device_lost(e);
+                    panic!("pick submit failed: {e:?}");
+                });
+            rd.reset_command_buffer(tail, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            rd.begin_command_buffer(
+                tail,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+        }
+        tail
+    }
+
     /// Records the pick after the TLAS build, ends `cmd` and submits it on the timeline
-    /// ([`Self::point`], which the frame's submit waits for).
+    /// ([`Self::point`], which the frame's submit waits for), after `timeline_waits` (the async
+    /// compute the TLAS reads).
     pub fn submit(
         &mut self,
         rd: &RenderDevice,
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         tlas: &TLAS,
+        timeline_waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)],
     ) {
         let count = self.staged.len() as u32;
         if count > self.capacity {
@@ -242,11 +287,12 @@ impl Picker {
             let queue = rd.queue.lock().unwrap();
             self.point = rd
                 .timeline
-                .submit(
+                .submit_with(
                     rd,
                     *queue,
                     std::slice::from_ref(&cmd),
                     &[],
+                    timeline_waits,
                     &[],
                     &[],
                     vk::Fence::null(),

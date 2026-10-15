@@ -13,7 +13,6 @@
 pub const MAX_VIEWS: usize = 4;
 
 pub mod aftermath;
-pub mod nsight;
 pub mod animclip;
 pub mod assets;
 pub mod atmosphere;
@@ -31,7 +30,6 @@ pub mod dev_ui;
 pub mod dlss;
 pub mod environment;
 pub mod fog_grid;
-pub mod post_prep;
 pub mod fog_volume;
 pub mod frame_sync;
 pub mod gizmo_render;
@@ -41,10 +39,12 @@ pub mod latency;
 pub mod lights;
 pub mod material;
 pub mod mesh;
+pub mod nsight;
 pub mod omm;
 pub mod picking;
 pub mod pointer_picking;
 pub mod portal;
+pub mod post_prep;
 pub mod post_process_filter;
 pub mod procedural_mesh;
 pub mod ray_render_plugin;

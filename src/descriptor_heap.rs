@@ -487,7 +487,6 @@ impl DescriptorHeaps {
         self.gizmo
     }
 
-
     /// The create-time mapping for a pipeline reading `mappings`.
     pub fn mappings(
         &self,
@@ -496,17 +495,20 @@ impl DescriptorHeaps {
         mappings
             .iter()
             .map(|m| match *m {
-                Mapping::Volumes { set, binding } => vk::DescriptorSetAndBindingMappingEXT::default()
-                    .descriptor_set(set)
-                    .first_binding(binding)
-                    .binding_count(1)
-                    .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
-                    .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
-                    .source_data(vk::DescriptorMappingSourceDataEXT {
-                        constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default()
+                Mapping::Volumes { set, binding } => {
+                    vk::DescriptorSetAndBindingMappingEXT::default()
+                        .descriptor_set(set)
+                        .first_binding(binding)
+                        .binding_count(1)
+                        .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
+                        .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
+                        .source_data(vk::DescriptorMappingSourceDataEXT {
+                            constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default(
+                            )
                             .heap_offset(self.volumes)
                             .heap_array_stride(self.stride),
-                    }),
+                        })
+                }
                 Mapping::Prep {
                     set,
                     binding,

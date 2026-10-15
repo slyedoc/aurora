@@ -283,36 +283,44 @@ struct ViewExposure {
     state: Buffer<AeGpu>,
     /// Host-visible copy of a PROBE_SIDE^2 patch of `lum` at screen centre, for the panel
     /// readout. One frame behind, like the metering.
-    probe: Buffer<f32>,
+    probe: [Buffer<f32>; 2],
     /// Smoothed centre-screen scene luminance, NITS -- physical, pre-exposure, so it reads
     /// the same whatever the metering or the look is doing. See [`Self::probe_nits`].
     probe_nits: f32,
     /// `lum` holds a full traced frame at the current size (metering skips until then).
     primed: bool,
     /// Host copy of last frame's state (its look `ev`), read after the frame fence.
-    readback: Buffer<AeGpu>,
+    readback: [Buffer<AeGpu>; 2],
     /// Ray Reconstruction's input exposure (log2), decided here: the look, never the raw
     /// metering. RR's history cannot follow an input-exposure change (a full-screen transient
     /// per change; telling NGX the pre-exposure shifts its output but keeps the transient),
     /// so it changes only as fast as the picture does: never under a fixed look.
     input_ev: Option<f32>,
-    /// The input exposure for the frame being recorded, `[ev, exp2(ev)]`: written by
-    /// [`Self::latch`] after the previous frame's wait (it needs that frame's readback), copied
-    /// into `state` by the recorded commands.
-    latch: Buffer<[f32; 2]>,
+    /// The input exposure, `[ev, exp2(ev)]`, per `slot`: written by [`Self::latch`] after the
+    /// previous frame's wait (it needs that frame's readback) for the next frame, whose recorded
+    /// commands copy it into `state`.
+    latch: [Buffer<[f32; 2]>; 2],
+    /// Which of each host-visible pair (`probe`, `readback`, `latch`) the frame being recorded
+    /// uses; [`Self::latch`] reads the previous frame's and writes the next frame's, so a
+    /// frame submitted ahead of the CPU's wait never touches the copy the CPU is reading.
+    slot: usize,
+    /// The stages that read the state in the queue recording it (the raygen; the composite's
+    /// fragment shader on the graphics queue). On the async compute queue the semaphore its
+    /// readers wait on carries the rest.
+    readers: vk::PipelineStageFlags2,
     /// What [`Self::latch`] eases the input with: the look, its speed and the frame's dt.
     pending: Option<(AuroraExposure, f32, f32)>,
 }
 
 impl ViewExposure {
     /// Reads back the patch the PREVIOUS frame copied and folds it into the smoothed
-    /// value. Called at the top of `record`, by which point (one frame in flight) that
-    /// copy has landed.
+    /// value. Called from [`Self::latch`], after that frame's wait.
     fn read_probe(&mut self, rd: &RenderDevice) {
-        if self.probe.handle == vk::Buffer::null() || !self.primed {
+        let probe = &mut self.probe[self.slot ^ 1];
+        if probe.handle == vk::Buffer::null() || !self.primed {
             return;
         }
-        let mut view = rd.map_buffer(&mut self.probe);
+        let mut view = rd.map_buffer(probe);
         // Interleaved (meter, nits) pairs; the readout is the nits.
         let nits: Vec<f32> = view
             .as_slice_mut()
@@ -335,7 +343,8 @@ impl ViewExposure {
 
     /// Copies the centre patch of `lum` into the host-visible probe buffer.
     fn record_probe(&self, rd: &RenderDevice, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
-        if self.probe.handle == vk::Buffer::null() || extent.width == 0 || extent.height == 0 {
+        let probe = &self.probe[self.slot];
+        if probe.handle == vk::Buffer::null() || extent.width == 0 || extent.height == 0 {
             return;
         }
         let side = PROBE_SIDE.min(extent.width).min(extent.height);
@@ -358,7 +367,7 @@ impl ViewExposure {
             .collect();
         unsafe {
             rd.device
-                .cmd_copy_buffer(cmd, self.lum.handle, self.probe.handle, &regions);
+                .cmd_copy_buffer(cmd, self.lum.handle, probe.handle, &regions);
         }
     }
 
@@ -369,10 +378,11 @@ impl ViewExposure {
             self.input_ev = Some(fixed.ev);
             return;
         }
-        if self.readback.handle == vk::Buffer::null() || !self.primed {
+        let readback = &mut self.readback[self.slot ^ 1];
+        if readback.handle == vk::Buffer::null() || !self.primed {
             return;
         }
-        let look = rd.map_buffer(&mut self.readback)[0].ev;
+        let look = rd.map_buffer(readback)[0].ev;
         if !look.is_finite() || look == 0.0 {
             return;
         }
@@ -391,10 +401,11 @@ impl ViewExposure {
             self.update_input(rd, &exposure, speed, dt);
         }
         if let Some(ev) = self.input_ev
-            && self.latch.handle != vk::Buffer::null()
+            && self.latch[self.slot ^ 1].handle != vk::Buffer::null()
         {
-            rd.map_buffer(&mut self.latch)[0] = [ev, ev.exp2()];
+            rd.map_buffer(&mut self.latch[self.slot ^ 1])[0] = [ev, ev.exp2()];
         }
+        self.slot ^= 1;
     }
 
     /// Copies this frame's input exposure (latched after the previous frame's wait) into the
@@ -414,7 +425,7 @@ impl ViewExposure {
         unsafe {
             rd.device.cmd_copy_buffer(
                 cmd,
-                self.latch.handle,
+                self.latch[self.slot].handle,
                 self.state.handle,
                 &[vk::BufferCopy::default()
                     .dst_offset(std::mem::offset_of!(AeGpu, input_ev) as u64)
@@ -433,7 +444,7 @@ impl ViewExposure {
             rd.device.cmd_copy_buffer(
                 cmd,
                 self.state.handle,
-                self.readback.handle,
+                self.readback[self.slot].handle,
                 &[vk::BufferCopy::default().size(size_of::<AeGpu>() as u64)],
             );
         }
@@ -442,8 +453,7 @@ impl ViewExposure {
             cmd,
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            self.readers,
             vk::AccessFlags2::SHADER_READ,
         );
     }
@@ -473,8 +483,7 @@ impl ViewExposure {
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_WRITE,
             // The raygen applies the exposure; the blit reads it for a fixed look's ratio.
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            self.readers,
             vk::AccessFlags2::SHADER_READ,
         );
     }
@@ -499,12 +508,18 @@ impl ViewExposure {
         if self.state.handle == vk::Buffer::null() {
             self.histogram = rd.create_device_buffer(64, usage);
             self.state = rd.create_device_buffer(1, usage);
-            self.probe = rd.create_host_buffer(
-                2 * (PROBE_SIDE * PROBE_SIDE) as u64,
-                vk::BufferUsageFlags::TRANSFER_DST,
-            );
-            self.readback = rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_DST);
-            self.latch = rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_SRC);
+            self.probe = std::array::from_fn(|_| {
+                rd.create_host_buffer(
+                    2 * (PROBE_SIDE * PROBE_SIDE) as u64,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                )
+            });
+            self.readback = std::array::from_fn(|_| {
+                rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_DST)
+            });
+            self.latch = std::array::from_fn(|_| {
+                rd.create_host_buffer(1, vk::BufferUsageFlags::TRANSFER_SRC)
+            });
             unsafe {
                 rd.device
                     .cmd_fill_buffer(cmd, self.histogram.handle, 0, vk::WHOLE_SIZE, 0);
@@ -605,8 +620,7 @@ impl ViewExposure {
             vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
             // The raygen applies the exposure; the blit reads it for a fixed look's ratio.
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            self.readers,
             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
         );
     }
@@ -616,9 +630,12 @@ impl ViewExposure {
             self.lum.handle,
             self.histogram.handle,
             self.state.handle,
-            self.probe.handle,
-            self.readback.handle,
-            self.latch.handle,
+            self.probe[0].handle,
+            self.probe[1].handle,
+            self.readback[0].handle,
+            self.readback[1].handle,
+            self.latch[0].handle,
+            self.latch[1].handle,
         ] {
             rd.destroyer.destroy_buffer(handle);
         }
@@ -657,7 +674,7 @@ impl AutoExposureState {
     /// returns the (luminance, exposure state) addresses its trace writes and reads. Call
     /// once per camera per frame, before its trace is recorded; the first camera recorded
     /// in a frame is the primary.
-    #[expect(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         rd: &RenderDevice,
@@ -667,15 +684,17 @@ impl AutoExposureState {
         extent: vk::Extent2D,
         exposure: &AuroraExposure,
         dt: f32,
+        readers: vk::PipelineStageFlags2,
     ) -> (u64, u64) {
         let module = modules.get(&self.module);
         let view = self.views.entry(camera).or_default();
+        view.readers = readers;
         view.record(rd, cmd, module, extent, exposure, dt);
         view.addresses()
     }
 
-    /// After the previous frame's wait, before this frame's submit: every camera's readback
-    /// read and input exposure latched (see `ViewExposure::latch`).
+    /// After the previous frame's wait: every camera's readback read and the next frame's
+    /// input exposure latched (see `ViewExposure::latch`).
     pub fn latch(&mut self, rd: &RenderDevice) {
         for view in self.views.values_mut() {
             view.latch(rd);
