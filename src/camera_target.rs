@@ -7,8 +7,8 @@
 //! which do the same for offscreen `bevy_ui` trees; the split between them is `Camera3d`.
 //!
 //! Cost: a view is per-view state (uniform buffer, reservoirs, DLSS feature) plus its own
-//! raygen dispatch, but the world-scale work -- TLAS, light table, GPU transforms, the SHARC
-//! cache -- is built once per frame no matter how many views read it. So N targets cost
+//! raygen dispatch, but the world-scale work -- TLAS, light table, GPU transforms -- is
+//! built once per frame no matter how many views read it. So N targets cost
 //! roughly their total pixels, not N frames. [`crate::MAX_VIEWS`] caps how many render in
 //! one frame; a host wanting more (a wall of asset thumbnails) should render them over
 //! successive frames rather than raising it.

@@ -10,8 +10,9 @@ use bevy::prelude::*;
 use crate::dlss::{RrPreset, set_jitter_scale};
 
 /// How the frame is traced. Read every frame; edit it from any inspector. `samples`,
-/// `max_bounces`, `light_candidates`, `spec_hit_roughness` and `roulette_from` are built into the
-/// ray tracing pipeline (specialization constants): changing one rebuilds it.
+/// `max_bounces`, `light_candidates`, `spec_hit_roughness`, `roulette_from`, `restir` and
+/// `restir_gi` are built into the ray tracing pipeline (specialization constants): changing one
+/// rebuilds it.
 #[derive(Resource, Reflect, Clone, Debug)]
 #[reflect(Resource, Default)]
 pub struct RenderSettings {
@@ -67,6 +68,28 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
+    /// ReSTIR GI (restir_gi.rs): the first indirect bounce at the primary vertex reused across
+    /// neighbouring pixels (reservoirs of secondary hits), shaded by a pass of its own. Needs no
+    /// lights: a sun-only scene gets it too. On by default: at 1 spp without it Ray
+    /// Reconstruction drops the rare bright indirect paths (Northshire's abbey 7 % dark against
+    /// a 4 spp reference); with it within 1 %, local error 7.1 % -> 5.5 %, for ~0.9 ms at
+    /// 3840x1080. It replaced a radiance cache (SHaRC), which held the brightness but with more
+    /// local error (8.8 %) and bias.
+    pub restir_gi: bool,
+    /// Perceptual roughness from which a primary vertex and a secondary hit take part; glossier
+    /// surfaces and glass keep their indirect light in the path.
+    #[reflect(@0.0..=1.0_f32)]
+    pub restir_gi_roughness: f32,
+    /// GI's temporal history cap, in frames (0 = no temporal reuse, the default: reused across
+    /// frames, its samples stay correlated long enough for Ray Reconstruction to keep them as
+    /// detail, and the image boils -- 2.2 against 0.46 outdoors at 8, 1.3 at 1).
+    #[reflect(@0.0..=64.0_f32)]
+    pub restir_gi_history: f32,
+    /// Neighbours merged by GI's spatial pass (0 = temporal only) and their disc (pixels).
+    #[reflect(@0.0..=16.0_f32)]
+    pub restir_gi_spatial_samples: u32,
+    #[reflect(@1.0..=64.0_f32)]
+    pub restir_gi_spatial_radius: f32,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
     /// under test take their old path at 0 and the new one at 1.
     pub ab: u32,
@@ -75,13 +98,6 @@ pub struct RenderSettings {
     pub light_grid_cell: f32,
     #[reflect(@1.0..=64.0_f32)]
     pub light_grid_samples: u32,
-    /// Radiance cache: indirect paths end in converged voxels from the first bounce on (a few
-    /// train it to the end). Biased, but at 1 spp it keeps the light Ray Reconstruction would
-    /// throw away as fireflies (the abbey 25 % dark without it).
-    pub sharc: bool,
-    /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
-    #[reflect(@0.05..=2.0_f32)]
-    pub sharc_voxel: f32,
     /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = any-hit alpha test).
     pub omm: bool,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
@@ -122,11 +138,14 @@ impl Default for RenderSettings {
             restir_spatial_samples: 2,
             restir_spatial_radius: 30.0,
             restir_boiling: 0.0,
+            restir_gi: true,
+            restir_gi_roughness: 0.35,
+            restir_gi_history: 0.0,
+            restir_gi_spatial_samples: 3,
+            restir_gi_spatial_radius: 30.0,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
-            sharc: true,
-            sharc_voxel: 0.25,
             omm: true,
             rr_preset: RrPreset::current(),
             low_latency: crate::latency::LowLatency::On,

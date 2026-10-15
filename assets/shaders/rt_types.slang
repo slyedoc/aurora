@@ -164,15 +164,15 @@ public struct UniformData {
     public uint pad_candidates[2];
     // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
     public float lod_bias;
-    public uint pad_spec_hit;
+    // ReSTIR GI: the perceptual roughness from which a primary vertex and a secondary hit take
+    // part (raygen.slang `main`, restir_gi.slang).
+    public float gi_roughness;
     // Light-table generation; reservoirs from another generation are dropped.
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
     public float restir_m_clamp;
-    // Radiance cache: 0 = off; else paths may terminate into it.
-    public uint sharc;
-    // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
-    public float sharc_voxel;
+    // Free (the radiance cache went: ReSTIR GI does its job).
+    public uint pad_cache[2];
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -261,24 +261,6 @@ public struct LightInstance {
     public uint pad2_x, pad2_y;
 };
 
-// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 32 bytes; resolved
-// values are packed f16 pairs.
-public struct SharcEntry {
-    public uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
-    public uint frame;    // Last frame the entry was deposited into or queried.
-    // Radiance accumulated this frame, fixed point at SHARC_UNIT (1/65536 nit): 64-bit so a
-    // moonlit voxel keeps its precision and a sunlit one cannot overflow.
-    public uint64_t acc_r;
-    public uint64_t acc_g;
-    public uint64_t acc_b;
-    public uint acc_n;    // Samples accumulated this frame.
-    public float conf;    // Samples folded into the resolved value.
-    public float res_r;   // Resolved outgoing radiance (nits).
-    public float res_g;
-    public float res_b;
-    public uint pad;
-};
-
 // One ReSTIR DI reservoir (src/restir.rs allocates one per traced pixel). 32 bytes.
 // The primary vertex as ReSTIR DI sees it (src/restir.rs), written by the raygen at sample 0's
 // first shaded surface; `frame` marks it live (a pixel that hit nothing keeps an old one).
@@ -359,6 +341,125 @@ public struct PrimaryHit {
     public float primary_t;
     public uint hit_kind;
 };
+
+// RGB9E5 (shared exponent, nine-bit mantissas): non-negative radiance up to 65408 in one word.
+public uint packRgb9e5(float3 c) {
+    let rgb = clamp(c, float3(0.0), float3(65408.0));
+    let maxc = max(rgb.r, max(rgb.g, rgb.b));
+    var e = max(-16, int(floor(log2(max(maxc, 1.0e-30))))) + 16;
+    var denom = exp2(float(e - 24));
+    if (floor(maxc / denom + 0.5) >= 512.0) {
+        denom *= 2.0;
+        e += 1;
+    }
+    let m = uint3(min(floor(rgb / denom + 0.5), float3(511.0)));
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+
+public float3 unpackRgb9e5(uint p) {
+    let m = float3(float(p & 511u), float((p >> 9) & 511u), float((p >> 18) & 511u));
+    return m * exp2(float(int(p >> 27) - 24));
+}
+
+// ReSTIR GI's candidate (src/restir_gi.rs), written by the path tracer per traced pixel whose
+// primary vertex takes part: the secondary hit, the radiance leaving it toward the primary
+// vertex and the direction's pdf there (0 = a null candidate). 32 bytes.
+public struct GiCandidate {
+    public float3 x_s;
+    // The secondary hit's geometric normal, toward the primary vertex (oct 2xf16).
+    public uint n_s_oct;
+    // RGB9E5, nits.
+    public uint L;
+    public float pdf;
+    public uint frame;
+    // Aerial perspective x cloud transmittance at the primary vertex (Sky::Atmosphere), RGB9E5.
+    public uint view_t;
+};
+
+public GiCandidate giCandidateLoad(GiCandidate* p) {
+    let d = (uint4*)p;
+    let a = loadAligned<16>(d);
+    let b = loadAligned<16>(d + 1);
+    GiCandidate c;
+    c.x_s = asfloat(a.xyz);
+    c.n_s_oct = a.w;
+    c.L = b.x;
+    c.pdf = asfloat(b.y);
+    c.frame = b.z;
+    c.view_t = b.w;
+    return c;
+}
+
+// ReSTIR GI's reservoir, one per traced pixel. 64 bytes.
+public struct GiReservoir {
+    public float3 x_s;
+    public uint n_s_oct;
+    public uint L;
+    // Unbiased contribution weight (0 after an occluded visibility ray) and history length.
+    public float W;
+    public float M;
+    // The winner's target at this reservoir's own vertex.
+    public float phat;
+    // The primary vertex it belongs to (the temporal shift's Jacobian) and its view depth.
+    public float3 x_v;
+    public float depth;
+    public uint n_v_oct;
+    public uint frame;
+    // GI_FRESH: the winner is this frame's own candidate (traced from here: no visibility ray).
+    public uint flags;
+    public uint pad;
+};
+
+public static const uint GI_FRESH = 1u;
+
+public GiReservoir giReservoirLoad(GiReservoir* p) {
+    let d = (uint4*)p;
+    let a = loadAligned<16>(d);
+    let b = loadAligned<16>(d + 1);
+    let c = loadAligned<16>(d + 2);
+    let e = loadAligned<16>(d + 3);
+    GiReservoir r;
+    r.x_s = asfloat(a.xyz);
+    r.n_s_oct = a.w;
+    r.L = b.x;
+    r.W = asfloat(b.y);
+    r.M = asfloat(b.z);
+    r.phat = asfloat(b.w);
+    r.x_v = asfloat(c.xyz);
+    r.depth = asfloat(c.w);
+    r.n_v_oct = e.x;
+    r.frame = e.y;
+    r.flags = e.z;
+    r.pad = e.w;
+    return r;
+}
+
+public void giReservoirStore(GiReservoir* p, GiReservoir r) {
+    let d = (uint4*)p;
+    storeAligned<16>(d, uint4(asuint(r.x_s), r.n_s_oct));
+    storeAligned<16>(d + 1, uint4(r.L, asuint(r.W), asuint(r.M), asuint(r.phat)));
+    storeAligned<16>(d + 2, uint4(asuint(r.x_v), asuint(r.depth)));
+    storeAligned<16>(d + 3, uint4(r.n_v_oct, r.frame, r.flags, r.pad));
+}
+
+// A world position's pixel in a frame with view-projection `m` (column-major) at `width` x
+// `height`, or (-1, -1) behind it. The raygen's pixel centre is (x, H - 1 - y) + 0.5.
+public int2 restirReproject(float* m, uint width, uint height, float3 p) {
+    let c = mat4MulVecAt(m, float4(p, 1.0));
+    if (c.w <= 1.0e-4) {
+        return int2(-1, -1);
+    }
+    let uv = (c.xy / c.w) * 0.5 + 0.5;
+    return int2(int(uv.x * float(width)), int(float(height) - uv.y * float(height)));
+}
+
+// Whether a neighbour / history surface (shading normal, view depth) is close enough to `s` to
+// reuse from.
+public bool restirSimilar(RestirSurface s, uint normal_oct, float depth) {
+    let n0 = oct_to_float32x3(unpackHalf2(s.normal_oct));
+    let n1 = oct_to_float32x3(unpackHalf2(normal_oct));
+    return dot(n0, n1) > 0.9 && abs(depth - s.depth) < 0.1 * s.depth;
+}
 
 // PrimaryHit kinds: the path tracer traces from the camera as before; rebuilds the hit and
 // shades it; adds the radiance in `origin` and ends.
@@ -612,8 +713,6 @@ public struct PushConstants {
     // ReSTIR DI reservoirs: last frame's (read) and this frame's (written).
     public Reservoir* reservoirs_prev;
     public Reservoir* reservoirs_cur;
-    // Radiance-cache entries (valid whenever uniforms.sharc != 0).
-    public SharcEntry* sharc;
     // Auto-exposure: per-pixel (incident meter, raw nits) pairs out, smoothed exposure in
     // (auto_exposure.slang).
     public float* lum;
@@ -628,6 +727,10 @@ public struct PushConstants {
     public uint* cost;
     // The primary pass's hit records (null while the old frame runs).
     public PrimaryHit* primary_hits;
+    // ReSTIR GI (restir_gi.rs; null when off): the candidates `main` writes, the final
+    // reservoirs `gi_shade` shades.
+    public GiCandidate* gi_candidates;
+    public GiReservoir* gi_final;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

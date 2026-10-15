@@ -614,12 +614,17 @@ void cloudMarch(float3 world_pos, float3 dir, float hit_dist, float dither,
 // The full primary-ray composite: clouds and aerial perspective over `surface` (the path
 // tracer's radiance for this pixel; `hit_dist` <= 0 means the ray reached the sky, whose
 // sky-view radiance already carries its own in-scatter).
-public float3 atmoComposite(float3 world_pos, float3 dir, float hit_dist, float dither, float3 surface) {
+// Affine in the surface colour: also returns the multiplier `surface_t` it applies (Ta x Tc),
+// for light added to the surface afterwards (ReSTIR GI's gi_shade).
+public float3 atmoCompositeT(float3 world_pos, float3 dir, float hit_dist, float dither, float3 surface,
+                             out float3 surface_t) {
     var col = surface;
+    surface_t = float3(1.0);
     if (hit_dist > 0.0) {
         float3 La, Ta;
         atmoAerial(world_pos, dir, hit_dist, 12u, La, Ta);
         col = La + Ta * col;
+        surface_t = Ta;
     }
     float3 Lc;
     float Tc, front;
@@ -628,8 +633,14 @@ public float3 atmoComposite(float3 world_pos, float3 dir, float hit_dist, float 
         float3 Lh, Th;
         atmoAerial(world_pos, dir, front, 8u, Lh, Th);
         col = Tc * col + Th * Lc + (1.0 - Tc) * Lh;
+        surface_t *= Tc;
     }
     return col;
+}
+
+public float3 atmoComposite(float3 world_pos, float3 dir, float hit_dist, float dither, float3 surface) {
+    float3 t;
+    return atmoCompositeT(world_pos, dir, hit_dist, dither, surface, t);
 }
 
 // 4x4 Bayer offset in [0, 1) for a pixel: a static dither for the cloud march.

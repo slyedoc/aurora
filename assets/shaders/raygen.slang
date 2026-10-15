@@ -1,6 +1,6 @@
 // The path tracer's ray generation: camera paths with NEE (light table + ReSTIR DI, HDR
-// environment, suns), the radiance cache, ray portals, the DLSS Ray Reconstruction guides,
-// the atmosphere composite and the auto-exposure meter.
+// environment, suns), ReSTIR GI's candidates and shading, ray portals, the DLSS Ray
+// Reconstruction guides, the atmosphere composite and the auto-exposure meter.
 import rt_types;
 import rand;
 import disney;
@@ -29,9 +29,8 @@ static const bool ENABLE_BLUENOISE = true;
 
 // Settings fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
 // `RenderSettings`; changing one rebuilds it): the driver folds them, so a feature that is off
-// is gone from the shader, registers and all, and loops get constant bounds. SHARC's and
-// ReSTIR's uniforms still switch them per frame within a build that has them.
-[vk::constant_id(0)] const bool SHARC_ON = false;
+// is gone from the shader, registers and all, and loops get constant bounds. ReSTIR's
+// uniforms still switch it per frame within a build that has it. Constant 0 is free.
 [vk::constant_id(1)] const bool RESTIR_ON = false;
 // Some environment's sky is the atmosphere (sky.rs `EnvironmentSkies::atmosphere`).
 [vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
@@ -45,6 +44,8 @@ static const bool ENABLE_BLUENOISE = true;
 [vk::constant_id(6)] const float SPEC_HIT_ROUGHNESS = 0.3;
 // Russian roulette from this bounce on (0 = off).
 [vk::constant_id(7)] const uint ROULETTE_FROM = 1;
+// ReSTIR GI (restir_gi.rs): sample 0's first indirect bounce goes to reservoirs and `gi_shade`.
+[vk::constant_id(8)] const bool GI_ON = false;
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
 // sky does (rotation only), and still a finite half float.
@@ -366,112 +367,6 @@ LightCtx lightCtx() {
     ctx.emissive_boost = pc.uniforms.emissive_boost;
     return ctx;
 }
-
-// ---- Radiance cache (SHaRC-style; see src/sharc.rs) ---------------------------------------
-
-// Must match SHARC_ENTRIES in src/sharc.rs.
-static const uint SHARC_ENTRIES = 1u << 20;
-// The share of paths that never query the cache (they train it).
-static const float SHARC_TRAIN = 0.125;
-// Cache vertices a path records (its vertices past the camera's): all of max_bounces 4's.
-// Deeper paths' later vertices only read the cache. Every slot is live across every trace,
-// and the raygen's stack is what the trace's time follows (4 slots: +0.17 ms at 3840x1080).
-static const uint SHARC_VERTICES = 3u;
-
-// The voxel size at a point: `sharc_voxel` near the camera, doubling per distance octave
-// past 8 m.
-float sharcLevel(float3 pos, float3 cam) {
-    return floor(log2(max(max(length(pos - cam), 1.0e-3) / 8.0, 1.0)));
-}
-
-float sharcVoxelSize(float3 pos, float3 cam) {
-    return max(pc.uniforms.sharc_voxel, 1.0e-3) * exp2(sharcLevel(pos, cam));
-}
-
-// Voxel key: position quantized at a distance-scaled size, level, dominant face normal.
-uint4 sharcKey(float3 pos, float3 n, float3 cam) {
-    let level = sharcLevel(pos, cam);
-    let s = sharcVoxelSize(pos, cam);
-    let c = int3(floor(pos / s));
-    var axis = abs(n.x) > abs(n.y) ? (abs(n.x) > abs(n.z) ? 0u : 2u)
-                                   : (abs(n.y) > abs(n.z) ? 1u : 2u);
-    axis = axis * 2u + (n[axis] < 0.0 ? 1u : 0u);
-    return uint4(uint(c.x), uint(c.y), uint(c.z), (uint(level) << 3) | axis);
-}
-
-uint sharcHash(uint4 k) {
-    var h = k.x * 0x8da6b343u ^ k.y * 0xd8163841u ^ k.z * 0xcb1ab31fu ^ k.w * 0x165667b1u;
-    h ^= h >> 16;
-    h *= 0x7feb352du;
-    h ^= h >> 15;
-    h *= 0x846ca68bu;
-    h ^= h >> 16;
-    return h;
-}
-
-// Find-or-insert the entry for a voxel key: linear probe with a tag compare, claiming an
-// empty slot atomically. Returns ~0 when the neighbourhood is full (the path just traces on).
-uint sharcSlot(float3 pos, float3 n, float3 cam) {
-    let key = sharcKey(pos, n, cam);
-    let h = sharcHash(key);
-    let tag = (sharcHash(key.wxyz) | 1u);
-    for (uint i = 0u; i < 8u; i++) {
-        let slot = (h + i) & (SHARC_ENTRIES - 1u);
-        let t = pc.sharc[slot].tag;
-        if (t == tag) {
-            return slot;
-        }
-        if (t == 0u) {
-            uint prev;
-            InterlockedCompareExchange(pc.sharc[slot].tag, 0u, tag, prev);
-            if (prev == 0u || prev == tag) {
-                return slot;
-            }
-        }
-    }
-    return 0xFFFFFFFFu;
-}
-
-// The resolved radiance, if the entry has folded in enough samples to be trusted.
-// Finite and non-negative, by bit pattern (fast-math may fold isnan away): exponent all ones
-// is NaN or infinity, the sign bit is negative.
-bool sharcSane(float3 v) {
-    let b = asuint(v);
-    return all((b & 0x7f800000u) != 0x7f800000u) && all((b & 0x80000000u) == 0u);
-}
-
-bool sharcQuery(uint slot, out float3 radiance) {
-    radiance = float3(pc.sharc[slot].res_r, pc.sharc[slot].res_g, pc.sharc[slot].res_b);
-    return pc.sharc[slot].conf >= 16.0 && sharcSane(radiance);
-}
-
-// One path sample of the voxel's outgoing radiance (nits; fixed point at 1/65536 nit, so a
-// moonlit voxel is not rounded to black).
-// A NaN from one degenerate hit (the camera inside a wall, a mirror up close) cast to an
-// integer poisoned a whole voxel's channel: it glowed red, blue or yellow until it washed out.
-void sharcDeposit(uint slot, float3 radiance) {
-    if (!sharcSane(radiance)) {
-        return;
-    }
-    let r = min(radiance, float3(1.0e5)) * 65536.0;
-    InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(r.r));
-    InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(r.g));
-    InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(r.b));
-    InterlockedAdd(pc.sharc[slot].acc_n, 1u);
-    pc.sharc[slot].frame = pc.uniforms.frame;
-}
-
-
-
-
-
-
-
-
-
-
-
-
 
 // The shading normal bent the least amount into the viewer's hemisphere: n' = n + v * (eps - n.v)
 // leaves n untouched when it already faces v and otherwise gives n'.v = eps (before the
@@ -1089,8 +984,9 @@ void primary() {
                 if (rec.hit_kind != 0u) {
                     rec.t = t;
                     rec.state = PRIMARY_HIT | (bounce << 2) | ((ray_mask & 0xFFu) << 8) | ((ray_env & 7u) << 16);
-                    // ReSTIR DI's surface: its passes run between this pass and the path tracer.
-                    if (RESTIR_ON && pc.restir_surfaces != nullptr && pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
+                    // ReSTIR's surface: DI's passes run between this pass and the path tracer,
+                    // GI's after it.
+                    if ((RESTIR_ON || GI_ON) && pc.restir_surfaces != nullptr) {
                         restirSurfaceStore(pc.restir_surfaces + (launch_id.y * launch_size.x + launch_id.x), restirSurfacePack(
                             hit_point, pc.uniforms.frame, payload.prev_world_pos,
                             mat4MulVecAt(&pc.uniforms.view_proj[0], float4(hit_point, 1.0)).w, payload.color.rgb,
@@ -1149,6 +1045,66 @@ void primary() {
     rec.meter_albedo = meter_albedo;
     rec.primary_t = primary_t;
     guide_fog[px] = float4(min(veil, float3(65504.0)), fog_t);
+}
+
+// ReSTIR GI's shading (restir_gi.rs), one thread per traced pixel, after the path tracer and the
+// reuse passes: the final reservoir's secondary hit lights the primary vertex (layered BSDF x
+// cos x its radiance x W), through one visibility ray unless it is the pixel's own fresh
+// candidate, and is added to the noisy colour and the exposure meter as `main` would have. An
+// occluded winner zeroes its reservoir's W (its M stays: next frame's history).
+[shader("raygeneration")]
+void gi_shade() {
+    let launch_id = DispatchRaysIndex().xy;
+    let launch_size = DispatchRaysDimensions().xy;
+    let idx = launch_id.y * launch_size.x + launch_id.x;
+    if (!GI_ON || pc.gi_final == nullptr) {
+        return;
+    }
+    let r = giReservoirLoad(pc.gi_final + idx);
+    if (r.frame != pc.uniforms.frame || !(r.W > 0.0 && r.W < 1.0e20)) {
+        return;
+    }
+    let s = restirSurfaceLoad(pc.restir_surfaces + idx);
+    let n_s = oct_to_float32x3(unpackHalf2(r.n_s_oct));
+    float cos_s, d2;
+    let c = giContribution(s, r.x_s, n_s, unpackRgb9e5(r.L), cos_s, d2);
+    if (!(luma(c) > 0.0)) {
+        return;
+    }
+    if ((r.flags & GI_FRESH) == 0u) {
+        let ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
+        let to = offsetRay(r.x_s, n_s);
+        let d = to - s.position;
+        let start = leaveSurface(s.position, ng, d);
+        let dist = length(to - start);
+        // A degenerate ray (the hit on the vertex, a non-finite position) is never traced: a NaN
+        // direction can stall traversal.
+        if (!(dist > 1.0e-4 && dist < 1.0e7)) {
+            return;
+        }
+        if (!traceVisible(restirRayMask(s), start, 0.0, (to - start) / dist, dist * 0.999)) {
+            pc.gi_final[idx].W = 0.0;
+            return;
+        }
+    }
+    var gi = c * r.W * restirThroughput(s) / float(SAMPLES);
+    if (!(luma(gi) < 1.0e20)) {
+        return;
+    }
+    if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
+        gi *= unpackRgb9e5(pc.gi_candidates[idx].view_t);
+    }
+    let px = int2(launch_id);
+    let col = dlss_color[px];
+    dlss_color[px] = float4(min(col.rgb + gi * pc.ae.input_exposure, float3(65504.0)), col.a);
+    // The meter as `main` writes it: the surface's light through the fog over its albedo.
+    if (pc.lum != nullptr) {
+        let meter_albedo = pc.primary_hits[idx].meter_albedo;
+        if (meter_albedo >= 0.0) {
+            pc.lum[2u * idx] += dot(float3(0.2125, 0.7154, 0.0721), gi) * guide_fog[px].a
+                / max(meter_albedo, 0.04);
+        }
+    }
 }
 
 uint packUnorm16(float x) {
@@ -1230,9 +1186,11 @@ void lensRay(float2 lens, uint2 launch_id, uint2 launch_size, out float3 origin,
 // The camera path's flags (main's `path`).
 static const uint PATH_WANT_SUN = 1u;
 static const uint PATH_CAMERA = 2u;
-static const uint PATH_SHARC_TRAIN = 8u;
-static const uint PATH_FROM_ROUGH = 16u;
-static const uint PATH_CACHE_BLIND = 32u;
+// ReSTIR GI: the primary vertex takes part (its candidate is written at the path's end); the ray
+// toward the secondary hit is in flight; the secondary hit took part (the snapshot is live).
+static const uint PATH_GI_VERTEX = 64u;
+static const uint PATH_GI_SEGMENT = 128u;
+static const uint PATH_GI_LIVE = 256u;
 
 [shader("raygeneration")]
 void main() {
@@ -1285,23 +1243,11 @@ void main() {
         var surf_n = float3(0.0);
         // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
-        // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
-        // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
-        // once the path ends.
-        uint sh_slot[SHARC_VERTICES];
-        float3 sh_mask[SHARC_VERTICES];
-        float3 sh_acc[SHARC_VERTICES];
-        var sh_n = 0u;
-        // PATH_SHARC_TRAIN: one path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
-        // cache learns from (answered paths only pass on what it already knows).
-        if (SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN) {
-            path |= PATH_SHARC_TRAIN;
-        }
-        // PATH_FROM_ROUGH: the ray being traced left a rough surface: only then may the cache answer for what it
-        // hits (a mirror's or a glossy floor's reflection is traced, never the cache's cells).
-        // PATH_CACHE_BLIND: the camera ray met the back of a solid surface first: the camera is inside geometry
-        // (a wall it clipped through). Such a path sees unlit insides and must not teach the
-        // cache -- it poisoned the voxels of the room side, which glowed until washed out.
+        // ReSTIR GI's snapshots: the path weight leaving the primary vertex without its roulette
+        // boosts (the candidate's radiance is the rest of the path over it), and the radiance
+        // gathered when the secondary hit took part.
+        var gi_mask = float3(1.0);
+        var gi_acc = float3(0.0);
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
         // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
@@ -1374,6 +1320,7 @@ void main() {
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
+                    path &= ~PATH_GI_SEGMENT;
                     continue;
                 }
             }
@@ -1401,9 +1348,6 @@ void main() {
             let transmission = hitPayloadGetTransmission(payload);
             let inside = hitPayloadGetInside(payload);
             let lob = unpackLobes(payload.lobes);
-            if (((path & PATH_CAMERA) != 0u) && inside && transmission < 0.01 && !hitPayloadGetMasked(payload)) {
-                path |= PATH_CACHE_BLIND;
-            }
 
             // fog bounce (skybox has a distance of 0 so will never hit
             // this case, having an extra check for this is slower than
@@ -1440,7 +1384,7 @@ void main() {
                 }
                 direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
-                path &= ~PATH_WANT_SUN;
+                path &= ~(PATH_WANT_SUN | PATH_GI_SEGMENT);
                 continue;
             }
 
@@ -1489,6 +1433,29 @@ void main() {
                 continue;
             }
             path &= ~PATH_CAMERA;
+
+            // ReSTIR GI. The primary vertex takes part when it is rough and not glass: its
+            // first bounce's light reflected at the secondary hit becomes the candidate. The
+            // secondary hit (the next accepted surface: no fog scatter, portal or emitter on the
+            // way) takes part when rough and not glass; its position and the direction's pdf go
+            // to memory now, its radiance at the path's end. Either test failing leaves the light
+            // in the path (a null candidate).
+            if (GI_ON && (path & PATH_GI_SEGMENT) != 0u) {
+                path &= ~PATH_GI_SEGMENT;
+                if (roughness >= pc.uniforms.gi_roughness && transmission <= 0.0) {
+                    path |= PATH_GI_LIVE;
+                    gi_acc = acc;
+                    let ns = dot(surface_normal, direction) > 0.0 ? -surface_normal : surface_normal;
+                    let cand = (uint4*)(pc.gi_candidates + prim_at);
+                    storeAligned<16>(cand, uint4(asuint(origin), packHalf2(float32x3_to_oct(ns))));
+                    pc.gi_candidates[prim_at].pdf = prev_pdf;
+                }
+            }
+            if (GI_ON && resumed && sample_idx == 0u && pc.gi_candidates != nullptr
+                && roughness >= pc.uniforms.gi_roughness && transmission <= 0.0) {
+                path |= PATH_GI_VERTEX;
+                gi_mask = mask;
+            }
 
             // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
             // vector is sampled from the NDF, Fresnel is evaluated about it, and the ray
@@ -1585,33 +1552,6 @@ void main() {
             }
 
             let disney_mat = disneyMaterial(payload.color.rgb, metallic, roughness);
-
-            // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
-            // indirect hit on, a converged voxel ends the path with its cached outgoing
-            // radiance -- when the ray came off a rough surface and its footprint (the cone's width
-            // here) covers a voxel: a mirror's reflection or a close contact showed the cache's
-            // cells as blocks and leaked light. Training paths never ask. Every participating
-            // vertex of a traced path is an update target.
-            if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
-                && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
-                let slot = sharcSlot(origin, world_normal, cameraOrigin());
-                if (slot != 0xFFFFFFFFu) {
-                    if ((path & PATH_SHARC_TRAIN) == 0u && ((path & PATH_FROM_ROUGH) != 0u)
-                        && cone_width >= sharcVoxelSize(origin, cameraOrigin())) {
-                        float3 cached;
-                        if (sharcQuery(slot, cached)) {
-                            acc += mask * cached;
-                            break;
-                        }
-                    }
-                    if (sh_n < SHARC_VERTICES) {
-                        sh_slot[sh_n] = slot;
-                        sh_mask[sh_n] = mask;
-                        sh_acc[sh_n] = acc;
-                        sh_n++;
-                    }
-                }
-            }
 
             // Direct light from the emissive-triangle table. At the primary vertex of sample 0,
             // with ReSTIR DI on, its passes do it (light grid, initial + temporal and spatial
@@ -1775,10 +1715,13 @@ void main() {
                 let r2 = randf();
                 direction = sampleTransmission(world_normal, r1, r2);
                 mask *= disney_mat.albedo;
+                if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
+                    gi_mask *= disney_mat.albedo;
+                    path |= PATH_GI_SEGMENT;
+                }
                 prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                 path &= ~PATH_WANT_SUN;
                 cone_spread = max(cone_spread, 0.37);
-                path |= PATH_FROM_ROUGH;
                 continue;
             }
             if (lob.clearcoat > 0.0) {
@@ -1793,10 +1736,13 @@ void main() {
                     }
                     direction = l;
                     mask *= lob.clearcoat * w / q;
+                    if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
+                        gi_mask *= lob.clearcoat * w / q;
+                        path |= PATH_GI_SEGMENT;
+                    }
                     prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                     path &= ~PATH_WANT_SUN;
                     cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
-                    path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
                     continue;
                 }
             }
@@ -1844,9 +1790,12 @@ void main() {
             }
 
             mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+            if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
+                gi_mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+                path |= PATH_GI_SEGMENT;
+            }
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
-            path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
@@ -1859,16 +1808,22 @@ void main() {
             }
         }
 
-        // The path ended: everything gathered after each cache vertex, divided by its mask
-        // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
-        // darkness is learned too).
-        for (uint si = 0u; si < ((path & PATH_CACHE_BLIND) != 0u ? 0u : sh_n); si++) {
-            let delta = max(acc - sh_acc[si], float3(0.0));
-            let m = sh_mask[si];
-            sharcDeposit(sh_slot[si], float3(
-                m.r > 1.0e-6 ? delta.r / m.r : 0.0,
-                m.g > 1.0e-6 ? delta.g / m.g : 0.0,
-                m.b > 1.0e-6 ? delta.b / m.b : 0.0));
+        // ReSTIR GI's candidate: what the path gathered from the secondary hit on, over the
+        // weight that reached it, leaves the path for gi_shade (null: the light stays here).
+        if (GI_ON && (path & PATH_GI_VERTEX) != 0u) {
+            var L = float3(0.0);
+            if ((path & PATH_GI_LIVE) != 0u) {
+                let delta = max(acc - gi_acc, float3(0.0));
+                L = float3(
+                    gi_mask.r > 1.0e-6 ? delta.r / gi_mask.r : 0.0,
+                    gi_mask.g > 1.0e-6 ? delta.g / gi_mask.g : 0.0,
+                    gi_mask.b > 1.0e-6 ? delta.b / gi_mask.b : 0.0);
+                acc = gi_acc;
+            } else {
+                pc.gi_candidates[prim_at].pdf = 0.0;
+            }
+            pc.gi_candidates[prim_at].L = packRgb9e5(L);
+            pc.gi_candidates[prim_at].frame = pc.uniforms.frame;
         }
     }
 
@@ -1876,9 +1831,14 @@ void main() {
     // Planetary atmosphere: aerial perspective on the primary hit and the cloud shell,
     // folded into the colour before Ray Reconstruction (deterministic: no per-frame noise).
     if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
-        mean = atmoComposite(cameraOrigin(), pixelDirection(launch_id, launch_size),
-                             pc.primary_hits[prim_at].primary_t,
-                             atmoBayer(px), mean);
+        float3 surface_t;
+        mean = atmoCompositeT(cameraOrigin(), pixelDirection(launch_id, launch_size),
+                              pc.primary_hits[prim_at].primary_t,
+                              atmoBayer(px), mean, surface_t);
+        // gi_shade's light reaches the camera through the same air.
+        if (GI_ON && pc.gi_candidates != nullptr) {
+            pc.gi_candidates[prim_at].view_t = packRgb9e5(surface_t);
+        }
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =
     // skipped) and the raw nits for the panel readout.

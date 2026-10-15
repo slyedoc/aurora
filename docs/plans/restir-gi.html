@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>aurora ReSTIR GI</title>
+<style>
+  :root { --fg:#1d1f23; --muted:#5b6170; --bg:#fbfbfa; --card:#fff; --line:#e3e3df; --accent:#2f5bd3; --warn:#a4570a; --ok:#2a7a3b; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e6e6e3; --muted:#a2a6b0; --bg:#15161a; --card:#1d1f24; --line:#2d3038; --accent:#8aa8ff; --warn:#e3a35a; --ok:#7cc48a; } }
+  body { font: 15px/1.55 system-ui, sans-serif; color:var(--fg); background:var(--bg); max-width: 980px; margin: 2rem auto; padding: 0 1.2rem; }
+  h1 { font-size: 1.6rem; margin-bottom:.2rem } h2 { margin-top:2.2rem; border-bottom:1px solid var(--line); padding-bottom:.3rem }
+  h3 { margin-top:1.4rem } .sub { color:var(--muted) }
+  code, pre { font: 13px/1.45 ui-monospace, monospace } pre { background:var(--card); border:1px solid var(--line); padding:.8rem; overflow-x:auto; border-radius:6px }
+  table { border-collapse: collapse; width:100%; margin:.6rem 0; font-size:14px } th, td { border:1px solid var(--line); padding:.35rem .5rem; vertical-align:top; text-align:left } th { background:var(--card) }
+  .decision { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); padding:.6rem .9rem; margin:.9rem 0; border-radius:4px }
+  .decision h3 { margin:.1rem 0 .4rem } .tweak { color:var(--warn); font-weight:600 } .note { color:var(--muted); font-size:13.5px }
+  .ok { color:var(--ok) } .warn { color:var(--warn) }
+</style>
+</head>
+<body>
+<h1>aurora ReSTIR GI</h1>
+<p class="sub">Reservoir resampling of the first indirect bounce at sample 0's primary vertex (Ouyang et al. 2021, "ReSTIR GI"), as passes beside ReSTIR DI. Written 2026-10-15. Implementation notes: <code>restir-gi-notes.md</code>.</p>
+<p class="sub"><b>Status 2026-10-15: implemented, phases 0-4: on by default (spatial reuse; temporal off), SHaRC deleted. Measurements, decisions and deviations (gi_shade as a raygen, the 64-byte reservoir with the stored vertex, the array-free spatial pass) in restir-gi-notes.md.</b></p>
+
+<p><b>Why.</b> ReSTIR DI fixed the direct term from the light table at 1 spp; the indirect term is still one BRDF ray per pixel, with SHaRC answering past the first bounce. That one ray decides the look of every interior lit by bounce light (the abbey, sun through a doorway, a lamp around a corner), and at 1 spp Ray Reconstruction throws away its rare bright samples as fireflies, the same failure ReSTIR DI fixed for lamps. Reusing the secondary hit and its radiance across pixels and frames gives each pixel many effective indirect samples for one ray plus reuse passes.</p>
+
+<pre>today:   fog grid → restir grid → primary → di temporal → di spatial → trace (shades DI winner, BRDF bounce adds indirect to acc) → dlss
+planned: fog grid → restir grid → primary → di temporal → di spatial → trace (writes the GI candidate, keeps its indirect out of acc)
+                                                                     → gi temporal → gi spatial → gi_shade (+= dlss_color, meter) → dlss</pre>
+<p class="note">Since <code>ec94ef0</code> the view lane records in two halves: everything after the first view's primary pass is the back half (it waits on the async light grids). The GI passes sit in the back half, between the trace and DLSS, on the graphics queue.</p>
+
+<h2>Cost budget</h2>
+<p>Estimated from today's measurements (Northshire 3840x1080 Balanced, busy ~5.6 ms flat; XR runs every per-view pass twice):</p>
+<table>
+<tr><th>Part</th><th>Estimate</th><th>Basis</th></tr>
+<tr><td>candidate writes in <code>main</code> (32 B/px, aligned)</td><td>~0.02 ms</td><td>the primary record and surface writes</td></tr>
+<tr><td><code>main</code>'s extra live state (two snapshots + a flag)</td><td>0.03&ndash;0.1 ms</td><td>stack 352 &rarr; 256 B was worth &minus;7 % of the trace</td></tr>
+<tr><td><code>gi_temporal</code> + <code>gi_spatial</code></td><td>0.5&ndash;0.7 ms</td><td>DI's two passes cost 0.48 ms; GI's target (<code>evalLayered</code> + <code>layeredPdf</code> + Jacobian per shift) is heavier</td></tr>
+<tr><td><code>gi_shade</code> + its visibility ray</td><td>~0.3 ms</td><td>one ray per pixel is what the shared shadow ray saved (0.3 ms), plus the material rebuild</td></tr>
+<tr><td><b>total</b></td><td><b>~0.9&ndash;1.1 ms flat (15&ndash;20 %), ~2 ms XR</b></td><td></td></tr>
+</table>
+<p><b>Gates.</b> Phase 0: candidate writes + <code>gi_shade</code> &le; 0.35 ms and the raygen stack grows by &le; 32 B (the pipeline logs it). Phase 2: the whole feature &le; 1.0 ms flat. Phase 3 turns it on by default only if its error reduction against the 4 spp reference justifies its measured cost; the notes record both numbers. Retiring SHaRC (D8) gives back the cache's resolve and its three snapshot slots in <code>main</code>, which is what pays for GI's two.</p>
+
+<h2>Decisions you are most likely to tweak</h2>
+
+<div class="decision">
+<h3>D1. What GI owns, and what stays in the path <span class="tweak">(the integral split)</span></h3>
+<p>The radiance at the primary vertex splits into two integrals that never overlap, so nothing is counted twice and either side can be switched off alone:</p>
+<table>
+<tr><th>GI (reservoirs, <code>gi_shade</code>)</th><th>Path tracer, unchanged (<code>acc</code>)</th></tr>
+<tr><td>light <b>reflected</b> by the secondary hit <code>x_s</code> toward the primary vertex <code>x_v</code>: everything the path gathers from <code>x_s</code> on (its NEE, sun, sky NEE, deeper bounces, SHaRC answers)</td><td>emission at <code>x_s</code> and the sky on a miss (they keep their MIS weights against DI and the sky NEE at <code>x_v</code>)</td></tr>
+<tr><td>only when <code>x_v</code> is eligible: perceptual roughness &ge; <code>restir_gi_roughness</code> and no glass transmission</td><td>every ineligible <code>x_v</code> (mirrors, glossy floors, glass): their indirect stays the traced path, as today</td></tr>
+<tr><td>only when <code>x_s</code> is a plain surface: rough (&ge; the same threshold), not glass, not an emitter</td><td>a glossy / glass <code>x_s</code> (its radiance is too view-dependent to reconnect from another pixel); a fog scatter or portal on the segment</td></tr>
+<tr><td>sample 0 only</td><td>samples 1.. (accumulation modes): their indirect as today; the GI term counts as sample 0's share (<code>/ SAMPLES</code>), as the DI winner does</td></tr>
+</table>
+<p class="note">The eligibility tests are functions of the surface and the sampled direction, not of history, so the split is exact. Alpha pass-through between <code>x_v</code> and <code>x_s</code> keeps the candidate (<code>x_s</code> is the first accepted surface; the visibility ray sees cutouts through the any-hit shader).</p>
+</div>
+
+<div class="decision">
+<h3>D2. The candidate's weight: the whole layered sampler as one mixture <span class="tweak">(estimator)</span></h3>
+<p>The path picks transmission / coat / base and weights by that lobe alone. The GI candidate instead takes <code>W = 1 / layeredPdf(v, n, &omega;)</code> and the integrand <code>evalLayered(v, n, &omega;, coat) &middot; |n&middot;&omega;| &middot; L</code> (one-sample MIS with the balance heuristic). Any lobe's direction is then a valid candidate, and reuse at another surface needs only <code>evalLayered</code> + <code>layeredPdf</code>, both of which exist. Target <code>p&#770; = luma(that integrand)</code>.</p>
+<ul>
+<li><code>L</code> is recovered as SHaRC does it: snapshot <code>acc</code> and <code>mask</code> at <code>x_s</code> (after its emitter check), and at the path's end <code>L = (acc &minus; acc_snap) / mask_snap</code>; then <code>acc = acc_snap</code>.</li>
+<li><b>Roulette:</b> <code>mask_snap</code> is taken <i>before</i> the bounce's roulette boost (<code>ROULETTE_FROM</code> 1 rolls right after the primary bounce). A path roulette kills there becomes a null candidate (<code>L = 0</code>, M = 1), not a missing one; survivors carry the 1/q boost inside <code>L</code>.</li>
+<li>A failed BRDF sample is a null candidate too (M still counts).</li>
+</ul>
+<p class="note">Alternative if the mixture weight proves noisy on coated stone: restrict GI to the base lobe (integrand scaled by (1&minus;t)(1&minus;q)) and leave coat / translucency picks to <code>acc</code>.</p>
+</div>
+
+<div class="decision">
+<h3>D3. Data model: candidate and reservoir <span class="tweak">(data model)</span></h3>
+<pre>// Written by `main` per traced pixel (sample 0), read by gi_temporal as the canonical sample.
+// 32 bytes: two 16-byte stores / loads.
+public struct GiCandidate {
+    public float3 x_s;        // secondary hit (world)
+    public uint   n_s_oct;    // its geometric normal, oct 2xf16
+    public uint   L;          // radiance leaving x_s toward x_v, RGB9E5 (nits)
+    public float  pdf;        // layeredPdf of the direction at x_v (0 = null candidate)
+    public uint   frame;      // marks it live; an ineligible pixel keeps an old one
+    public uint   view_t;     // aerial-perspective x cloud transmittance at x_v (D6), RGB9E5
+};
+
+// Final / temporal reservoirs, one per traced pixel. 48 bytes: three 16-byte loads.
+// x_v is not stored: rebuilt from the pixel, `depth` and that frame's inverse view-projection.
+public struct GiReservoir {
+    public float3 x_s;        // the winning secondary hit
+    public uint   n_s_oct;
+    public uint   L;          // the winner's radiance, RGB9E5
+    public float  W;          // unbiased contribution weight (0 after an occluded visibility ray)
+    public float  M;          // history length
+    public float  phat;       // the winner's target at x_v (spatial pairwise MIS never re-evaluates it)
+    public float  depth;      // view depth (clip w) at x_v: rebuilds x_v for the Jacobian
+    public uint   n_v_oct;    // x_v's shading normal (temporal similarity)
+    public uint   frame;
+    public uint   flags;      // bit 0: the winner is this frame's own candidate (no visibility ray)
+};</pre>
+<p>Per view, at trace resolution: one candidate buffer + three reservoir buffers (last frame's final, this frame's final, temporal scratch; DI's ping-pong). <b>176 B/px</b>: 3840x1080 Balanced traces ~2227x626 = 245 MB per view, ~490 MB in XR. Freed when GI is off.</p>
+<p class="note">Shrunk up front (XR doubles everything): radiance and the atmosphere multiplier as RGB9E5, and <code>x_v</code> rebuilt from depth instead of stored (+ALU in the passes). Unshrunk it was 240 B/px, 670 MB in XR. Further option: the spatial pass writes over the candidate buffer (needs the canonical read first, one barrier).</p>
+</div>
+
+<div class="decision">
+<h3>D4. Reuse: what is reused and how hard <span class="tweak">(quality vs. bias)</span></h3>
+<ul>
+<li><b>Shift:</b> reconnection at <code>x_s</code> (keep <code>x_s</code> and <code>L</code>, change <code>x_v</code>). Jacobian <code>J = (|cos &phi;_new| / |cos &phi;_old|) &middot; (|x_old &minus; x_s|&sup2; / |x_new &minus; x_s|&sup2;)</code>, &phi; the angle at <code>x_s</code> between <code>n_s</code> and the direction to the vertex. A shift with <code>J</code> outside <b>[1/8, 8]</b> or a back-facing <code>x_s</code> is rejected (a neighbour's sample from across a corner).</li>
+<li><b>Temporal:</b> canonical = this frame's candidate (M = 1), merged with last frame's final at the reprojected pixel (DI's <code>reproject</code> + <code>similar</code>), its <code>x_v</code> from the reservoir. History cap <code>restir_gi_history</code>, default <b>8</b> (DI's: Ray Reconstruction wants decorrelated input).</li>
+<li><b>Spatial:</b> DI's pairwise MIS over <code>restir_gi_spatial_samples</code> (default <b>3</b>) neighbours in a <code>restir_gi_spatial_radius</code> disc (default <b>30</b> px), each tested with <code>similar</code> on the shared <code>RestirSurface</code> buffer. No neighbour visibility (biased, as DI); the final winner gets one visibility ray (D5).</li>
+<li><b>Fireflies:</b> no clamp on the candidate's <code>L</code>; the shared <code>restir_boiling</code> filter applies to GI's spatial pass too (one knob for both). If a lone hot <code>L</code> still spreads into a disc, a per-candidate luminance clamp at <i>k</i> x the neighbourhood mean is the next lever.</li>
+<li><b>Moving geometry:</b> <code>x_s</code> is stored in world space and not re-projected; a sample on a moving object is stale for at most the history cap. The visibility ray catches what moved in between.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D5. Where the winner is shaded: a <code>gi_shade</code> compute kernel with an inline ray query <span class="tweak">(frame order, cost)</span></h3>
+<p>The candidate exists only after <code>main</code> has traced, so the reuse passes run after it and a third pass shades the winner: rebuild the material from <code>RestirSurface</code>, evaluate <code>evalLayered &middot; |cos| &middot; L &middot; W</code>, one visibility ray from <code>x_v</code> to <code>x_s</code> (skipped when <code>flags</code> bit 0 says the winner is the pixel's own fresh candidate: it was just traced), and add the result to <code>dlss_color</code>. An occluded winner zeroes its reservoir's <code>W</code> and keeps <code>M</code>, as DI.</p>
+<p>It is a <b>compute kernel</b> in <code>restir_gi.slang</code> with a <code>RayQuery</code> (as the picking kernel), not a raygen: this is the same shape as the <code>restir_shade</code> pass deleted in the primary-pass work (0.32 ms), and as a raygen it would inherit the RT pipeline's 126-register allocation, an SBT region and its own ray stack. A compute kernel gets its own register count (the driver reports it, <code>VK_KHR_pipeline_executable_properties</code>, which it does not for RT pipelines) and writes <code>dlss_color</code> through a heap storage-image mapping like the fog grid's volumes.</p>
+<p><b>Catch: alpha cutouts.</b> An inline ray query runs no any-hit shader. Opacity micromaps answer baked cutouts in hardware; a hit on an unknown-state micro-triangle or an un-baked cutout needs a manual alpha test in the query loop (the triangle's UVs and alpha texture), or it counts as opaque and foliage darkens the bounce light behind it. Phase 0 decides: if the manual test is cheap enough, keep compute; otherwise fall back to a raygen with <code>traceVisible</code> and record the cost difference in the notes.</p>
+<p class="note">Async queue: no help on a flat view (DLSS waits on <code>gi_shade</code> and nothing runs beside it). In XR, view 0's GI passes could overlap view 1's front half; that is the cross-view overlap left for later, not part of this plan.</p>
+<p class="note">Rejected: shading in next frame's <code>main</code> (no extra pass, but a frame of lag, a second shift from last frame's vertex, and the fresh candidate missing from what is shown). Rejected for now: proposing the GI winner into <code>main</code>'s <code>ShadowPick</code> (impossible: the reservoir is not ready while <code>main</code> runs).</p>
+</div>
+
+<div class="decision">
+<h3>D6. What <code>gi_shade</code> must reproduce from <code>main</code>'s epilogue <span class="tweak">(correctness)</span></h3>
+<ul>
+<li><b>Exposure:</b> <code>dlss_color</code> is pre-exposed: add <code>gi &middot; input_exposure</code>, clamped to f16 like <code>main</code>.</li>
+<li><b>Atmosphere</b> (aerial perspective and the cloud shell, <code>Sky::Atmosphere</code> only; not a darkness fix, so GI does not replace it): <code>atmoComposite</code> is affine in the surface colour (<code>col = Tc&middot;(La + Ta&middot;s) + &hellip;</code>), so the GI term only needs the multiplier <code>Ta&middot;Tc</code>. <code>main</code> computes it anyway; a split <code>atmoCompositeT</code> returns it and <code>main</code> writes it into the candidate (<code>view_t</code>). No second aerial / cloud march.</li>
+<li><b>Fog veil:</b> nothing: the composite applies <code>guide_fog</code> after Ray Reconstruction to the whole surface radiance.</li>
+<li><b>Meter:</b> <code>pc.lum[2i]</code> gains <code>luma(gi) &middot; fog_t / meter_albedo</code> (same divisor as <code>main</code>, from the primary record; skipped when not metered or the meter is null, which it is for a camera's second view since <code>c7a5861</code>: in XR only the left eye meters).</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D7. Settings and what is user-facing <span class="tweak">(settings)</span></h3>
+<table>
+<tr><th><code>RenderSettings</code> field</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>restir_gi: bool</code></td><td><b>false</b> until phase 3 measures it; then decided by the abbey and the noon bench</td><td>the whole feature; off frees its buffers and compiles its code out (<code>GI_ON</code> specialization constant 8, like <code>RESTIR_ON</code>)</td></tr>
+<tr><td><code>restir_gi_roughness: f32</code></td><td>0.35 (SHaRC's threshold)</td><td>eligibility of <code>x_v</code> and <code>x_s</code> (D1)</td></tr>
+<tr><td><code>restir_gi_history: f32</code></td><td>8</td><td>temporal M cap</td></tr>
+<tr><td><code>restir_gi_spatial_samples: u32</code></td><td>3</td><td>0 = temporal only</td></tr>
+<tr><td><code>restir_gi_spatial_radius: f32</code></td><td>30</td><td>disc, pixels</td></tr>
+</table>
+<ul>
+<li>GI does <b>not</b> need lights: a sun-only scene (empty light table) gets it. The <code>RestirSurface</code> write in <code>primary</code> and the surfaces buffer are enabled by <code>RESTIR_ON || GI_ON</code>; DI's grid and passes still require the table.</li>
+<li>No <code>ab</code> branches kept. During the work, phases are measured with zero's <code>bench --ab</code> using <code>restir_gi</code> itself as the switch (it is the shipped setting, not a debug path).</li>
+<li>F3 panel: the five fields appear with the others via reflection; nothing else.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h3>D8. Does GI retire SHaRC? <span class="tweak">(simplification)</span></h3>
+<p>SHaRC went in (30be5eb) to fix darkness at 1 spp: Ray Reconstruction threw away the rare bright indirect paths as fireflies, and the abbey came out 25 % dark. ReSTIR GI fixes the same problem the unbiased way, by reusing those rare paths instead of averaging them away inside a voxel. If GI alone gets the interiors there, the cache is a second biased system doing the same job:</p>
+<ul>
+<li><b>Until phase 3, SHaRC stays as is.</b> Its answers past <code>x_s</code> go into <code>L</code> (cheaper, shorter candidate paths).</li>
+<li><b>Phase 3 compares four images</b> against a 4 spp reference (no cache, no reuse): GI + SHaRC, GI only, SHaRC only (today), neither. It compares error, boil and busy time, in the abbey, the lamp-lit plaza at night and the noon bench.</li>
+<li><b>If GI alone is within a few % of GI + SHaRC</b>, delete SHaRC in a follow-up. That removes <code>sharc.rs</code>, <code>sharc.slang</code>, the resolve on the async queue, three stack slots of snapshots in <code>main</code>, <code>PATH_SHARC_TRAIN</code>/<code>FROM_ROUGH</code>/<code>CACHE_BLIND</code>, and two settings. Deeper bounces then stay plain paths, and reuse averages their noise at <code>x_s</code>.</li>
+<li><b>If the cache still pays</b> (bounce 2+ light in deep interiors), keep both and say why in the notes.</li>
+</ul>
+</div>
+
+<h2>Phases and how each is measured</h2>
+<table>
+<tr><th>Phase</th><th>Done when</th><th>Measured by</th></tr>
+<tr><td><b>0. Split, no reuse</b>: <code>main</code> writes candidates and keeps their indirect out of <code>acc</code>; <code>gi_shade</code> shades each pixel's own candidate (final = candidate, W = 1/pdf, M = 1, no visibility ray)</td><td>image matches <code>restir_gi</code> off in expectation: shots ratio 1.000, error at noise, boil equal. This proves D1/D2/D6 before any reuse can hide a mistake. Cost gate met (candidate writes + <code>gi_shade</code> &le; 0.35 ms, raygen stack +&le; 32 B); D5's compute-vs-raygen decision made; XR meter null-skip checked</td><td>bench shots on vs off; <code>--ab</code> on the passes; the logged ray stack per raygen; <code>gi_shade</code>'s register count (debug log)</td></tr>
+<tr><td><b>1. Temporal</b>: <code>gi_temporal</code> + Jacobian + similarity; visibility ray for reused winners</td><td>ratio within ~2 % of off (reuse is biased only through the Jacobian rejection), less boil in the abbey</td><td><code>--ab</code> busy / passes; boil metric; abbey shots</td></tr>
+<tr><td><b>2. Spatial</b>: pairwise MIS, boiling filter</td><td>abbey interior's error against a 4 spp reference (<code>compare.py</code>) lower than off by a stated margin; boil not worse; no new blotches on moving camera; the whole feature &le; 1.0 ms flat</td><td>shots vs 4 spp reference (error number), boil, moving-camera capture, <code>--ab</code> span</td></tr>
+<tr><td><b>3. Tune and decide the default</b>: thresholds, history, neighbour count; memory shrink (D3) if needed; default on/off; the SHaRC four-way (D8)</td><td>defaults and SHaRC's fate justified by numbers in the notes: error reduction and measured cost side by side (flat and XR)</td><td>bench sweep vs 4 spp reference; GPU Trace of the three passes</td></tr>
+<tr><td><b>4. (if D8 says so) Remove SHaRC</b></td><td>builds; the abbey and plaza within the phase-3 GI-only numbers</td><td>bench vs phase 3</td></tr>
+</table>
+
+<h2>Risks</h2>
+<ul>
+<li><b>Ray Reconstruction and correlated input.</b> Reused samples are correlated across pixels and frames; RR was trained on independent 1 spp noise. DI at history 8 / 2 neighbours was fine; GI's samples are larger in footprint. Watch for blotches and smearing on camera motion; the history cap is the first lever.</li>
+<li><b>SHaRC inside <code>L</code>.</b> Cache answers are biased and blocky at their voxel size; reuse spreads them across pixels. Expected harmless (the cache only answers past the first indirect hit, when the cone covers a voxel); compare against SHaRC off in phase 2.</li>
+<li><b>Raygen stack / registers.</b> <code>main</code> gains two snapshots (acc, mask: 6 floats) and an eligibility flag live across the bounce loop. The stack is what trace time follows (352 &rarr; 256 B was worth 0.09 ms, &minus;7 % of the trace): the candidate write must happen at the path's end from those two values only, and the logged stack is checked right after phase 0. SHaRC's three snapshot slots (D8) are the offset.</li>
+<li><b>Memory in XR.</b> ~490 MB for two views even shrunk (D3); with DLSS, ReSTIR DI and the guides on a 32 GB card it fits, but it is the first thing to look at if XR memory gets tight.</li>
+<li><b>Mixture pdf vs. the real sampler.</b> <code>sampleDisneyBRDF</code> picks its lobe by Fresnel at the <i>sampled</i> half vector; <code>pdfDisneyBRDF</code> at <code>normalize(l + v)</code>. The MIS code already lives with this; phase 0's on/off match is where a mismatch would show.</li>
+<li><b>XR.</b> Two eyes, two views, two buffer sets, as DI; every per-view cost doubles (the budget's ~2 ms). Test after phase 2.</li>
+</ul>
+
+<h2>Mechanical work (per file)</h2>
+<table>
+<tr><th>File</th><th>Change</th></tr>
+<tr><td><code>assets/shaders/rt_types.slang</code></td><td><code>GiCandidate</code>, <code>GiReservoir</code> + aligned load/store helpers; <code>GiFrame</code> parameter block; push constants <code>gi_candidates</code>, <code>gi_final</code></td></tr>
+<tr><td><code>assets/shaders/raygen.slang</code></td><td><code>GI_ON</code> constant; <code>primary</code> writes the surface under <code>RESTIR_ON || GI_ON</code>; <code>main</code>: eligibility at the resumed vertex, <code>PATH_GI</code> flag, snapshot at <code>x_s</code> (after the emitter check, past pass-through), invalidation on fog scatter / portal / ineligible <code>x_s</code>, candidate write and <code>acc = acc_snap</code> after the SHaRC deposits (only if D5 falls back: a <code>gi_shade</code> raygen)</td></tr>
+<tr><td><code>assets/shaders/atmosphere_rt.slang</code></td><td><code>atmoCompositeT</code> (colour and the surface multiplier); <code>atmoComposite</code> calls it</td></tr>
+<tr><td><code>assets/shaders/restir_gi.slang</code> (new)</td><td><code>gi_temporal</code>, <code>gi_spatial</code>: reconnection Jacobian (<code>x_v</code> rebuilt from depth), target via <code>evalLayered</code> / <code>layeredPdf</code> on the <code>RestirSurface</code> material, reprojection and similarity shared with DI (move <code>reproject</code> / <code>similar</code> to a small module both import); <code>gi_shade</code> (compute, <code>RayQuery</code> visibility with the cutout handling of D5, writes <code>dlss_color</code>); RGB9E5 pack/unpack</td></tr>
+<tr><td><code>src/restir_gi.rs</code> (new)</td><td><code>RestirGiState</code> (per-view candidate + 3 reservoir buffers, <code>GiFrameGpu</code>), <code>prepare</code> / <code>record_passes</code> / <code>release</code>, plugin + teardown, as <code>restir.rs</code></td></tr>
+<tr><td><code>src/restir.rs</code></td><td><code>prepare</code> splits the surfaces buffer from the DI buffers: surfaces whenever DI or GI is on, grid / reservoirs only for DI</td></tr>
+<tr><td><code>src/raytracing_pipeline.rs</code></td><td><code>PipelineFeatures::gi</code> &rarr; constant 8 (and, only on D5's fallback, a <code>gi_shade</code> raygen group, SBT region in <code>src/sbt.rs</code>, <code>stack_gi_shade</code>)</td></tr>
+<tr><td><code>src/descriptor_heap.rs</code></td><td>a storage-image mapping for <code>gi_shade</code>'s write to the colour guide (the view's guide block, as a compute heap mapping)</td></tr>
+<tr><td><code>src/ray_render_plugin.rs</code></td><td>view lane: GI prepare beside DI's (the async compute grid submit, if its buffers clear there: a just-made buffer skips GI that frame, as DI); in the back half after the trace: gi temporal &rarr; gi spatial &rarr; <code>gi_shade</code> &rarr; barrier &rarr; <code>heaps.leave</code> &rarr; DLSS; push constants; release when off</td></tr>
+<tr><td><code>src/render_settings.rs</code></td><td>the five fields (D7)</td></tr>
+<tr><td><code>docs/plans/restir-gi-notes.md</code></td><td>log, measurements, deviations</td></tr>
+</table>
+</body>
+</html>

@@ -67,16 +67,14 @@ pub struct UniformData {
     pad_candidates: [u32; 2],
     /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
     lod_bias: f32,
-    /// Free (spec_hit_roughness).
-    pad_spec_hit: u32,
+    /// ReSTIR GI's roughness threshold (`RenderSettings::restir_gi_roughness`).
+    gi_roughness: f32,
     /// Light-table generation; reservoirs from another generation are dropped.
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
-    /// Radiance cache: 0 = off (also while accumulating).
-    sharc: u32,
-    /// Base cache voxel size (meters) at the camera.
-    sharc_voxel: f32,
+    /// Free (the radiance cache went: ReSTIR GI does its job).
+    pad_cache: [u32; 2],
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -486,7 +484,6 @@ fn render_frame(
         Res<SBT>,
         ResMut<crate::lights::LightManager>,
         ResMut<crate::restir::RestirState>,
-        ResMut<crate::sharc::SharcState>,
         ResMut<ScreenshotRequests>,
         ResMut<crate::auto_exposure::AutoExposureState>,
         Res<Time>,
@@ -528,6 +525,7 @@ fn render_frame(
         ResMut<crate::gpu_profiler::GpuProfiler>,
         ResMut<crate::util::video::VideoRecorder>,
         ResMut<crate::post_prep::PostPrepState>,
+        ResMut<crate::restir_gi::RestirGiState>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -555,7 +553,6 @@ fn render_frame(
         sbt,
         mut lights,
         mut restir,
-        mut sharc,
         mut screenshots,
         mut ae,
         time,
@@ -575,6 +572,7 @@ fn render_frame(
         mut profiler,
         mut video,
         mut post_prep,
+        mut restir_gi,
     ) = dlss_stuff;
 
     let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
@@ -1025,11 +1023,10 @@ fn render_frame(
                 / view.output_extent.width.max(1) as f32)
                 .log2()
                 + settings.texture_lod_bias,
-            pad_spec_hit: 0,
+            gi_roughness: settings.restir_gi_roughness.clamp(0.0, 1.0),
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
-            sharc: settings.sharc as u32,
-            sharc_voxel: settings.sharc_voxel.max(0.01),
+            pad_cache: [0; 2],
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
@@ -1091,7 +1088,7 @@ fn render_frame(
             _ => None,
         };
         // Three command buffers, recorded on three threads and submitted in this order: the
-        // scene (main pool: UI surfaces, the transform-driven chain, lights, SHaRC), the views
+        // scene (main pool: UI surfaces, the transform-driven chain, lights), the views
         // (exposure, atmosphere, each view's trace and DLSS) and the present pass.
         let parity = sync.frame_count % 2;
         let frame_count = sync.frame_count;
@@ -1190,13 +1187,6 @@ fn render_frame(
         } else {
             cmd_buffer
         };
-        // The radiance cache's first-use allocation, before the view lane reads its address.
-        sharc.ensure(
-            &render_device,
-            compute_cmd.unwrap_or(cmd_buffer),
-            settings.sharc,
-        );
-
         // Exposure: each camera meters its own last frame into this frame's exposure (the
         // raygen reads it). A headset's two eyes are one camera and share one meter. Recorded
         // here, at the head of the view lane, because the present lane needs the addresses.
@@ -1251,7 +1241,6 @@ fn render_frame(
         let light_entries = lights.active_entries;
         let light_epoch = lights.epoch;
         let light_header = lights.header_address();
-        let sharc_address = sharc.address();
         let atmo_address = atmo.address();
         let rtx_pipeline = rtx_pipelines.get(&render_config.rtx_pipeline);
         let sbt_ready = sbt.data().address != 0;
@@ -1325,21 +1314,9 @@ fn render_frame(
             let skinned = skins.record(&render_device, skin_cmd, &modules, &transforms);
             prof.end(&render_device, skin_cmd, scope);
             drop(section);
-            let section = info_span!("record_sharc").entered();
-            let sharc_cmd = compute_cmd.unwrap_or(cmd_buffer);
-            if compute_cmd.is_some() {
-                let scope = prof.begin(&render_device, sharc_cmd, "sharc");
-                sharc.record(
-                    &render_device,
-                    sharc_cmd,
-                    &modules,
-                    *frame_counter,
-                    settings.sharc,
-                );
-                prof.end(&render_device, sharc_cmd, scope);
-                render_device.end_command_buffer(sharc_cmd).unwrap();
+            if let Some(compute) = compute_cmd {
+                render_device.end_command_buffer(compute).unwrap();
             }
-            drop(section);
             // With a pick the early submit splits: its head (frame commands) beside the compute
             // work, its tail (TLAS, pick) after it. Without one the frame's own submits do.
             let mut compute_wait = Vec::new();
@@ -1381,19 +1358,6 @@ fn render_frame(
             lights.record(&render_device, after_compute, &modules, tlas);
             prof.end(&render_device, after_compute, scope);
             drop(section);
-            if compute_cmd.is_none() {
-                let section = info_span!("record_sharc").entered();
-                let scope = prof.begin(&render_device, cmd_buffer, "sharc");
-                sharc.record(
-                    &render_device,
-                    cmd_buffer,
-                    &modules,
-                    *frame_counter,
-                    settings.sharc,
-                );
-                prof.end(&render_device, cmd_buffer, scope);
-                drop(section);
-            }
             render_device.end_command_buffer(cmd_buffer).unwrap();
             render_device.end_command_buffer(tlas_cmd).unwrap();
         };
@@ -1456,6 +1420,31 @@ fn render_frame(
                         );
                     restir_views[view.slot] = (on, addresses, built);
                 }
+                // ReSTIR GI's buffers and parameters, beside DI's (same queue, same rule: buffers
+                // just made skip GI this frame). It shares DI's surfaces when DI runs.
+                let mut gi_views =
+                    [(false, crate::restir_gi::GiAddresses::default()); crate::MAX_VIEWS];
+                for view in views {
+                    if !(settings.restir_gi && view.plan.is_some()) {
+                        restir_gi.release(&render_device, view.slot);
+                        continue;
+                    }
+                    let (di_on, di_addresses, _) = restir_views[view.slot];
+                    let addresses = restir_gi.prepare(
+                        &render_device,
+                        grid_cmd.unwrap_or(view_cmd),
+                        &crate::restir_gi::GiInput {
+                            extent: view.trace_extent,
+                            frame: *frame_counter,
+                            slot: view.slot,
+                            prev_view_proj: view.last_view_proj,
+                            di_surfaces: if di_on { di_addresses.surfaces } else { 0 },
+                            settings,
+                        },
+                    );
+                    grid_split |= grid_cmd.is_some();
+                    gi_views[view.slot] = (!(addresses.fresh && grid_cmd.is_some()), addresses);
+                }
                 render_device.cmd_bind_pipeline(
                     view_cmd,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1503,6 +1492,12 @@ fn render_frame(
                     } else {
                         crate::restir::RestirAddresses::default()
                     };
+                    let (gi_on, gi_addresses) = gi_views[view.slot];
+                    let gi_addresses = if gi_on {
+                        gi_addresses
+                    } else {
+                        crate::restir_gi::GiAddresses::default()
+                    };
                     fog_grid.record_clear(&render_device, cmd.get(), view.slot);
                     // The Cost view's frame total, summed into by the raygen.
                     if view.cost.1 != 0 {
@@ -1523,13 +1518,16 @@ fn render_frame(
                         material_buffer: tlas.materials,
                         bluenoise_buffer2: bluenoise_buffer.0.address,
                         focus_buffer: frame.focus_data.address,
-                        restir_surfaces: restir_addresses.surfaces,
+                        restir_surfaces: if restir_addresses.surfaces != 0 {
+                            restir_addresses.surfaces
+                        } else {
+                            gi_addresses.surfaces
+                        },
                         prev_instances: tlas.prev_instances,
                         lights: light_header,
                         instances: tlas.instances,
                         reservoirs_prev: restir_addresses.prev,
                         reservoirs_cur: restir_addresses.final_,
-                        sharc: sharc_address,
                         lum_buffer: if view.meters { view.ae.0 } else { 0 },
                         auto_exposure: view.ae.1,
                         atmo: atmo_address,
@@ -1537,6 +1535,8 @@ fn render_frame(
                         instance_slots: tlas.instance_slots,
                         cost: view.cost.1,
                         primary_hits: view.primary_hits,
+                        gi_candidates: gi_addresses.candidates,
+                        gi_final: gi_addresses.final_,
                     };
 
                     push_trace(push_constants);
@@ -1682,6 +1682,37 @@ fn render_frame(
                             1,
                         );
                         prof.end(&render_device, cmd.get(), scope);
+                        // ReSTIR GI: the trace's candidates through its reuse passes, then the
+                        // winners shaded into the colour.
+                        if gi_on
+                            && restir_gi.record_passes(
+                                &render_device,
+                                cmd.get(),
+                                &modules,
+                                view.slot,
+                                prof,
+                            )
+                        {
+                            push_trace(trace_constants);
+                            let scope = prof.begin(&render_device, cmd.get(), "gi shade");
+                            render_device
+                                .ext_rtx_pipeline
+                                .cmd_set_ray_tracing_pipeline_stack_size(
+                                    cmd.get(),
+                                    rtx_pipeline.stack_gi_shade,
+                                );
+                            render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                cmd.get(),
+                                &sbt.gi_shade_region,
+                                &sbt.miss_region,
+                                &sbt.hit_region,
+                                &vk::StridedDeviceAddressRegionKHR::default(),
+                                plan.render.width,
+                                plan.render.height,
+                                1,
+                            );
+                            prof.end(&render_device, cmd.get(), scope);
+                        }
                         // NGX knows nothing of heaps (descriptor_heap.rs `leave`).
                         heaps.leave(&render_device, cmd.get());
                         let scope = prof.begin(&render_device, cmd.get(), "dlss");
@@ -1805,7 +1836,11 @@ fn render_frame(
                                 fog: 0,
                                 local_tonemap,
                                 bloom,
-                                lum: if views[eye].meters { views[eye].ae.0 } else { 0 },
+                                lum: if views[eye].meters {
+                                    views[eye].ae.0
+                                } else {
+                                    0
+                                },
                                 lum_width: views[eye].trace_extent.width,
                                 lum_height: views[eye].trace_extent.height,
                                 cost: views[eye].cost.1,
@@ -2073,7 +2108,7 @@ fn render_frame(
                             DescriptorHeaps::post_block(parity, target),
                             source_view,
                             dlss_outputs[view.slot].1,
-                        view.prep_textures,
+                            view.prep_textures,
                             &crate::post_process_filter::PostProcessPushConstants {
                                 uniforms: frame.uniform_buffers[view.slot].address,
                                 auto_exposure: view.ae.1,
@@ -2710,7 +2745,7 @@ mod tests {
         assert_eq!(offset_of!(U, view), 144);
         assert_eq!(offset_of!(U, prev_view_proj), 272);
         assert_eq!(offset_of!(U, frame), 344);
-        assert_eq!(offset_of!(U, sharc_voxel), 396);
+        assert_eq!(offset_of!(U, pad_cache), 392);
         assert_eq!(offset_of!(U, portals), 400);
         assert_eq!(offset_of!(U, camera_mask), 416);
         assert_eq!(offset_of!(U, primary_hidden), 420);

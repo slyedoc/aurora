@@ -1149,7 +1149,7 @@ unsafe fn create_logical_device(
         // gpu_profiler.rs resets its timestamps from the host after reading them. 16-bit
         // arithmetic: Slang's f16tof32 / f32tof16 lower through 16-bit integer ops (core
         // shaderInt16 below), and half math proper declares Float16. 64-bit atomic adds: the
-        // radiance cache accumulates in fine fixed point (sharc.rs).
+        // Cost view sums the frame's raygen nanoseconds (raygen.slang).
         let mut features_12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             // The shaders' bindless `textures[]` (mapped onto the descriptor heap).

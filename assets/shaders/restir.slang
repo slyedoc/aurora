@@ -108,23 +108,6 @@ void restir_grid(uint3 gid: SV_DispatchThreadID) {
     f.grid[idx] = uint2(W > 0.0 ? sel : NO_ENTRY, asuint(W));
 }
 
-// The pixel's reprojected position in last frame's image, or (-1, -1).
-int2 reproject(RestirFrame* f, float3 prev_position) {
-    float4 c;
-    let m = f.prev_view_proj;
-    let p = float4(prev_position, 1.0);
-    // Column-major 4x4 (glam to_cols_array), as mat4MulVec in the raygen.
-    c.x = m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12];
-    c.y = m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13];
-    c.w = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
-    if (c.w <= 1.0e-4) {
-        return int2(-1, -1);
-    }
-    let uv = (c.xy / c.w) * 0.5 + 0.5;
-    // The raygen's pixel centre is (x, H - 1 - y) + 0.5: H - uv * H lands on row y.
-    return int2(int(uv.x * float(f.width)), int(float(f.height) - uv.y * float(f.height)));
-}
-
 Reservoir emptyReservoir(RestirFrame* f, RestirSurface s) {
     Reservoir r;
     r.y = NO_ENTRY;
@@ -138,13 +121,6 @@ Reservoir emptyReservoir(RestirFrame* f, RestirSurface s) {
     r.phat = 0.0;
     r.density = 0.0;
     return r;
-}
-
-// Whether a neighbour / history surface is close enough to reuse from.
-bool similar(RestirSurface s, uint normal_oct, float depth) {
-    let n0 = oct_to_float32x3(unpackHalf2(s.normal_oct));
-    let n1 = oct_to_float32x3(unpackHalf2(normal_oct));
-    return dot(n0, n1) > 0.9 && abs(depth - s.depth) < 0.1 * s.depth;
 }
 
 // The target of sample (entry, uv) at surface `s` (0 for an empty sample), and the area density
@@ -227,13 +203,13 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     r.uv_pk = sel_uv;
 
     // Temporal: last frame's final reservoir at the reprojected pixel, re-evaluated here.
-    let pp = reproject(f, s.prev_position);
+    let pp = restirReproject(&f.prev_view_proj[0], f.width, f.height, s.prev_position);
     if (all(pp >= int2(0)) && pp.x < int(f.width) && pp.y < int(f.height)) {
         let prev = f.prev[uint(pp.y) * f.width + uint(pp.x)];
         // An occluded winner (W zeroed by the shade pass) still counts its samples: dropping
         // its M would average only the lucky, visible ones (biased bright).
         if (prev.frame + 1u == f.frame && prev.epoch == f.epoch && prev.M > 0.0
-            && similar(s, prev.normal_pk, prev.depth)) {
+            && restirSimilar(s, prev.normal_pk, prev.depth)) {
             let Mprev = min(prev.M, f.m_cap);
             var phat = 0.0;
             var dens = 0.0;
@@ -303,7 +279,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
         }
         let qi = uint(q.y) * f.width + uint(q.x);
         let qs = restirSurfaceLoad(f.surfaces + qi);
-        if (qs.frame != f.frame || f.temporal[qi].M <= 0.0 || !similar(s, qs.normal_oct, qs.depth)) {
+        if (qs.frame != f.frame || f.temporal[qi].M <= 0.0 || !restirSimilar(s, qs.normal_oct, qs.depth)) {
             continue;
         }
         picked[k] = qi;

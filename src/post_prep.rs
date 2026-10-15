@@ -87,7 +87,10 @@ struct PrepView {
 
 /// `texture` at `width` x `height` (made, cleared, left GENERAL), or remade at a new size.
 fn sized_texture(rd: &RenderDevice, texture: &mut Option<RenderTexture>, width: u32, height: u32) {
-    if texture.as_ref().is_some_and(|t| t.width == width && t.height == height) {
+    if texture
+        .as_ref()
+        .is_some_and(|t| t.width == width && t.height == height)
+    {
         return;
     }
     if let Some(old) = texture.take() {

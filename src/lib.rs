@@ -3,7 +3,7 @@
 /// A view owns per-view GPU state -- uniform buffer, guide descriptors, ReSTIR reservoir pair,
 /// DLSS feature and its temporal history -- so views do NOT share denoiser history and each
 /// costs its own raygen dispatch. What they DO share is everything world-scale: the TLAS,
-/// the light table, GPU transforms and the SHARC cache are built once per frame regardless.
+/// the light table and GPU transforms are built once per frame regardless.
 /// So frame cost tracks total PIXELS traced, not view count.
 ///
 /// Slots are allocated per frame in order. Four covers the cases that exist: an editor
@@ -56,9 +56,9 @@ pub mod render_settings;
 pub mod render_shaders;
 pub mod render_texture;
 pub mod restir;
+pub mod restir_gi;
 pub mod sbt;
 pub mod shader;
-pub mod sharc;
 pub mod skinning;
 pub mod sky;
 pub mod sky_gen;
@@ -182,9 +182,9 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::skinning::SkinningPlugin);
         group = group.add(crate::lights::LightsPlugin);
         group = group.add(crate::restir::RestirPlugin);
+        group = group.add(crate::restir_gi::RestirGiPlugin);
         group = group.add(crate::fog_grid::FogGridPlugin);
         group = group.add(crate::post_prep::PostPrepPlugin);
-        group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
         group = group.add(crate::atmosphere::AtmospherePlugin);
         group = group.add(crate::sky_gen::SkyGenPlugin);

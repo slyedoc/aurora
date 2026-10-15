@@ -42,8 +42,8 @@ pub struct ExtractedRaytracingPipeline {
 /// registers included. Changing one rebuilds the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PipelineFeatures {
-    pub sharc: bool,
     pub restir: bool,
+    pub restir_gi: bool,
     /// Some environment's sky is the atmosphere.
     pub atmosphere: bool,
     pub samples: u32,
@@ -62,8 +62,8 @@ impl PipelineFeatures {
         let d = crate::render_settings::RenderSettings::default();
         let s = settings.unwrap_or(&d);
         Self {
-            sharc: settings.is_some_and(|s| s.sharc),
             restir: settings.is_some_and(|s| s.restir),
+            restir_gi: settings.is_some_and(|s| s.restir_gi),
             atmosphere: skies.is_some_and(|s| s.atmosphere.is_some()),
             samples: s.samples.max(1),
             max_bounces: s.max_bounces.max(1),
@@ -100,11 +100,14 @@ pub struct CompiledRaytracingPipeline {
     pub stack_main: u32,
     pub stack_fog_grid: u32,
     pub stack_primary: u32,
+    pub stack_gi_shade: u32,
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
     /// The primary pass's raygen (docs/plans/primary-pass.html).
     pub primary_handle: RTGroupHandle,
+    /// ReSTIR GI's shading raygen (restir_gi.rs).
+    pub gi_shade_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
     /// Miss index 1: shadow rays.
     pub shadow_miss_handle: RTGroupHandle,
@@ -155,8 +158,6 @@ pub struct RaytracingPushConstants {
     /// ReSTIR DI reservoirs: last frame's and this frame's (`restir`).
     pub reservoirs_prev: u64,
     pub reservoirs_cur: u64,
-    /// Radiance-cache entries (`sharc`; 0 until first enabled).
-    pub sharc: u64,
     /// Auto-exposure: per-pixel luminance out, smoothed exposure in (`auto_exposure`).
     pub lum_buffer: u64,
     pub auto_exposure: u64,
@@ -170,6 +171,9 @@ pub struct RaytracingPushConstants {
     pub cost: u64,
     /// The primary pass's hit records (`Frame::primary_hits`; 0 while the old frame runs).
     pub primary_hits: u64,
+    /// ReSTIR GI's candidates and final reservoirs (`restir_gi`; 0 when off).
+    pub gi_candidates: u64,
+    pub gi_final: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to
@@ -282,11 +286,11 @@ impl VulkanAsset for RaytracingPipeline {
             surface_groups,
             features,
         } = asset;
-        // raygen.slang's `constant_id`s, 4 bytes each: 0 SHARC_ON, 1 RESTIR_ON, 2 ATMOSPHERE_ON
+        // raygen.slang's `constant_id`s, 4 bytes each: 0 free, 1 RESTIR_ON, 2 ATMOSPHERE_ON
         // (miss.slang's too), 3 SAMPLES, 4 MAX_BOUNCES, 5 LIGHT_CANDIDATES, 6 SPEC_HIT_ROUGHNESS
-        // (f32), 7 ROULETTE_FROM.
+        // (f32), 7 ROULETTE_FROM, 8 GI_ON.
         let spec_data = [
-            features.sharc as u32,
+            0,
             features.restir as u32,
             features.atmosphere as u32,
             features.samples,
@@ -294,6 +298,7 @@ impl VulkanAsset for RaytracingPipeline {
             features.light_candidates,
             features.spec_hit_roughness,
             features.roulette_from,
+            features.restir_gi as u32,
         ];
         let spec_entries: Vec<_> = (0..spec_data.len() as u32)
             .map(|id| {
@@ -444,6 +449,27 @@ impl VulkanAsset for RaytracingPipeline {
             vk::RayTracingShaderGroupCreateInfoKHR::default()
                 .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
                 .general_shader(primary_stage)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
+        // ReSTIR GI's shading (raygen.slang `gi_shade`).
+        let gi_shade_group = shader_group.len();
+        let gi_shade_stage = shader_stages.len() as u32;
+        shader_stages.push(
+            render_device
+                .load_shader_entry(
+                    raygen_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                    c"gi_shade",
+                )
+                .specialization_info(&spec),
+        );
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(gi_shade_stage)
                 .closest_hit_shader(vk::SHADER_UNUSED_KHR)
                 .any_hit_shader(vk::SHADER_UNUSED_KHR)
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
@@ -601,6 +627,7 @@ impl VulkanAsset for RaytracingPipeline {
             .collect();
         let fog_grid_handle = handles[fog_grid_group];
         let primary_handle = handles[primary_group];
+        let gi_shade_handle = handles[gi_shade_group];
         let shadow_miss_handle = handles[shadow_miss_group];
         let shadow_hit_handle = handles[shadow_hit_group];
         let shadow_empty_handle = handles[shadow_empty_group];
@@ -646,9 +673,12 @@ impl VulkanAsset for RaytracingPipeline {
         let stack_fog_grid =
             group_stack(fog_grid_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         let stack_primary = group_stack(primary_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
+        let stack_gi_shade =
+            group_stack(gi_shade_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         log::debug!(
             "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B; per thread: main \
-             {stack_main}, fog grid {stack_fog_grid}, primary {stack_primary} B",
+             {stack_main}, fog grid {stack_fog_grid}, primary {stack_primary}, gi shade \
+             {stack_gi_shade} B",
             start.elapsed()
         );
         render_device.save_pipeline_cache();
@@ -658,9 +688,11 @@ impl VulkanAsset for RaytracingPipeline {
             stack_main,
             stack_fog_grid,
             stack_primary,
+            stack_gi_shade,
             raygen_handle,
             fog_grid_handle,
             primary_handle,
+            gi_shade_handle,
             miss_handle,
             shadow_miss_handle,
             shadow_hit_handle,

@@ -40,7 +40,7 @@ Feature-gate all of it (`feature = "xr"`) so the desktop path is untouched.
 
 ## Reality check
 
-Two eyes at 72–90 Hz with reprojection punishing every dropped frame is a very different perf envelope from a 1440p window. Bistro on the 5090 through WiVRn at a modest per-eye res with RR upscaling is plausibly in reach, but expect to drop to 72 Hz mode and lean on the ReSTIR/SHaRC work. Motion-to-photon also cares about the encode leg — WiVRn supports h264/h265/AV1; the 5090's encoder is not the bottleneck.
+Two eyes at 72–90 Hz with reprojection punishing every dropped frame is a very different perf envelope from a 1440p window. Bistro on the 5090 through WiVRn at a modest per-eye res with RR upscaling is plausibly in reach, but expect to drop to 72 Hz mode and lean on the ReSTIR work. Motion-to-photon also cares about the encode leg — WiVRn supports h264/h265/AV1; the 5090's encoder is not the bottleneck.
 
 ## Status (2026-08-31)
 
