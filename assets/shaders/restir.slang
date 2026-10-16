@@ -16,7 +16,7 @@
 // biased one (no neighbour visibility).
 import rt_types;
 import rand;
-import disney;
+import bsdf;
 import light_eval;
 
 // `RestirFrameGpu` in src/restir.rs (scalar layout; pointers first).

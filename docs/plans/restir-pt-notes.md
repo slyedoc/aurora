@@ -228,3 +228,13 @@ Plan: `restir-pt.html`. Newest last.
   same for 0.1 ms more. The lit share stays small: past x_k the light is found by chance (a sunlit
   patch, the sky through leaves), which NEE cannot target. With temporal reuse off, the sun room's
   spatial-only input is 90 % black without SHaRC (21 % with it): the cache was its density.
+- 2026-10-16: the surface BSDF is now bsdf.slang (Falcor's standard BSDF, BSD-3, adapted): Falcor's
+  IBSDF lobes and an ISampler interface, so the PT search and its replay sample through the same
+  `SurfaceBSDF.sample` (a PathSampler replays the path seed's numbers; the hand-numbered pathRandom
+  slots are gone), one lobe pick replaces the separate translucency and coat coins, eval is
+  `[Differentiable]`. Diffuse is Lambert under the GGX layer by its albedo (Falcor's Frostbite
+  default read 0.686 of Cycles in the sun room, plain Lambert added 1.087; layered 1.038 / block
+  0.045, Disney was 1.052 / 0.073). PT stays unbiased (1.000 / 0.012), NRC 1.000 / 0.012 against the
+  16-bounce truth. tests/bsdf_check.rs: sampling weights vs eval (uniform sphere) within 1.9 %, pdf
+  vs kept samples 1.8 %, bwd_diff vs finite differences 2e-4, replay exact. Glass keeps its own
+  refraction code (Falcor's dielectric BSDF is the next step).

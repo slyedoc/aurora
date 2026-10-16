@@ -2,7 +2,7 @@
 // (restir.slang). Everything reaches the table and the live instance rows through a
 // `LightCtx`, never the ray-tracing push constant, so a compute kernel can import it.
 import rt_types;
-import disney;
+import bsdf;
 
 // Where the light table lives: its header, this frame's TLAS instance rows (3x4 transforms,
 // 4 float4 per slot) and the emissive multiplier (`RenderSettings::emissive_boost`).
@@ -71,7 +71,7 @@ public uint lightsFindInstance(LightCtx ctx, uint e) {
 // A surface's response to light from `dir`, cosine included: the whole layered BSDF in front
 // (base, coat, less what is transmitted), and behind a thin translucent one the light coming
 // through it. Zero where it takes none (and wherever the geometric normal disagrees).
-public float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+public float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, SurfaceMaterial mat, Lobes lob) {
     // n = 0: a point in the fog, `ns.x` its Henyey-Greenstein g.
     if (all(n == float3(0.0))) {
         return float3(fogPhaseG(ns.x, dot(-v, dir)));
@@ -82,14 +82,14 @@ public float3 thinSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMater
     if (!above && !through) {
         return float3(0.0);
     }
-    return evalLayered(v, n, dir, mat, lob, true) * abs(NoL);
+    return surfaceEval(v, n, dir, mat, lob);
 }
 
 // A cheap stand-in for thinSurface, luminance only: Lambert for the diffuse share, GGX D with
 // Schlick's F0 and one Smith G1 for the base and the coat, Lambert through a translucent one.
 // ReSTIR resamples by it (any target that is non-zero wherever the light can contribute keeps
 // it unbiased); the shade evaluates the exact layered BSDF for the winner.
-public float cheapSurface(float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+public float cheapSurface(float3 v, float3 n, float3 ns, float3 dir, SurfaceMaterial mat, Lobes lob) {
     let NoL = dot(n, dir);
     let a = dot(mat.albedo, float3(0.2126, 0.7152, 0.0722));
     if (lob.transmission > 0.0 && NoL < 0.0 && dot(dir, ns) < 0.0) {
@@ -114,13 +114,13 @@ float cheapGgx(float alpha, float NoH, float NoL, float NoV) {
     return a2 * g1 / (PI * d * d * 4.0 * NoV);
 }
 
-float3 surfaceResponse(bool cheap, float3 v, float3 n, float3 ns, float3 dir, DisneyMaterial mat, Lobes lob) {
+float3 surfaceResponse(bool cheap, float3 v, float3 n, float3 ns, float3 dir, SurfaceMaterial mat, Lobes lob) {
     return cheap ? float3(cheapSurface(v, n, ns, dir, mat, lob)) : thinSurface(v, n, ns, dir, mat, lob);
 }
 
 public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, float sv,
                                  float3 sp, float3 n, float3 ns, float3 v,
-                                 DisneyMaterial mat, Lobes lob, bool fixed_point,
+                                 SurfaceMaterial mat, Lobes lob, bool fixed_point,
                                  out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     return analyticSampleEvalWith(ctx, e, p_pick, su, sv, sp, n, ns, v, mat, lob, fixed_point, false,
                                   p_area, pdf_solid, dir, dist);
@@ -128,7 +128,7 @@ public float3 analyticSampleEval(LightCtx ctx, uint e, float p_pick, float su, f
 
 public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, float su, float sv,
                               float3 sp, float3 n, float3 ns, float3 v,
-                              DisneyMaterial mat, Lobes lob, uint ray_mask, bool fixed_point,
+                              SurfaceMaterial mat, Lobes lob, uint ray_mask, bool fixed_point,
                               out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     return lightSampleEvalWith(ctx, e, li_idx, p_pick, su, sv, sp, n, ns, v, mat, lob, ray_mask,
                                fixed_point, false, p_area, pdf_solid, dir, dist);
@@ -141,7 +141,7 @@ public float3 lightSampleEval(LightCtx ctx, uint e, uint li_idx, float p_pick, f
 // complementary weight. A sphere emitter (kind 3) does: see sphereEmitterPdf.
 float3 analyticSampleEvalWith(LightCtx ctx, uint e, float p_pick, float su, float sv,
                           float3 sp, float3 n, float3 ns, float3 v,
-                          DisneyMaterial mat, Lobes lob, bool fixed_point, bool cheap,
+                          SurfaceMaterial mat, Lobes lob, bool fixed_point, bool cheap,
                           out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     p_area = 0.0;
     pdf_solid = 0.0;
@@ -303,7 +303,7 @@ public float sphereEmitterPdf(LightCtx ctx, uint e, float3 from) {
 // otherwise light through).
 float3 lightSampleEvalWith(LightCtx ctx, uint e, uint li_idx, float p_pick, float su, float sv,
                        float3 sp, float3 n, float3 ns, float3 v,
-                       DisneyMaterial mat, Lobes lob, uint ray_mask, bool fixed_point, bool cheap,
+                       SurfaceMaterial mat, Lobes lob, uint ray_mask, bool fixed_point, bool cheap,
                        out float p_area, out float pdf_solid, out float3 dir, out float dist) {
     if (e < ctx.lights.analytic_count) {
         if (((ctx.lights.analytics[e].flags >> 8) & ray_mask & 0xFFu) == 0u) {
@@ -362,9 +362,9 @@ public float fogPhaseG(float g, float cos_theta) {
 // ---- ReSTIR DI (src/restir.rs) -------------------------------------------------------------
 
 // A surface's material, normals and view from its packed record.
-public void restirSurfaceUnpack(RestirSurface s, out DisneyMaterial mat, out Lobes lob,
+public void restirSurfaceUnpack(RestirSurface s, out SurfaceMaterial mat, out Lobes lob,
                                 out float3 n, out float3 ns, out float3 v) {
-    mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    mat = surfaceMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
     lob = unpackLobes(s.material);
     n = oct_to_float32x3(unpackHalf2(s.normal_oct));
     ns = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
@@ -378,7 +378,7 @@ public void restirSurfaceUnpack(RestirSurface s, out DisneyMaterial mat, out Lob
 // and pick probability, the shadow ray's direction and length.
 public float3 restirTarget(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
                            out float p_area_cdf, out float p_cdf, out float3 dir, out float dist) {
-    DisneyMaterial mat;
+    SurfaceMaterial mat;
     Lobes lob;
     float3 n, ns, v;
     restirSurfaceUnpack(s, mat, lob, n, ns, v);
@@ -389,7 +389,7 @@ public float3 restirTarget(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
                               s.position, n, ns, v, mat, lob, restirRayMask(s), true,
                               p_area_cdf, pdf_solid, dir, dist);
     if (pdf_solid > 0.0) {
-        val *= pdf_solid / (pdf_solid + layeredPdf(v, n, dir, mat, lob));
+        val *= pdf_solid / (pdf_solid + surfacePdf(v, n, dir, mat, lob));
     }
     return val;
 }
@@ -399,7 +399,7 @@ public float3 restirTarget(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
 // area pdf and pick probability, as restirTarget.
 public float restirTargetCheap(LightCtx ctx, RestirSurface s, uint e, uint uv_pk,
                                out float p_area_cdf, out float p_cdf) {
-    DisneyMaterial mat;
+    SurfaceMaterial mat;
     Lobes lob;
     float3 n, ns, v;
     restirSurfaceUnpack(s, mat, lob, n, ns, v);
@@ -429,7 +429,7 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     let a = float3(float(c.albedo_metallic & 0xFFu), float((c.albedo_metallic >> 8) & 0xFFu),
                    float((c.albedo_metallic >> 16) & 0xFFu)) / 255.0;
     let rt = unpackHalf2(asuint(c.roughness));
-    let mat = disneyMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, rt.x);
+    let mat = surfaceMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, rt.x);
     // x_k's thin translucency: light it took through its far side keeps its (constant) lobe.
     Lobes lob = {};
     lob.transmission = rt.y;
@@ -438,8 +438,8 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     let Lc = unpackRadiance(c.L);
     if (any(Lc > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_c));
-        let f0 = evalLayered(wo_src, n, wi, mat, lob, false);
-        let f1 = evalLayered(wo, n, wi, mat, lob, false);
+        let f0 = surfaceEval(wo_src, n, wi, mat, lob);
+        let f1 = surfaceEval(wo, n, wi, mat, lob);
         L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
     }
@@ -449,8 +449,8 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     }
     if (any(Ln > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_n));
-        let f0 = evalLayered(wo_src, n, wi, mat, lob, false);
-        let f1 = evalLayered(wo, n, wi, mat, lob, false);
+        let f0 = surfaceEval(wo_src, n, wi, mat, lob);
+        let f1 = surfaceEval(wo, n, wi, mat, lob);
         L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Ln;
     }
@@ -484,6 +484,6 @@ public float3 ptOwnTarget(RestirSurface s, GiCandidate c) {
         return float3(0.0);
     }
     let v = oct_to_float32x3(unpackHalf2(s.view_oct));
-    let mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
-    return evalLayered(v, n, w, mat, lob, true) * abs(NoL) * ptSampleRadiance(c, -w);
+    let mat = surfaceMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    return surfaceEval(v, n, w, mat, lob) * ptSampleRadiance(c, -w);
 }

@@ -3,7 +3,7 @@
 // Reconstruction guides, the atmosphere composite and the auto-exposure meter.
 import rt_types;
 import rand;
-import disney;
+import bsdf;
 import atmosphere_rt;
 import light_eval;
 import fog;
@@ -56,18 +56,6 @@ static const float GI_RECONNECT_MIN = 0.03;
 // The deepest reconnection vertex (x_k, k counted from the primary vertex x_0): a replay traces
 // up to k - 1 rays, and the search holds Russian roulette back until it ends.
 static const uint PT_MAX_K = 3u;
-
-uint ptHash(uint v) {
-    let state = v * 747796405u + 2891336453u;
-    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-// The path's BSDF random number `dim` at vertex `vertex`: stateless, so random replay draws the
-// same numbers from another primary vertex.
-float pathRandom(uint seed, uint vertex, uint dim) {
-    return float(ptHash(ptHash(ptHash(seed) + vertex * 0x9e3779b9u) + dim * 0x85ebca6bu) >> 8) / 16777216.0;
-}
 
 // A vertex a reconnection may start or end at: rough, not glass, no thin layers (replay draws
 // the base lobe only).
@@ -690,7 +678,7 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, ino
     if (pc.uniforms.light_entries == 0u) {
         return float3(0.0);
     }
-    DisneyMaterial mat = {};
+    SurfaceMaterial mat = {};
     Lobes lob = {};
     let M = max(1u, LIGHT_CANDIDATES);
     var wsum = 0.0;
@@ -1272,7 +1260,7 @@ struct PtVertex {
     float3 n;
     float3 ng;
     float3 v;
-    DisneyMaterial mat;
+    SurfaceMaterial mat;
     Lobes lob;
 };
 
@@ -1282,7 +1270,7 @@ PtVertex ptPrimaryVertex(RestirSurface s) {
     p.n = oct_to_float32x3(unpackHalf2(s.normal_oct));
     p.ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
     p.v = oct_to_float32x3(unpackHalf2(s.view_oct));
-    p.mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    p.mat = surfaceMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
     p.lob = unpackLobes(s.material);
     return p;
 }
@@ -1311,23 +1299,20 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
     var rough = ptRough(p.mat.roughness, 0.0, p.lob);
     let ray_mask = restirRayMask(s);
     for (uint i = 0u; i + 1u < k; i++) {
-        var dir = float3(0.0);
-        // Through a thin translucent surface with probability `transmission`, as `main` drew it.
-        if (p.lob.transmission > 0.0 && pathRandom(seed, i, 5u) < p.lob.transmission) {
-            dir = sampleTransmission(p.n, pathRandom(seed, i, 6u), pathRandom(seed, i, 7u));
-            if (dot(dir, p.ng) >= 0.0) {
-                return res;
-            }
-            res.T *= p.mat.albedo;
-        } else {
-            let noise = float4(pathRandom(seed, i, 0u), pathRandom(seed, i, 1u),
-                               pathRandom(seed, i, 2u), pathRandom(seed, i, 3u));
-            let brdf = sampleDisneyBRDF(noise, pathRandom(seed, i, 4u), p.v, p.n, p.mat, dir);
-            if (brdf.a < 0.0 || dot(dir, p.ng) <= 0.0) {
-                return res;
-            }
-            res.T *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+        // The BSDF's numbers at vertex i, as `main` drew them.
+        var sg = PathSampler(seed, i);
+        float3 dir;
+        float bpdf;
+        float3 weight;
+        uint lobe;
+        if (!surfaceBSDF(p.v, p.n, p.mat, p.lob).sample(sg, dir, bpdf, weight, lobe)) {
+            return res;
         }
+        let through = (lobe & 3u) == LOBE_TRANSLUCENT;
+        if (through ? dot(dir, p.ng) >= 0.0 : dot(dir, p.ng) <= 0.0) {
+            return res;
+        }
+        res.T *= weight;
         HitPayload payload = {};
         payload.miss_flags = 0u;
         payload.cone = float2(0.0, 0.01);
@@ -1346,7 +1331,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
             q.ng = -q.ng;
         }
         q.v = -dir;
-        q.mat = disneyMaterial(payload.color.rgb, hitPayloadGetMetallic(payload), roughness);
+        q.mat = surfaceMaterial(payload.color.rgb, hitPayloadGetMetallic(payload), roughness);
         q.lob = lob;
         if (!ptReplayable(transmission, lob)) {
             return res;
@@ -1385,7 +1370,7 @@ float3 ptReconnect(PtVertex p, float3 T, GiCandidate c, float3 x_s, float3 n_s, 
         return float3(0.0);
     }
     geo = cos_s / d2;
-    return T * evalLayered(p.v, p.n, w, p.mat, p.lob, true) * abs(NoL) * ptSampleRadiance(c, -w);
+    return T * surfaceEval(p.v, p.n, w, p.mat, p.lob) * ptSampleRadiance(c, -w);
 }
 
 // A sample shifted to a primary vertex: its target vector there (visibility of the reconnection
@@ -1813,7 +1798,7 @@ uint packUnorm16(float x) {
 // BSDF, MIS-weighted against BRDF sampling, as restirTarget) times the reservoir weight, its
 // direction and distance; it joins the vertex's one shadow ray.
 float3 restirWinnerUnshadowed(uint idx, float3 origin, float3 n, float3 ns, float3 v,
-                              DisneyMaterial mat, Lobes lob, uint ray_mask, out float3 dir,
+                              SurfaceMaterial mat, Lobes lob, uint ray_mask, out float3 dir,
                               out float dist) {
     dir = float3(0.0, 1.0, 0.0);
     dist = 0.0;
@@ -1831,7 +1816,7 @@ float3 restirWinnerUnshadowed(uint idx, float3 origin, float3 n, float3 ns, floa
     var val = lightSampleEval(ctx, r.y, lightsFindInstance(ctx, r.y), p_cdf, uv.x, uv.y, origin, n, ns,
                               v, mat, lob, ray_mask, true, p_area, pdf_solid, dir, dist);
     if (pdf_solid > 0.0) {
-        val *= pdf_solid / (pdf_solid + layeredPdf(v, n, dir, mat, lob));
+        val *= pdf_solid / (pdf_solid + surfacePdf(v, n, dir, mat, lob));
     }
     return val * r.W;
 }
@@ -2431,7 +2416,7 @@ void main() {
                 }
             }
 
-            let disney_mat = disneyMaterial(payload.color.rgb, metallic, roughness);
+            let surf_mat = surfaceMaterial(payload.color.rgb, metallic, roughness);
 
             // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
             // indirect hit on, a converged voxel ends the path with its cached outgoing
@@ -2484,7 +2469,7 @@ void main() {
                     float3 wdir;
                     float wdist;
                     let c = restirWinnerUnshadowed(prim_at, origin, world_normal, surface_normal,
-                                                   -direction, disney_mat, lob, ray_mask, wdir, wdist);
+                                                   -direction, surf_mat, lob, ray_mask, wdir, wdist);
                     pick.propose(mask * c, wdir, wdist * (1.0 - 1.0e-4));
                 } else {
                     // Resampled importance sampling, no reuse: M candidates, each weighted by its
@@ -2534,12 +2519,12 @@ void main() {
                         float3 cdir;
                         let val = lightSampleEval(lightCtx(), e, lightsFindInstance(lightCtx(), e), p_pick, su, sv,
                                                   origin, world_normal, surface_normal, -direction,
-                                                  disney_mat, lob, ray_mask, false, p_area, pdf_solid, cdir,
+                                                  surf_mat, lob, ray_mask, false, p_area, pdf_solid, cdir,
                                                   cdist);
                         if (luma(val) <= 0.0 || p_area <= 0.0) {
                             continue;
                         }
-                        let w = pdf_solid / (pdf_solid + layeredPdf(-direction, world_normal, cdir, disney_mat, lob));
+                        let w = pdf_solid / (pdf_solid + surfacePdf(-direction, world_normal, cdir, surf_mat, lob));
                         let g = val * w;
                         let phat = luma(g);
                         let wi = phat / (p_area * src_ratio);
@@ -2571,10 +2556,10 @@ void main() {
                 let through = lob.transmission > 0.0 && NoL < 0.0 && dot(l, surface_normal) < 0.0;
                 let above = NoL > 0.0 && dot(l, surface_normal) > 0.0;
                 if (pdf_env > 0.0 && (above || through) && luma(L) > 0.0) {
-                    let f = evalLayered(-direction, world_normal, l, disney_mat, lob, true);
+                    let f = surfaceEval(-direction, world_normal, l, surf_mat, lob);
                     if (any(f > float3(0.0))) {
-                        let w = pdf_env / (pdf_env + layeredPdf(-direction, world_normal, l, disney_mat, lob));
-                        let c = mask * f * abs(NoL) * L * (w / pdf_env);
+                        let w = pdf_env / (pdf_env + surfacePdf(-direction, world_normal, l, surf_mat, lob));
+                        let c = mask * f * L * (w / pdf_env);
                         pick.propose(c, l, tmax);
                     }
                 }
@@ -2597,7 +2582,7 @@ void main() {
                     if (!through && (NoL <= 0.0 || dot(l, surface_normal) <= 0.0)) {
                         continue;
                     }
-                    let f = evalLayered(-direction, world_normal, l, disney_mat, lob, true);
+                    let f = surfaceEval(-direction, world_normal, l, surf_mat, lob);
                     // Under an atmosphere the first sun's radiance is top-of-atmosphere: attenuate by
                     // the air above the hit, and (primary hits only) by the cloud shell.
                     var sun_radiance = sun.radiance.rgb;
@@ -2612,7 +2597,7 @@ void main() {
                         // shader, so the payload's t only becomes 0 when the miss shader ran. Not
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
                         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                        let c = mask * f * abs(NoL) * sun_radiance * solid_angle;
+                        let c = mask * f * sun_radiance * solid_angle;
                         pick.propose(c, l, tmax);
                     }
                 }
@@ -2625,96 +2610,52 @@ void main() {
                 pt_acc_mid = acc;
             }
 
-            // Thin layers before the base: through the surface with probability `transmission`
-            // (weight = albedo: a Lambertian lobe drawn by its own cosine), off the coat with
-            // probability clearcoat x Fresnel (weight F G1 / that). What is left samples the
-            // base, whose weight the two cancel out of. Ordinary materials draw nothing here.
-            // The view the sampler below draws from (its MIS pdf needs it after `direction` moves).
-            let wo = -direction;
-            // While ReSTIR PT searches, the coin and the direction come from the path seed, which
-            // replay draws again (ptReplay).
-            let pt_searching = GI_ON && (path & PATH_PT_SEARCH) != 0u;
-            let pt_vi = bounce_idx - pt_base;
-            if (lob.transmission > 0.0
-                && (pt_searching ? pathRandom(pt_seed, pt_vi, 5u) : randf()) < lob.transmission) {
-                let r1 = pt_searching ? pathRandom(pt_seed, pt_vi, 6u) : randf();
-                let r2 = pt_searching ? pathRandom(pt_seed, pt_vi, 7u) : randf();
-                direction = sampleTransmission(world_normal, r1, r2);
-                if (GI_ON && bounce_idx == pt_k_bounce) {
-                    pt_cont_dir = direction;
-                }
-                mask *= disney_mat.albedo;
-                prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
-                path &= ~PATH_WANT_SUN;
-                cone_spread = max(cone_spread, 0.37);
-                path |= PATH_FROM_ROUGH;
-                continue;
-            }
-            if (lob.clearcoat > 0.0) {
-                let q = lob.clearcoat * coatFresnel(dot(world_normal, -direction));
-                if (randf() < q) {
-                    let r1 = randf();
-                    let r2 = randf();
-                    float3 l;
-                    float w;
-                    if (!sampleCoat(-direction, world_normal, lob.coat_alpha, r1, r2, l, w)) {
-                        break;
-                    }
-                    direction = l;
-                    mask *= lob.clearcoat * w / q;
-                    prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
-                    path &= ~PATH_WANT_SUN;
-                    cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
-                    path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
-                    continue;
-                }
-            }
-
-            // White noise from the PCG stream: Ray Reconstruction assumes independent samples,
-            // no pattern shared across the screen (DLSS-RR Integration Guide 3.5). While ReSTIR PT
-            // searches, the path seed's numbers instead, which replay draws again.
-            float4 noise;
-            float u_lobe;
+            // One lobe, picked by albedo, and its direction (bsdf.slang: Falcor's standard BSDF
+            // under the clear coat). While ReSTIR PT searches, the numbers come from the path
+            // seed, which replay draws again (ptReplay); otherwise white noise from the PCG stream:
+            // Ray Reconstruction assumes independent samples (DLSS-RR Integration Guide 3.5).
+            let bs = surfaceBSDF(-direction, world_normal, surf_mat, lob);
+            float3 l;
+            float bpdf;
+            float3 weight;
+            uint lobe;
+            bool sampled;
             if (GI_ON && (path & PATH_PT_SEARCH) != 0u) {
-                let vi = bounce_idx - pt_base;
-                noise = float4(pathRandom(pt_seed, vi, 0u), pathRandom(pt_seed, vi, 1u),
-                               pathRandom(pt_seed, vi, 2u), pathRandom(pt_seed, vi, 3u));
-                u_lobe = pathRandom(pt_seed, vi, 4u);
+                var sg = PathSampler(pt_seed, bounce_idx - pt_base);
+                sampled = bs.sample(sg, l, bpdf, weight, lobe);
             } else {
-                let n0 = randf();
-                let n1 = randf();
-                let n2 = randf();
-                let n3 = randf();
-                noise = float4(n0, n1, n2, n3);
-                u_lobe = randf();
+                var sg = PcgSampler();
+                sampled = bs.sample(sg, l, bpdf, weight, lobe);
             }
-
-            let brdf = sampleDisneyBRDF(noise, u_lobe, -direction, world_normal, disney_mat, direction);
-            if (GI_ON && bounce_idx == pt_k_bounce && brdf.a > 0.0) {
+            // A failed sample carries nothing: the path ends. Nor may it leak through the surface,
+            // unless it is the translucent lobe, which must cross it.
+            let through = (lobe & 3u) == LOBE_TRANSLUCENT;
+            if (!sampled || (through ? dot(l, surface_normal) >= 0.0 : dot(l, surface_normal) < 0.0)) {
+                break;
+            }
+            direction = l;
+            if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_cont_dir = direction;
             }
-            // A mirror bounce still sees the sun disc: its delta lobe is no part of next-event
-            // estimation (evalDisneyBRDF leaves it out), so the disc is how the sun reaches it.
-            if (brdf.a != 0.0) {
+            // A mirror bounce still sees the sun disc: a delta lobe is no part of next-event
+            // estimation, so the disc is how the sun reaches it.
+            if ((lobe & LOBE_DELTA) == 0u) {
                 path &= ~PATH_WANT_SUN;
             }
-            // A failed sample (direction under the surface) carries nothing: the path ends.
-            if (brdf.a < 0.0) {
-                break;
-            }
-            // brdf.a is the base lobe's pdf; 0 marks a delta (mirror) bounce whose weight is
-            // applied as is. Otherwise the MIS pdf is the whole layered sampler's.
-            prev_pdf = brdf.a > 0.0001 ? layeredPdf(wo, world_normal, direction, disney_mat, lob) : 0.0;
-
-            // Prevent going into the surface (leaks light through walls)
-            if (dot(direction, surface_normal) < 0) {
-                break;
-            }
-
-            mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+            // The whole mixture's pdf (0 for a delta): the MIS partner of light sampling.
+            prev_pdf = bpdf;
+            mask *= weight;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
-            cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
-            path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
+            if (through) {
+                cone_spread = max(cone_spread, 0.37);
+                path |= PATH_FROM_ROUGH;
+            } else if ((lobe & 3u) == LOBE_COAT) {
+                cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
+                path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
+            } else {
+                cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
+                path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
+            }
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.

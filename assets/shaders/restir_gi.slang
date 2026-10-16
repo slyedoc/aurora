@@ -9,7 +9,7 @@
 // k = 1 that is the primary vertex's BSDF, cosine and radiance: ReSTIR GI's).
 import rt_types;
 import rand;
-import disney;
+import bsdf;
 import light_eval;
 
 struct GiPush {

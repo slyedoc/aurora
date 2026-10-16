@@ -3,7 +3,7 @@
 // Adam step that refreshes the f16 copies the forward passes read. Plus the gym's synthetic
 // records (tests/nrc_gym.rs).
 import rt_types;
-import disney;
+import bsdf;
 import nrc;
 
 static const uint NRC_PARAMS = NRC_LAYERS * (NRC_MATRIX_HALVES + NRC_WIDTH);
