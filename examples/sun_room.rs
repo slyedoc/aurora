@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--matte-spheres] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -24,7 +24,7 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     render_settings::RenderSettings,
-    sky::Sky,
+    sky::{Fog, Sky},
     sphere::Sphere,
     util::{
         ScreenshotExt, TimeoutAppExt,
@@ -201,6 +201,23 @@ fn setup(
             },
         ))
         .id();
+    // `--fog DENSITY`: Northshire's kind of haze (per metre, forward scattering, thinning with
+    // height).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(density) = args
+        .iter()
+        .position(|a| a == "--fog")
+        .and_then(|at| args.get(at + 1)?.parse::<f32>().ok())
+    {
+        commands.entity(environment).insert(Fog {
+            density,
+            scatter: 0.85,
+            height: 4.0,
+            falloff: 20.0,
+            grid_slices: 16,
+            ..default()
+        });
+    }
 
     // The sun, high in the south, its beam through the window onto the floor.
     // `--no-sun`: none (the sky alone lights the room).

@@ -366,6 +366,20 @@ public float3 unpackRgb9e5(uint p) {
     return m * exp2(float(int(p >> 27) - 24));
 }
 
+// ReSTIR PT's radiance words (a sample's L and L_nee, a reservoir's C): RGB9E5 of radiance / 256,
+// which reaches 1.7e7 nits. Plain RGB9E5 stops at 65408, and one sample of fog in-scatter (the
+// sun through a forward phase function) is far brighter: clamped, Northshire's lane read 4.7 %
+// dark under the canopy.
+static const float PT_RADIANCE_SCALE = 256.0;
+
+public uint packRadiance(float3 c) {
+    return packRgb9e5(c * (1.0 / PT_RADIANCE_SCALE));
+}
+
+public float3 unpackRadiance(uint p) {
+    return unpackRgb9e5(p) * PT_RADIANCE_SCALE;
+}
+
 // One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 32 bytes; resolved
 // values are packed f16 pairs.
 public struct SharcEntry {

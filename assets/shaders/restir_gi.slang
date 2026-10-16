@@ -46,7 +46,7 @@ void gi_candidates(uint3 gid: SV_DispatchThreadID) {
     if (f.spatial_samples == 0u) {
         GiReservoir r;
         r.from_ = s.position;
-        r.C = packRgb9e5(C);
+        r.C = packRadiance(C);
         r.to = cand.x_s;
         r.W = W;
         r.frame = live ? f.frame : f.frame - 1u;

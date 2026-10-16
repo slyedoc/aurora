@@ -1056,7 +1056,13 @@ fn render_frame(
             environments: frame.environments.address,
             fog_volumes: fog_volumes.address(),
             fog_volume_count: fog_volumes.count(),
-            time: time.elapsed_secs_wrapped(),
+            // A capture pins the shader clock: animated fog volumes and wind froze at whatever
+            // moment the capture paused, and two runs of one view differed by 3 %.
+            time: if reference.capture {
+                0.0
+            } else {
+                time.elapsed_secs_wrapped()
+            },
             fog_grid_prev: grid.prev,
             fog_grid_cur: grid.cur,
             fog_grid_cells: grid.cells,

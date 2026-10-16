@@ -505,7 +505,9 @@ float4 fragment(VertexOut v) : SV_Target0 {
     if (push.capture != nullptr && view == 0u) {
         let size = uint2(frame.output);
         let p = min(uint2(uv * frame.output), size - 1u);
-        push.capture[p.y * size.x + p.x] = float4((src * through + veil) / input, 1.0);
+        // RR's output as RR made it: the camera ray's fog is composited after it, and the
+        // reference (its input, accumulated) has none either.
+        push.capture[p.y * size.x + p.x] = float4(src / input, 1.0);
     }
     if (push.scene_radiance != 0u) {
         return float4((src * through + veil) / input, 1.0);

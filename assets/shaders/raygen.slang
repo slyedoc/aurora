@@ -1232,7 +1232,7 @@ void gi_shade() {
     if (r.frame != pc.uniforms.frame || !(r.W > 0.0 && r.W < 1.0e20)) {
         return;
     }
-    let c = unpackRgb9e5(r.C);
+    let c = unpackRadiance(r.C);
     if (!(luma(c) > 0.0)) {
         return;
     }
@@ -1460,7 +1460,7 @@ GiReservoir ptReservoir(float3 from_, float3 n_from, float3 to, float3 n_to, flo
                         uint frame, uint flags) {
     GiReservoir r;
     r.from_ = from_;
-    r.C = packRgb9e5(C);
+    r.C = packRadiance(C);
     r.to = to;
     r.W = W;
     r.frame = frame;
@@ -1643,7 +1643,7 @@ void gi_spatial() {
     var C_c = float3(0.0);
     var M_c = 1.0;
     if (temporal) {
-        C_c = unpackRgb9e5(giReservoirLoad(f.final_ + idx).C);
+        C_c = unpackRadiance(giReservoirLoad(f.final_ + idx).C);
         M_c = max(own.q, 1.0);
     } else if (own_W > 0.0 && own_W < 1.0e20) {
         var own_pdf = own;
@@ -2660,11 +2660,11 @@ void main() {
                 }
                 acc = gi_acc;
                 storeAligned<16>((uint4*)(pc.gi_candidates + prim_at) + 3,
-                                 uint4(packRgb9e5(Ln), packHalf2(float32x3_to_oct(pt_cont_dir)), wi_n, pt_nk));
+                                 uint4(packRadiance(Ln), packHalf2(float32x3_to_oct(pt_cont_dir)), wi_n, pt_nk));
             } else {
                 pc.gi_candidates[prim_at].pdf = 0.0;
             }
-            pc.gi_candidates[prim_at].L = packRgb9e5(Lc);
+            pc.gi_candidates[prim_at].L = packRadiance(Lc);
             pc.gi_candidates[prim_at].frame = pc.uniforms.frame;
         }
     }

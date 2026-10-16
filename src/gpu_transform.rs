@@ -935,8 +935,16 @@ fn extract_transforms(
         let first = node.is_added();
         let slot = node.0;
         let parent_changed = child_of.as_ref().is_some_and(Ref::is_changed);
-        if first || transform.is_changed() || parent_changed {
+        // A write of the same value is no move: animation and clocks rewrite unchanged
+        // transforms every frame, and each push marks the world changed (it reset a reference
+        // accumulation every frame).
+        if first || parent_changed {
             table.push_local(slot, NodeLocal::from_transform(&transform));
+        } else if transform.is_changed() {
+            let local = NodeLocal::from_transform(&transform);
+            if table.locals.get(slot as usize) != Some(&local) {
+                table.push_local(slot, local);
+            }
         }
         if first || parent_changed {
             let parent = child_of

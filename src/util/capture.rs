@@ -93,6 +93,12 @@ impl CaptureArgs {
     }
 }
 
+/// Frames without a reset before a capture starts.
+const QUIET: u32 = 240;
+
+/// Frames to wait for a `Camera3d` to appear.
+const CAMERA_WAIT: u32 = 100_000;
+
 /// Frames of camera motion into each `--motion` noisy frame.
 const MOTION_STEPS: u32 = 60;
 
@@ -100,30 +106,63 @@ const MOTION_STEPS: u32 = 60;
 /// finished (two in flight).
 const DRAIN: u32 = 4;
 
+/// The image the captured camera renders into, and that camera.
+#[derive(Resource)]
+struct CaptureTarget {
+    image: Handle<Image>,
+    camera: Option<Entity>,
+}
+
+/// Keeps the image target on the first active `Camera3d`: a game may replace its camera once it
+/// has loaded, and a camera without a target (no window) renders nothing. DLAA: Ray
+/// Reconstruction at the trace's own resolution, so the reference, the noisy input and RR's
+/// output are the same pixels (no upscale in the comparison).
+fn retarget(
+    mut commands: Commands,
+    mut capture: ResMut<CaptureTarget>,
+    cameras: Query<(Entity, &Camera, Option<&RenderTarget>), With<Camera3d>>,
+) {
+    let mut active: Vec<_> = cameras.iter().filter(|(_, c, _)| c.is_active).collect();
+    active.sort_by_key(|(e, _, _)| *e);
+    let Some((camera, _, target)) = active.first().copied() else {
+        capture.camera = None;
+        return;
+    };
+    let ours = matches!(target, Some(RenderTarget::Image(t)) if t.handle == capture.image);
+    if !ours {
+        commands.entity(camera).insert((
+            RenderTarget::Image(capture.image.clone().into()),
+            crate::dlss::AuroraDlss::Dlaa,
+        ));
+    }
+    capture.camera = Some(camera);
+}
+
 /// Runs `app` (built without `WinitPlugin`) to a capture in `args.dir`, then tears the renderer
-/// down. The first `Camera3d` renders into a `args.size` image target.
+/// down. The first active `Camera3d` renders into a `args.size` image target.
 pub fn run(app: &mut App, args: &CaptureArgs) {
     std::fs::create_dir_all(&args.dir).expect("capture directory");
     app.finish();
     app.cleanup();
-    let target = app
+    let image = app
         .world_mut()
         .resource_mut::<Assets<Image>>()
         .add(camera_target_placeholder(args.size));
-    // Startup spawns the scene and its camera.
-    app.update();
-    let camera = app
-        .world_mut()
-        .query_filtered::<Entity, With<Camera3d>>()
-        .iter(app.world())
-        .next()
-        .expect("a Camera3d to capture");
-    // DLAA: Ray Reconstruction at the trace's own resolution, so the reference, the noisy input
-    // and RR's output are the same pixels (no upscale in the comparison).
-    app.world_mut().entity_mut(camera).insert((
-        RenderTarget::Image(target.into()),
-        crate::dlss::AuroraDlss::Dlaa,
-    ));
+    app.insert_resource(CaptureTarget {
+        image,
+        camera: None,
+    });
+    app.add_systems(PostUpdate, retarget);
+    // Startup spawns the scene and its camera (a game may spawn it later, once it has loaded).
+    let mut camera = None;
+    for _ in 0..CAMERA_WAIT {
+        app.update();
+        camera = app.world().resource::<CaptureTarget>().camera;
+        if camera.is_some() {
+            break;
+        }
+    }
+    camera.expect("a Camera3d to capture");
     app.world_mut().resource_mut::<ReferenceState>().capture = true;
     // The CPU counts frames before the trace can run (pipelines still compiling): wait for the
     // GPU's own count to move, then settle on traced frames (the auto-exposure's RR input eases
@@ -136,6 +175,20 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
     for _ in 0..args.settle {
         app.update();
     }
+    // A reference needs a world that holds still: animation, physics and the clock stop (the
+    // capture moves the camera and the sun itself).
+    app.world_mut().resource_mut::<Time<Virtual>>().pause();
+    // Then until the scene is quiet: QUIET frames with no reset (a game streams textures and
+    // levels of detail in for a while; a capture taken mid-stream matched neither another run
+    // nor its own reference).
+    while app.world().resource::<ReferenceState>().frames(0) < QUIET {
+        app.update();
+    }
+    let camera = app
+        .world()
+        .resource::<CaptureTarget>()
+        .camera
+        .expect("a Camera3d to capture");
 
     if args.feed {
         feed(app, args);
@@ -216,6 +269,7 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
 
     app.world_mut().resource_mut::<ReferenceState>().reset_next = true;
     app.update();
+    let resets = app.world().resource::<ReferenceState>().unrequested_resets;
     loop {
         while app.world().resource::<ReferenceState>().frames(0) < args.frames {
             app.update();
@@ -229,6 +283,12 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         reference.top_up(args.frames - have);
     }
     pause(app, true);
+    let changed = app.world().resource::<ReferenceState>().unrequested_resets - resets;
+    if changed > 0 {
+        warn!(
+            "capture: the scene changed {changed} times while capturing; the frames may not match"
+        );
+    }
     let (reference, w, h, count) = read_reference(app).expect("the accumulation");
     write_pfm(&args.dir.join("reference.pfm"), &reference, w, h);
     let settings = app

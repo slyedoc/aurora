@@ -431,7 +431,7 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     let mat = disneyMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, c.roughness);
     let wo_src = oct_to_float32x3(unpackHalf2(c.wo));
     var L = float3(0.0);
-    let Lc = unpackRgb9e5(c.L);
+    let Lc = unpackRadiance(c.L);
     if (any(Lc > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_c));
         let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
@@ -439,7 +439,7 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
         L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
     }
-    let Ln = unpackRgb9e5(c.L_nee);
+    let Ln = unpackRadiance(c.L_nee);
     if (c.wi_n == PT_NO_DIRECTION) {
         return L + Ln;
     }

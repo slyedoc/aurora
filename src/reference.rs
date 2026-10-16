@@ -70,6 +70,9 @@ pub struct ReferenceState {
     pub write_output: bool,
     /// Ray Reconstruction takes the accumulation's mean instead of each frame's noisy colour.
     pub feed: bool,
+    /// View 0's resets that nobody asked for (the scene, the camera or the settings changed): a
+    /// capture checks the world held still.
+    pub unrequested_resets: u32,
 }
 
 /// The addresses a view's passes take this frame (0 = off).
@@ -134,6 +137,10 @@ impl ReferenceState {
             );
             view.out = out;
         }
+        if reset && slot == 0 && !reset_next {
+            self.unrequested_resets += 1;
+        }
+        let view = &mut self.views[slot];
         if reset {
             let why = match &view.key {
                 _ if reset_next => "requested",
