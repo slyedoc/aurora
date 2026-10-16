@@ -1984,6 +1984,11 @@ void main() {
         float3 nrc_mask[NRC_VERTICES];
         float3 nrc_acc[NRC_VERTICES];
         var nrc_n = 0u;
+        // A training path's pixel takes what it would have rendered had it ended in the cache
+        // (its extension only teaches the cache: traced on, it is the old heavy-tailed estimate,
+        // fireflies Ray Reconstruction rejected among the cached pixels).
+        var nrc_render = float3(0.0);
+        var nrc_ended = false;
         if (pc.nrc != nullptr && sample_idx == 0u && randf() < pc.nrc.train_fraction) {
             path |= PATH_NRC_TRAIN;
         }
@@ -2375,9 +2380,18 @@ void main() {
                 let pt_past = (path & PATH_PT_SEARCH) == 0u
                     && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
                 let last = bounce_idx + 1u >= MAX_BOUNCES;
+                let spread_out = nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0;
                 if (nrcInBox(q.position) && (pc.nrc.flags & NRC_FLAG_INLINE) != 0u && pt_past
-                    && (last || ((path & PATH_NRC_TRAIN) == 0u
-                                 && nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0))) {
+                    && (last || spread_out) && !nrc_ended) {
+                    let cached = acc + mask * nrcQuery(pc.nrc, q) / max(pc.ae.input_exposure, 1.0e-20);
+                    if ((path & PATH_NRC_TRAIN) == 0u || last) {
+                        acc = cached;
+                        break;
+                    }
+                    nrc_render = cached;
+                    nrc_ended = true;
+                } else if (last && nrc_ended && nrcInBox(q.position)) {
+                    // The extension's own end: the cache's answer finishes its targets.
                     acc += mask * nrcQuery(pc.nrc, q) / max(pc.ae.input_exposure, 1.0e-20);
                     break;
                 }
@@ -2728,6 +2742,9 @@ void main() {
                                 m.g > 1.0e-6 ? delta.g / m.g : 0.0,
                                 m.b > 1.0e-6 ? delta.b / m.b : 0.0);
             pc.nrc.records[nrc_slot[ni]].target = packRadiance(target * pc.ae.input_exposure);
+        }
+        if (nrc_ended) {
+            acc = nrc_render;
         }
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --

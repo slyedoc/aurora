@@ -270,17 +270,35 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
     app.world_mut().resource_mut::<ReferenceState>().reset_next = true;
     app.update();
     let resets = app.world().resource::<ReferenceState>().unrequested_resets;
-    loop {
-        while app.world().resource::<ReferenceState>().frames(0) < args.frames {
-            app.update();
+    // Checkpoints at N/16 and N/4 (reference-<frames>.pfm): refcmp.py reads how fast the noise
+    // falls from them (independent frames halve it every 4x).
+    let checkpoints = [args.frames / 16, args.frames / 4]
+        .into_iter()
+        .filter(|&n| n >= 16);
+    for target in checkpoints.chain(std::iter::once(args.frames)) {
+        loop {
+            while app.world().resource::<ReferenceState>().frames(0) < target {
+                app.update();
+            }
+            // The GPU's count is the truth; top up until it has them all.
+            let have = gpu_frames(app) as u32;
+            if have >= target {
+                break;
+            }
+            let mut reference = app.world_mut().resource_mut::<ReferenceState>();
+            reference.top_up(target - have);
         }
-        // The GPU's count is the truth; top up until it has them all.
-        let have = gpu_frames(app) as u32;
-        if have >= args.frames {
-            break;
+        if target < args.frames {
+            pause(app, true);
+            let (checkpoint, w, h, count) = read_reference(app).expect("the accumulation");
+            write_pfm(
+                &args.dir.join(format!("reference-{}.pfm", count as u32)),
+                &checkpoint,
+                w,
+                h,
+            );
+            pause(app, false);
         }
-        let mut reference = app.world_mut().resource_mut::<ReferenceState>();
-        reference.top_up(args.frames - have);
     }
     pause(app, true);
     let changed = app.world().resource::<ReferenceState>().unrequested_resets - resets;

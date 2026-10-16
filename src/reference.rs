@@ -156,10 +156,19 @@ impl ReferenceState {
                 Some(old) if old.textures != key.textures => "a texture arrived",
                 _ => "the buffer was made",
             };
-            log::debug!(
-                "reference: view {slot} starts over ({why}) after {} frames",
-                view.frames
-            );
+            // Loud once it had converged a while: a view that keeps starting over looks like one
+            // that stopped cleaning up.
+            if view.frames >= 64 && !reset_next {
+                log::info!(
+                    "reference: view {slot} starts over ({why}) after {} frames",
+                    view.frames
+                );
+            } else {
+                log::debug!(
+                    "reference: view {slot} starts over ({why}) after {} frames",
+                    view.frames
+                );
+            }
         }
         view.key = Some(key);
         if paused {

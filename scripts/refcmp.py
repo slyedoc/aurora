@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure reference captures (bevy_aurora::util::capture, docs/plans/reference-mode.html).
 
-    scripts/refcmp.py DIR            one capture: the reference's convergence, the noisy input's
+    scripts/refcmp.py DIR            one capture: the reference's convergence (its checkpoints), the noisy input's
                                      noise and clumping, RR's output against the reference
     scripts/refcmp.py DIR_A DIR_B    and B's reference against A's: the tracer's bias, no denoiser
     scripts/refcmp.py --png DIR      reference.png, noisy-0.png, output-0.png beside the PFMs
@@ -73,6 +73,23 @@ def autocorr(res, offsets=(1, 2, 4, 8, 16)):
     return out
 
 
+def convergence(d, ref, m):
+    """From the checkpoints (reference-<n>.pfm at N/16 and N/4): how fast the reference's noise
+    falls. Each step is 4x the frames; with independent frames the change between successive
+    checkpoints halves (N^-0.5). Median and 99.9 %-clipped rms of the per-pixel change."""
+    cps = sorted((int(p.stem.split("-")[1]), p) for p in d.glob("reference-*.pfm"))
+    if len(cps) < 2:
+        return
+    imgs = [luma(load_pfm(p)) for _, p in cps] + [luma(ref)]
+    def change(a, b):
+        x = np.abs(a - b) / max(m, 1e-12)
+        return np.median(x), np.sqrt((np.minimum(x, np.percentile(x, 99.9)) ** 2).mean())
+    c1, c2 = change(imgs[-3], imgs[-2]), change(imgs[-2], imgs[-1])
+    exps = [np.log(c1[i] / max(c2[i], 1e-30)) / np.log(4.0) for i in range(2)]
+    print(f"  convergence ({cps[-2][0]} -> {cps[-1][0]} -> N frames): noise falls as N^-{exps[0]:.2f} (median), "
+          f"N^-{exps[1]:.2f} (rms); independent frames N^-0.50")
+
+
 def one(d):
     d = Path(d)
     ref = load_pfm(d / "reference.pfm")
@@ -89,12 +106,13 @@ def one(d):
         count = json.loads((d / "capture.json").read_text()).get("frames", 1)
         sigma = np.sqrt(((n - luma(ref)[None]) ** 2).mean(axis=0))
         stderr = float((sigma / np.sqrt(max(count, 1))).mean() / max(m, 1e-12))
-        print(f"  reference: {count} frames, relative standard error ~{stderr:.3f}")
+        print(f"  reference: {count} frames, relative standard error ~{stderr:.3f} (if frames are independent)")
         rel = float(np.sqrt(((n - luma(ref)[None]) ** 2).mean()) / max(m, 1e-12))
         zero = float((n <= 0).mean())
         ac = autocorr(noisy[0] - ref)
         print(f"  noisy input: relative rms {rel:.2f}, {zero * 100:.0f} % black pixels, "
               f"clumping (corr at 1/2/4/8/16 px) {' '.join(f'{c:.2f}' for c in ac)}")
+    convergence(d, ref, m)
     if out:
         h, w = ref.shape[:2]
         o = [resize(x, w, h) for x in out]

@@ -24,11 +24,17 @@ struct NrcNet {
     float* loss;      // [row]
     NrcRecord* records;
     uint* counter;    // records written into the ring (the trace's, the gym's)
+    // The parameters' exponential moving average (f32, laid out like `params`) and its f16 copies,
+    // what inference reads: steadier from frame to frame than the latest step (paper sec. 5).
+    float* ema;
+    half* weights_ema;
+    half* biases_ema;
     uint ring;        // records in the ring
     uint batch;
     float learning_rate;
     float radiance_scale;
     float loss_scale;
+    float ema_decay;
 };
 
 struct NrcPush {
@@ -198,14 +204,18 @@ void nrc_adam(uint3 id: SV_DispatchThreadID) {
     let vh = v / (1.0 - pow(b2, step));
     let w = clamp(net.params[p] - net.learning_rate * mh / (sqrt(vh) + 1.0e-8), -6.0e4, 6.0e4);
     net.params[p] = w;
+    let e = lerp(w, net.ema[p], net.ema_decay);
+    net.ema[p] = e;
     if (p < NRC_LAYERS * NRC_MATRIX_HALVES) {
         let l = p / NRC_MATRIX_HALVES;
         let o = (p % NRC_MATRIX_HALVES) / NRC_WIDTH;
         let i = p % NRC_WIDTH;
         net.weights[p] = half(w);
         net.weights_t[l * NRC_MATRIX_HALVES + i * NRC_WIDTH + o] = half(w);
+        net.weights_ema[p] = half(e);
     } else {
         net.biases[p - NRC_LAYERS * NRC_MATRIX_HALVES] = half(w);
+        net.biases_ema[p - NRC_LAYERS * NRC_MATRIX_HALVES] = half(e);
     }
 }
 

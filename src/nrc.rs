@@ -49,12 +49,15 @@ pub struct NrcNetGpu {
     pub loss: u64,
     pub records: u64,
     pub counter: u64,
+    pub ema: u64,
+    pub weights_ema: u64,
+    pub biases_ema: u64,
     pub ring: u32,
     pub batch: u32,
     pub learning_rate: f32,
     pub radiance_scale: f32,
     pub loss_scale: f32,
-    pub pad: u32,
+    pub ema_decay: f32,
 }
 
 /// Must match NrcPush in nrc_kernels.slang.
@@ -75,6 +78,8 @@ pub struct NrcTraining {
     pub learning_rate: f32,
     pub radiance_scale: f32,
     pub loss_scale: f32,
+    /// Per Adam step (four a frame): 0.99 averages the last ~100 steps.
+    pub ema_decay: f32,
 }
 
 impl Default for NrcTraining {
@@ -83,6 +88,7 @@ impl Default for NrcTraining {
             learning_rate: 2.0e-3,
             radiance_scale: 1.0,
             loss_scale: 1.0 / 16.0,
+            ema_decay: 0.99,
         }
     }
 }
@@ -100,6 +106,10 @@ pub struct NrcNetwork {
     pub loss: Buffer<u8>,
     pub records: Buffer<u8>,
     pub counter: Buffer<u8>,
+    /// The parameters' moving average and its f16 copies: what inference reads.
+    pub ema: Buffer<u8>,
+    pub weights_ema: Buffer<u8>,
+    pub biases_ema: Buffer<u8>,
     pub net: Buffer<NrcNetGpu>,
     pub batch: u32,
     pub ring: u32,
@@ -165,6 +175,9 @@ impl NrcNetwork {
             loss: rd.create_device_buffer(batch as u64 * 4, usage),
             records: rd.create_device_buffer(ring as u64 * NRC_RECORD_BYTES, usage),
             counter: rd.create_device_buffer(4, usage),
+            ema: rd.create_device_buffer(NRC_PARAMS * 4, usage),
+            weights_ema: rd.create_device_buffer(NRC_LAYERS * NRC_MATRIX * 2, usage),
+            biases_ema: rd.create_device_buffer(NRC_LAYERS * NRC_WIDTH * 2, usage),
             net: rd.create_device_buffer(1, usage),
             batch,
             ring,
@@ -180,11 +193,14 @@ impl NrcNetwork {
     pub fn reset(&mut self, rd: &RenderDevice, seed: u64) {
         let params = initial_params(seed);
         let (weights, weights_t, biases) = half_copies(&params);
-        let uploads: [(&Buffer<u8>, &[u8]); 4] = [
+        let uploads: [(&Buffer<u8>, &[u8]); 7] = [
             (&self.params, bytemuck::cast_slice(&params)),
             (&self.weights, bytemuck::cast_slice(&weights)),
             (&self.weights_t, bytemuck::cast_slice(&weights_t)),
             (&self.biases, bytemuck::cast_slice(&biases)),
+            (&self.ema, bytemuck::cast_slice(&params)),
+            (&self.weights_ema, bytemuck::cast_slice(&weights)),
+            (&self.biases_ema, bytemuck::cast_slice(&biases)),
         ];
         let total: usize = uploads.iter().map(|(_, b)| b.len()).sum();
         let mut staging: Buffer<u8> =
@@ -220,12 +236,17 @@ impl NrcNetwork {
 
     pub fn set_training(&mut self, training: NrcTraining) {
         let old = self.training;
-        if (old.learning_rate, old.radiance_scale, old.loss_scale)
-            != (
-                training.learning_rate,
-                training.radiance_scale,
-                training.loss_scale,
-            )
+        if (
+            old.learning_rate,
+            old.radiance_scale,
+            old.loss_scale,
+            old.ema_decay,
+        ) != (
+            training.learning_rate,
+            training.radiance_scale,
+            training.loss_scale,
+            training.ema_decay,
+        )
         {
             self.training = training;
             self.dirty = true;
@@ -246,12 +267,15 @@ impl NrcNetwork {
             loss: self.loss.address,
             records: self.records.address,
             counter: self.counter.address,
+            ema: self.ema.address,
+            weights_ema: self.weights_ema.address,
+            biases_ema: self.biases_ema.address,
             ring: self.ring,
             batch: self.batch,
             learning_rate: self.training.learning_rate,
             radiance_scale: self.training.radiance_scale,
             loss_scale: self.training.loss_scale,
-            pad: 0,
+            ema_decay: self.training.ema_decay,
         }
     }
 
@@ -408,6 +432,9 @@ impl NrcNetwork {
             self.loss.handle,
             self.records.handle,
             self.counter.handle,
+            self.ema.handle,
+            self.weights_ema.handle,
+            self.biases_ema.handle,
             self.net.handle,
         ] {
             if handle != vk::Buffer::null() {
@@ -504,8 +531,8 @@ impl NrcState {
             .nrc_train_fraction
             .min(RING as f32 / (pixels.max(1) as f32 * VERTICES_PER_PATH));
         let gpu = NrcFrameGpu {
-            weights: network.weights.address,
-            biases: network.biases.address,
+            weights: network.weights_ema.address,
+            biases: network.biases_ema.address,
             records: network.records.address,
             counter: network.counter.address,
             box_: [centre.x, centre.y, centre.z, 1.0 / RADIUS],
@@ -609,8 +636,8 @@ mod tests {
 
     #[test]
     fn layouts_match_the_shaders() {
-        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 120);
-        assert_eq!(std::mem::offset_of!(NrcNetGpu, ring), 96);
+        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 144);
+        assert_eq!(std::mem::offset_of!(NrcNetGpu, ring), 120);
         assert_eq!(std::mem::size_of::<NrcPush>(), 32);
         assert_eq!(std::mem::size_of::<NrcFrameGpu>(), 64);
         assert_eq!(std::mem::offset_of!(NrcFrameGpu, ring), 48);
