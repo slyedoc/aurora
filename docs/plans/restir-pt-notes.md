@@ -215,3 +215,16 @@ Plan: `restir-pt.html`. Newest last.
   1.038); skipping it at random for half the pixels did not help (abbey 0.123, sun room 0.034).
   restir_pt_history defaults to 0 again: spatial reuse only. The first frame after a sun change
   being traced partly with the old lighting (engine-wide) is still open.
+
+- 2026-10-16: why the input stays sparse (per-pixel PT states, one noisy frame). Of pixels taking
+  part: canopy 60 % found no reconnection vertex, 37 % found one with no light behind it, 2.7 % a lit
+  one (lane 64 / 30 / 4.4, sun room 53 / 45 / 1.2). The empty searches were Russian roulette: the
+  survival is the throughput (~ the albedo, 0.3-0.5 in Northshire), and it ran already at the primary
+  vertex, killing ~60 % of paths before their first indirect ray. ReSTIR PT's primary vertex now
+  skips it (canopy no-vertex 60 -> 24 %, sun room 53 -> 4 %); unbiased (canopy 1.000 / 0.009, lane
+  1.000 / 0.005, sun room 1.000 / 0.014); RR error canopy 0.021 -> 0.017, lane 0.019 -> 0.017, sun
+  room 0.040 -> 0.037; black input canopy 74 -> 66 %, lane 49 -> 41 %; +0.8 ms at 3840x1080 (the
+  first-bounce rays every pixel now traces). Skipping roulette for the whole search measured the
+  same for 0.1 ms more. The lit share stays small: past x_k the light is found by chance (a sunlit
+  patch, the sky through leaves), which NEE cannot target. With temporal reuse off, the sun room's
+  spatial-only input is 90 % black without SHaRC (21 % with it): the cache was its density.

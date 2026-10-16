@@ -2632,7 +2632,10 @@ void main() {
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
-            if (ROULETTE_FROM > 0u && bounce_idx + 1u >= ROULETTE_FROM) {
+            // Not off ReSTIR PT's primary vertex: the bounce reuse shares (killed there, 60 % of
+            // Northshire's paths never reached a reconnection vertex).
+            let pt_first = GI_ON && (path & PATH_PT_SEARCH) != 0u && bounce_idx == pt_base;
+            if (ROULETTE_FROM > 0u && bounce_idx + 1u >= ROULETTE_FROM && !pt_first) {
                 let q = clamp(max(mask.r, max(mask.g, mask.b)), 0.25, 1.0);
                 if (randf() >= q) {
                     break;
