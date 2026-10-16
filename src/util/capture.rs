@@ -30,7 +30,7 @@ pub struct CaptureArgs {
     pub frames: u32,
     /// Single frames captured (noisy colour and RR's output) before it.
     pub noisy: u32,
-    /// Frames run first (assets, pipelines, BLASes, RR's history).
+    /// Traced frames run first (RR's history, the exposure's adaptation).
     pub settle: u32,
     /// `--feed-reference`: Ray Reconstruction takes the accumulation's mean instead of the noisy
     /// colour; after the N frames, `noisy` frames of its output are captured while feeding goes
@@ -97,15 +97,16 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         crate::dlss::AuroraDlss::Dlaa,
     ));
     app.world_mut().resource_mut::<ReferenceState>().capture = true;
-    for _ in 0..args.settle {
-        app.update();
-    }
     // The CPU counts frames before the trace can run (pipelines still compiling): wait for the
-    // GPU's own count to move.
+    // GPU's own count to move, then settle on traced frames (the auto-exposure's RR input eases
+    // in from its reference over ~a second; captured earlier, RR's history lagged it dark).
     while gpu_frames(app) < 1.0 {
         for _ in 0..60 {
             app.update();
         }
+    }
+    for _ in 0..args.settle {
+        app.update();
     }
 
     if args.feed {

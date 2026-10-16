@@ -2,9 +2,9 @@
 // resolved image into the target, or shows one of its guides (AuroraDebugView).
 
 // `AeData` in rt_types.slang: the exposure state from the metering (auto_exposure.slang). The
-// raygen applies `input_exposure` (quantised, held still between rare whole-EV steps -- Ray
-// Reconstruction's history needs a still input exposure); the blit maps it onto the smooth
-// `exposure` (Auto look) or a fixed one.
+// raygen applies `input_exposure` (eased after the look, so Ray Reconstruction's history sees
+// a slowly moving input exposure); the blit maps it onto the smooth `exposure` (Auto look) or a
+// fixed one.
 struct AeData {
     float ev;
     float exposure;
@@ -381,7 +381,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
     let frame = frameOf(v);
     let view = push.debug_view;
     // Luminance: the one view that must UNDO the exposure. The colour guide is what Ray
-    // Reconstruction ingests, pre-exposed at the quantised `input_exposure`; dividing that
+    // Reconstruction ingests, pre-exposed at `input_exposure`; dividing that
     // back out recovers the scene's physical radiance in nits, independent of the look and
     // of whatever the metering is currently doing.
     // Cost: the raygen's time for the render pixel under this one, against the frame's mean.
@@ -468,7 +468,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
     }
 
     // The DLSS output (or, view 1, its noisy colour input): resolved linear HDR at the
-    // quantised input exposure. Re-expose to the look here -- the smooth metered value (Auto)
+    // input exposure. Re-expose to the look here -- the smooth metered value (Auto)
     // or a fixed one -- where it cannot disturb RR's history. Tonemap to display-linear; the
     // sRGB attachment applies the transfer function on store.
     let input = max(push.ae.input_exposure, 1.0e-12);

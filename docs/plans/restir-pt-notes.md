@@ -91,6 +91,12 @@ Plan: `restir-pt.html`. Newest last.
     matched the reference. Either the metered exposure varies between frames (RR's history is in
     pre-exposed units) or the capture's conversion back to nits uses a different exposure: open, outside PT.
     RR gates below are at a pinned exposure.
+  - Resolved (2026-10-15): neither. The capture's 600 settle frames were CPU frames; the trace starts
+    only once the pipelines compile, so the noisy frames came ~12-20 traced frames in, while RR's input
+    exposure was still easing from the -13 reference to the metered -9.9 (~0.03 EV per frame) and
+    RR's history, built darker, lagged it. Settle now counts traced frames: under auto-exposure RR's
+    output against the reference 0.822 -> 1.003 (block error 0.109 -> 0.034, change 0.125 -> 0.003).
+    RR is faithful at any exposure (pinned 6, 9, 12 and auto all ~1.00).
   - gi_temporal (raygen): this pixel's sample against last frame's final reservoir at the reprojected pixel
     (confidence capped by restir_pt_history), pairwise MIS with confidence weights, both shifts (last
     frame's sample here, ours to last frame's vertex, from a compact copy of it in the history). The result

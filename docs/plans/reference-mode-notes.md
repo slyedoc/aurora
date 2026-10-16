@@ -62,3 +62,12 @@ Plan: `reference-mode.html`. Newest last.
   asks for white noise from a good hash and no pattern shared across the screen. Sun room
   1920x1080: reference unchanged (ratio 1.000, block error 0.007); RR output ratio 0.58 -> 0.67,
   block error 0.22 -> 0.15, frame-to-frame change 0.058 -> 0.038.
+
+- 2026-10-15: "Ray Reconstruction is what darkens" (above) was the capture: its settle frames were
+  CPU frames, the trace started only after the pipelines compiled, and the noisy frames came while
+  RR's input exposure was still easing in from the reference, its history lagging dark. Settle now
+  counts traced frames; RR's output reads ~1.00 against the reference under auto and pinned exposure
+  (sun room 960x540, PT default: 1.003 / block error 0.034). Auto-exposure review on the way: a
+  resize no longer restarts the exposure at the reference (a several-stop RR transient), a fixed
+  look's RR input eases after an EV change instead of jumping, the input's ease takes at most 1/30 s
+  per frame (a hitch no longer jumps it), stale "quantised input exposure" comments corrected.

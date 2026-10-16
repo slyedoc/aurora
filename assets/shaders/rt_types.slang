@@ -737,8 +737,8 @@ public struct LightsHeader {
 };
 
 // Exposure state from the metering (auto_exposure.slang). The raygen applies
-// `input_exposure` (quantised, held constant between rare whole-EV steps -- Ray
-// Reconstruction's history needs a still input exposure); the blit maps it onto the smooth
+// `input_exposure` (eased after the look -- Ray Reconstruction's history needs a slowly
+// moving input exposure); the blit maps it onto the smooth
 // `exposure` (Auto look) or a fixed one.
 public struct AeData {
     public float ev;

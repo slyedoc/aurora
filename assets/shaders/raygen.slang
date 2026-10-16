@@ -2662,9 +2662,9 @@ void main() {
         pc.lum[lum_at + 1u] = meter_albedo < 0.0 ? -1.0 : max(meter_albedo, 0.04);
     }
     // Ray Reconstruction takes PRE-EXPOSED linear HDR (it has no exposure handling of its
-    // own -- RR guide 3.7), so the QUANTISED metered exposure is applied here (constant
-    // between rare whole-EV steps: RR's history mixes frames, and a per-frame wobble in the
-    // input exposure showed up as full-screen flicker) and the blit re-exposes to the look.
+    // own -- RR guide 3.7), so the input exposure is applied here (eased after the look: RR's
+    // history mixes frames, and a moving input exposure reads as a transient) and the blit
+    // re-exposes to the look.
     // Finite and inside f16 range.
     let radiance = clamp(mean * pc.ae.input_exposure, float3(0.0), float3(65504.0));
     dlss_color[px] = float4(radiance, 1.0);

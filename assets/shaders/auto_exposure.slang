@@ -150,8 +150,7 @@ void ae_resolve(uint3 gid: SV_DispatchThreadID) {
         state.ev = clamp(state.ev + clamp(d * step_ / p.exp_transition, -step_, step_),
                          p.min_ev, p.max_ev);
 
-        // Ray Reconstruction's input follows the full metering (it wants mid-gray whatever the
-        // look); the CPU eases it there and tells NGX (the pre-exposure).
+        // Ray Reconstruction's input (input_ev) is eased after the look by the CPU.
         state.metered = metered;
     }
     state.exposure = exp2(state.ev);

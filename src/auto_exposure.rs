@@ -12,8 +12,8 @@
 //! out. A pale wall filling the screen, or a dark sky overhead, no longer moves it.
 //!
 //! Every camera meters for itself: each one has its own buffers and adaptation state.
-//! With RR always ingesting mid-gray-centred colour, its internal per-frame estimator (the
-//! dev-overlay flicker) has nothing left to do.
+//! Ray Reconstruction ingests colour pre-exposed at an input exposure that eases after the look
+//! (RR has no exposure input of its own, RR guide 3.7); the blit maps input -> look.
 //!
 //! Controlled by [`AuroraExposure`] on the camera (inserted on every `Camera3d`, edit it in
 //! the F1 environment inspector): `Auto` meters, `Fixed` locks an EV for a look that never
@@ -53,9 +53,8 @@ const LOG_LUM_RANGE: f32 = 32.0;
 pub enum AuroraExposure {
     /// Histogram metering with percentile trimming and temporal adaptation.
     Auto(AutoExposureSettings),
-    /// A locked LOOK: applied in the blit, so the picture never adapts to content (Ray
-    /// Reconstruction's input stays metered underneath -- changing the EV is instant and
-    /// costs no denoiser history).
+    /// A locked LOOK: applied in the blit, so the picture never adapts to content. Changing the
+    /// EV is instant on screen; Ray Reconstruction's input eases after it.
     Fixed(FixedExposure),
     /// The fixed exposure of the camera's environment (sky.rs `EnvironmentSky::ev100`: its
     /// `EnvironmentExposure`, else its brightest sun's), so crossing a portal changes it.
@@ -235,11 +234,10 @@ struct AeGpu {
     /// Smoothed log2 exposure (the Auto look).
     ev: f32,
     exposure: f32,
-    /// What the raygen applies: `ev` quantised to whole EV steps with hysteresis, so Ray
-    /// Reconstruction's history sees a still input exposure.
+    /// What the raygen applies (Ray Reconstruction's input), eased after the look by the CPU.
     input_ev: f32,
     input_exposure: f32,
-    /// The full metering, written by `ae_resolve`; the CPU eases `input_ev` towards it.
+    /// The full metering (log2 exposure that puts the scene at mid-gray), from `ae_resolve`.
     metered: f32,
     /// 0 until the look has jumped to its first real metering (`ae_resolve`).
     settled: u32,
@@ -371,22 +369,23 @@ impl ViewExposure {
         }
     }
 
-    /// This frame's input exposure: a fixed look's own EV, or (Auto) eased towards last
-    /// frame's adapted look, read back after the fence.
+    /// This frame's input exposure, eased towards the look: a fixed look's own EV, or (Auto)
+    /// last frame's adapted look, read back after the fence.
     fn update_input(&mut self, rd: &RenderDevice, exposure: &AuroraExposure, speed: f32, dt: f32) {
-        if let AuroraExposure::Fixed(fixed) = exposure {
-            self.input_ev = Some(fixed.ev);
-            return;
-        }
-        let readback = &mut self.readback[self.slot ^ 1];
-        if readback.handle == vk::Buffer::null() || !self.primed {
-            return;
-        }
-        let look = rd.map_buffer(readback)[0].ev;
+        let look = if let AuroraExposure::Fixed(fixed) = exposure {
+            fixed.ev
+        } else {
+            let readback = &mut self.readback[self.slot ^ 1];
+            if readback.handle == vk::Buffer::null() || !self.primed {
+                return;
+            }
+            rd.map_buffer(readback)[0].ev
+        };
         if !look.is_finite() || look == 0.0 {
             return;
         }
-        let alpha = 1.0 - (-speed.max(0.0) * dt.clamp(0.0, 0.25)).exp();
+        // RR's history lags in frames, not seconds: a hitch's long dt must not jump the input.
+        let alpha = 1.0 - (-speed.max(0.0) * dt.clamp(0.0, 1.0 / 30.0)).exp();
         self.input_ev = Some(match self.input_ev {
             Some(ev) => ev + (look - ev) * alpha,
             None => look,
@@ -547,12 +546,17 @@ impl ViewExposure {
             }
         };
         let (true, Some(module)) = (self.primed, module) else {
-            // Not meterable yet: start adaptation from the reference exposure.
-            let ev = settings
-                .reference_ev
-                .clamp(settings.min_ev, settings.max_ev);
-            self.write_ev(rd, cmd, ev);
-            self.input_ev = Some(ev);
+            // Not meterable yet. The first time, start adaptation from the reference exposure (a
+            // fixed look from its own); after a resize, hold what it had (a restart cost Ray
+            // Reconstruction a transient of several stops).
+            if self.input_ev.is_none() {
+                let ev = match exposure {
+                    AuroraExposure::Fixed(fixed) => fixed.ev,
+                    _ => settings.reference_ev.clamp(settings.min_ev, settings.max_ev),
+                };
+                self.write_ev(rd, cmd, ev);
+                self.input_ev = Some(ev);
+            }
             self.pending = Some((exposure.clone(), settings.input_speed, dt));
             self.write_input(rd, cmd);
             return;
