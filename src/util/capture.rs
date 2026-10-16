@@ -5,11 +5,14 @@
 //! or move the camera.
 //!
 //!   app ... --capture DIR [--size WxH] [--frames N] [--noisy K] [--settle F] [--feed-reference]
-//!           [--motion SPEED]
+//!           [--motion SPEED] [--sun-motion DEG] [--sun-jump DEG [--after N]]
 //!
 //! `--motion SPEED`: each noisy frame ends a second of camera strafe (60 steps at SPEED m/s along
 //! the camera's right) at the captured pose, so RR's output and the reuse there come from a moving
-//! history; the reference is accumulated at that pose, held still.
+//! history; the reference is accumulated at that pose, held still. `--sun-motion DEG`: likewise the
+//! first directional light sweeps about the vertical at DEG per second into its pose.
+//! `--sun-jump DEG`: the light sits DEG off its pose for a second, then jumps to it N frames
+//! (`--after`, default 1) before the captured frame.
 //!
 //! An example builds its app without `WinitPlugin` when [`CaptureArgs::from_args`] is some and
 //! hands it to [`run`] instead of `App::run`.
@@ -43,6 +46,10 @@ pub struct CaptureArgs {
     pub feed: bool,
     /// `--motion SPEED`: strafe speed (m/s at 60 frames a second) into each noisy frame.
     pub motion: Option<f32>,
+    /// `--sun-motion DEG`: the sun's sweep (degrees a second at 60 frames a second).
+    pub sun_motion: Option<f32>,
+    /// `--sun-jump DEG` and `--after N`: the sun jumps DEG to its pose N frames before.
+    pub sun_jump: Option<(f32, u32)>,
 }
 
 impl CaptureArgs {
@@ -72,6 +79,10 @@ impl CaptureArgs {
                 .unwrap_or(600),
             feed: args.iter().any(|a| a == "--feed-reference"),
             motion: value("--motion").and_then(|v| v.parse().ok()),
+            sun_motion: value("--sun-motion").and_then(|v| v.parse().ok()),
+            sun_jump: value("--sun-jump").and_then(|v| v.parse().ok()).map(|deg| {
+                (deg, value("--after").and_then(|v| v.parse().ok()).unwrap_or(1u32).max(1))
+            }),
         })
     }
 }
@@ -125,16 +136,44 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         return;
     }
     let pose = *app.world().get::<Transform>(camera).expect("the camera's transform");
+    let sun = app
+        .world_mut()
+        .query_filtered::<Entity, With<DirectionalLight>>()
+        .iter(app.world())
+        .next();
+    let sun_pose = sun.and_then(|e| app.world().get::<Transform>(e).copied());
+    let set_sun = |app: &mut App, yaw_deg: f32| {
+        if let (Some(e), Some(p)) = (sun, sun_pose) {
+            *app.world_mut().get_mut::<Transform>(e).unwrap() =
+                p.with_rotation(Quat::from_rotation_y(yaw_deg.to_radians()) * p.rotation);
+        }
+    };
     for k in 0..args.noisy {
-        if let Some(speed) = args.motion {
-            // A second of strafe that ends on the pose (the last step is the captured frame).
-            let step = pose.right() * (speed / MOTION_STEPS as f32);
+        // A second of motion that ends on the pose (the last step is the captured frame).
+        if args.motion.is_some() || args.sun_motion.is_some() {
             for i in (1..MOTION_STEPS).rev() {
-                app.world_mut().get_mut::<Transform>(camera).unwrap().translation =
-                    pose.translation - step * i as f32;
+                let t = i as f32 / MOTION_STEPS as f32;
+                if let Some(speed) = args.motion {
+                    app.world_mut().get_mut::<Transform>(camera).unwrap().translation =
+                        pose.translation - pose.right() * (speed * t);
+                }
+                if let Some(deg) = args.sun_motion {
+                    set_sun(app, -deg * t);
+                }
                 app.update();
             }
             *app.world_mut().get_mut::<Transform>(camera).unwrap() = pose;
+            set_sun(app, 0.0);
+        }
+        if let Some((deg, after)) = args.sun_jump {
+            set_sun(app, deg);
+            for _ in 0..MOTION_STEPS {
+                app.update();
+            }
+            set_sun(app, 0.0);
+            for _ in 1..after {
+                app.update();
+            }
         }
         // One frame: reset, add it and write RR's output; then hold still and read.
         loop {

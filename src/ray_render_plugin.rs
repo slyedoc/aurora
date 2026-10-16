@@ -1492,6 +1492,12 @@ fn render_frame(
                         continue;
                     }
                     let (di_on, di_addresses, _) = restir_views[view.slot];
+                    let suns: Vec<(Vec3, Vec3)> = skies.environments
+                        [skies.view_environment(view.camera_mask as u8) as usize]
+                        .suns
+                        .iter()
+                        .map(|sun| (sun.direction, sun.radiance))
+                        .collect();
                     let addresses = restir_gi.prepare(
                         &render_device,
                         grid_cmd.unwrap_or(view_cmd),
@@ -1501,6 +1507,7 @@ fn render_frame(
                             slot: view.slot,
                             di_surfaces: if di_on { di_addresses.surfaces } else { 0 },
                             settings,
+                            suns: &suns,
                         },
                     );
                     grid_split |= grid_cmd.is_some();

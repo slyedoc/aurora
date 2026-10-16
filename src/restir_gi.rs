@@ -76,6 +76,9 @@ pub struct GiInput<'a> {
     /// ReSTIR DI's surface buffer this frame (0: GI keeps its own).
     pub di_surfaces: u64,
     pub settings: &'a RenderSettings,
+    /// The view's environment's suns (direction, radiance): when they change, last frame's
+    /// samples carry stale light and the history is trusted less.
+    pub suns: &'a [(Vec3, Vec3)],
 }
 
 /// The addresses the RT pipeline's push constants take.
@@ -105,6 +108,8 @@ struct GiView {
     threads: u32,
     spatial: bool,
     temporal: bool,
+    /// Last frame's suns (`GiInput::suns`).
+    suns: Vec<(Vec3, Vec3)>,
 }
 
 impl GiView {
@@ -199,6 +204,9 @@ impl RestirGiState {
         let final_ = view.reservoirs.address;
         view.spatial = settings.restir_gi_spatial_samples > 0;
         view.temporal = settings.restir_pt_history >= 1.0;
+        let trust = sun_trust(&view.suns, input.suns);
+        view.suns.clear();
+        view.suns.extend_from_slice(input.suns);
         view.threads = pixels as u32;
         let gpu = GiFrameGpu {
             candidates: view.candidates.address,
@@ -214,7 +222,7 @@ impl RestirGiState {
             spatial_radius: settings.restir_gi_spatial_radius.max(1.0),
             boiling: settings.restir_boiling.clamp(0.0, 1.0),
             history_cap: if view.temporal {
-                settings.restir_pt_history.min(32.0)
+                settings.restir_pt_history.min(32.0) * trust
             } else {
                 0.0
             },
@@ -325,6 +333,22 @@ impl Plugin for RestirGiPlugin {
     }
 }
 
+/// How far last frame's samples are trusted after the suns changed: 1 / (1 + change), the change
+/// counted as 1 per half degree a sun turned and per 2 % its radiance moved; 0 when one came or went.
+/// A day cycle (~0.004 degrees a frame) keeps the history, a jump drops it.
+fn sun_trust(prev: &[(Vec3, Vec3)], now: &[(Vec3, Vec3)]) -> f32 {
+    if prev.len() != now.len() {
+        return 0.0;
+    }
+    let change = prev.iter().zip(now).fold(0.0f32, |m, ((d0, r0), (d1, r1))| {
+        let angle = d0.dot(*d1).clamp(-1.0, 1.0).acos().to_degrees();
+        let lum = |r: &Vec3| r.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        let rel = (lum(r1) - lum(r0)).abs() / lum(r0).max(lum(r1)).max(1.0e-6);
+        m.max(angle / 0.5 + rel / 0.02)
+    });
+    1.0 / (1.0 + change)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +358,14 @@ mod tests {
         use core::mem::offset_of;
         assert_eq!(offset_of!(GiFrameGpu, width), 40);
         assert_eq!(std::mem::size_of::<GiFrameGpu>(), 72);
+    }
+
+    #[test]
+    fn sun_trust_keeps_slow_suns_and_drops_jumps() {
+        let sun = |deg: f32| (Vec3::new(deg.to_radians().cos(), 0.5, deg.to_radians().sin()).normalize(), Vec3::ONE);
+        assert!(sun_trust(&[sun(0.0)], &[sun(0.004)]) > 0.99);
+        assert!(sun_trust(&[sun(0.0)], &[sun(10.0)]) < 0.1);
+        assert_eq!(sun_trust(&[], &[sun(0.0)]), 0.0);
+        assert_eq!(sun_trust(&[], &[]), 1.0);
     }
 }

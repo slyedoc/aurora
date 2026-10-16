@@ -185,3 +185,14 @@ Plan: `restir-pt.html`. Newest last.
   | temporal 8 (adaptive) + spatial 4 | 0.021 | 0.045 | 0.071 |
 
   Every configuration unbiased against the truth, still and moving (input mean / reference 1.000-1.001).
+
+- 2026-10-15: lighting changes (util/capture.rs `--sun-motion DEG` per second into each noisy frame,
+  `--sun-jump DEG --after N`). Temporal reuse kept stale light: a history sample carries x_k's
+  radiance from the frame that traced it, so after a 10 degree jump the input read 1.014 four frames
+  on (16 to settle), and a 60 degree/s sweep 0.989. restir_gi.rs `sun_trust` scales the confidence
+  cap by 1 / (1 + change), the change 1 per half degree a sun turned and per 2 % of its radiance
+  (0 when a sun comes or goes): a jump drops the history, a day cycle keeps it. Now: jump +4 frames
+  1.001, 60 degrees/s 0.998, 15 degrees/s 0.999; still scenes unchanged (RR 0.025).
+  Found on the way, engine-wide, not PT: the first frame after a sun change is traced partly with the
+  old lighting (no GI, no ReSTIR: 0.965 / block error 0.168 one frame after a 10 degree jump, 1.000
+  the next; the generated sky most, a flat sky 0.041). Open.
