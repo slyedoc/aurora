@@ -92,13 +92,14 @@ float loadSlope(TerrainSplat s, int2 c) {
 }
 
 // One texture id's share, summed over the corners that named it (`accumulate` in the WGSL).
-// `lod` is the ray-cone level in terrain-local units; the id's UV scale is added here.
+// `foot` is the ray cone's footprint ellipse in terrain-local xz (axis 1, axis 2); the id's UV
+// scale and each tap's turn are applied here, and the reads filter it (SampleGrad).
 void accumulate(inout Accum a, TerrainSplat s, uint id, float4 corner_weights,
-                float layer_weight, float2 local_xz, float lod) {
+                float layer_weight, float2 local_xz, float4 foot) {
     let layer = min(id, min(max(s.layer_count, 1u), MAX_SLOTS) - 1u);
     let slot = s.slots[layer];
     let uv = local_xz * slot.uv_scale;
-    let slot_lod = lod + log2(max(slot.uv_scale, 1.0e-6));
+    let g = foot * slot.uv_scale;
 
     // Detiling: the four tile centres around the sample, each turned and shifted rigidly by
     // its own hash and sampled in its own frame, blended with bilinear weights.
@@ -143,13 +144,16 @@ void accumulate(inout Accum a, TerrainSplat s, uint id, float4 corner_weights,
             continue;
         }
         let tuv = tap_uv[t];
+        // The tap's frame turns its gradients with its UV.
+        let g1 = turnedBy(g.xy, tap_turn[t]);
+        let g2 = turnedBy(g.zw, tap_turn[t]);
         albedo_sum += w * ((slot.flags & HAS_ALBEDO) != 0u
-            ? sampleLod(slot.albedo, tuv, slot_lod).rgb : float3(0.2159));
+            ? sampleGrad(slot.albedo, tuv, g1, g2).rgb : float3(0.2159));
         height_sum += w * ((slot.flags & HAS_HEIGHT) != 0u
-            ? sampleLod(slot.height, tuv, slot_lod).r : 0.5);
+            ? sampleGrad(slot.height, tuv, g1, g2).r : 0.5);
         var n = float3(0.0, 0.0, 1.0);
         if ((slot.flags & HAS_NORMAL) != 0u) {
-            n = normalTexel(sampleLod(slot.normal, tuv, slot_lod));
+            n = normalTexel(sampleGrad(slot.normal, tuv, g1, g2));
             if ((slot.flags & FLIP_NORMAL_Y) != 0u) {
                 n.y = -n.y;
             }
@@ -158,9 +162,9 @@ void accumulate(inout Accum a, TerrainSplat s, uint id, float4 corner_weights,
         }
         normal_sum += w * n;
         occlusion_sum += w * ((slot.flags & HAS_OCCLUSION) != 0u
-            ? sampleLod(slot.occlusion, tuv, slot_lod).r : 1.0);
+            ? sampleGrad(slot.occlusion, tuv, g1, g2).r : 1.0);
         roughness_sum += w * ((slot.flags & HAS_ROUGHNESS) != 0u
-            ? sampleLod(slot.roughness, tuv, slot_lod).g : s.perceptual_roughness);
+            ? sampleGrad(slot.roughness, tuv, g1, g2).g : s.perceptual_roughness);
         taken += w;
     }
     let inv = 1.0 / max(taken, 1.0e-8);
@@ -179,15 +183,15 @@ void accumulate(inout Accum a, TerrainSplat s, uint id, float4 corner_weights,
 }
 
 void accumulateControl(inout Accum a, TerrainSplat s, uint control, float4 corner_weights,
-                       float2 local_xz, float lod) {
+                       float2 local_xz, float4 foot) {
     let base_id = control & ID_MASK;
     let overlay_id = (control >> OVERLAY_SHIFT) & ID_MASK;
     let blend = float((control >> BLEND_SHIFT) & BLEND_MASK) / 255.0;
     if (blend < 1.0) {
-        accumulate(a, s, base_id, corner_weights, 1.0 - blend, local_xz, lod);
+        accumulate(a, s, base_id, corner_weights, 1.0 - blend, local_xz, foot);
     }
     if (blend >= 1.0 || (blend > 0.0 && overlay_id != base_id)) {
-        accumulate(a, s, overlay_id, corner_weights, blend, local_xz, lod);
+        accumulate(a, s, overlay_id, corner_weights, blend, local_xz, foot);
     }
 }
 
@@ -220,10 +224,8 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             let origin = float2(s.terrain_origin_x, s.terrain_origin_z);
             let uv = saturate((local_xz - origin) / size);
 
-            // The ray-cone footprint in terrain-local units, before any texture's own terms.
-            let object_scale = max(length(objectToWorldDir(float3(1.0, 0.0, 0.0))), 1.0e-6);
-            let incidence = max(abs(dot(hit.surface_normal, WorldRayDirection())), 0.1);
-            let lod = log2(coneWidth(payload) / object_scale) - log2(incidence) + uniformLodBias();
+            // The ray cone's footprint ellipse in terrain-local xz, before any texture's terms.
+            let foot = float4(worldToObjectDir(hit.axis1).xz, worldToObjectDir(hit.axis2).xz);
 
             let res = float(s.control_resolution);
             let g = uv * (res - 1.0);
@@ -254,12 +256,12 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             a.roughness = 0.0;
             a.total = 0.0;
             if (c00 == c10 && c00 == c01 && c00 == c11) {
-                accumulateControl(a, s, c00, w, local_xz, lod);
+                accumulateControl(a, s, c00, w, local_xz, foot);
             } else {
-                accumulateControl(a, s, c00, float4(w.x, 0.0, 0.0, 0.0), local_xz, lod);
-                accumulateControl(a, s, c10, float4(0.0, w.y, 0.0, 0.0), local_xz, lod);
-                accumulateControl(a, s, c01, float4(0.0, 0.0, w.z, 0.0), local_xz, lod);
-                accumulateControl(a, s, c11, float4(0.0, 0.0, 0.0, w.w), local_xz, lod);
+                accumulateControl(a, s, c00, float4(w.x, 0.0, 0.0, 0.0), local_xz, foot);
+                accumulateControl(a, s, c10, float4(0.0, w.y, 0.0, 0.0), local_xz, foot);
+                accumulateControl(a, s, c01, float4(0.0, 0.0, w.z, 0.0), local_xz, foot);
+                accumulateControl(a, s, c11, float4(0.0, 0.0, 0.0, w.w), local_xz, foot);
             }
             let inv_total = 1.0 / max(a.total, 1.0e-8);
 

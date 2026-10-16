@@ -55,17 +55,20 @@ float3 triplanarWeights(float3 n) {
     return sum > 1.0e-5 ? w / sum : float3(0.0, 1.0, 0.0);
 }
 
-float4 triplanar(uint tex, float3 p, float3 w, float lod) {
-    return w.x * sampleLod(tex, p.yz, lod) + w.y * sampleLod(tex, p.xz, lod)
-        + w.z * sampleLod(tex, p.xy, lod);
+// Each projection reads the footprint ellipse (`a1`, `a2`: its axes in the projected space)
+// through the same two axes it projects onto.
+float4 triplanar(uint tex, float3 p, float3 w, float3 a1, float3 a2) {
+    return w.x * sampleGrad(tex, p.yz, a1.yz, a2.yz) + w.y * sampleGrad(tex, p.xz, a1.xz, a2.xz)
+        + w.z * sampleGrad(tex, p.xy, a1.xy, a2.xy);
 }
 
 // Whiteout blend: each projection's tangent normal is lifted into world space by swizzling
 // to that plane's axes, then summed. Cheaper than three TBNs and stable at the seams.
-float3 triplanarNormal(uint tex, float3 p, float3 w, float3 n, float lod, float strength) {
-    let sx = normalTexel(sampleLod(tex, p.yz, lod));
-    let sy = normalTexel(sampleLod(tex, p.xz, lod));
-    let sz = normalTexel(sampleLod(tex, p.xy, lod));
+float3 triplanarNormal(uint tex, float3 p, float3 w, float3 n, float3 a1, float3 a2,
+                       float strength) {
+    let sx = normalTexel(sampleGrad(tex, p.yz, a1.yz, a2.yz));
+    let sy = normalTexel(sampleGrad(tex, p.xz, a1.xz, a2.xz));
+    let sz = normalTexel(sampleGrad(tex, p.xy, a1.xy, a2.xy));
     let axis = sign(n);
     let nx = float3(sx.z * axis.x, sx.y, sx.x);
     let ny = float3(sy.x, sy.z * axis.y, sy.y);
@@ -109,26 +112,30 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
 
         if (weight > 0.0) {
             let lp = world_p * p.layer_uv_scale;
+            let la1 = hit.axis1 * p.layer_uv_scale;
+            let la2 = hit.axis2 * p.layer_uv_scale;
             let layer_color = float4(p.layer_color_r, p.layer_color_g, p.layer_color_b, p.layer_color_a);
-            let layer = layer_color * triplanar(p.layer_base_color_texture, lp, w, hit.lod_base);
+            let layer = layer_color * triplanar(p.layer_base_color_texture, lp, w, la1, la2);
             // Occlusion red, roughness green, metallic blue -- the channel order glTF writes.
-            let orm = triplanar(p.layer_orm_texture, lp, w, hit.lod_base).rgb;
+            let orm = triplanar(p.layer_orm_texture, lp, w, la1, la2).rgb;
             albedo = lerp(albedo, layer, weight);
             roughness = lerp(roughness, p.layer_perceptual_roughness * orm.g, weight);
             metallic = lerp(metallic, p.layer_metallic * orm.b, weight);
             if ((p.flags & LAYER_NORMAL_MAP) != 0u) {
                 let ln = triplanarNormal(p.layer_normal_map_texture, lp, w, hit.surface_normal,
-                                         hit.lod_base, p.layer_normal_strength);
+                                         la1, la2, p.layer_normal_strength);
                 normal = normalize(lerp(normal, ln, weight));
             }
         }
 
         // The detail set multiplies over base and layer alike, so it is not part of the blend.
         let dp = world_p * p.detail_uv_scale;
+        let da1 = hit.axis1 * p.detail_uv_scale;
+        let da2 = hit.axis2 * p.detail_uv_scale;
         let detail_color = float4(p.detail_color_r, p.detail_color_g, p.detail_color_b, p.detail_color_a);
-        albedo *= detail_color * triplanar(p.detail_base_color_texture, dp, w, hit.lod_base);
+        albedo *= detail_color * triplanar(p.detail_base_color_texture, dp, w, da1, da2);
         if ((p.flags & DETAIL_NORMAL_MAP) != 0u) {
-            normal = triplanarNormal(p.detail_normal_map_texture, dp, w, normal, hit.lod_base,
+            normal = triplanarNormal(p.detail_normal_map_texture, dp, w, normal, da1, da2,
                                      p.detail_normal_strength);
         }
     }

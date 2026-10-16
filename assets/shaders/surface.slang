@@ -212,6 +212,11 @@ public float3 objectToWorldDir(float3 v) {
     return mul(ObjectToWorld3x4(), float4(v, 0.0));
 }
 
+// A world-space direction in object space (`gl_WorldToObjectEXT * vec4(v, 0)`).
+public float3 worldToObjectDir(float3 v) {
+    return mul(WorldToObject3x4(), float4(v, 0.0));
+}
+
 // An object-space normal in world space: the inverse transpose (WorldToObject's 3x3,
 // transposed). The plain transform tilts normals under non-uniform scale -- a floor scaled
 // 8.4 x 0.2 x 6.4 turned a 0.3 degree tilt into 9.
