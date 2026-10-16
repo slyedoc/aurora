@@ -160,3 +160,28 @@ Plan: `restir-pt.html`. Newest last.
   unbiased (1.000 / 0.004), RR 0.987 / 0.029. gi_temporal costs ~0.2x gi_spatial (0.67 vs 3.3 ms
   in a 1080p capture, whose host-visible writes slow every pass). Untested: camera motion
   (reprojection, disocclusion) -- captures hold the camera still.
+
+- 2026-10-15: moving captures (util/capture.rs `--motion SPEED`: each noisy frame ends a second of
+  strafe at the captured pose; the reference accumulates there, still). They found a real bias in
+  temporal reuse: gi_temporal computed the canonical's pairwise weight only when the history's sample
+  was valid, so the canonical took full weight exactly when the history came back empty -- light
+  counted twice. Hidden while the history was the same pixel (static: 1.008 / 0.065 temporal alone);
+  any other pixel exposed it (history read 3 px over, still camera: 1.062; strafing: 1.18 alone,
+  1.014 with spatial, RR error 0.188). Found by elimination: not the history race (fixed anyway: the
+  history is now two buffers by frame parity, gi_temporal had read pixels it was overwriting), not
+  chaining, not the compact surface, not the RNG; gi_temporal's code with gi_spatial's input stayed
+  biased while gi_spatial with one neighbour was not. The weight now counts last frame's pixel
+  whenever it took part. Also: permutation sampling (DLSS-RR guide 3.5: the history pixel XOR a
+  per-frame 2x2 mask), the history's reconnection threshold stored from its own frame's camera,
+  gi_temporal's RNG no longer the primary pass's stream, gi_spatial's canonical target the exact one
+  temporal's W was divided by. The confidence cap falls with the reprojection distance
+  (cap / (1 + px / 8)): fast motion still read 0.7 % bright with spatial after temporal (likely
+  neighbouring pixels sharing a history pixel), and RR suffers from correlated input there.
+
+  | RR block error (sun room, --ev100 9) | still | 1.5 m/s | 4 m/s |
+  |---|---|---|---|
+  | spatial 4 | 0.031 | 0.043 | 0.057 |
+  | temporal 4 (adaptive) + spatial 4, the default | 0.025 | 0.039 | 0.050 |
+  | temporal 8 (adaptive) + spatial 4 | 0.021 | 0.045 | 0.071 |
+
+  Every configuration unbiased against the truth, still and moving (input mean / reference 1.000-1.001).

@@ -48,6 +48,7 @@ struct GiFrameGpu {
     surfaces: u64,
     final_: u64,
     history: u64,
+    history_prev: u64,
     width: u32,
     height: u32,
     frame: u32,
@@ -95,7 +96,7 @@ pub struct GiAddresses {
 struct GiView {
     candidates: Buffer<u8>,
     reservoirs: Buffer<u8>,
-    /// Last frame's final reservoirs (temporal reuse).
+    /// The final reservoirs of this frame and the last (temporal reuse), by frame parity.
     history: Buffer<u8>,
     /// Only while ReSTIR DI is off.
     surfaces: Buffer<u8>,
@@ -148,7 +149,7 @@ impl RestirGiState {
             view.release(rd);
             view.candidates = rd.create_device_buffer(pixels * CANDIDATE_BYTES, usage);
             view.reservoirs = rd.create_device_buffer(pixels * RESERVOIR_BYTES, usage);
-            view.history = rd.create_device_buffer(pixels * HISTORY_BYTES, usage);
+            view.history = rd.create_device_buffer(2 * pixels * HISTORY_BYTES, usage);
             view.frame = rd.create_device_buffer(1, usage);
             view.pixels = pixels;
             log::debug!(
@@ -156,7 +157,7 @@ impl RestirGiState {
                 input.slot,
                 input.extent.width,
                 input.extent.height,
-                pixels * (CANDIDATE_BYTES + RESERVOIR_BYTES + HISTORY_BYTES) / (1024 * 1024)
+                pixels * (CANDIDATE_BYTES + RESERVOIR_BYTES + 2 * HISTORY_BYTES) / (1024 * 1024)
             );
         }
         let surfaces_made = own_surfaces && view.surfaces.handle == vk::Buffer::null();
@@ -203,7 +204,9 @@ impl RestirGiState {
             candidates: view.candidates.address,
             surfaces,
             final_,
-            history: view.history.address,
+            history: view.history.address + (input.frame & 1) as u64 * pixels * HISTORY_BYTES,
+            history_prev: view.history.address
+                + ((input.frame + 1) & 1) as u64 * pixels * HISTORY_BYTES,
             width: input.extent.width,
             height: input.extent.height,
             frame: input.frame,

@@ -488,7 +488,8 @@ public struct PtHistory {
     // throughput_b_mask's ray-mask byte (bits 16-23).
     public uint mask;
     public uint frame;
-    public uint pad;
+    // The reconnection threshold at that vertex, from that frame's camera.
+    public float thr;
 };
 
 public GiCandidate ptHistorySample(PtHistory* p) {
@@ -496,7 +497,7 @@ public GiCandidate ptHistorySample(PtHistory* p) {
 }
 
 // The history's primary vertex as a surface (the fields a shift reads).
-public RestirSurface ptHistorySurface(PtHistory* p, out uint frame) {
+public RestirSurface ptHistorySurface(PtHistory* p, out uint frame, out float thr) {
     let d = (uint4*)p;
     let a = loadAligned<16>(d + 5);
     let b = loadAligned<16>(d + 6);
@@ -511,15 +512,16 @@ public RestirSurface ptHistorySurface(PtHistory* p, out uint frame) {
     s.depth = asfloat(c.x);
     s.throughput_b_mask = c.y;
     frame = c.z;
+    thr = asfloat(c.w);
     return s;
 }
 
-public void ptHistoryStore(PtHistory* p, GiCandidate c, RestirSurface s, uint frame) {
+public void ptHistoryStore(PtHistory* p, GiCandidate c, RestirSurface s, uint frame, float thr) {
     giCandidateStore((GiCandidate*)p, c);
     let d = (uint4*)p;
     storeAligned<16>(d + 5, uint4(asuint(s.position), s.normal_oct));
     storeAligned<16>(d + 6, uint4(s.geo_normal_oct, s.view_oct, s.albedo_metallic, s.material));
-    storeAligned<16>(d + 7, uint4(asuint(s.depth), s.throughput_b_mask & 0x00FF0000u, frame, 0u));
+    storeAligned<16>(d + 7, uint4(asuint(s.depth), s.throughput_b_mask & 0x00FF0000u, frame, asuint(thr)));
 }
 
 public uint ptPackAlbedoMetallic(float3 albedo, float metallic) {
@@ -582,8 +584,10 @@ public struct GiFrame {
     public GiCandidate* candidates;
     public RestirSurface* surfaces;
     public GiReservoir* final_;
-    // Last frame's final reservoirs (temporal reuse; read before, written after this frame's).
+    // The temporal history, two buffers by frame parity: this frame's final reservoirs (written)
+    // and last frame's (read; written in place, a moving camera read pixels already overwritten).
     public PtHistory* history;
+    public PtHistory* history_prev;
     public uint width;
     public uint height;
     public uint frame;

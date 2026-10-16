@@ -85,8 +85,10 @@ pub struct RenderSettings {
     #[reflect(@1.0..=64.0_f32)]
     pub restir_gi_spatial_radius: f32,
     /// ReSTIR PT's temporal reuse: the confidence (samples) last frame's reservoir may carry into
-    /// this frame's (0 = none). With spatial reuse it halves Ray Reconstruction's error against
-    /// the reference (sun room 0.031 -> 0.016, 3 % black input); alone it is worse than spatial.
+    /// this frame's (0 = none), lowered as the history moves (cap / (1 + pixels / 8)). With
+    /// spatial reuse it cuts Ray Reconstruction's error against the reference at every speed (sun
+    /// room, still / 1.5 / 4 m/s: 0.031 / 0.043 / 0.057 -> 0.025 / 0.039 / 0.050); 8 is better
+    /// still and worse moving.
     #[reflect(@0.0..=32.0_f32)]
     pub restir_pt_history: f32,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
@@ -152,7 +154,7 @@ impl Default for RenderSettings {
             restir_gi_roughness: 0.35,
             restir_gi_spatial_samples: 4,
             restir_gi_spatial_radius: 30.0,
-            restir_pt_history: 8.0,
+            restir_pt_history: 4.0,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,

@@ -1504,11 +1504,11 @@ void gi_temporal() {
         giReservoirStore(f.final_ + idx, ptReservoir(float3(0.0), float3(0.0, 1.0, 0.0), float3(0.0),
                                                      float3(0.0, 1.0, 0.0), float3(0.0), 0.0, f.frame - 1u, 0u));
         if (!spatial) {
-            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u);
+            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u, 0.0);
         }
         return;
     }
-    initRandom(uint2(f.width, f.height), uint2(launch_id), f.frame * 7u + 5u);
+    initRandom(uint2(f.width, f.height), uint2(launch_id), f.frame * 7u + 3u);
     let thr = GI_RECONNECT_MIN * length(s.position - cameraOrigin());
     let own_W = own.pdf;
     var own_pdf = own;
@@ -1525,16 +1525,31 @@ void gi_temporal() {
     var M = 1.0;
     var fresh = true;
 
-    let pp = restirReproject(&pc.uniforms.prev_view_proj[0], f.width, f.height, s.prev_position);
+    var pp = restirReproject(&pc.uniforms.prev_view_proj[0], f.width, f.height, s.prev_position);
+    // The further the history moved, the less it is trusted: under fast motion RR suffers from
+    // reused (correlated) samples and neighbouring pixels start to share a history pixel.
+    let moved = length(float2(pp - int2(launch_id)));
+    let cap = f.history_cap / (1.0 + moved / 8.0);
+    // Permutation sampling (DLSS-RR guide 3.5: RR assumes independent samples): the history is
+    // read from the reprojected pixel XOR a per-frame mask inside 2x2 blocks, a permutation, so
+    // each pixel continues a different pixel's chain every frame and no two share one.
+    if (all(pp >= int2(0))) {
+        let h = ptHash(f.frame * 0x2c1b3c6du + 0x297a2d39u);
+        pp ^= int2(h & 1u, (h >> 1u) & 1u);
+    }
     if (all(pp >= int2(0)) && pp.x < int(f.width) && pp.y < int(f.height)) {
         let hi = uint(pp.y) * f.width + uint(pp.x);
         uint hframe;
-        let ps = ptHistorySurface(f.history + hi, hframe);
-        let hs = ptHistorySample(f.history + hi);
-        let M_t = min(hs.q, f.history_cap);
-        if (hframe == f.frame - 1u && M_t > 0.0 && hs.pdf > 0.0 && hs.pdf < 1.0e20 && hs.phat > 0.0
-            && restirSimilar(s, ps.normal_oct, ps.depth)) {
-            let thr_p = GI_RECONNECT_MIN * length(ps.position - cameraOrigin());
+        float thr_p;
+        let ps = ptHistorySurface(f.history_prev + hi, hframe, thr_p);
+        let hs = ptHistorySample(f.history_prev + hi);
+        let M_t = min(hs.q, cap);
+        // The canonical weight counts last frame's pixel whenever it took part, whether or not its
+        // sample came back empty: weighting the canonical by what the other sample happened to be
+        // counted light twice (temporal alone read 6-18 % bright once the history came from
+        // another pixel).
+        if (hframe == f.frame - 1u && M_t > 0.0 && restirSimilar(s, ps.normal_oct, ps.depth)) {
+            let hs_valid = hs.pdf > 0.0 && hs.pdf < 1.0e20 && hs.phat > 0.0;
             // Ours at last frame's vertex, in our measure.
             var m_c = 1.0;
             if (own_valid) {
@@ -1544,7 +1559,10 @@ void gi_temporal() {
                 m_c = den > 0.0 ? pc_c / den : 1.0;
             }
             // Last frame's, here.
-            let here = ptShift(s, thr, hs);
+            var here = PtShift(float3(0.0), 0.0, s.position, float3(0.0, 1.0, 0.0));
+            if (hs_valid) {
+                here = ptShift(s, thr, hs);
+            }
             let p_here = luma(here.f);
             var w_t = 0.0;
             if (p_here > 0.0 && here.J > 1.0 / PT_MAX_JACOBIAN && here.J < PT_MAX_JACOBIAN) {
@@ -1576,7 +1594,7 @@ void gi_temporal() {
     giReservoirStore(f.final_ + idx, ptReservoir(s.position, float3(0.0, 1.0, 0.0), r_sample.x_s,
                                                  float3(0.0, 1.0, 0.0), r_C, W, f.frame, fresh ? GI_FRESH : 0u));
     if (!spatial) {
-        ptHistoryStore(f.history + idx, res, s, f.frame);
+        ptHistoryStore(f.history + idx, res, s, f.frame, thr);
     }
 }
 
@@ -1607,7 +1625,7 @@ void gi_spatial() {
                                                      float3(0.0, 1.0, 0.0), float3(0.0), 0.0,
                                                      f.frame - 1u, 0u));
         if (temporal) {
-            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u);
+            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u, 0.0);
         }
         return;
     }
@@ -1635,7 +1653,8 @@ void gi_spatial() {
     if (!(own_W > 0.0 && own_W < 1.0e20)) {
         C_c = float3(0.0);
     }
-    let pc_yc = luma(C_c);
+    // Its scalar target: after gi_temporal the exact one W was divided by (C is RGB9E5-rounded).
+    let pc_yc = temporal ? (luma(C_c) > 0.0 ? own.phat : 0.0) : luma(C_c);
     let own_valid = pc_yc > 0.0;
 
     let S = min(f.spatial_samples, PT_MAX_SPATIAL);
@@ -1651,7 +1670,7 @@ void gi_spatial() {
                                                      own_valid ? own_W : 0.0, f.frame, GI_FRESH));
         if (temporal) {
             ptHistoryStore(f.history + idx, ptAsReservoir(own, own_valid ? own_W : 0.0, M_c, pc_yc, own.geo), s,
-                           f.frame);
+                           f.frame, thr);
         }
         return;
     }
@@ -1748,7 +1767,7 @@ void gi_spatial() {
                                                  (W > 0.0 && fresh) ? GI_FRESH : 0u));
     if (temporal) {
         ptHistoryStore(f.history + idx, ptAsReservoir(r_sample, W, min(M_sum, f.history_cap), r_phat, r_geo),
-                       s, f.frame);
+                       s, f.frame, thr);
     }
 }
 

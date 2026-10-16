@@ -5,6 +5,11 @@
 //! or move the camera.
 //!
 //!   app ... --capture DIR [--size WxH] [--frames N] [--noisy K] [--settle F] [--feed-reference]
+//!           [--motion SPEED]
+//!
+//! `--motion SPEED`: each noisy frame ends a second of camera strafe (60 steps at SPEED m/s along
+//! the camera's right) at the captured pose, so RR's output and the reuse there come from a moving
+//! history; the reference is accumulated at that pose, held still.
 //!
 //! An example builds its app without `WinitPlugin` when [`CaptureArgs::from_args`] is some and
 //! hands it to [`run`] instead of `App::run`.
@@ -36,6 +41,8 @@ pub struct CaptureArgs {
     /// colour; after the N frames, `noisy` frames of its output are captured while feeding goes
     /// on (no noisy frames: a single-frame accumulation would feed it noise).
     pub feed: bool,
+    /// `--motion SPEED`: strafe speed (m/s at 60 frames a second) into each noisy frame.
+    pub motion: Option<f32>,
 }
 
 impl CaptureArgs {
@@ -64,9 +71,13 @@ impl CaptureArgs {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),
             feed: args.iter().any(|a| a == "--feed-reference"),
+            motion: value("--motion").and_then(|v| v.parse().ok()),
         })
     }
 }
+
+/// Frames of camera motion into each `--motion` noisy frame.
+const MOTION_STEPS: u32 = 60;
 
 /// Frames to run after pausing before the buffers are read: the frames that wrote them have
 /// finished (two in flight).
@@ -113,7 +124,18 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         feed(app, args);
         return;
     }
+    let pose = *app.world().get::<Transform>(camera).expect("the camera's transform");
     for k in 0..args.noisy {
+        if let Some(speed) = args.motion {
+            // A second of strafe that ends on the pose (the last step is the captured frame).
+            let step = pose.right() * (speed / MOTION_STEPS as f32);
+            for i in (1..MOTION_STEPS).rev() {
+                app.world_mut().get_mut::<Transform>(camera).unwrap().translation =
+                    pose.translation - step * i as f32;
+                app.update();
+            }
+            *app.world_mut().get_mut::<Transform>(camera).unwrap() = pose;
+        }
         // One frame: reset, add it and write RR's output; then hold still and read.
         loop {
             {
