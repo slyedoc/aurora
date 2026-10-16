@@ -288,7 +288,12 @@ fn update_sbt(
                             geometry_to_index: mesh.geometry_to_index.address,
                             geometry_to_triangle: mesh.geometry_to_triangle.address,
                             prev_vertex_buffer: 0,
-                            flags: 0,
+                            // Bit 1: a 2-state opacity micromap decides every hit (surface.slang).
+                            flags: if mesh.micromap.as_ref().is_some_and(|m| m.two_state) {
+                                2
+                            } else {
+                                0
+                            },
                             surface_data: surface_data.get(SurfaceClass(*class)),
                         },
                     );

@@ -40,6 +40,9 @@ pub struct Micromap {
     index: Buffer<i32>,
     index_usage: Vec<vk::MicromapUsageEXT>,
     pub triangle_count: usize,
+    /// Every micro-triangle is opaque or transparent (2-state, no unknown special index): the
+    /// hardware decides each hit, even for force-opaque rays, so a hit is a plain surface.
+    pub two_state: bool,
 }
 
 impl Micromap {
@@ -192,6 +195,10 @@ impl MicromapBuild {
                 index,
                 index_usage,
                 triangle_count,
+                two_state: slices.usage.iter().all(|u| {
+                    u32::from(u.format)
+                        == vk::OpacityMicromapFormatEXT::TYPE_2_STATE.as_raw() as u32
+                }) && !slices.index.iter().any(|&i| i == -3 || i == -4),
             },
             array_data,
             array_data_address,

@@ -432,7 +432,8 @@ public struct GiCandidate {
     public uint wi_c;
     public uint wi_n;
     public uint n_k;
-    // x_k's material: sqrt albedo (unorm8 x3) and metallic (unorm8); perceptual roughness.
+    // x_k's material: sqrt albedo (unorm8 x3) and metallic (unorm8); perceptual roughness and
+    // thin translucency (2 x f16 in the float's bits).
     public uint albedo_metallic;
     public float roughness;
     // The direction x_k -> x_{k-1} on the path that found it (oct 2xf16).

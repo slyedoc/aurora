@@ -71,13 +71,12 @@ float pathRandom(uint seed, uint vertex, uint dim) {
 // A vertex a reconnection may start or end at: rough, not glass, no thin layers (replay draws
 // the base lobe only).
 bool ptRough(float roughness, float transmission, Lobes lob) {
-    return roughness >= pc.uniforms.gi_roughness && transmission < 0.01
-        && lob.transmission <= 0.0 && lob.clearcoat <= 0.0;
+    return roughness >= pc.uniforms.gi_roughness && transmission < 0.01 && lob.clearcoat <= 0.0;
 }
 
-// A replayable vertex: the base lobe only (no glass, no thin layers).
+// A replayable vertex: the base lobe and thin translucency (a leaf); no glass, no clear coat.
 bool ptReplayable(float transmission, Lobes lob) {
-    return transmission < 0.01 && lob.transmission <= 0.0 && lob.clearcoat <= 0.0;
+    return transmission < 0.01 && lob.clearcoat <= 0.0;
 }
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
@@ -1311,14 +1310,23 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
     var rough = ptRough(p.mat.roughness, 0.0, p.lob);
     let ray_mask = restirRayMask(s);
     for (uint i = 0u; i + 1u < k; i++) {
-        let noise = float4(pathRandom(seed, i, 0u), pathRandom(seed, i, 1u),
-                           pathRandom(seed, i, 2u), pathRandom(seed, i, 3u));
         var dir = float3(0.0);
-        let brdf = sampleDisneyBRDF(noise, pathRandom(seed, i, 4u), p.v, p.n, p.mat, dir);
-        if (brdf.a < 0.0 || dot(dir, p.ng) <= 0.0) {
-            return res;
+        // Through a thin translucent surface with probability `transmission`, as `main` drew it.
+        if (p.lob.transmission > 0.0 && pathRandom(seed, i, 5u) < p.lob.transmission) {
+            dir = sampleTransmission(p.n, pathRandom(seed, i, 6u), pathRandom(seed, i, 7u));
+            if (dot(dir, p.ng) >= 0.0) {
+                return res;
+            }
+            res.T *= p.mat.albedo;
+        } else {
+            let noise = float4(pathRandom(seed, i, 0u), pathRandom(seed, i, 1u),
+                               pathRandom(seed, i, 2u), pathRandom(seed, i, 3u));
+            let brdf = sampleDisneyBRDF(noise, pathRandom(seed, i, 4u), p.v, p.n, p.mat, dir);
+            if (brdf.a < 0.0 || dot(dir, p.ng) <= 0.0) {
+                return res;
+            }
+            res.T *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
         }
-        res.T *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
         HitPayload payload = {};
         payload.miss_flags = 0u;
         payload.cone = float2(0.0, 0.01);
@@ -1368,12 +1376,15 @@ float3 ptReconnect(PtVertex p, float3 T, GiCandidate c, float3 x_s, float3 n_s, 
     if (cos_s <= 0.0 || sqrt(d2) <= thr) {
         return float3(0.0);
     }
+    // In front, or behind a thin translucent surface (its transmission lobe).
     let NoL = dot(p.n, w);
-    if (NoL <= 0.0 || dot(w, p.ng) <= 0.0) {
+    let front = NoL > 0.0 && dot(w, p.ng) > 0.0;
+    let back = p.lob.transmission > 0.0 && NoL < 0.0 && dot(w, p.ng) < 0.0;
+    if (!front && !back) {
         return float3(0.0);
     }
     geo = cos_s / d2;
-    return T * evalLayered(p.v, p.n, w, p.mat, p.lob, true) * NoL * ptSampleRadiance(c, -w);
+    return T * evalLayered(p.v, p.n, w, p.mat, p.lob, true) * abs(NoL) * ptSampleRadiance(c, -w);
 }
 
 // A sample shifted to a primary vertex: its target vector there (visibility of the reconnection
@@ -2214,7 +2225,7 @@ void main() {
                     pt_acc_mid = acc;
                     pt_nk = packHalf2(float32x3_to_oct(world_normal));
                     storeAligned<16>(cand + 4, uint4(ptPackAlbedoMetallic(payload.color.rgb, metallic),
-                                                     asuint(roughness),
+                                                     packHalf2(float2(roughness, lob.transmission)),
                                                      packHalf2(float32x3_to_oct(-direction)), asuint(pt_q)));
                 } else if (bounce_idx - pt_base >= PT_MAX_K || hitPayloadGetMasked(payload)
                            || !ptReplayable(transmission, lob)) {
@@ -2534,10 +2545,18 @@ void main() {
             // base, whose weight the two cancel out of. Ordinary materials draw nothing here.
             // The view the sampler below draws from (its MIS pdf needs it after `direction` moves).
             let wo = -direction;
-            if (lob.transmission > 0.0 && randf() < lob.transmission) {
-                let r1 = randf();
-                let r2 = randf();
+            // While ReSTIR PT searches, the coin and the direction come from the path seed, which
+            // replay draws again (ptReplay).
+            let pt_searching = GI_ON && (path & PATH_PT_SEARCH) != 0u;
+            let pt_vi = bounce_idx - pt_base;
+            if (lob.transmission > 0.0
+                && (pt_searching ? pathRandom(pt_seed, pt_vi, 5u) : randf()) < lob.transmission) {
+                let r1 = pt_searching ? pathRandom(pt_seed, pt_vi, 6u) : randf();
+                let r2 = pt_searching ? pathRandom(pt_seed, pt_vi, 7u) : randf();
                 direction = sampleTransmission(world_normal, r1, r2);
+                if (GI_ON && bounce_idx == pt_k_bounce) {
+                    pt_cont_dir = direction;
+                }
                 mask *= disney_mat.albedo;
                 prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                 path &= ~PATH_WANT_SUN;

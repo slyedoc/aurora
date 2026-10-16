@@ -428,14 +428,18 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     let n = oct_to_float32x3(unpackHalf2(c.n_k));
     let a = float3(float(c.albedo_metallic & 0xFFu), float((c.albedo_metallic >> 8) & 0xFFu),
                    float((c.albedo_metallic >> 16) & 0xFFu)) / 255.0;
-    let mat = disneyMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, c.roughness);
+    let rt = unpackHalf2(asuint(c.roughness));
+    let mat = disneyMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, rt.x);
+    // x_k's thin translucency: light it took through its far side keeps its (constant) lobe.
+    Lobes lob = {};
+    lob.transmission = rt.y;
     let wo_src = oct_to_float32x3(unpackHalf2(c.wo));
     var L = float3(0.0);
     let Lc = unpackRadiance(c.L);
     if (any(Lc > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_c));
-        let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
-        let f1 = evalDisneyBRDF(wo, n, wi, mat);
+        let f0 = evalLayered(wo_src, n, wi, mat, lob, false);
+        let f1 = evalLayered(wo, n, wi, mat, lob, false);
         L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
     }
@@ -445,8 +449,8 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
     }
     if (any(Ln > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_n));
-        let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
-        let f1 = evalDisneyBRDF(wo, n, wi, mat);
+        let f0 = evalLayered(wo_src, n, wi, mat, lob, false);
+        let f1 = evalLayered(wo, n, wi, mat, lob, false);
         L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Ln;
     }
@@ -472,11 +476,14 @@ public float3 ptOwnTarget(RestirSurface s, GiCandidate c) {
     }
     let n = oct_to_float32x3(unpackHalf2(s.normal_oct));
     let ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
+    let lob = unpackLobes(s.material);
     let NoL = dot(n, w);
-    if (NoL <= 0.0 || dot(w, ng) <= 0.0) {
+    let front = NoL > 0.0 && dot(w, ng) > 0.0;
+    let back = lob.transmission > 0.0 && NoL < 0.0 && dot(w, ng) < 0.0;
+    if (!front && !back) {
         return float3(0.0);
     }
     let v = oct_to_float32x3(unpackHalf2(s.view_oct));
     let mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
-    return evalLayered(v, n, w, mat, unpackLobes(s.material), true) * NoL * ptSampleRadiance(c, -w);
+    return evalLayered(v, n, w, mat, lob, true) * abs(NoL) * ptSampleRadiance(c, -w);
 }

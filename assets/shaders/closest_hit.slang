@@ -36,5 +36,8 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
     hitPayloadSetTransmission(payload, transmission);
     hitPayloadSetRoughness(payload, roughness);
     hitPayloadSetMetallic(payload, metallic);
-    hitPayloadSetMasked(payload, material.alpha_cutoff > 0.0);
+    // A 2-state opacity micromap already decided this hit (record flag bit 1, sbt.rs): the
+    // texel's alpha is no coin to flip, the leaf is a surface like any other (ReSTIR PT replays
+    // paths through it).
+    hitPayloadSetMasked(payload, material.alpha_cutoff > 0.0 && (record.record_flags.x & 2u) == 0u);
 }
