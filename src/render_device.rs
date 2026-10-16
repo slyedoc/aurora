@@ -248,6 +248,8 @@ pub struct BindlessMap {
     /// ([`RenderDevice::retire_released`]), however many earlier submits that frame makes.
     pub released: Vec<u32>,
     pub next: u32,
+    /// Textures registered so far: grows whenever one arrives (reference.rs resets on it).
+    pub registrations: u64,
 }
 
 impl Clone for RenderDevice {
@@ -487,10 +489,16 @@ impl RenderDevice {
             crate::descriptor_heap::BINDLESS_SLOTS
         );
         map.by_view.insert(texture.image_view, index);
+        map.registrations += 1;
 
         self.heaps().write_bindless(index, texture.image_view);
 
         index
+    }
+
+    /// Textures registered so far (it grows as textures stream in).
+    pub fn bindless_registrations(&self) -> u64 {
+        self.bindless_descriptor_map.lock().unwrap().registrations
     }
 
     pub fn get_bindless_texture_index(&self, texture: &RenderTexture) -> Option<u32> {

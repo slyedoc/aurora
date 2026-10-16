@@ -1178,6 +1178,7 @@ fn render_frame(
                     settings: format!("{settings:?}"),
                     skies: format!("{:?}", skies.environments),
                     light_epoch: lights.epoch,
+                    textures: render_device.bindless_registrations(),
                 }
             } else {
                 crate::reference::ReferenceKey::default()

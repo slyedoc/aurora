@@ -30,6 +30,8 @@ pub struct ReferenceKey {
     pub settings: String,
     pub skies: String,
     pub light_epoch: u32,
+    /// Textures registered (render_device.rs): a streamed-in texture changes the image.
+    pub textures: u64,
 }
 
 #[derive(Default)]
@@ -151,6 +153,7 @@ impl ReferenceState {
                 Some(old) if old.settings != key.settings => "the settings changed",
                 Some(old) if old.skies != key.skies => "the sky changed",
                 Some(old) if old.light_epoch != key.light_epoch => "the lights changed",
+                Some(old) if old.textures != key.textures => "a texture arrived",
                 _ => "the buffer was made",
             };
             log::debug!(
