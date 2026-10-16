@@ -67,6 +67,20 @@ Plan: `nrc.html`. Newest last.
   1.014-1.018 / 0.08-0.10 and the abbey 1.009 (they kick the network up). The relative L2 gradient
   2 (p - t) / (p^2 + 0.01) explodes on a dim prediction; epsilon is in pre-exposed units. Open.
 
+- Sun room against Cycles (Blender MCP, the matching scene: flat sky 6000, no sun, no ground;
+  960x540; Cycles 16k samples; room only, window masked), ratio / block error:
+  | aurora | vs Cycles 2 bounces | vs Cycles 32 bounces |
+  |---|---|---|
+  | truth (no PT), 4 bounces | 1.039 / 0.062 | 0.955 / 0.093 |
+  | truth, 16 bounces | 1.143 / 0.214 | 1.052 / 0.073 |
+  | default (PT) | 1.039 / 0.063 | 0.955 / 0.093 |
+  | NRC | 1.144 / 0.216 | 1.052 / 0.076 |
+  Cycles 14 bounces = 32. NRC against aurora's 16-bounce truth: 1.000 / 0.012 (default 0.987 /
+  0.080: its 4 bounces), black input 96 -> 27 %, RR 0.048 -> 0.044. Self-training makes NRC the
+  all-bounce answer; aurora's converged image is 5 % above Cycles' (the materials, known). So the
+  "sun room reads 1.014-1.018" above was the 4-bounce truth's missing light: judge NRC against a
+  16-bounce truth or Cycles, and the scaled (unclipped) gradient stands.
+
 ## Deviations
 
 - D5: aurora traces in world space (not camera-relative, the plan assumed solari's convention), so
@@ -77,5 +91,5 @@ Plan: `nrc.html`. Newest last.
   so targets carry every bounce. Without it records near max_bounces taught "direct light only"
   and indirect-lit surfaces read 7 % dark.
 - D3: position by triangle wave x 12 (tiny-cuda-nn's NRC encoding), not sin/cos x 6.
-- Gates are read against the plan's truth (4 bounces, as shipped); the 16-bounce truth is reported
-  beside it.
+- Gates: the plan's truth (4 bounces) under-reads an all-bounce cache; NRC is judged against a
+  16-bounce truth and Cycles (sun room).
