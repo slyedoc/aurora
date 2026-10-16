@@ -55,17 +55,20 @@ import nrc;
 static const float GI_RECONNECT_MIN = 0.03;
 // The deepest reconnection vertex (x_k, k counted from the primary vertex x_0): a replay traces
 // up to k - 1 rays, and the search holds Russian roulette back until it ends.
-static const uint PT_MAX_K = 3u;
+static const uint PT_MAX_K = 5u;
 
-// A vertex a reconnection may start or end at: rough, not glass, no thin layers (replay draws
-// the base lobe only).
+// A vertex a reconnection may start or end at: rough (no delta lobe, the reconnection's BSDF is
+// evaluated), not glass (estimated by sampling alone), no clear coat (x_k's BSDF is evaluated
+// again for shifted paths from its candidate record, which holds neither).
 bool ptRough(float roughness, float transmission, Lobes lob) {
     return roughness >= pc.uniforms.gi_roughness && transmission < 0.01 && lob.clearcoat <= 0.0;
 }
 
-// A replayable vertex: the base lobe and thin translucency (a leaf); no glass, no clear coat.
+// A primary vertex replay can start from: not glass (its packed record, RestirSurface, holds no
+// glass parameters; a coat it has). Past it any vertex replays (bsdf.slang samples every lobe from
+// the path's numbers): glass, clear coat and mirrors may lie between x_0 and x_k.
 bool ptReplayable(float transmission, Lobes lob) {
-    return transmission < 0.01 && lob.clearcoat <= 0.0;
+    return transmission < 0.01;
 }
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
@@ -1331,10 +1334,15 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
             q.ng = -q.ng;
         }
         q.v = -dir;
-        q.mat = surfaceMaterial(payload.color.rgb, hitPayloadGetMetallic(payload), roughness);
+        // Glass as `main` saw it: eta for the side the ray came from, the medium's absorption
+        // along the segment inside.
+        let inside = hitPayloadGetInside(payload);
+        let ior = max(payload.refract_index, 1.0e-3);
+        q.mat = surfaceMaterial(payload.color.rgb, hitPayloadGetMetallic(payload), roughness,
+                                transmission, inside ? ior : 1.0 / ior);
         q.lob = lob;
-        if (!ptReplayable(transmission, lob)) {
-            return res;
+        if (inside && transmission > 0.0) {
+            res.T *= exp(-payload.t * payload.absorption);
         }
         let q_rough = ptRough(roughness, transmission, lob);
         // `main` would have reconnected here, before k.
@@ -1899,6 +1907,9 @@ static const uint PATH_PT_PREV_ROUGH = 512u;
 // Neural radiance cache: the path is traced on to teach the cache (records every vertex, never
 // ends in it).
 static const uint PATH_NRC_TRAIN = 1024u;
+// ReSTIR PT: the camera ray has crossed only mirrors and glass so far (bounces drawn with pdf 0):
+// the first opaque vertex it reaches is the pixel's primary vertex x_0 for the reuse.
+static const uint PATH_PT_CHAIN = 2048u;
 // Vertices a training path records.
 static const uint NRC_VERTICES = 4u;
 
@@ -1938,7 +1949,7 @@ void main() {
         lensRay(lens, launch_id, launch_size, origin, direction);
         var mask = float3(1.0);
         // The path's flags, one word (PATH_*, each explained where it would have been declared).
-        var path = PATH_WANT_SUN | PATH_CAMERA;
+        var path = PATH_WANT_SUN | PATH_CAMERA | PATH_PT_CHAIN;
         // PATH_WANT_SUN: the camera ray and pure-specular continuations may see the sun disc directly; after a
         // BRDF-sampled bounce the sun comes from next-event estimation only.
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
@@ -2153,7 +2164,7 @@ void main() {
                 }
                 direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
-                path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH);
+                path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH | PATH_PT_CHAIN);
                 continue;
             }
 
@@ -2246,18 +2257,28 @@ void main() {
                     storeAligned<16>(cand + 4, uint4(ptPackAlbedoMetallic(payload.color.rgb, metallic),
                                                      packHalf2(float2(roughness, lob.transmission)),
                                                      packHalf2(float32x3_to_oct(-direction)), asuint(pt_q)));
-                } else if (bounce_idx - pt_base >= PT_MAX_K || hitPayloadGetMasked(payload)
-                           || !ptReplayable(transmission, lob)) {
+                } else if (bounce_idx - pt_base >= PT_MAX_K || hitPayloadGetMasked(payload)) {
                     path &= ~PATH_PT_SEARCH;
                 } else {
                     path = rough_here ? (path | PATH_PT_PREV_ROUGH) : (path & ~PATH_PT_PREV_ROUGH);
                     pt_prev_pos = origin;
                 }
             }
-            // The primary vertex takes part unless replay could not start from it.
-            if (GI_ON && resumed && sample_idx == 0u && pc.gi_candidates != nullptr
+            // The pixel's primary vertex x_0 takes part unless replay could not start from it: the
+            // camera ray's first hit, or the first opaque surface behind the mirrors and glass it
+            // crossed (its surface record is written here then, the chain's weight its throughput:
+            // gi_shade scales the reuse by it).
+            if (GI_ON && sample_idx == 0u && pc.gi_candidates != nullptr
+                && (path & (PATH_PT_CHAIN | PATH_GI_VERTEX)) == PATH_PT_CHAIN
                 && ptReplayable(transmission, lob) && !hitPayloadGetMasked(payload)) {
-                path |= PATH_GI_VERTEX | PATH_PT_SEARCH;
+                if (!resumed && pc.restir_surfaces != nullptr) {
+                    restirSurfaceStore(pc.restir_surfaces + prim_at, restirSurfacePack(
+                        origin, pc.uniforms.frame, payload.prev_world_pos,
+                        mat4MulVecAt(&pc.uniforms.view_proj[0], float4(origin, 1.0)).w,
+                        payload.color.rgb, metallic, roughness, payload.lobes, mask, ray_mask,
+                        world_normal, surface_normal, -direction));
+                }
+                path = (path | PATH_GI_VERTEX | PATH_PT_SEARCH) & ~PATH_PT_CHAIN;
                 path = ptRough(roughness, transmission, lob) ? (path | PATH_PT_PREV_ROUGH)
                                                              : (path & ~PATH_PT_PREV_ROUGH);
                 pt_v0_mask = mask;
@@ -2570,9 +2591,10 @@ void main() {
                 pt_cont_dir = direction;
             }
             // A mirror bounce or glass still sees the sun disc: neither is part of next-event
-            // estimation (bpdf 0), so the disc is how the sun reaches them.
+            // estimation (bpdf 0), so the disc is how the sun reaches them; any other bounce also
+            // ends the camera's mirror-and-glass chain.
             if (bpdf > 0.0) {
-                path &= ~PATH_WANT_SUN;
+                path &= ~(PATH_WANT_SUN | PATH_PT_CHAIN);
             }
             // The opaque lobes' pdf (0 for a delta or glass): the MIS partner of light sampling.
             prev_pdf = bpdf;
