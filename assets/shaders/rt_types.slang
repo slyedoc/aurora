@@ -423,7 +423,8 @@ public struct GiCandidate {
     public float roughness;
     // The direction x_k -> x_{k-1} on the path that found it (oct 2xf16).
     public uint wo;
-    public uint pad;
+    // The chance its prefix survived Russian roulette (part of its density, not of T).
+    public float q;
 };
 
 public GiCandidate giCandidateLoad(GiCandidate* p) {
@@ -451,9 +452,13 @@ public GiCandidate giCandidateLoad(GiCandidate* p) {
     r.albedo_metallic = g.x;
     r.roughness = asfloat(g.y);
     r.wo = g.z;
-    r.pad = 0u;
+    r.q = asfloat(g.w);
     return r;
 }
+
+// A sample's `wi_n` when its next-event slot holds the radiance cache's answer at x_k: the same
+// toward every direction (the cache's own assumption).
+public static const uint PT_NO_DIRECTION = 0xFFFFFFFFu;
 
 public uint ptPackAlbedoMetallic(float3 albedo, float metallic) {
     let a = sqrt(saturate(albedo));

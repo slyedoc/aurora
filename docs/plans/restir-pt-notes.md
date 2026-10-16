@@ -62,6 +62,27 @@ Plan: `restir-pt.html`. Newest last.
   was high toward their own pixel). RR's output still reads ~0.72 of the reference (its energy loss on
   sparse input is not solved by spatial reuse; temporal reuse is phase 3).
 
+- 2026-10-16: the residual bias, the cost. Reuse read 1-2 % bright without SHaRC (16 neighbours 0.049, even
+  one neighbour, even radius 2, even the pixel as its own neighbour: +2.2 %). Instrumented (debug values
+  through the final reservoir's float fields into the noisy colour; RGB9E5 and half floats garbled the first
+  dumps): the same shift of a pixel's own sample passed its facing test before the neighbour loop and failed
+  it on 45 % of pixels inside it. ptShift inlined into the loop came out wrong; `[noinline]` fixed it
+  (self-test 1.001 / 0.015; 16 neighbours 1.001 / 0.015 without SHaRC, 0.999 / 0.017 with). Two
+  lessons from the hunt: zsh does not word-split `$F` (whole flag sets were silently ignored: scratchpad
+  cap.sh passes arrays now); RGB9E5 debug values with mixed magnitudes read back as garbage.
+- Russian roulette runs during the search again: the prefix's survival q goes into the density
+  (W = 1 / (pdf q)), not into T (replay rolls no dice). Trace at 1080p 3.3 -> 2.0 ms (no PT: 1.0).
+- The radiance cache may answer at x_k: its value is stored as a direction-free part of x_k's light
+  (PT_NO_DIRECTION, the cache's own assumption); a PT path teaches the cache from x_k on. The earlier
+  attempt read 1.3 % dark because the cache then learned nothing from PT paths (prefix and x_k both
+  excluded). Own and 4 neighbours unbiased (0.018 / 0.021).
+- gi_spatial cost: the shift's visibility as TraceRay was ~85 % of it (8.2 ms at 4 neighbours, 1080p).
+  Now a ray query (opaque triangles and the analytic sphere inline; alpha-tested, glass or other procedural
+  candidates fall back to traceVisible) and a sample's target at its own pixel computed once in
+  gi_candidates (ptOwnTarget: visibility 1; k >= 2 takes its path's T L pdf) instead of by every neighbour.
+  4 neighbours 8.2 -> 1.5 ms, 8 -> 2.8 ms. PT overhead at 4 neighbours ~3 ms (trace +1.0, candidates 0.26,
+  spatial 1.5, shade 0.3) on a 7.4 ms frame.
+
 ## Deviations
 
 - Phase 0, procedural spheres in the primary record: deferred. Recording them needs MakeHit with the
@@ -70,9 +91,10 @@ Plan: `restir-pt.html`. Newest last.
   camera (no ReSTIR surface; their direct light comes from the path's NEE).
 - Layered primary vertices (thin translucency, clear coat) take no part: replay draws the base lobe only.
   GI took them for k = 1.
-- SHaRC: a PT path teaches the cache only from past x_k. Its search vertices (no cached answers, no
-  roulette) made the voxels read brighter than the truth (own-only PT 0.035 against the truth; 0.018 with
-  the restriction). The mechanism is not identified. Letting the cache answer at x_k (as a
-  direction-free part) densified the input (30 % black) but read 1.3 % dark (0.064): not taken.
+- SHaRC: a PT path teaches the cache only from x_k on. Its search vertices (no cached answers) made the
+  voxels read brighter than the truth (own-only 0.035-0.038 against the truth, also with a stronger path
+  hash; 0.018 with the restriction). The mechanism is not identified.
+- A k >= 2 sample's own target is its path's T L pdf, not a replay from the stored primary vertex (they
+  differ by that vertex's stored precision): the pairwise weights' targets are one function only up to that.
 - restir_gi_spatial_samples stays 0 by default until the cost is measured (phase 3).
 

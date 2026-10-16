@@ -33,11 +33,11 @@ void gi_candidates(uint3 gid: SV_DispatchThreadID) {
     let live = s.frame == f.frame && cand.frame == f.frame;
     var C = float3(0.0);
     if (live && cand.pdf > 0.0) {
-        C = unpackRgb9e5(cand.T) * ptSampleRadiance(cand, oct_to_float32x3(unpackHalf2(cand.wo)))
-            * cand.pdf;
+        C = ptOwnTarget(s, cand);
     }
     let phat = luma(C);
-    let W = phat > 0.0 ? 1.0 / cand.pdf : 0.0;
+    // The density includes the prefix's survival of Russian roulette.
+    let W = phat > 0.0 && cand.q > 0.0 ? 1.0 / (cand.pdf * cand.q) : 0.0;
     if (live) {
         let c = (uint*)(f.candidates + idx);
         c[5] = asuint(W);

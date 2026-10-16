@@ -740,7 +740,7 @@ impl VulkanAsset for RaytracingPipeline {
         log::debug!(
             "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B; per thread: main \
              {stack_main}, fog grid {stack_fog_grid}, primary {stack_primary}, gi shade \
-             {stack_gi_shade} B",
+             {stack_gi_shade}, gi spatial {stack_gi_spatial} B",
             start.elapsed()
         );
         render_device.save_pipeline_cache();

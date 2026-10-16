@@ -467,6 +467,9 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
     }
     let Ln = unpackRgb9e5(c.L_nee);
+    if (c.wi_n == PT_NO_DIRECTION) {
+        return L + Ln;
+    }
     if (any(Ln > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_n));
         let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
@@ -475,4 +478,32 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Ln;
     }
     return L;
+}
+
+// ReSTIR PT: a sample's target vector at its own primary vertex `s` -- the same function the
+// shift evaluates (raygen.slang ptReconnect: the vertex's BSDF and cosine over the reconnection,
+// x_k's radiance re-evaluated) with visibility 1 (the path that found it is the proof). Computed
+// once per sample (gi_candidates) and read by every neighbour's pairwise weight. A sample found
+// deeper (k >= 2) would need a replay here: it takes its path's own value, T L pdf, which differs
+// from a replay's only by the primary vertex's stored precision.
+public float3 ptOwnTarget(RestirSurface s, GiCandidate c) {
+    if ((c.k & 15u) != 1u) {
+        return unpackRgb9e5(c.T) * ptSampleRadiance(c, oct_to_float32x3(unpackHalf2(c.wo))) * c.pdf;
+    }
+    let n_s = oct_to_float32x3(unpackHalf2(c.n_s_oct));
+    let d = c.x_s - s.position;
+    let d2 = max(dot(d, d), 1.0e-8);
+    let w = d * rsqrt(d2);
+    if (-dot(n_s, w) <= 0.0) {
+        return float3(0.0);
+    }
+    let n = oct_to_float32x3(unpackHalf2(s.normal_oct));
+    let ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
+    let NoL = dot(n, w);
+    if (NoL <= 0.0 || dot(w, ng) <= 0.0) {
+        return float3(0.0);
+    }
+    let v = oct_to_float32x3(unpackHalf2(s.view_oct));
+    let mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    return evalLayered(v, n, w, mat, unpackLobes(s.material), true) * NoL * ptSampleRadiance(c, -w);
 }
