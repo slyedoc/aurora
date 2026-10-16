@@ -87,6 +87,15 @@ impl Drop for AllocatorState {
 pub static EXECUTABLE_STATISTICS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// VK_NV_cooperative_vector is on (with the Vulkan memory model its modules declare): the
+/// neural radiance cache (nrc.rs) can run its tensor-core matmuls.
+pub static COOPERATIVE_VECTOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn cooperative_vector() -> bool {
+    COOPERATIVE_VECTOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `CAPTURE_STATISTICS_KHR` when the extension is on.
 pub fn capture_statistics() -> vk::PipelineCreateFlags2 {
     if EXECUTABLE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1139,6 +1148,21 @@ unsafe fn create_logical_device(
             device_extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
         }
         EXECUTABLE_STATISTICS.store(executable_stats, std::sync::atomic::Ordering::Relaxed);
+        // Cooperative vectors (nrc.rs). Slang lowers a CoopVec splat to a replicated composite.
+        let cooperative_vector = has(vk::NV_COOPERATIVE_VECTOR_NAME)
+            && has(vk::EXT_SHADER_REPLICATED_COMPOSITES_NAME)
+            && {
+                let mut query = vk::PhysicalDeviceCooperativeVectorFeaturesNV::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut query);
+                instance.get_physical_device_features2(physical_device, &mut features);
+                query.cooperative_vector == vk::TRUE
+            };
+        if cooperative_vector {
+            device_extensions.push(vk::NV_COOPERATIVE_VECTOR_NAME.as_ptr());
+            device_extensions.push(vk::EXT_SHADER_REPLICATED_COMPOSITES_NAME.as_ptr());
+        }
+        COOPERATIVE_VECTOR.store(cooperative_vector, std::sync::atomic::Ordering::Relaxed);
+        log::info!("vulkan: cooperative vectors: {cooperative_vector}");
         let mut queue_infos = vec![
             vk::DeviceQueueCreateInfo::default()
                 .flags(queue_flags)
@@ -1169,6 +1193,9 @@ unsafe fn create_logical_device(
             .shader_buffer_int64_atomics(true)
             // 64-bit wave reductions (the Cost view's per-wave total, raygen.slang).
             .shader_subgroup_extended_types(true)
+            // Modules using cooperative vectors declare the Vulkan memory model (device scope).
+            .vulkan_memory_model(true)
+            .vulkan_memory_model_device_scope(true)
             .timeline_semaphore(true);
 
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -1251,6 +1278,18 @@ unsafe fn create_logical_device(
                 .pipeline_executable_info(true);
         let device_info = if executable_stats {
             device_info.push(&mut features_executable)
+        } else {
+            device_info
+        };
+        let mut features_cooperative_vector =
+            vk::PhysicalDeviceCooperativeVectorFeaturesNV::default().cooperative_vector(true);
+        let mut features_replicated =
+            vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT::default()
+                .shader_replicated_composites(true);
+        let device_info = if cooperative_vector {
+            device_info
+                .push(&mut features_cooperative_vector)
+                .push(&mut features_replicated)
         } else {
             device_info
         };

@@ -38,6 +38,7 @@ pub mod latency;
 pub mod lights;
 pub mod material;
 pub mod mesh;
+pub mod nrc;
 pub mod nsight;
 pub mod omm;
 pub mod picking;
@@ -186,6 +187,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::restir_gi::RestirGiPlugin);
         group = group.add(crate::reference::ReferencePlugin);
         group = group.add(crate::sharc::SharcPlugin);
+        group = group.add(crate::nrc::NrcPlugin);
         group = group.add(crate::fog_grid::FogGridPlugin);
         group = group.add(crate::post_prep::PostPrepPlugin);
         group = group.add(crate::auto_exposure::AutoExposurePlugin);

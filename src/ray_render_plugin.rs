@@ -531,6 +531,7 @@ fn render_frame(
         ResMut<crate::post_prep::PostPrepState>,
         ResMut<crate::restir_gi::RestirGiState>,
         ResMut<crate::reference::ReferenceState>,
+        ResMut<crate::nrc::NrcState>,
     ),
     mut xr: Option<ResMut<crate::xr::XrState>>,
 ) {
@@ -580,6 +581,7 @@ fn render_frame(
         mut post_prep,
         mut restir_gi,
         mut reference,
+        mut nrc,
     ) = dlss_stuff;
 
     let (settings, mut ui, skies, mut gizmos, atmosphere, clouds, sky_gen) = dev_ui_stuff;
@@ -1292,6 +1294,21 @@ fn render_frame(
         );
         prof.end(&render_device, view_cmd, scope);
         drop(section);
+        let scope = prof.begin(&render_device, view_cmd, "nrc");
+        let nrc_pixels = views
+            .iter()
+            .filter_map(|v| v.plan)
+            .map(|p| p.render.width * p.render.height)
+            .sum();
+        let nrc_address = nrc.prepare(
+            &render_device,
+            view_cmd,
+            &modules,
+            &settings,
+            camera.map_or(Vec3::ZERO, |c| c.2.translation()),
+            nrc_pixels,
+        );
+        prof.end(&render_device, view_cmd, scope);
 
         // What the lanes read of each other's state, taken before they start.
         let light_entries = lights.active_entries;
@@ -1638,6 +1655,7 @@ fn render_frame(
                         reference: view.reference.accum.1,
                         sharc: sharc_address,
                         gi_frame: gi_addresses.frame,
+                        nrc: nrc_address,
                     };
 
                     push_trace(push_constants);
@@ -1783,6 +1801,15 @@ fn render_frame(
                             1,
                         );
                         prof.end(&render_device, cmd.get(), scope);
+                        // The neural radiance cache learns from the records the trace wrote (one
+                        // network: the first view's records).
+                        if nrc_address != 0 && views.first().map(|v| v.slot) == Some(view.slot) {
+                            let scope = prof.begin(&render_device, cmd.get(), "nrc training");
+                            if nrc.record_training(&render_device, cmd.get(), &modules) {
+                                push_trace(trace_constants);
+                            }
+                            prof.end(&render_device, cmd.get(), scope);
+                        }
                         // ReSTIR GI: the trace's candidates through its reuse passes, then the
                         // winners shaded into the colour.
                         if gi_on

@@ -862,6 +862,43 @@ public uint gridCell(RestirFrame* f, float3 p) {
     return (uint(c.y) * f.grid_z + uint(c.z)) * f.grid_x + uint(c.x);
 }
 
+// One surface point the network is asked about or trained on (48 B; NRC_RECORD_BYTES in
+// src/nrc.rs). Training records carry the radiance measured leaving the point (packRadiance,
+// nits, its own emission excluded); queries carry where the answer goes.
+public struct NrcRecord {
+    public float3 position;
+    public uint dir;            // octahedral, 2 x unorm16
+    public uint normal;         // octahedral, 2 x unorm16
+    public uint rough_diffuse;  // unorm8 x 4: roughness, diffuse albedo
+    public uint specular;       // unorm8 x 3: specular albedo, then flags
+    public uint target;         // training: packRadiance; query: destination pixel
+    public uint a;
+    public uint b;
+    public uint c;
+    public uint d;
+};
+
+// The neural radiance cache's per-view block (nrc.slang). Must match NrcFrameGpu in src/nrc.rs.
+public struct NrcFrame {
+    // NRC_LAYERS matrices [out][in], row-major f16, then NRC_LAYERS x NRC_WIDTH f16 biases.
+    public half* weights;
+    public half* biases;
+    // The training ring and the count of records written into it this frame.
+    public NrcRecord* records;
+    public uint* counter;
+    // The cache box (world position of its centre, 1 / its size): positions are encoded in it.
+    public float4 box;
+    public uint ring;
+    // A path ends in the cache once its spread exceeds this x the primary vertex's (Müller et
+    // al. 2021, sec. 5), and this share of paths trains instead.
+    public float spread;
+    public float train_fraction;
+    // NRC_FLAG_*.
+    public uint flags;
+};
+// The raygen asks the network itself at the termination vertex.
+public static const uint NRC_FLAG_INLINE = 1u;
+
 // `RaytracingPushConstants` in raytracing_pipeline.rs.
 public struct PushConstants {
     public UniformData* uniforms;
@@ -911,6 +948,8 @@ public struct PushConstants {
     public SharcEntry* sharc;
     // ReSTIR PT's per-view block (restir_gi.rs; null when off): the spatial pass's parameters.
     public GiFrame* gi_frame;
+    // The neural radiance cache (nrc.rs; null when off).
+    public NrcFrame* nrc;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

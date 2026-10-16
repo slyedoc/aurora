@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -91,9 +91,20 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             "--no-restir" => settings.restir = false,
             "--no-sharc" => settings.sharc = false,
             "--sharc" => settings.sharc = true,
+            "--nrc" => settings.nrc = true,
             "--bounces" => {
                 if let Some(n) = args.get(i + 1).and_then(|n| n.parse().ok()) {
                     settings.max_bounces = n;
+                }
+            }
+            "--di-history" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    settings.restir_history = v;
+                }
+            }
+            "--di-spatial" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    settings.restir_spatial_samples = v;
                 }
             }
             "--ab" => {

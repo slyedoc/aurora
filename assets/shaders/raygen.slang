@@ -7,6 +7,7 @@ import disney;
 import atmosphere_rt;
 import light_eval;
 import fog;
+import nrc;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
 // primary hit of sample 0.
@@ -1910,6 +1911,11 @@ static const uint PATH_GI_VERTEX = 64u;
 static const uint PATH_PT_SEARCH = 128u;
 static const uint PATH_GI_LIVE = 256u;
 static const uint PATH_PT_PREV_ROUGH = 512u;
+// Neural radiance cache: the path is traced on to teach the cache (records every vertex, never
+// ends in it).
+static const uint PATH_NRC_TRAIN = 1024u;
+// Vertices a training path records.
+static const uint NRC_VERTICES = 4u;
 
 [shader("raygeneration")]
 void main() {
@@ -1969,6 +1975,18 @@ void main() {
         float3 sh_mask[SHARC_VERTICES];
         float3 sh_acc[SHARC_VERTICES];
         var sh_n = 0u;
+        // Neural radiance cache: the path's footprint (the sum of square roots of its spread so far
+        // and the primary vertex's spread, Müller et al. 2021 sec. 5) and, on a training path, each
+        // recorded vertex's ring slot with the mask and radiance it was reached with.
+        var nrc_spread = 0.0;
+        var nrc_a0 = 0.0;
+        uint nrc_slot[NRC_VERTICES];
+        float3 nrc_mask[NRC_VERTICES];
+        float3 nrc_acc[NRC_VERTICES];
+        var nrc_n = 0u;
+        if (pc.nrc != nullptr && sample_idx == 0u && randf() < pc.nrc.train_fraction) {
+            path |= PATH_NRC_TRAIN;
+        }
         // ReSTIR PT's snapshots: the path weight reaching the reconnection vertex (the sample's
         // radiance is the rest of the path over it) and the radiance gathered before it; while
         // searching, the seed the BSDF numbers come from, the vertex just left, the reconnection
@@ -2195,6 +2213,17 @@ void main() {
                 path &= ~PATH_PT_SEARCH;
                 continue;
             }
+            // The footprint: the camera ray's at the primary vertex (d^2 / (4 pi cos)), then each
+            // scattered ray's sqrt(d^2 / (pdf cos)) (a delta bounce spreads nothing).
+            if (pc.nrc != nullptr) {
+                let cos_in = max(abs(dot(surface_normal, direction)), 1.0e-3);
+                let t2 = payload.t * payload.t;
+                if ((path & PATH_CAMERA) != 0u) {
+                    nrc_a0 = t2 / (4.0 * PI * cos_in);
+                } else if (prev_pdf > 0.0) {
+                    nrc_spread += sqrt(t2 / (prev_pdf * cos_in));
+                }
+            }
             path &= ~PATH_CAMERA;
 
             // ReSTIR PT. While the path searches, each vertex it reaches is tested as the
@@ -2324,6 +2353,49 @@ void main() {
                 }
                 prev_pdf = 0.0;
                 continue;
+            }
+
+            // Neural radiance cache (src/nrc.rs). A path whose footprint has spread past the
+            // threshold ends in the network's answer, before this vertex's next-event estimate
+            // (the cached radiance is all the vertex scatters). Never at or before ReSTIR PT's
+            // reconnection vertex: the cache's light then reaches x_k through its continuation,
+            // which shifted paths carry as is. A training path records every vertex instead.
+            if (pc.nrc != nullptr && transmission < 0.01 && !hitPayloadGetMasked(payload)
+                && (path & PATH_CACHE_BLIND) == 0u) {
+                NrcInput q;
+                q.position = nrcBoxPosition(pc.nrc, origin);
+                q.dir = -direction;
+                q.normal = world_normal;
+                q.roughness = roughness;
+                q.diffuse = payload.color.rgb * (1.0 - metallic);
+                q.specular = lerp(float3(0.04), payload.color.rgb, metallic);
+                // The path's last vertex ends in the cache too, training or not: what lies past
+                // max_bounces comes back (self-training, Müller et al. 2021 sec. 5: training
+                // targets then carry every bounce).
+                let pt_past = (path & PATH_PT_SEARCH) == 0u
+                    && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
+                let last = bounce_idx + 1u >= MAX_BOUNCES;
+                if (nrcInBox(q.position) && (pc.nrc.flags & NRC_FLAG_INLINE) != 0u && pt_past
+                    && (last || ((path & PATH_NRC_TRAIN) == 0u
+                                 && nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0))) {
+                    acc += mask * nrcQuery(pc.nrc, q) / max(pc.ae.input_exposure, 1.0e-20);
+                    break;
+                }
+                if (nrcInBox(q.position)) {
+                    if ((path & PATH_NRC_TRAIN) != 0u) {
+                        if (nrc_n < NRC_VERTICES) {
+                            uint slot;
+                            InterlockedAdd(pc.nrc.counter[0], 1u, slot);
+                            if (slot < pc.nrc.ring) {
+                                pc.nrc.records[slot] = nrcPackRecord(q);
+                                nrc_slot[nrc_n] = slot;
+                                nrc_mask[nrc_n] = mask;
+                                nrc_acc[nrc_n] = acc;
+                                nrc_n++;
+                            }
+                        }
+                    }
+                }
             }
 
             // russian roullete
@@ -2647,6 +2719,16 @@ void main() {
             }
         }
 
+        // A training path's records: each vertex's target is what the path gathered from it on,
+        // over the mask that reached it, pre-exposed like the network's answers.
+        for (uint ni = 0u; ni < nrc_n; ni++) {
+            let delta = max(acc - nrc_acc[ni], float3(0.0));
+            let m = nrc_mask[ni];
+            let target = float3(m.r > 1.0e-6 ? delta.r / m.r : 0.0,
+                                m.g > 1.0e-6 ? delta.g / m.g : 0.0,
+                                m.b > 1.0e-6 ? delta.b / m.b : 0.0);
+            pc.nrc.records[nrc_slot[ni]].target = packRadiance(target * pc.ae.input_exposure);
+        }
         // The path ended: everything gathered after each cache vertex, divided by its mask
         // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
         // darkness is learned too).

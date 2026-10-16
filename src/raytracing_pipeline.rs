@@ -192,6 +192,8 @@ pub struct RaytracingPushConstants {
     pub sharc: u64,
     /// ReSTIR PT's per-view block (`restir_gi`; 0 when off).
     pub gi_frame: u64,
+    /// The neural radiance cache's per-view block (`nrc`; 0 when off).
+    pub nrc: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to

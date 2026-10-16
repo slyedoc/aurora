@@ -108,6 +108,20 @@ pub struct RenderSettings {
     /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
     #[reflect(@0.05..=2.0_f32)]
     pub sharc_voxel: f32,
+    /// Neural radiance cache (nrc.rs; needs VK_NV_cooperative_vector): paths that have spread
+    /// far end in a small network's answer, trained online from the frame's own paths. In
+    /// development (docs/plans/nrc.html).
+    pub nrc: bool,
+    /// A path ends in the cache once its footprint has spread past this x the primary vertex's
+    /// (larger: later, less bias, more tracing).
+    #[reflect(@0.0001..=1.0_f32)]
+    pub nrc_spread: f32,
+    /// Share of paths traced on to teach the cache (capped near 64k records a frame).
+    #[reflect(@0.0..=0.2_f32)]
+    pub nrc_train_fraction: f32,
+    /// The training's Adam step size.
+    #[reflect(@0.0001..=0.02_f32)]
+    pub nrc_learning_rate: f32,
     /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = any-hit alpha test).
     pub omm: bool,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
@@ -161,6 +175,10 @@ impl Default for RenderSettings {
             light_grid_samples: 16,
             sharc: false,
             sharc_voxel: 0.25,
+            nrc: false,
+            nrc_spread: 0.01,
+            nrc_train_fraction: 0.03,
+            nrc_learning_rate: 2.0e-3,
             omm: true,
             rr_preset: RrPreset::current(),
             low_latency: crate::latency::LowLatency::On,
