@@ -1308,7 +1308,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         if (!surfaceBSDF(p.v, p.n, p.mat, p.lob).sample(sg, dir, bpdf, weight, lobe)) {
             return res;
         }
-        let through = (lobe & 3u) == LOBE_TRANSLUCENT;
+        let through = dot(dir, p.n) < 0.0;
         if (through ? dot(dir, p.ng) >= 0.0 : dot(dir, p.ng) <= 0.0) {
             return res;
         }
@@ -2267,82 +2267,10 @@ void main() {
                 pt_seed = ptHash(prim_at * 0x9e3779b9u ^ ptHash(pc.uniforms.frame + 0x632be5abu));
             }
 
-            // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
-            // vector is sampled from the NDF, Fresnel is evaluated about it, and the ray
-            // reflects/refracts THROUGH it, so rough glass scatters around the true refraction
-            // direction. (The old path lerped toward a cosine sample about the OUTWARD normal,
-            // which fogged and bent refraction for any nonzero roughness.)
-            if (randf() < transmission) {
-                // calculate the eta based on whether we are inside
-                let n1 = inside ? payload.refract_index : 1.0;
-                let n2 = inside ? 1.0 : payload.refract_index;
-                let eta = n1 / n2;
-
-                // Half-vector from the GGX NDF: theta_h = atan(alpha * sqrt(u / (1 - u))).
-                // alpha 0 keeps H = N and the block below reduces to the smooth (delta) case.
-                let t_alpha = roughness * roughness;
-                var H = world_normal;
-                if (t_alpha > 0.0) {
-                    let u1 = randf();
-                    let ct = rsqrt(1.0 + t_alpha * t_alpha * u1 / max(1.0 - u1, 1.0e-6));
-                    let st = sqrt(max(0.0, 1.0 - ct * ct));
-                    let phi = 2.0 * PI * randf();
-                    H = normalize(mul(float3(st * cos(phi), st * sin(phi), ct), orthonormalBasis(world_normal)));
-                }
-                let costi = dot(H, -direction);
-                if (costi <= 0.0) {
-                    break;  // half-vector faces away from the ray: zero weight
-                }
-
-                let k = 1 - (eta * eta) * (1 - costi * costi);
-
-                float pReflect;
-                if (k < 0) {
-                    // Total internal reflection
-                    pReflect = 1;
-                } else {
-                    // Fresnel about H. (sin^2 = 1 - cos^2; the old code had `1 - costi - costi`,
-                    // which zeroed the sine for every mid angle and skewed reflectance.)
-                    let sinti = sqrt(max(0.0, 1.0 - costi * costi));
-                    let costt = sqrt(1.0 - eta * eta * sinti * sinti);
-                    let spol = (n1 * costi - n2 * costt) / (n1 * costi + n2 * costt);
-                    let ppol = (n1 * costt - n2 * costi) / (n1 * costt + n2 * costi);
-                    pReflect = 0.5 * (spol * spol + ppol * ppol);
-                }
-
-                let lobe_reflect = randf() <= pReflect;
-                float3 new_dir;
-                if (lobe_reflect) {
-                    new_dir = reflect(direction, H);
-                    // A microfacet reflection that tunnels below the surface has zero weight.
-                    if (dot(new_dir, world_normal) * dot(-direction, world_normal) < 0.0) {
-                        break;
-                    }
-                } else {
-                    new_dir = normalize(eta * direction + H * (eta * costi - sqrt(k)));
-                    // A refraction that stays on the incoming side likewise.
-                    if (dot(new_dir, world_normal) * dot(-direction, world_normal) > 0.0) {
-                        break;
-                    }
-                }
-
-                // Single-scatter Smith weight for NDF-sampled H (Walter eq. 41 with the D and pdf
-                // cancelled): G1(i)·G1(o)·|i·h| / (|i·n|·|h·n|), clamped against grazing fireflies.
-                if (t_alpha > 0.0) {
-                    let a2 = t_alpha * t_alpha;
-                    let NoV = abs(dot(world_normal, -direction));
-                    let NoL = abs(dot(world_normal, new_dir));
-                    let NoH = max(abs(dot(world_normal, H)), 1.0e-6);
-                    let g1v = 2.0 * NoV / (NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV));
-                    let g1l = 2.0 * NoL / (NoL + sqrt(a2 + (1.0 - a2) * NoL * NoL));
-                    mask *= clamp(g1v * g1l * costi / max(NoV * NoH, 1.0e-6), 0.0, 4.0);
-                }
-                direction = new_dir;
-                if (inside) {
-                    mask *= exp(-payload.t * payload.absorption);
-                }
-                prev_pdf = 0.0;
-                continue;
+            // Inside glass the medium absorbs along the segment that reached this vertex (the
+            // interface itself is a lobe of the surface BSDF, sampled below).
+            if (inside && transmission > 0.0) {
+                mask *= exp(-payload.t * payload.absorption);
             }
 
             // Neural radiance cache (src/nrc.rs). A path whose footprint has spread past the
@@ -2416,7 +2344,10 @@ void main() {
                 }
             }
 
-            let surf_mat = surfaceMaterial(payload.color.rgb, metallic, roughness);
+            // Glass's eta = etaI / etaT for the side the ray came from.
+            let ior = max(payload.refract_index, 1.0e-3);
+            let surf_mat = surfaceMaterial(payload.color.rgb, metallic, roughness, transmission,
+                                           inside ? ior : 1.0 / ior);
 
             // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
             // indirect hit on, a converged voxel ends the path with its cached outgoing
@@ -2628,8 +2559,9 @@ void main() {
                 sampled = bs.sample(sg, l, bpdf, weight, lobe);
             }
             // A failed sample carries nothing: the path ends. Nor may it leak through the surface,
-            // unless it is the translucent lobe, which must cross it.
-            let through = (lobe & 3u) == LOBE_TRANSLUCENT;
+            // unless it crossed the shading normal (the translucent lobe, refraction), and then it
+            // must cross the face as well.
+            let through = dot(l, world_normal) < 0.0;
             if (!sampled || (through ? dot(l, surface_normal) >= 0.0 : dot(l, surface_normal) < 0.0)) {
                 break;
             }
@@ -2637,19 +2569,19 @@ void main() {
             if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_cont_dir = direction;
             }
-            // A mirror bounce still sees the sun disc: a delta lobe is no part of next-event
-            // estimation, so the disc is how the sun reaches it.
-            if ((lobe & LOBE_DELTA) == 0u) {
+            // A mirror bounce or glass still sees the sun disc: neither is part of next-event
+            // estimation (bpdf 0), so the disc is how the sun reaches them.
+            if (bpdf > 0.0) {
                 path &= ~PATH_WANT_SUN;
             }
-            // The whole mixture's pdf (0 for a delta): the MIS partner of light sampling.
+            // The opaque lobes' pdf (0 for a delta or glass): the MIS partner of light sampling.
             prev_pdf = bpdf;
             mask *= weight;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             if (through) {
                 cone_spread = max(cone_spread, 0.37);
                 path |= PATH_FROM_ROUGH;
-            } else if ((lobe & 3u) == LOBE_COAT) {
+            } else if ((lobe & LOBE_MASK) == LOBE_COAT) {
                 cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
                 path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             } else {

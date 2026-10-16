@@ -365,6 +365,130 @@ public struct SpecularMicrofacetBRDF : IBSDF, IDifferentiable {
     }
 };
 
+// Fresnel reflectance of a dielectric interface, eta = etaI / etaT (unpolarized), and the cosine of
+// the refracted direction (0 under total internal reflection).
+[Differentiable]
+float evalFresnelDielectric(float eta, float cosThetaI, out float cosThetaT) {
+    var e = eta;
+    var ci = cosThetaI;
+    if (ci < 0.0) {
+        e = 1.0 / e;
+        ci = -ci;
+    }
+    let sin2t = e * e * (1.0 - ci * ci);
+    if (sin2t > 1.0) {
+        cosThetaT = 0.0;
+        return 1.0;
+    }
+    cosThetaT = sqrt(1.0 - sin2t);
+    let rs = (e * ci - cosThetaT) / (e * ci + cosThetaT);
+    let rp = (e * cosThetaT - ci) / (e * cosThetaT + ci);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+[Differentiable]
+float evalFresnelDielectric(float eta, float cosThetaI) {
+    float cosThetaT;
+    return evalFresnelDielectric(eta, cosThetaI, cosThetaT);
+}
+
+// A dielectric interface (glass): GGX reflection and refraction picked by Fresnel (Walter et al.
+// 2007), eta = etaI / etaT; alpha 0 is smooth (deltas). Refraction carries radiance's eta^2.
+public struct DielectricBSDF : IBSDF, IDifferentiable {
+    public float3 transmission_albedo;
+    public float alpha;
+    public float eta;
+
+    [Differentiable]
+    public float3 eval(float3 wi, float3 wo) {
+        if (min(wi.z, abs(wo.z)) < kMinCosTheta || alpha == 0.0) {
+            return float3(0.0);
+        }
+        let reflection = wo.z > 0.0;
+        var h = normalize(wo + wi * (reflection ? 1.0 : eta));
+        h *= h.z < 0.0 ? -1.0 : 1.0;
+        let wi_h = dot(wi, h);
+        let wo_h = dot(wo, h);
+        // A refraction needs wi and wo on opposite sides of the microfacet (Falcor's evalPdf
+        // checks it; its eval did not, and counted impossible pairs).
+        if (wi_h <= 0.0 || (!reflection && wo_h >= 0.0)) {
+            return float3(0.0);
+        }
+        let D = evalNdfGGX(alpha, h.z);
+        let G = evalMaskingSmithGGXCorrelated(alpha, wi.z, abs(wo.z));
+        let F = evalFresnelDielectric(eta, wi_h);
+        if (reflection) {
+            return float3(F * D * G * 0.25 / wi.z);
+        }
+        let s = wo_h + eta * wi_h;
+        let t = eta * eta * wi_h * wo_h / (wi.z * s * s);
+        return transmission_albedo * (1.0 - F) * D * G * abs(t);
+    }
+
+    public bool sample<S : ISampler>(float3 wi, out float3 wo, out float pdf, out float3 w, inout S sg) {
+        wo = float3(0.0);
+        w = float3(0.0);
+        pdf = 0.0;
+        if (wi.z < kMinCosTheta) {
+            return false;
+        }
+        let u_lobe = sg.next();
+        let u = next2(sg);
+        if (alpha == 0.0) {
+            float cos_t;
+            let F = evalFresnelDielectric(eta, wi.z, cos_t);
+            let reflection = u_lobe < F;
+            w = reflection ? float3(1.0) : transmission_albedo * eta * eta;
+            wo = reflection ? float3(-wi.x, -wi.y, wi.z) : float3(-wi.x * eta, -wi.y * eta, -cos_t);
+            return abs(wo.z) >= kMinCosTheta && (wo.z > 0.0) == reflection;
+        }
+        let h = sampleGGX_VNDF(alpha, wi, u, pdf);
+        let wi_h = dot(wi, h);
+        float cos_t;
+        let F = evalFresnelDielectric(eta, wi_h, cos_t);
+        let reflection = u_lobe < F;
+        wo = reflection ? 2.0 * wi_h * h - wi : (eta * wi_h - cos_t) * h - eta * wi;
+        if (abs(wo.z) < kMinCosTheta || (wo.z > 0.0) != reflection) {
+            return false;
+        }
+        let wo_h = dot(wo, h);
+        let G = evalMaskingSmithGGXCorrelated(alpha, wi.z, abs(wo.z));
+        w = float3(G * (1.0 + evalLambdaGGX(alpha * alpha, wi.z)));
+        if (reflection) {
+            pdf /= 4.0 * wo_h;
+        } else {
+            let s = wo_h + eta * wi_h;
+            pdf = s * s > 0.0 ? pdf * abs(wo_h) / (s * s) : 3.0e38;
+            w *= transmission_albedo * eta * eta;
+        }
+        pdf *= reflection ? F : 1.0 - F;
+        return true;
+    }
+
+    public float evalPdf(float3 wi, float3 wo) {
+        if (min(wi.z, abs(wo.z)) < kMinCosTheta || alpha == 0.0) {
+            return 0.0;
+        }
+        let reflection = wo.z > 0.0;
+        var h = normalize(wo + wi * (reflection ? 1.0 : eta));
+        h *= h.z < 0.0 ? -1.0 : 1.0;
+        let wi_h = dot(wi, h);
+        let wo_h = dot(wo, h);
+        let F = evalFresnelDielectric(eta, wi_h);
+        var pdf = evalPdfGGX_VNDF(alpha, wi, h);
+        if (reflection) {
+            pdf /= 4.0 * wo_h;
+        } else {
+            if (wo_h >= 0.0 || wi_h <= 0.0) {
+                return 0.0;
+            }
+            let s = wo_h + eta * wi_h;
+            pdf = s * s > 0.0 ? pdf * abs(wo_h) / (s * s) : 3.0e38;
+        }
+        return pdf * (reflection ? F : 1.0 - F);
+    }
+};
+
 // ---- Materials --------------------------------------------------------------------------------
 
 // What a hit reads of its material (the payload's or a packed record's).
@@ -372,13 +496,24 @@ public struct SurfaceMaterial : IDifferentiable {
     public float3 albedo;
     public float metallic;
     public float roughness;
+    // Glass: the share of the surface that is a dielectric interface (Falcor's specular
+    // transmission), and its eta = etaI / etaT for this side.
+    public float transmission;
+    public float eta;
 };
 
 public SurfaceMaterial surfaceMaterial(float3 albedo, float metallic, float roughness) {
+    return surfaceMaterial(albedo, metallic, roughness, 0.0, 1.0);
+}
+
+public SurfaceMaterial surfaceMaterial(float3 albedo, float metallic, float roughness,
+                                       float transmission, float eta) {
     SurfaceMaterial m;
     m.albedo = albedo;
     m.metallic = metallic;
     m.roughness = roughness;
+    m.transmission = transmission;
+    m.eta = eta;
     return m;
 }
 
@@ -403,18 +538,26 @@ public static const uint LOBE_DIFFUSE = 0u;
 public static const uint LOBE_TRANSLUCENT = 1u;
 public static const uint LOBE_SPECULAR = 2u;
 public static const uint LOBE_COAT = 3u;
-public static const uint LOBE_DELTA = 4u;
+public static const uint LOBE_GLASS = 4u;
+public static const uint LOBE_MASK = 7u;
+public static const uint LOBE_DELTA = 8u;
 
-// Falcor's standard BSDF (diffuse and translucent mixed by `transmission`, under the specular
-// layer by its albedo, specular added) under
-// aurora's clear coat (the base weighted by 1 - clearcoat F_coat(wi), the coat's GGX added), in
-// the shading frame of normal `n`, for the view `wi` it was made with.
+// Falcor's standard BSDF (diffuse and translucent mixed by the thin layer's transmission, under
+// the specular layer by its albedo, specular added; that opaque base and the dielectric mixed by
+// the glass share) under aurora's clear coat (all of it weighted by 1 - clearcoat F_coat(wi), the
+// coat's GGX added), in the shading frame of normal `n`, for the view `wi` it was made with.
+//
+// The glass lobe is estimated by sampling alone (pdf reported 0, like a delta: next-event shadow
+// rays cannot cross the glass that refracts them); the opaque lobes by next-event estimation and
+// sampling with MIS over their own pdf (`evalNee`, `pdfNee`).
 public struct SurfaceBSDF : IDifferentiable {
     public DiffuseBRDF diffuse;
     public LambertDiffuseBTDF translucent;
     public SpecularMicrofacetBRDF specular;
     public SpecularMicrofacetBRDF coat;
+    public DielectricBSDF glass;
     public float diff_trans;
+    public float spec_trans;
     public float clearcoat;
     no_diff public float3 t;
     no_diff public float3 b;
@@ -425,6 +568,7 @@ public struct SurfaceBSDF : IDifferentiable {
     no_diff float p_translucent = 0.0;
     no_diff float p_specular = 0.0;
     no_diff float p_coat = 0.0;
+    no_diff float p_glass = 0.0;
 
     public float3 toLocal(float3 v) {
         return float3(dot(v, t), dot(v, b), dot(v, n));
@@ -447,20 +591,41 @@ public struct SurfaceBSDF : IDifferentiable {
         return 1.0 - clearcoat * evalFresnelSchlick(0.04, 1.0, detach(wi.z));
     }
 
+    // The opaque base: diffuse and translucent under the specular layer, specular.
+    [Differentiable]
+    float3 evalBase(float3 wo) {
+        return ((1.0 - diff_trans) * diffuse.eval(wi, wo) + diff_trans * translucent.eval(wi, wo))
+            * underSpecular() + specular.eval(wi, wo);
+    }
+
     // f(v, l) |n.l| in world space, every lobe.
     [Differentiable]
     public float3 eval(no_diff float3 l) {
         let wo = no_diff toLocal(l);
-        var f = ((1.0 - diff_trans) * diffuse.eval(wi, wo) + diff_trans * translucent.eval(wi, wo))
-            * underSpecular() + specular.eval(wi, wo);
+        var f = (1.0 - spec_trans) * evalBase(wo);
+        if (spec_trans > 0.0) {
+            f += spec_trans * glass.eval(wi, wo);
+        }
         if (clearcoat > 0.0) {
             f = f * baseWeight() + clearcoat * coat.eval(wi, wo);
         }
         return f;
     }
 
-    // The sampling pdf of `l` (solid angle; 0 for what only a delta reaches).
-    public float pdf(float3 l) {
+    // What next-event estimation covers: every lobe but the glass.
+    [Differentiable]
+    public float3 evalNee(no_diff float3 l) {
+        let wo = no_diff toLocal(l);
+        var f = (1.0 - spec_trans) * evalBase(wo);
+        if (clearcoat > 0.0) {
+            f = f * baseWeight() + clearcoat * coat.eval(wi, wo);
+        }
+        return f;
+    }
+
+    // The pdf of sampling `l` from the lobes next-event estimation covers (their selection
+    // included): the MIS partner of light sampling.
+    public float pdfNee(float3 l) {
         let wo = toLocal(l);
         var p = 0.0;
         if (p_diffuse > 0.0) {
@@ -478,9 +643,18 @@ public struct SurfaceBSDF : IDifferentiable {
         return p;
     }
 
-    // A direction `l` from one lobe, picked by albedo: its weight f |cos| / pdf over the whole
-    // mixture (the pdf every lobe gives `l`), or for a delta the lobe's own. One number picks the
-    // lobe, two draw the direction.
+    // The sampling pdf of `l` from every lobe (solid angle; 0 for what only a delta reaches).
+    public float pdf(float3 l) {
+        var p = pdfNee(l);
+        if (p_glass > 0.0) {
+            p += p_glass * glass.evalPdf(wi, toLocal(l));
+        }
+        return p;
+    }
+
+    // A direction `l` from one lobe, picked by albedo. An opaque lobe's weight is f |cos| / pdf
+    // over the opaque lobes (both next-event's), `pdf` that MIS pdf; the glass lobe's (and a
+    // delta's) is the lobe's own, `pdf` 0. One number picks the lobe, then the lobe draws.
     public bool sample<S : ISampler>(inout S sg, out float3 l, out float pdf, out float3 weight,
                                      out uint lobe) {
         l = float3(0.0);
@@ -497,19 +671,24 @@ public struct SurfaceBSDF : IDifferentiable {
         if (u < p_diffuse) {
             ok = diffuse.sample(wi, wo, lobe_pdf, w, sg);
             w *= underSpecular();
-            scale = (1.0 - diff_trans) * baseWeight();
+            scale = (1.0 - spec_trans) * (1.0 - diff_trans) * baseWeight();
             p = p_diffuse;
         } else if (u < p_diffuse + p_translucent) {
             ok = translucent.sample(wi, wo, lobe_pdf, w, sg);
             w *= underSpecular();
-            scale = diff_trans * baseWeight();
+            scale = (1.0 - spec_trans) * diff_trans * baseWeight();
             p = p_translucent;
             lobe = LOBE_TRANSLUCENT;
         } else if (u < p_diffuse + p_translucent + p_specular) {
             ok = specular.sample(wi, wo, lobe_pdf, w, sg);
-            scale = baseWeight();
+            scale = (1.0 - spec_trans) * baseWeight();
             p = p_specular;
             lobe = LOBE_SPECULAR;
+        } else if (u < p_diffuse + p_translucent + p_specular + p_glass) {
+            ok = glass.sample(wi, wo, lobe_pdf, w, sg);
+            scale = spec_trans * baseWeight();
+            p = p_glass;
+            lobe = LOBE_GLASS;
         } else {
             ok = coat.sample(wi, wo, lobe_pdf, w, sg);
             scale = clearcoat;
@@ -520,16 +699,18 @@ public struct SurfaceBSDF : IDifferentiable {
             return false;
         }
         l = toWorld(wo);
-        if (lobe_pdf == 0.0) {
+        if (lobe_pdf == 0.0 || lobe == LOBE_GLASS) {
             weight = w * scale / p;
-            lobe |= LOBE_DELTA;
+            if (lobe_pdf == 0.0) {
+                lobe |= LOBE_DELTA;
+            }
             return true;
         }
-        pdf = this.pdf(l);
+        pdf = pdfNee(l);
         if (pdf <= 0.0) {
             return false;
         }
-        weight = eval(l) / pdf;
+        weight = evalNee(l) / pdf;
         return true;
     }
 };
@@ -565,31 +746,38 @@ public SurfaceBSDF surfaceBSDF(float3 v, float3 n, SurfaceMaterial mat, Lobes lo
     s.specular.alpha = alpha;
     s.coat.albedo = float3(0.04);
     s.coat.alpha = lob.coat_alpha < kMinGGXAlpha ? 0.0 : lob.coat_alpha;
+    s.glass.transmission_albedo = float3(1.0);
+    s.glass.alpha = mat.eta == 1.0 ? 0.0 : alpha;
+    s.glass.eta = mat.eta;
     s.diff_trans = lob.transmission;
+    s.spec_trans = mat.transmission;
     s.clearcoat = lob.clearcoat;
     let diffuse_weight = luminance(diffuse_albedo * s.underSpecular());
     let specular_weight = luminance(evalFresnelSchlick(s.specular.albedo, 1.0, s.wi.z));
-    s.p_diffuse = diffuse_weight * (1.0 - s.diff_trans);
-    s.p_translucent = diffuse_weight * s.diff_trans;
-    s.p_specular = specular_weight;
-    let norm = s.p_diffuse + s.p_translucent + s.p_specular;
+    s.p_diffuse = diffuse_weight * (1.0 - s.diff_trans) * (1.0 - s.spec_trans);
+    s.p_translucent = diffuse_weight * s.diff_trans * (1.0 - s.spec_trans);
+    s.p_specular = specular_weight * (1.0 - s.spec_trans);
+    s.p_glass = s.spec_trans;
+    let norm = s.p_diffuse + s.p_translucent + s.p_specular + s.p_glass;
     let q = lob.clearcoat * evalFresnelSchlick(0.04, 1.0, saturate(s.wi.z));
     let k = norm > 0.0 ? (1.0 - q) / norm : 0.0;
     s.p_diffuse *= k;
     s.p_translucent *= k;
     s.p_specular *= k;
+    s.p_glass *= k;
     s.p_coat = norm > 0.0 ? q : (q > 0.0 ? 1.0 : 0.0);
     return s;
 }
 
-// f(v, l) |n.l| of a surface (every lobe): the shorthand for one evaluation.
+// f(v, l) |n.l| of a surface over the lobes next-event estimation covers (all but glass): the
+// shorthand for one evaluation toward a light.
 public float3 surfaceEval(float3 v, float3 n, float3 l, SurfaceMaterial mat, Lobes lob) {
-    return surfaceBSDF(v, n, mat, lob).eval(l);
+    return surfaceBSDF(v, n, mat, lob).evalNee(l);
 }
 
-// The sampling pdf of `l` at a surface (solid angle), the MIS partner of light sampling.
+// The pdf of sampling `l` from those lobes (solid angle), the MIS partner of light sampling.
 public float surfacePdf(float3 v, float3 n, float3 l, SurfaceMaterial mat, Lobes lob) {
-    return surfaceBSDF(v, n, mat, lob).pdf(l);
+    return surfaceBSDF(v, n, mat, lob).pdfNee(l);
 }
 
 // ---- Shared small helpers ---------------------------------------------------------------------

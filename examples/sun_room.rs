@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--glass R] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -392,6 +392,28 @@ fn setup(
                 }
             })),
             Transform::from_xyz(x, 0.4, z).with_scale(Vec3::splat(0.8)),
+        ));
+    }
+
+    // `--glass R`: a clear glass sphere (IOR 1.5, roughness R) on the floor in front of the box.
+    if let Some(roughness) = std::env::args().position(|a| a == "--glass").map(|i| {
+        std::env::args()
+            .nth(i + 1)
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(0.0)
+    }) {
+        commands.spawn((
+            ChildOf(environment),
+            Sphere,
+            AuroraMaterial3d(materials.add(AuroraMaterial {
+                base_color: Color::WHITE,
+                metallic: 0.0,
+                perceptual_roughness: roughness,
+                specular_transmission: 1.0,
+                ior: 1.5,
+                ..default()
+            })),
+            Transform::from_xyz(0.6, 0.4, 0.9).with_scale(Vec3::splat(0.8)),
         ));
     }
 }

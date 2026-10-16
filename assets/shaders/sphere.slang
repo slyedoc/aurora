@@ -27,11 +27,20 @@ void intersection() {
     let orig = ObjectRayOrigin();
     let dir = ObjectRayDirection();
     let t = gemsIntersections(orig, dir, float3(0.0), 0.5);
+    // A ray leaving the surface (a refraction into glass, a reflection off it) starts a few ulps
+    // off it, closer than the quadratic's own error: its own surface came back at t ~ 0 and the
+    // ray "re-entered" (rings inside a glass sphere). Roots within 1e-4 of the diameter of the
+    // origin are that surface.
+    let min_t = 1.0e-4 / max(length(dir), 1.0e-20);
     SphereAttributes a;
-    a.point = orig + t.x * dir;
-    ReportHit(t.x, 0, a);
-    a.point = orig + t.y * dir;
-    ReportHit(t.y, 0, a);
+    if (t.x > min_t) {
+        a.point = orig + t.x * dir;
+        ReportHit(t.x, 0, a);
+    }
+    if (t.y > min_t) {
+        a.point = orig + t.y * dir;
+        ReportHit(t.y, 0, a);
+    }
 }
 
 [shader("closesthit")]

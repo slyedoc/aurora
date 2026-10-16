@@ -1,6 +1,6 @@
 //! The surface BSDF (assets/shaders/bsdf.slang) checked against itself on the GPU: the sampler's
 //! weights integrate to the same albedo as its evaluation (uniform sphere sampling), its pdf
-//! integrates to the share of samples kept, eval's derivatives (Slang's bwd_diff) match finite differences, and a
+//! integrates to the share of samples kept, each sample's weight is f / pdf, eval's derivatives (Slang's bwd_diff) match finite differences, and a
 //! PathSampler replay repeats its sample. Windowless.
 
 use ash::vk;
@@ -12,9 +12,9 @@ use bevy_aurora::{
     vulkan_asset::VulkanAsset,
 };
 
-const CONFIGS: usize = 48;
+const CONFIGS: usize = 64;
 const THREADS: usize = 64;
-const SAMPLES: u32 = 1 << 14;
+const SAMPLES: u32 = 1 << 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -37,7 +37,7 @@ fn bsdf_check() {
         (shader, vec!["bsdf_check".to_string()], Vec::new()),
         &rd,
     );
-    let floats = CONFIGS * THREADS * 4 + CONFIGS * 8;
+    let floats = CONFIGS * THREADS * 5 + CONFIGS * 8;
     let out: Buffer<u8> = rd.create_device_buffer(
         floats as u64 * 4,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
@@ -82,23 +82,35 @@ fn bsdf_check() {
     let mut worst_albedo = 0.0f64;
     let mut worst_pdf = 0.0f64;
     let mut worst_grad = 0.0f64;
+    let mut worst_sample = 0.0f64;
     let mut failures = Vec::new();
     for c in 0..CONFIGS {
         let mean = |k: usize| {
             (0..THREADS)
-                .map(|t| data[(c * THREADS + t) * 4 + k] as f64)
+                .map(|t| data[(c * THREADS + t) * 5 + k] as f64)
                 .sum::<f64>()
                 / THREADS as f64
         };
         let (sampled, uniform, pdf, success) = (mean(0), mean(1), mean(2), mean(3));
-        let tail = &data[CONFIGS * THREADS * 4 + c * 8..][..8];
+        let per_sample = (0..THREADS)
+            .map(|t| data[(c * THREADS + t) * 5 + 4] as f64)
+            .fold(0.0f64, f64::max);
+        let tail = &data[CONFIGS * THREADS * 5 + c * 8..][..8];
         let (rough, metal, layer) = (tail[5], tail[6], tail[7] as u32);
         let label = format!(
             "roughness {rough} metallic {metal} {} view {}",
-            ["", "translucent", "coat"][layer as usize],
-            if c / 24 == 0 { "0.9" } else { "0.35" }
+            ["", "translucent", "coat", "glass"][layer as usize],
+            if c / 32 == 0 { "0.9" } else { "0.35" }
         );
         let albedo_err = (sampled - uniform).abs() / uniform.max(0.05);
+        // Uniform sphere sampling of a sharp refraction lobe is heavy-tailed: two seeds of
+        // roughness 0.3 glass differ by 3 %; the per-sample check is the exact one there.
+        let tolerance = if layer == 3 && rough < 0.4 {
+            0.06
+        } else {
+            0.02
+        };
+        worst_sample = worst_sample.max(per_sample);
         worst_albedo = worst_albedo.max(albedo_err);
         worst_pdf = worst_pdf.max((pdf - success).abs());
         let grad = |a: f32, b: f32| ((a - b).abs() / (b.abs() + 0.05)) as f64;
@@ -109,12 +121,17 @@ fn bsdf_check() {
              d/droughness {:.4} (fd {:.4}), d/dalbedo.r {:.4} (fd {:.4}), replay {}",
             tail[0], tail[1], tail[2], tail[3], tail[4]
         );
-        if albedo_err > 0.02 {
+        if per_sample > 1.0e-3 {
+            failures.push(format!(
+                "{label}: a sample's weight is not f / pdf ({per_sample:.2e})"
+            ));
+        }
+        if albedo_err > tolerance {
             failures.push(format!(
                 "{label}: sampling weights {sampled:.4} vs eval {uniform:.4}"
             ));
         }
-        if (pdf - success).abs() > 0.02 {
+        if (pdf - success).abs() > tolerance {
             failures.push(format!(
                 "{label}: pdf integrates to {pdf:.4}, samples kept {success:.4}"
             ));
@@ -127,7 +144,8 @@ fn bsdf_check() {
         }
     }
     eprintln!(
-        "bsdf check: worst albedo mismatch {worst_albedo:.4}, pdf {worst_pdf:.4}, gradient {worst_grad:.4}"
+        "bsdf check: worst albedo mismatch {worst_albedo:.4}, pdf {worst_pdf:.4}, gradient {worst_grad:.4}, \
+         sample weight vs f / pdf {worst_sample:.2e}"
     );
     assert!(failures.is_empty(), "{failures:#?}");
 }

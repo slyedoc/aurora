@@ -2,7 +2,7 @@
 // 64 threads each estimate (1) the directional albedo from the sampler's weights, (2) the same
 // integral of eval by uniform sphere sampling, (3) the integral of the pdf, which must equal the share of samples that succeed (a rough
 // lobe's draws below the horizon are rejected); thread 0 also writes
-// eval's derivatives (bwd_diff) beside finite differences, and whether a PathSampler replay
+// eval's derivatives (bwd_diff) beside finite differences, each sample's weight against eval / pdf, and whether a PathSampler replay
 // repeats its sample.
 import bsdf;
 import rt_types;
@@ -24,16 +24,20 @@ struct Lcg : ISampler {
     }
 };
 
-static const uint CONFIGS = 48u;
-static const uint OUT_PER_THREAD = 4u;
+static const uint CONFIGS = 64u;
+static const uint OUT_PER_THREAD = 5u;
 
 // Configuration c: roughness x metallic x thin layer x view.
 void config(uint c, out SurfaceMaterial m, out Lobes lob, out float3 v) {
     let roughness = float[4](0.3, 0.5, 0.7, 1.0)[c % 4u];
     let metallic = float((c / 4u) % 2u);
-    let layer = (c / 8u) % 3u;
-    let cos_v = float[2](0.9, 0.35)[(c / 24u) % 2u];
-    m = surfaceMaterial(float3(0.8, 0.5, 0.3), metallic, roughness);
+    let layer = (c / 8u) % 4u;
+    let cos_v = float[2](0.9, 0.35)[(c / 32u) % 2u];
+    // Glass: entering from air at the first view, leaving from inside at the second (total
+    // internal reflection past 42 degrees).
+    let glass = layer == 3u;
+    m = surfaceMaterial(float3(0.8, 0.5, 0.3), glass ? 0.0 : metallic, roughness,
+                        glass ? 1.0 : 0.0, glass ? ((c / 32u) % 2u == 0u ? 1.0 / 1.5 : 1.5) : 1.0);
     lob.transmission = layer == 1u ? 0.5 : 0.0;
     lob.clearcoat = layer == 2u ? 1.0 : 0.0;
     lob.coat_alpha = 0.25;
@@ -68,6 +72,9 @@ void bsdf_check(uint3 id: SV_DispatchThreadID) {
     var albedo_uniform = 0.0;
     var pdf_integral = 0.0;
     var success = 0.0;
+    // Each sample's weight against f |cos| / pdf from eval and pdf themselves: the glass lobe's
+    // weight is the lobe's own, which equals the mixture's when the surface is all glass.
+    var worst = 0.0;
     for (uint k = 0u; k < push.samples; k++) {
         float3 l;
         float pdf;
@@ -76,6 +83,15 @@ void bsdf_check(uint3 id: SV_DispatchThreadID) {
         if (bs.sample(sg, l, pdf, w, lobe)) {
             albedo_sampled += lum(w);
             success += (lobe & LOBE_DELTA) == 0u ? 1.0 : 0.0;
+            if ((lobe & LOBE_DELTA) == 0u) {
+                let glass_lobe = (lobe & LOBE_MASK) == LOBE_GLASS;
+                if (!glass_lobe || m.transmission >= 1.0) {
+                    let f = glass_lobe ? bs.eval(l) : bs.evalNee(l);
+                    let q = glass_lobe ? bs.pdf(l) : bs.pdfNee(l);
+                    let ref = lum(f) / q;
+                    worst = max(worst, abs(lum(w) - ref) / max(ref, 1.0e-3));
+                }
+            }
         }
         // Uniform on the sphere: pdf 1 / 4 pi.
         let z = sg.next() * 2.0 - 1.0;
@@ -90,6 +106,7 @@ void bsdf_check(uint3 id: SV_DispatchThreadID) {
     at[1] = albedo_uniform / float(push.samples);
     at[2] = pdf_integral / float(push.samples);
     at[3] = success / float(push.samples);
+    at[4] = worst;
     if (t == 0u) {
         // Derivatives of eval (luminance) at one direction: roughness and albedo.r.
         let l = normalize(float3(-0.3, 0.2, 0.8));
@@ -126,6 +143,6 @@ void bsdf_check(uint3 id: SV_DispatchThreadID) {
         tail[4] = all(la == lb) && all(wa == wb) && oa == ob ? 1.0 : 0.0;
         tail[5] = m.roughness;
         tail[6] = m.metallic;
-        tail[7] = float((c / 8u) % 3u);
+        tail[7] = float((c / 8u) % 4u);
     }
 }
