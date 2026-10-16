@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--matte-spheres] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -90,6 +90,7 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             "--no-gi" => settings.restir_gi = false,
             "--no-restir" => settings.restir = false,
             "--no-sharc" => settings.sharc = false,
+            "--sharc" => settings.sharc = true,
             "--bounces" => {
                 if let Some(n) = args.get(i + 1).and_then(|n| n.parse().ok()) {
                     settings.max_bounces = n;
@@ -340,16 +341,27 @@ fn setup(
         Vec3::new(-HALF_X + 0.6, 1.8, 2.0),
     );
 
-    // Two metal spheres, 0.8 m across: a perfect mirror and a glossy one (roughness 0.2).
+    // Two metal spheres, 0.8 m across: a perfect mirror and a glossy one (roughness 0.2);
+    // `--matte-spheres`: both white and diffuse.
+    let matte = std::env::args().any(|a| a == "--matte-spheres");
     for (x, z, roughness) in [(-1.3, 0.6, 0.0), (-0.55, -0.25, 0.2)] {
         commands.spawn((
             ChildOf(environment),
             Sphere,
-            AuroraMaterial3d(materials.add(AuroraMaterial {
-                base_color: Color::srgb(0.95, 0.8, 0.55),
-                metallic: 1.0,
-                perceptual_roughness: roughness,
-                ..default()
+            AuroraMaterial3d(materials.add(if matte {
+                AuroraMaterial {
+                    base_color: Color::srgb(0.8, 0.8, 0.8),
+                    metallic: 0.0,
+                    perceptual_roughness: 0.9,
+                    ..default()
+                }
+            } else {
+                AuroraMaterial {
+                    base_color: Color::srgb(0.95, 0.8, 0.55),
+                    metallic: 1.0,
+                    perceptual_roughness: roughness,
+                    ..default()
+                }
             })),
             Transform::from_xyz(x, 0.4, z).with_scale(Vec3::splat(0.8)),
         ));

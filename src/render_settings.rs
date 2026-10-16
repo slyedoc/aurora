@@ -98,9 +98,9 @@ pub struct RenderSettings {
     #[reflect(@1.0..=64.0_f32)]
     pub light_grid_samples: u32,
     /// Radiance cache (SHaRC-style): indirect paths end in converged voxels from the first bounce
-    /// on (a few train it to the end). Its accumulated image matches the uncached one (sun room:
-    /// ratio 0.998) while the 1-spp input Ray Reconstruction gets is far denser (black pixels 95 %
-    /// -> 61 %, RR's local error 12.4 % -> 8.4 %): docs/plans/reference-mode-notes.md.
+    /// on (a few train it to the end). Off by default: the stopgap before ReSTIR PT, which now
+    /// gives Ray Reconstruction the dense input (sun room with PT: RR error 0.017 with it, 0.020
+    /// without, within noise) and is faster without it (trace 1.9 -> 1.6 ms at 1080p).
     pub sharc: bool,
     /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
     #[reflect(@0.05..=2.0_f32)]
@@ -156,7 +156,7 @@ impl Default for RenderSettings {
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
-            sharc: true,
+            sharc: false,
             sharc_voxel: 0.25,
             omm: true,
             rr_preset: RrPreset::current(),

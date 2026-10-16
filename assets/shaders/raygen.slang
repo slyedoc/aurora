@@ -1070,15 +1070,23 @@ void primary() {
         if (!recorded) {
             let kind = hit.GetHitKind();
             let triangle = hit.IsHit() && (kind == HIT_KIND_TRIANGLE_FRONT_FACE || kind == HIT_KIND_TRIANGLE_BACK_FACE);
-            rec.hit_kind = triangle ? kind : 0u;
-            if (triangle) {
-                let a = hit.GetAttributes<BuiltInTriangleIntersectionAttributes>();
+            // The analytic sphere: hit group 0 (sbt.rs); other procedural hits re-trace.
+            let sphere = hit.IsHit() && !triangle && hit.GetShaderTableIndex() == 0u;
+            rec.hit_kind = triangle ? kind : (sphere ? PRIMARY_SPHERE : 0u);
+            if (triangle || sphere) {
                 rec.origin = ray.Origin;
                 rec.direction = direction;
                 rec.instance = hit.GetInstanceIndex();
                 rec.geometry = hit.GetGeometryIndex();
                 rec.primitive = hit.GetPrimitiveIndex();
-                rec.bary = packUnorm16(a.barycentrics.x) | (packUnorm16(a.barycentrics.y) << 16);
+                if (triangle) {
+                    let a = hit.GetAttributes<BuiltInTriangleIntersectionAttributes>();
+                    rec.bary = packUnorm16(a.barycentrics.x) | (packUnorm16(a.barycentrics.y) << 16);
+                } else {
+                    // The object-space point lies on the radius-0.5 sphere: its direction, octahedral.
+                    let o = float32x3_to_oct(normalize(hit.GetAttributes<PrimarySphereAttributes>().point)) * 0.5 + 0.5;
+                    rec.bary = packUnorm16(o.x) | (packUnorm16(o.y) << 16);
+                }
                 rec.cone_width = cone_width;
             }
         }
@@ -1797,6 +1805,14 @@ float3 restirWinnerUnshadowed(uint idx, float3 origin, float3 n, float3 ns, floa
     return val * r.W;
 }
 
+// sphere.slang's hit attributes: the object-space point.
+struct PrimarySphereAttributes {
+    float3 point;
+};
+
+// `PrimaryHit::hit_kind` of a recorded analytic sphere (triangles keep their own kinds).
+static const uint PRIMARY_SPHERE = 0x100u;
+
 // The recorded hit rebuilt (no traversal) and shaded into `payload`.
 void resumeHit(PrimaryHit rec, inout HitPayload payload) {
     RayDesc ray;
@@ -1804,6 +1820,15 @@ void resumeHit(PrimaryHit rec, inout HitPayload payload) {
     ray.Direction = rec.direction;
     ray.TMin = 0.0;
     ray.TMax = rec.t;
+    if (rec.hit_kind == PRIMARY_SPHERE) {
+        PrimarySphereAttributes sa;
+        let o = float2(float(rec.bary & 0xFFFFu), float(rec.bary >> 16)) / 65535.0 * 2.0 - 1.0;
+        sa.point = 0.5 * oct_to_float32x3(o);
+        HitObject sphere = HitObject::MakeHit(topLevelAS, rec.instance, rec.geometry, rec.primitive,
+                                              0u, 0, 0, ray, sa);
+        HitObject::Invoke(topLevelAS, sphere, payload);
+        return;
+    }
     BuiltInTriangleIntersectionAttributes a;
     a.barycentrics = float2(float(rec.bary & 0xFFFFu), float(rec.bary >> 16)) / 65535.0;
     // No reorder: the records come in screen order, as coherent as the camera rays that made

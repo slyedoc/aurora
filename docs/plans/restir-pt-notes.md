@@ -121,12 +121,19 @@ Plan: `restir-pt.html`. Newest last.
 
 ## Deviations
 
-- Phase 0, procedural spheres in the primary record: deferred. Recording them needs MakeHit with the
-  sphere's attribute type and a marker other than hit_kind != 0; the sun room's spheres are metal (a
-  mirror and roughness 0.2), outside GI/PT eligibility anyway. Sphere pixels keep re-tracing from the
-  camera (no ReSTIR surface; their direct light comes from the path's NEE).
+- Phase 0, procedural spheres in the primary record: done 2026-10-15. The analytic sphere (hit group 0,
+  `HitObject::GetShaderTableIndex`) is recorded as hit_kind PRIMARY_SPHERE with its object-space point
+  octahedral in the barycentrics' word, and resumed by MakeHit with sphere.slang's attributes; its pixels
+  get a ReSTIR surface (DI and PT). Other procedural primitives still re-trace. Sun room
+  --matte-spheres: unbiased (1.000 / 0.012 against the truth, as before), RR error 0.024 -> 0.018,
+  black input 4 -> 0 %.
 - Layered primary vertices (thin translucency, clear coat) take no part: replay draws the base lobe only.
   GI took them for k = 1.
+- SHaRC off by default (2026-10-15): the stopgap before PT. With PT (temporal 8 + spatial 4) it no
+  longer helps: sun room RR error 0.017 with, 0.020 without (noise), bias 0.997 / 0.019 with, 1.000 /
+  0.012 without; many_lights identical; trace 1.9 -> 1.6 ms at 1080p without it (its queries and
+  deposits cost more than the paths it ends). The mechanism below is moot while it is off; removal
+  waits on Northshire (masked foliage is outside PT, where the cache might still pay).
 - SHaRC: a PT path teaches the cache only from x_k on. Its search vertices (no cached answers) made the
   voxels read brighter than the truth (own-only 0.035-0.038 against the truth, also with a stronger path
   hash; 0.018 with the restriction). The mechanism is not identified.
