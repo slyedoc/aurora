@@ -136,6 +136,12 @@ public float4 sampleLod(uint index, float2 uv, float lod_base) {
     return t.SampleLevel(uv, lod_base + 0.5 * log2(float(w) * float(h)));
 }
 
+// One texture read over the hit's footprint (SurfaceHit.duv1 / duv2: the ray cone's ellipse in
+// UV): the sampler filters it anisotropically, as a rasterizer's screen derivatives would.
+public float4 sampleGrad(uint index, float2 uv, float2 duv1, float2 duv2) {
+    return textures[NonUniformResourceIndex(index)].SampleGrad(uv, duv1, duv2);
+}
+
 public float4 sampleLevel(uint index, float2 uv, float level) {
     return textures[NonUniformResourceIndex(index)].SampleLevel(uv, level);
 }
@@ -191,6 +197,12 @@ public struct SurfaceHit {
     public float3 face_normal;
     // Ray-cone texture LOD before the per-texture texel-count term; feed `sampleLod`.
     public float lod_base;
+    // The ray cone's footprint on the surface as an ellipse (the bias applied): its two axes in
+    // world space, and in the mesh's UV; feed `sampleGrad`.
+    public float3 axis1;
+    public float3 axis2;
+    public float2 duv1;
+    public float2 duv2;
     public bool inside;
     public float3 bary;
 };
@@ -245,6 +257,37 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
     let incidence = max(abs(dot(hit.surface_normal, WorldRayDirection())), 0.1);
     hit.lod_base = tri.lod - log2(object_scale) + log2(coneWidth(payload)) - log2(incidence)
         + uniformLodBias();
+
+    // The footprint's ellipse (Akenine-Moller et al. 2021, "Improved Shader and Texture Level
+    // of Detail Using Ray Cones"): one axis across the ray, one along it stretched by the
+    // grazing angle, each the cone's width wide seen from the ray; then each axis's barycentric
+    // step over the face, in UV.
+    let d = WorldRayDirection();
+    let n = hit.face_normal;
+    let w = coneWidth(payload) * exp2(uniformLodBias());
+    var a1 = d - dot(n, d) * n;
+    if (dot(a1, a1) < 1.0e-8) {
+        a1 = abs(n.x) < 0.9 ? cross(n, float3(1.0, 0.0, 0.0)) : cross(n, float3(0.0, 1.0, 0.0));
+    }
+    let p1 = a1 - dot(d, a1) * d;
+    a1 *= w / max(length(p1), 1.0e-4);
+    var a2 = cross(n, a1);
+    let p2 = a2 - dot(d, a2) * d;
+    a2 *= w / max(length(p2), 1.0e-4);
+    hit.axis1 = a1;
+    hit.axis2 = a2;
+    let area = dot(n, cross(e1, e2));
+    let duv_e1 = unpackUv(tri.uv1) - unpackUv(tri.uv0);
+    let duv_e2 = unpackUv(tri.uv2) - unpackUv(tri.uv0);
+    if (abs(area) > 1.0e-12) {
+        let b1 = float2(dot(n, cross(a1, e2)), dot(n, cross(e1, a1))) / area;
+        let b2 = float2(dot(n, cross(a2, e2)), dot(n, cross(e1, a2))) / area;
+        hit.duv1 = b1.x * duv_e1 + b1.y * duv_e2;
+        hit.duv2 = b2.x * duv_e1 + b2.y * duv_e2;
+    } else {
+        hit.duv1 = float2(0.0);
+        hit.duv2 = float2(0.0);
+    }
     return hit;
 }
 
@@ -269,7 +312,7 @@ public float3 surfaceShadingNormal(SurfaceHit hit) {
         return hit.surface_normal;
     }
     return surfaceWorldNormal(
-        hit, normalTexel(sampleLod(hit.material.normal_texture, hit.uv, hit.lod_base)));
+        hit, normalTexel(sampleGrad(hit.material.normal_texture, hit.uv, hit.duv1, hit.duv2)));
 }
 
 // This hit's instance slot: the TLAS is built from the live slots packed (tlas_builder.rs), so

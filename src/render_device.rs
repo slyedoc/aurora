@@ -1249,6 +1249,8 @@ unsafe fn create_logical_device(
             .shader_int64(true)
             .shader_float64(true)
             .shader_int16(true)
+            // Anisotropic texture filtering (descriptor_heap.rs linear_sampler_info).
+            .sampler_anisotropy(true)
             // The post-process pass writes the exposure meter from what it displays.
             .fragment_stores_and_atomics(true);
 

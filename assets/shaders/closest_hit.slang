@@ -12,7 +12,7 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
     payload.absorption = float3(material.absorption_r, material.absorption_g, material.absorption_b);
 
     let base = materialBaseColor(material);
-    payload.color = base * sampleLod(material.base_color_texture, hit.uv, hit.lod_base);
+    payload.color = base * sampleGrad(material.base_color_texture, hit.uv, hit.duv1, hit.duv2);
     if (material.alpha_cutoff > 0.0) {
         // A cutout's coverage comes from level 0, like the any-hit test: a blurred alpha would
         // thin foliage out with distance. Binary at the cutoff, the any-hit's own test: the
@@ -23,12 +23,12 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
         payload.color.a = coverage >= material.alpha_cutoff ? 1.0 : 0.0;
     }
     payload.emission = materialEmissive(material)
-        * sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base).rgb
+        * sampleGrad(material.base_emissive_texture, hit.uv, hit.duv1, hit.duv2).rgb
         * uniformEmissiveBoost();
 
     let transmission = material.specular_transmission_factor
-        * sampleLod(material.specular_transmission_texture, hit.uv, hit.lod_base).r;
-    let mr = sampleLod(material.metallic_roughness_texture, hit.uv, hit.lod_base);
+        * sampleGrad(material.specular_transmission_texture, hit.uv, hit.duv1, hit.duv2).r;
+    let mr = sampleGrad(material.metallic_roughness_texture, hit.uv, hit.duv1, hit.duv2);
     let roughness = material.roughness_factor * mr.g;
     let metallic = material.metallic_factor * mr.b;
 

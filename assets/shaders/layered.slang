@@ -90,7 +90,7 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
     payload.absorption = float3(material.absorption_r, material.absorption_g, material.absorption_b);
 
     var albedo = materialBaseColor(material)
-        * sampleLod(material.base_color_texture, hit.uv, hit.lod_base);
+        * sampleGrad(material.base_color_texture, hit.uv, hit.duv1, hit.duv2);
     var roughness = material.roughness_factor;
     var metallic = material.metallic_factor;
     var normal = surfaceShadingNormal(hit);
@@ -135,11 +135,11 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
 
     payload.color = albedo;
     payload.emission = materialEmissive(material)
-        * sampleLod(material.base_emissive_texture, hit.uv, hit.lod_base).rgb
+        * sampleGrad(material.base_emissive_texture, hit.uv, hit.duv1, hit.duv2).rgb
         * uniformEmissiveBoost();
 
     let transmission = material.specular_transmission_factor
-        * sampleLod(material.specular_transmission_texture, hit.uv, hit.lod_base).r;
+        * sampleGrad(material.specular_transmission_texture, hit.uv, hit.duv1, hit.duv2).r;
 
     surfaceWritePayload(payload, hit, normal);
     hitPayloadSetTransmission(payload, transmission);

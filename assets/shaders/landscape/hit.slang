@@ -1,7 +1,8 @@
 // The landscape surface class: tiles shade from the evaluated material pages. The hit's
 // landscape-local position finds its texels; their top-4 sets blend bilinearly into one set,
 // whose four heaviest palette materials are sampled and mixed (aurora_landscape shading.rs).
-// A hit shader has no derivatives; every read is at the ray-cone level.
+// A hit shader has no derivatives; every read filters the ray cone's footprint (SampleGrad over
+// its ellipse, surface.slang), anisotropically like a rasterizer's.
 import surface;
 import materials;
 import pages;
@@ -77,10 +78,6 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
             mat_merge(s, texel_set(r, t + int2(0, 1)), (1.0 - f.x) * f.y);
             mat_merge(s, texel_set(r, t + int2(1, 1)), f.x * f.y);
 
-            // Ray-cone footprint in metres; each material adds its texels per metre.
-            let incidence = max(abs(dot(hit.surface_normal, WorldRayDirection())), 0.1);
-            let footprint = coneWidth(payload) / incidence;
-
             // No tangents on the tiles: +X projected onto the normal; the bitangent as the
             // meshes build it (surface.slang), so a normal map's +Y is the top of its image.
             let n = hit.surface_normal;
@@ -101,14 +98,18 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
                     continue;
                 }
                 let e = r.palette[min(s.ids[i], r.palette_len - 1)];
-                let uv = local.xz / max(e.tile_size, 1.0e-3);
-                let lod = log2(footprint / max(e.tile_size, 1.0e-3)) + uniformLodBias();
+                // The material tiles straight down (UV = xz / tile): the footprint's axes
+                // likewise.
+                let inv_tile = 1.0 / max(e.tile_size, 1.0e-3);
+                let uv = local.xz * inv_tile;
+                let d1 = hit.axis1.xz * inv_tile;
+                let d2 = hit.axis2.xz * inv_tile;
                 if (e.albedo != NO_TEXTURE) {
-                    a += sampleLod(e.albedo, uv, lod).rgb * w;
+                    a += sampleGrad(e.albedo, uv, d1, d2).rgb * w;
                 } else {
                     a += float3(0.5) * w;
                 }
-                tn += (e.normal != NO_TEXTURE ? normalTexel(sampleLod(e.normal, uv, lod))
+                tn += (e.normal != NO_TEXTURE ? normalTexel(sampleGrad(e.normal, uv, d1, d2))
                                               : float3(0.0, 0.0, 1.0)) * w;
                 rough += e.roughness * w;
                 coat += e.clearcoat * w;

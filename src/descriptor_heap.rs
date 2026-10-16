@@ -650,7 +650,10 @@ fn linear_sampler_info() -> vk::SamplerCreateInfo<'static> {
         .address_mode_u(vk::SamplerAddressMode::REPEAT)
         .address_mode_v(vk::SamplerAddressMode::REPEAT)
         .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .anisotropy_enable(false)
+        // Ray-traced hits read with SampleGrad over the ray cone's footprint (surface.slang):
+        // across a surface seen at an angle the hardware filters the ellipse, not one blurred mip.
+        .anisotropy_enable(true)
+        .max_anisotropy(16.0)
         .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
         .unnormalized_coordinates(false)
         .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
