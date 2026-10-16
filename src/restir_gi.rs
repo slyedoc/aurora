@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn gi_frame_layout() {
         use core::mem::offset_of;
-        assert_eq!(offset_of!(GiFrameGpu, width), 32);
-        assert_eq!(std::mem::size_of::<GiFrameGpu>(), 64);
+        assert_eq!(offset_of!(GiFrameGpu, width), 40);
+        assert_eq!(std::mem::size_of::<GiFrameGpu>(), 72);
     }
 }
