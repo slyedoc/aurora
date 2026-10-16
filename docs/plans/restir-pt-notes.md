@@ -137,3 +137,19 @@ Plan: `restir-pt.html`. Newest last.
   (Zero sets restir_gi); phase 4's "remove GI" is the replacement, not a rename.
 - Untested: Northshire (Zero has no capture yet; its default now runs PT with 4 neighbours), XR.
 
+
+- 2026-10-15: temporal reuse re-gated with captures that settle on traced frames (the earlier RR
+  numbers came ~15 traced frames in, RR's history unsettled). Sun room 960x540, --ev100 9:
+
+  | config | bias vs truth | input black | RR block error | RR change |
+  |---|---|---|---|---|
+  | spatial 4 | 0.998 / 0.019 | 21 % | 0.031 | 0.002 |
+  | temporal 8 | -- | 3 % | 0.060 | 0.012 |
+  | temporal 8 + spatial 4 | 0.998 / 0.018 | 3 % | 0.016 | 0.003 |
+  | temporal 20 + spatial 4 | 0.998 / 0.019 | 3 % | 0.015 | 0.002 |
+
+  Temporal + spatial halves RR's error: restir_pt_history defaults to 8 (20 is no better and
+  slower to follow lighting changes). Defaults under auto-exposure: RR 1.025 / 0.016; many_lights
+  unbiased (1.000 / 0.004), RR 0.987 / 0.029. gi_temporal costs ~0.2x gi_spatial (0.67 vs 3.3 ms
+  in a 1080p capture, whose host-visible writes slow every pass). Untested: camera motion
+  (reprojection, disocclusion) -- captures hold the camera still.
