@@ -81,7 +81,13 @@ impl CaptureArgs {
             motion: value("--motion").and_then(|v| v.parse().ok()),
             sun_motion: value("--sun-motion").and_then(|v| v.parse().ok()),
             sun_jump: value("--sun-jump").and_then(|v| v.parse().ok()).map(|deg| {
-                (deg, value("--after").and_then(|v| v.parse().ok()).unwrap_or(1u32).max(1))
+                (
+                    deg,
+                    value("--after")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1u32)
+                        .max(1),
+                )
             }),
         })
     }
@@ -135,7 +141,10 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         feed(app, args);
         return;
     }
-    let pose = *app.world().get::<Transform>(camera).expect("the camera's transform");
+    let pose = *app
+        .world()
+        .get::<Transform>(camera)
+        .expect("the camera's transform");
     let sun = app
         .world_mut()
         .query_filtered::<Entity, With<DirectionalLight>>()
@@ -154,8 +163,10 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
             for i in (1..MOTION_STEPS).rev() {
                 let t = i as f32 / MOTION_STEPS as f32;
                 if let Some(speed) = args.motion {
-                    app.world_mut().get_mut::<Transform>(camera).unwrap().translation =
-                        pose.translation - pose.right() * (speed * t);
+                    app.world_mut()
+                        .get_mut::<Transform>(camera)
+                        .unwrap()
+                        .translation = pose.translation - pose.right() * (speed * t);
                 }
                 if let Some(deg) = args.sun_motion {
                     set_sun(app, -deg * t);

@@ -552,7 +552,9 @@ impl ViewExposure {
             if self.input_ev.is_none() {
                 let ev = match exposure {
                     AuroraExposure::Fixed(fixed) => fixed.ev,
-                    _ => settings.reference_ev.clamp(settings.min_ev, settings.max_ev),
+                    _ => settings
+                        .reference_ev
+                        .clamp(settings.min_ev, settings.max_ev),
                 };
                 self.write_ev(rd, cmd, ev);
                 self.input_ev = Some(ev);

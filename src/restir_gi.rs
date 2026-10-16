@@ -340,12 +340,16 @@ fn sun_trust(prev: &[(Vec3, Vec3)], now: &[(Vec3, Vec3)]) -> f32 {
     if prev.len() != now.len() {
         return 0.0;
     }
-    let change = prev.iter().zip(now).fold(0.0f32, |m, ((d0, r0), (d1, r1))| {
-        let angle = d0.dot(*d1).clamp(-1.0, 1.0).acos().to_degrees();
-        let lum = |r: &Vec3| r.dot(Vec3::new(0.2126, 0.7152, 0.0722));
-        let rel = (lum(r1) - lum(r0)).abs() / lum(r0).max(lum(r1)).max(1.0e-6);
-        m.max(angle / 0.5 + rel / 0.02)
-    });
+    let change = prev
+        .iter()
+        .zip(now)
+        .fold(0.0f32, |m, ((d0, r0), (d1, r1))| {
+            // atan2, not acos: an f32 dot near 1 cannot tell a hundredth of a degree from nothing.
+            let angle = d0.cross(*d1).length().atan2(d0.dot(*d1)).to_degrees();
+            let lum = |r: &Vec3| r.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+            let rel = (lum(r1) - lum(r0)).abs() / lum(r0).max(lum(r1)).max(1.0e-6);
+            m.max(angle / 0.5 + rel / 0.02)
+        });
     1.0 / (1.0 + change)
 }
 
@@ -362,7 +366,12 @@ mod tests {
 
     #[test]
     fn sun_trust_keeps_slow_suns_and_drops_jumps() {
-        let sun = |deg: f32| (Vec3::new(deg.to_radians().cos(), 0.5, deg.to_radians().sin()).normalize(), Vec3::ONE);
+        let sun = |deg: f32| {
+            (
+                Vec3::new(deg.to_radians().cos(), 0.5, deg.to_radians().sin()).normalize(),
+                Vec3::ONE,
+            )
+        };
         assert!(sun_trust(&[sun(0.0)], &[sun(0.004)]) > 0.99);
         assert!(sun_trust(&[sun(0.0)], &[sun(10.0)]) < 0.1);
         assert_eq!(sun_trust(&[], &[sun(0.0)]), 0.0);
