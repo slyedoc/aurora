@@ -196,3 +196,22 @@ Plan: `restir-pt.html`. Newest last.
   Found on the way, engine-wide, not PT: the first frame after a sun change is traced partly with the
   old lighting (no GI, no ReSTIR: 0.965 / block error 0.168 one frame after a 10 degree jump, 1.000
   the next; the generated sky most, a flat sky 0.041). Open.
+
+- 2026-10-16: Northshire (zero examples/northshire --capture; the captures needed the world held
+  still, the shader clock pinned, a quiet wait and texture-arrival resets to be reproducible, then
+  agreed run to run to 0.2-0.4 %). Every PT configuration unbiased at canopy and lane (block error
+  0.003-0.009 against the no-PT truth). SHaRC: lane 1.005 / 0.020 (slightly biased), RR no better,
+  +0.3 ms: it stays off. Cost at 3840x1080 (lane, GPU busy): no PT 5.80 ms, spatial 4 6.73, temporal
+  4 + spatial 4 8.00 (gi_spatial 0.49 -> 1.44 ms on dense temporal reservoirs), + SHaRC 8.31.
+  RR error (16384-frame abbey reference; canopy / lane against their truths):
+
+  | | canopy | lane | abbey |
+  |---|---|---|---|
+  | no PT | 0.023 | 0.021 | 0.114 |
+  | spatial 4 | 0.022 | 0.023 | 0.113 |
+  | temporal 4 + spatial 4 | 0.023 | 0.019 | 0.139 (RR 1.087) |
+
+  In the abbey (sparse window light) temporal reuse makes RR read bright at every cap (cap 1 0.115,
+  1.038); skipping it at random for half the pixels did not help (abbey 0.123, sun room 0.034).
+  restir_pt_history defaults to 0 again: spatial reuse only. The first frame after a sun change
+  being traced partly with the old lighting (engine-wide) is still open.
