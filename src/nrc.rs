@@ -38,7 +38,6 @@ pub const NRC_RECORD_BYTES: u64 = 48;
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct NrcNetGpu {
     pub weights: u64,
-    pub weights_t: u64,
     pub biases: u64,
     pub params: u64,
     pub adam_m: u64,
@@ -95,7 +94,6 @@ impl Default for NrcTraining {
 
 pub struct NrcNetwork {
     pub weights: Buffer<u8>,
-    pub weights_t: Buffer<u8>,
     pub biases: Buffer<u8>,
     pub params: Buffer<u8>,
     pub adam_m: Buffer<u8>,
@@ -130,27 +128,17 @@ pub fn initial_params(seed: u64) -> Vec<f32> {
     params
 }
 
-/// The f16 forward copy ([layer][out][in]) and its transpose ([layer][in][out]) of `params`'s
-/// weights, and its biases.
-pub fn half_copies(params: &[f32]) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
-    let n = NRC_WIDTH as usize;
-    let weights: Vec<f16> = params[..(NRC_LAYERS * NRC_MATRIX) as usize]
+/// The f16 copies ([layer][out][in] weights, then biases) of `params`.
+pub fn half_copies(params: &[f32]) -> (Vec<f16>, Vec<f16>) {
+    let weights = params[..(NRC_LAYERS * NRC_MATRIX) as usize]
         .iter()
         .map(|&w| f16::from_f32(w))
         .collect();
-    let mut weights_t = vec![f16::ZERO; weights.len()];
-    for l in 0..NRC_LAYERS as usize {
-        for o in 0..n {
-            for i in 0..n {
-                weights_t[l * n * n + i * n + o] = weights[l * n * n + o * n + i];
-            }
-        }
-    }
     let biases = params[(NRC_LAYERS * NRC_MATRIX) as usize..]
         .iter()
         .map(|&b| f16::from_f32(b))
         .collect();
-    (weights, weights_t, biases)
+    (weights, biases)
 }
 
 impl NrcNetwork {
@@ -164,7 +152,6 @@ impl NrcNetwork {
         let rows = batch as u64 * NRC_LAYERS * NRC_WIDTH;
         let mut this = Self {
             weights: rd.create_device_buffer(NRC_LAYERS * NRC_MATRIX * 2, usage),
-            weights_t: rd.create_device_buffer(NRC_LAYERS * NRC_MATRIX * 2, usage),
             biases: rd.create_device_buffer(NRC_LAYERS * NRC_WIDTH * 2, usage),
             params: rd.create_device_buffer(NRC_PARAMS * 4, usage),
             adam_m: rd.create_device_buffer(NRC_PARAMS * 4, usage),
@@ -192,11 +179,10 @@ impl NrcNetwork {
     /// Fresh weights from `seed`, Adam's moments cleared, records zeroed (waits for the upload).
     pub fn reset(&mut self, rd: &RenderDevice, seed: u64) {
         let params = initial_params(seed);
-        let (weights, weights_t, biases) = half_copies(&params);
-        let uploads: [(&Buffer<u8>, &[u8]); 7] = [
+        let (weights, biases) = half_copies(&params);
+        let uploads: [(&Buffer<u8>, &[u8]); 6] = [
             (&self.params, bytemuck::cast_slice(&params)),
             (&self.weights, bytemuck::cast_slice(&weights)),
-            (&self.weights_t, bytemuck::cast_slice(&weights_t)),
             (&self.biases, bytemuck::cast_slice(&biases)),
             (&self.ema, bytemuck::cast_slice(&params)),
             (&self.weights_ema, bytemuck::cast_slice(&weights)),
@@ -246,8 +232,7 @@ impl NrcNetwork {
             training.radiance_scale,
             training.loss_scale,
             training.ema_decay,
-        )
-        {
+        ) {
             self.training = training;
             self.dirty = true;
         }
@@ -256,7 +241,6 @@ impl NrcNetwork {
     pub fn gpu(&self) -> NrcNetGpu {
         NrcNetGpu {
             weights: self.weights.address,
-            weights_t: self.weights_t.address,
             biases: self.biases.address,
             params: self.params.address,
             adam_m: self.adam_m.address,
@@ -421,7 +405,6 @@ impl NrcNetwork {
     pub fn destroy(&mut self, rd: &RenderDevice) {
         for handle in [
             self.weights.handle,
-            self.weights_t.handle,
             self.biases.handle,
             self.params.handle,
             self.adam_m.handle,
@@ -636,19 +619,18 @@ mod tests {
 
     #[test]
     fn layouts_match_the_shaders() {
-        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 144);
-        assert_eq!(std::mem::offset_of!(NrcNetGpu, ring), 120);
+        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 136);
+        assert_eq!(std::mem::offset_of!(NrcNetGpu, ring), 112);
         assert_eq!(std::mem::size_of::<NrcPush>(), 32);
         assert_eq!(std::mem::size_of::<NrcFrameGpu>(), 64);
         assert_eq!(std::mem::offset_of!(NrcFrameGpu, ring), 48);
     }
 
     #[test]
-    fn transposed_copy_is_the_transpose() {
+    fn half_copies_split_weights_and_biases() {
         let params = initial_params(3);
-        let (w, wt, b) = half_copies(&params);
-        let n = NRC_WIDTH as usize;
-        assert_eq!(w[2 * n * n + 5 * n + 9], wt[2 * n * n + 9 * n + 5]);
+        let (w, b) = half_copies(&params);
+        assert_eq!(w.len(), (NRC_LAYERS * NRC_MATRIX) as usize);
         assert_eq!(b.len(), (NRC_LAYERS * NRC_WIDTH) as usize);
         assert!(b.iter().all(|x| *x == f16::ZERO));
     }

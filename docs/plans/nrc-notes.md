@@ -52,6 +52,21 @@ Plan: `nrc.html`. Newest last.
 - Phase 0 soak #1 was void: the running app hot-reloaded raygen edits made meanwhile (a new
   NrcFrame layout against the old binary). Never edit shaders during a soak.
 
+- 2026-10-16 (later): Slang 2026.19 (standalone, ~/.local/share/slang; shader.rs picks the newest
+  slangc among the SDK's and PATH's). 2026.12 made CoopVec differentiable; matrix products are
+  still not (layout-dependent): each layer is `coopVecMatMulAdd` with a `[BackwardDerivative]`
+  rule (Slang's examples/mlp-training-coopvec), the loss and ReLUs are `bwd_diff`. The backward
+  reads the same weights `ColumnMajor` (the transposed f16 copy is gone). Gym unchanged (loss
+  gradient 3.8e-4, backward 4.0e-4, weight gradients 8.0e-8). Timing, lane 3840x1080 (busy /
+  trace, ms; two runs each): 2026.8 off 10.7, 10.4 / 5.35, 5.20, on 21.3, 21.2 / 15.5, 15.4, training
+  0.41; 2026.19 same shaders off 10.3, 10.1 / 5.14, 5.05, on 21.1, 21.1 / 15.4, 15.3, training 0.41;
+  autodiff port off 10.4, 10.2 / 5.23, 5.11, on 21.3, 21.3 / 15.5, 15.5, training 0.40. Gym 13.3-13.5k
+  steps/s throughout. Neither the compiler nor the port moves the cost; inline inference is +10 ms.
+- The output-gradient handling trades scenes: clipped at +-1024 (loss scale 1) the sun room reads
+  1.002 / 0.016 and the abbey 0.955 (rare bright targets dropped); scaled by 1/16 unclipped it reads
+  1.014-1.018 / 0.08-0.10 and the abbey 1.009 (they kick the network up). The relative L2 gradient
+  2 (p - t) / (p^2 + 0.01) explodes on a dim prediction; epsilon is in pre-exposed units. Open.
+
 ## Deviations
 
 - D5: aurora traces in world space (not camera-relative, the plan assumed solari's convention), so

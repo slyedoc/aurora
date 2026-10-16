@@ -190,18 +190,50 @@ pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
     Some(base.join("aurora"))
 }
 
-/// The Vulkan SDK's `slangc` (`$VULKAN_SDK/bin`), else the one on `PATH`.
+/// The newest `slangc` among the Vulkan SDK's (`$VULKAN_SDK/bin`) and those on `PATH` (by
+/// `slangc -v`, asked once): a standalone release newer than the SDK's wins (cooperative-vector
+/// autodiff needs 2026.12). Ties keep the SDK's.
 fn slangc_path() -> std::path::PathBuf {
-    let sdk = std::env::var_os("VULKAN_SDK")
-        .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"));
-    let path = std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|dir| dir.join("slangc"));
-    sdk.into_iter()
-        .chain(path)
-        .find(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("slangc"))
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let sdk = std::env::var_os("VULKAN_SDK")
+            .map(|sdk| std::path::PathBuf::from(sdk).join("bin").join("slangc"));
+        let path = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join("slangc"));
+        let mut best: Option<(Vec<u32>, std::path::PathBuf)> = None;
+        for candidate in sdk.into_iter().chain(path).filter(|p| p.exists()) {
+            let Some(version) = slangc_version(&candidate) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(v, _)| version > *v) {
+                best = Some((version, candidate));
+            }
+        }
+        match best {
+            Some((version, path)) => {
+                log::info!("slangc {version:?}: {}", path.display());
+                path
+            }
+            None => std::path::PathBuf::from("slangc"),
+        }
+    })
+    .clone()
+}
+
+/// `slangc -v` as numbers (`2026.19` -> [2026, 19]).
+fn slangc_version(slangc: &std::path::Path) -> Option<Vec<u32>> {
+    let out = std::process::Command::new(slangc).arg("-v").output().ok()?;
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let word = text.split_whitespace().next()?;
+    let version: Vec<u32> = word
+        .trim_start_matches('v')
+        .split('.')
+        .map_while(|n| n.parse().ok())
+        .collect();
+    (!version.is_empty()).then_some(version)
 }
 
 const SLANGC_ARGS: &[&str] = &[

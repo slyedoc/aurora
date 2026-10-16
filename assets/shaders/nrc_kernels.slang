@@ -13,7 +13,6 @@ static const uint NRC_CHUNK = 256;
 // Must match NrcNetGpu in src/nrc.rs.
 struct NrcNet {
     half* weights;    // [layer][out][in], what the forward passes read
-    half* weights_t;  // [layer][in][out], what backpropagation reads
     half* biases;     // [layer][out]
     float* params;    // f32 master copy: the weights ([layer][out][in]), then the biases
     float* adam_m;
@@ -57,7 +56,80 @@ uint ptHashKernel(uint x) {
     return h;
 }
 
-// One record per thread: forward, loss, backward to every layer's output gradient.
+// Where a training row keeps each layer's input (acts) and output gradient (dz) for the weight
+// gradients (nrc_train_grads): byte offsets of the row and of one layer's block.
+struct NrcRow {
+    NrcNet* net;
+    int row;
+    int layer;
+};
+
+// One layer, W x + b. A cooperative-vector matrix product is not differentiable (it depends on
+// layout), so it carries its own reverse rule (Slang's examples/mlp-training-coopvec pattern).
+[BackwardDerivative(nrcLayerBwd)]
+CoopVec<half, NRC_WIDTH> nrcLayer(NrcRow r, uint l, CoopVec<half, NRC_WIDTH> x) {
+    x.store(r.net.acts, int(l) * r.layer + r.row);
+    return coopVecMatMulAdd<half, NRC_WIDTH>(
+        x, CoopVecComponentType::Float16,
+        (void*)(r.net.weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
+        (void*)(r.net.biases + l * NRC_WIDTH), CoopVecComponentType::Float16,
+        CoopVecMatrixLayout::RowMajor, false, NRC_WIDTH * 2u);
+}
+
+// The layer's output gradient kept for the weight gradients; the input's is W^T dy: the same
+// matrix read column-major. Layer 0's input is the encoding, which needs none.
+void nrcLayerBwd(NrcRow r, uint l, inout DifferentialPair<CoopVec<half, NRC_WIDTH>> x,
+                 CoopVec<half, NRC_WIDTH> dy) {
+    dy.store(r.net.dz, int(l) * r.layer + r.row);
+    var dx = CoopVec<half, NRC_WIDTH>(half(0.0));
+    if (l > 0u) {
+        dx = coopVecMatMul<half, NRC_WIDTH>(
+            dy, CoopVecComponentType::Float16,
+            (void*)(r.net.weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
+            CoopVecMatrixLayout::ColumnMajor, false, NRC_WIDTH * 2u);
+    }
+    x = diffPair(x.p, dx);
+}
+
+[Differentiable]
+float3 nrcNetwork(NrcRow r, CoopVec<half, NRC_WIDTH> x) {
+    var h = x;
+    [ForceUnroll]
+    for (uint l = 0u; l < NRC_LAYERS; l++) {
+        h = nrcLayer(r, l, h);
+        if (l + 1u < NRC_LAYERS) {
+            h = max(h, CoopVec<half, NRC_WIDTH>(half(0.0)));
+        }
+    }
+    return float3(float(h[0]), float(h[1]), float(h[2]));
+}
+
+// Identity forward; backward keeps the output gradient inside f16 (it is a tensor-core operand)
+// and drops a non-finite one (0 x NaN is NaN: a poisoned row must not reach Adam).
+[BackwardDerivative(nrcGuardBwd)]
+float3 nrcGuard(float3 p) {
+    return p;
+}
+
+void nrcGuardBwd(inout DifferentialPair<float3> p, float3 d) {
+    let ok = !(any(isnan(d)) || any(isinf(d)));
+    p = diffPair(p.p, ok ? clamp(d, -6.0e4, 6.0e4) : float3(0.0));
+}
+
+// Relative L2: the prediction's luminance in the denominator, held constant. Its value is kept
+// per row (the loss readout).
+[Differentiable]
+float nrcLoss(NrcRow r, CoopVec<half, NRC_WIDTH> x, no_diff float3 t, no_diff uint row_index) {
+    let p = nrcGuard(nrcNetwork(r, x));
+    let lp = no_diff luma(max(detach(p), float3(0.0)));
+    let diff = p - t;
+    let loss = dot(diff, diff) / (lp * lp + 0.01);
+    r.net.loss[row_index] = isnan(detach(loss)) || isinf(detach(loss)) ? 0.0 : detach(loss);
+    return loss;
+}
+
+// One record per thread: the loss's reverse pass (bwd_diff), which leaves every layer's input
+// and output gradient for nrc_train_grads.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void nrc_train_forward(uint3 id: SV_DispatchThreadID) {
@@ -75,50 +147,10 @@ void nrc_train_forward(uint3 id: SV_DispatchThreadID) {
     let pick = ptHashKernel((push.offset + row_index) ^ (push.step * 0x9e3779b9u)) % count;
     let rec = net.records[pick];
     let inp = nrcUnpackRecord(rec);
-    let row = int(row_index * NRC_WIDTH * 2u);
-    let layer = int(net.batch * NRC_WIDTH * 2u);
-    var x = nrcEncode(inp);
-    var z = x;
-    [ForceUnroll]
-    for (uint l = 0u; l < NRC_LAYERS; l++) {
-        x.store(net.acts, int(l) * layer + row);
-        z = coopVecMatMulAdd<half, NRC_WIDTH>(
-            x, CoopVecComponentType::Float16,
-            (void*)(net.weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
-            (void*)(net.biases + l * NRC_WIDTH), CoopVecComponentType::Float16,
-            CoopVecMatrixLayout::RowMajor, false, NRC_WIDTH * 2u);
-        x = max(z, CoopVec<half, NRC_WIDTH>(half(0.0)));
-    }
-    let p = float3(float(z[0]), float(z[1]), float(z[2]));
     let t = unpackRadiance(rec.target) * net.radiance_scale / nrcFactor(inp);
-    // Relative L2 (the prediction's luminance in the denominator, held constant).
-    let lp = luma(max(p, float3(0.0)));
-    let den = lp * lp + 0.01;
-    let diff = p - t;
-    let loss = dot(diff, diff) / den;
-    let finite = !(isnan(loss) || isinf(loss));
-    net.loss[row_index] = finite ? loss : 0.0;
-    let g = finite ? clamp(2.0 * diff / den * net.loss_scale, -6.0e4, 6.0e4) : float3(0.0);
-    var d = CoopVec<half, NRC_WIDTH>(half(0.0));
-    d[0] = half(g.x);
-    d[1] = half(g.y);
-    d[2] = half(g.z);
-    d.store(net.dz, int(NRC_LAYERS - 1u) * layer + row);
-    [ForceUnroll]
-    for (uint l = NRC_LAYERS - 1u; l > 0u; l--) {
-        d = coopVecMatMul<half, NRC_WIDTH>(
-            d, CoopVecComponentType::Float16,
-            (void*)(net.weights_t + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
-            CoopVecMatrixLayout::RowMajor, false, NRC_WIDTH * 2u);
-        let a = coopVecLoad<NRC_WIDTH, half>(net.acts, int(l) * layer + row);
-        [ForceUnroll]
-        for (uint i = 0u; i < NRC_WIDTH; i++) {
-            if (a[i] <= half(0.0)) {
-                d[i] = half(0.0);
-            }
-        }
-        d.store(net.dz, int(l - 1u) * layer + row);
-    }
+    NrcRow r = { net, int(row_index * NRC_WIDTH * 2u), int(net.batch * NRC_WIDTH * 2u) };
+    var x = diffPair(nrcEncode(inp));
+    bwd_diff(nrcLoss)(r, x, t, row_index, net.loss_scale);
 }
 
 groupshared float g_dz[32][NRC_WIDTH];
@@ -207,11 +239,7 @@ void nrc_adam(uint3 id: SV_DispatchThreadID) {
     let e = lerp(w, net.ema[p], net.ema_decay);
     net.ema[p] = e;
     if (p < NRC_LAYERS * NRC_MATRIX_HALVES) {
-        let l = p / NRC_MATRIX_HALVES;
-        let o = (p % NRC_MATRIX_HALVES) / NRC_WIDTH;
-        let i = p % NRC_WIDTH;
         net.weights[p] = half(w);
-        net.weights_t[l * NRC_MATRIX_HALVES + i * NRC_WIDTH + o] = half(w);
         net.weights_ema[p] = half(e);
     } else {
         net.biases[p - NRC_LAYERS * NRC_MATRIX_HALVES] = half(w);
