@@ -2185,9 +2185,11 @@ void main() {
                 // The path's last vertex ends in the cache too, training or not: what lies past
                 // max_bounces comes back (self-training, Müller et al. 2021 sec. 5: training
                 // targets then carry every bounce).
-                let pt_past = (path & PATH_PT_SEARCH) == 0u
-                    && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
+                // A path still searching at its last vertex found no x_k (its light stays in the
+                // pixel), so the cache may end it too: glass in front had used up its bounces.
                 let last = bounce_idx + 1u >= MAX_BOUNCES;
+                let pt_past = ((path & PATH_PT_SEARCH) == 0u || last)
+                    && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
                 let spread_out = nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0;
                 if (nrcInBox(q.position) && (pc.nrc.flags & NRC_FLAG_INLINE) != 0u && pt_past
                     && (last || spread_out) && !nrc_ended) {
