@@ -98,7 +98,11 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             }
             "--bounces" => {
                 if let Some(n) = args.get(i + 1).and_then(|n| n.parse().ok()) {
-                    settings.max_bounces = n;
+                    // N path vertices: N - 1 bounces of every kind.
+                    let b: u32 = n;
+                    settings.max_diffuse_bounces = b.saturating_sub(1);
+                    settings.max_specular_bounces = b.saturating_sub(1);
+                    settings.max_transmission_bounces = b.saturating_sub(1).max(10);
                 }
             }
             "--di-history" => {

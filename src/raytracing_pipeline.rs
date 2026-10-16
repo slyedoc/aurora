@@ -47,7 +47,11 @@ pub struct PipelineFeatures {
     /// Some environment's sky is the atmosphere.
     pub atmosphere: bool,
     pub samples: u32,
+    /// The loop's vertex cap: the largest budget plus the primary vertex.
     pub max_bounces: u32,
+    pub max_diffuse_bounces: u32,
+    pub max_specular_bounces: u32,
+    pub max_transmission_bounces: u32,
     pub light_candidates: u32,
     /// `spec_hit_roughness`'s bits (the struct compares exactly).
     pub spec_hit_roughness: u32,
@@ -66,7 +70,15 @@ impl PipelineFeatures {
             restir_gi: settings.is_some_and(|s| s.restir_gi),
             atmosphere: skies.is_some_and(|s| s.atmosphere.is_some()),
             samples: s.samples.max(1),
-            max_bounces: s.max_bounces.max(1),
+            max_bounces: (s
+                .max_diffuse_bounces
+                .max(s.max_specular_bounces)
+                .max(s.max_transmission_bounces)
+                + 1)
+            .min(64),
+            max_diffuse_bounces: s.max_diffuse_bounces.min(63),
+            max_specular_bounces: s.max_specular_bounces.min(63),
+            max_transmission_bounces: s.max_transmission_bounces.min(63),
             light_candidates: s.light_candidates.clamp(1, 32),
             spec_hit_roughness: s.spec_hit_roughness.to_bits(),
             roulette_from: s.roulette_from,
@@ -304,7 +316,8 @@ impl VulkanAsset for RaytracingPipeline {
         } = asset;
         // raygen.slang's `constant_id`s, 4 bytes each: 0 free, 1 RESTIR_ON, 2 ATMOSPHERE_ON
         // (miss.slang's too), 3 SAMPLES, 4 MAX_BOUNCES, 5 LIGHT_CANDIDATES, 6 SPEC_HIT_ROUGHNESS
-        // (f32), 7 ROULETTE_FROM, 8 GI_ON.
+        // (f32), 7 ROULETTE_FROM, 8 GI_ON, 9 MAX_DIFFUSE_BOUNCES, 10 MAX_SPECULAR_BOUNCES,
+        // 11 MAX_TRANSMISSION_BOUNCES.
         let spec_data = [
             0,
             features.restir as u32,
@@ -315,6 +328,9 @@ impl VulkanAsset for RaytracingPipeline {
             features.spec_hit_roughness,
             features.roulette_from,
             features.restir_gi as u32,
+            features.max_diffuse_bounces,
+            features.max_specular_bounces,
+            features.max_transmission_bounces,
         ];
         let spec_entries: Vec<_> = (0..spec_data.len() as u32)
             .map(|id| {

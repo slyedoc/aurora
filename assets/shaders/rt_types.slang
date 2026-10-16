@@ -154,7 +154,7 @@ public struct UniformData {
     public float jitter_x, jitter_y;
     // Free-running frame counter (the RNG seed -- fresh noise every frame for the denoiser).
     public uint frame;
-    // Free: samples, max_bounces and the firefly clamp moved to raygen.slang's specialization
+    // Free: samples, the bounce budgets and the firefly clamp moved to raygen.slang's specialization
     // constants or went.
     public uint pad_paths[3];
     // Post-process vignette strength (0 = off).
@@ -277,8 +277,9 @@ public struct RestirSurface {
     // The hit's lobes word (packLobes: transmission, clear coat, coat roughness) and perceptual
     // roughness in the top byte.
     public uint material;
-    // The path weight reaching this vertex (alpha pass-through, glass in front) as f16 rgb, and
-    // the ray's layer mask above blue.
+    // The path weight reaching this vertex (alpha pass-through, glass in front) as f16 rgb, the
+    // ray's layer mask above blue (bits 16-23), and the bounces the mirror and glass in front
+    // used (raygen.slang packBounces, bits 24-31).
     public uint throughput_rg;
     public uint throughput_b_mask;
     // Octahedral 2xf16.
@@ -477,7 +478,7 @@ public struct PtHistory {
     public uint albedo_metallic;
     public uint material;
     public float depth;
-    // throughput_b_mask's ray-mask byte (bits 16-23).
+    // throughput_b_mask's ray mask and chain bounces (bits 16-31).
     public uint mask;
     public uint frame;
     // The reconnection threshold at that vertex, from that frame's camera.
@@ -513,7 +514,7 @@ public void ptHistoryStore(PtHistory* p, GiCandidate c, RestirSurface s, uint fr
     let d = (uint4*)p;
     storeAligned<16>(d + 5, uint4(asuint(s.position), s.normal_oct));
     storeAligned<16>(d + 6, uint4(s.geo_normal_oct, s.view_oct, s.albedo_metallic, s.material));
-    storeAligned<16>(d + 7, uint4(asuint(s.depth), s.throughput_b_mask & 0x00FF0000u, frame, asuint(thr)));
+    storeAligned<16>(d + 7, uint4(asuint(s.depth), s.throughput_b_mask & 0xFFFF0000u, frame, asuint(thr)));
 }
 
 public uint ptPackAlbedoMetallic(float3 albedo, float metallic) {

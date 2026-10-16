@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use crate::dlss::{RrPreset, set_jitter_scale};
 
 /// How the frame is traced. Read every frame; edit it from any inspector. `samples`,
-/// `max_bounces`, `light_candidates`, `spec_hit_roughness`, `roulette_from`, `restir` and
+/// the bounce budgets, `light_candidates`, `spec_hit_roughness`, `roulette_from`, `restir` and
 /// `restir_gi` are built into the ray tracing pipeline (specialization constants): changing one
 /// rebuilds it.
 #[derive(Resource, Reflect, Clone, Debug)]
@@ -20,9 +20,16 @@ pub struct RenderSettings {
     /// trace time.
     #[reflect(@1.0..=4.0_f32)]
     pub samples: u32,
-    /// Maximum path length (Russian roulette ends most paths well before it).
-    #[reflect(@1.0..=64.0_f32)]
-    pub max_bounces: u32,
+    /// Bounce budgets by kind (Falcor's path tracer): a path ends once one is exceeded. Diffuse
+    /// counts diffuse lobes and reflections rougher than perceptual 0.25, specular the smoother
+    /// reflections (mirrors), transmission whatever goes through a surface (glass, leaves): so
+    /// a glass sphere does not use up the diffuse light behind it. 0 = direct light only.
+    #[reflect(@0.0..=32.0_f32)]
+    pub max_diffuse_bounces: u32,
+    #[reflect(@0.0..=32.0_f32)]
+    pub max_specular_bounces: u32,
+    #[reflect(@0.0..=32.0_f32)]
+    pub max_transmission_bounces: u32,
     /// Uniform multiplier on every light's emission, emissive surfaces and analytic lights
     /// alike. Uniform, so NEE stays unbiased.
     #[reflect(@0.0..=100.0_f32)]
@@ -45,7 +52,7 @@ pub struct RenderSettings {
     pub spec_hit_roughness: f32,
     /// Russian roulette: from this bounce on, a path continues with probability its throughput
     /// (its brightest channel, at least 5 %) and survivors are boosted to match, so dim paths end
-    /// early instead of running to `max_bounces`. Unbiased; 0 = off.
+    /// early instead of running to its bounce budgets. Unbiased; 0 = off.
     #[reflect(@0.0..=8.0_f32)]
     pub roulette_from: u32,
     /// ReSTIR DI for the light table at the primary vertex: candidates from a world light grid,
@@ -144,7 +151,9 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             samples: 1,
-            max_bounces: 4,
+            max_diffuse_bounces: 3,
+            max_specular_bounces: 3,
+            max_transmission_bounces: 10,
             emissive_boost: 1.0,
             light_nee: true,
             light_candidates: 4,

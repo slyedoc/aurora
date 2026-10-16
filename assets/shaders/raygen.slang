@@ -36,7 +36,14 @@ import nrc;
 [vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
 // Paths per pixel and their maximum length.
 [vk::constant_id(3)] const uint SAMPLES = 1;
-[vk::constant_id(4)] const uint MAX_BOUNCES = 4;
+// The loop's vertex cap: the largest bounce budget below, plus the primary vertex.
+[vk::constant_id(4)] const uint MAX_BOUNCES = 11;
+// Bounce budgets by kind (Falcor's path tracer): a path ends once one is exceeded. Diffuse: a
+// diffuse lobe, or reflection rougher than SPECULAR_ROUGHNESS_THRESHOLD; specular: smoother
+// reflection (mirrors); transmission: through the surface (glass, thin translucency).
+[vk::constant_id(9)] const uint MAX_DIFFUSE_BOUNCES = 3;
+[vk::constant_id(10)] const uint MAX_SPECULAR_BOUNCES = 3;
+[vk::constant_id(11)] const uint MAX_TRANSMISSION_BOUNCES = 10;
 // Light candidates resampled per shading point outside ReSTIR (1 = one plain CDF sample).
 [vk::constant_id(5)] const uint LIGHT_CANDIDATES = 4;
 // Perceptual roughness up to which the primary vertex traces a specular hit-distance ray for
@@ -68,6 +75,41 @@ bool ptRough(float roughness, float transmission, Lobes lob) {
 // the path's numbers): glass, clear coat and mirrors may lie between x_0 and x_k.
 bool ptReplayable(float transmission, Lobes lob) {
     return transmission < 0.01;
+}
+
+static const float SPECULAR_ROUGHNESS_THRESHOLD = 0.25;
+
+// A scatter's bounce kind as a shift into a packed counter word (diffuse bits 0-7, specular
+// 8-15, transmission 16-23): from the lobe sampled and the side it left by.
+uint bounceKind(uint lobe, bool through, float roughness, float coat_alpha) {
+    if (through) {
+        return 16u;
+    }
+    let kind = lobe & LOBE_MASK;
+    if (kind == LOBE_DIFFUSE) {
+        return 0u;
+    }
+    let r = kind == LOBE_COAT ? sqrt(coat_alpha) : roughness;
+    return r > SPECULAR_ROUGHNESS_THRESHOLD ? 0u : 8u;
+}
+
+// Counts a scatter of kind `shift`; false once its budget is exceeded.
+bool bounceWithinBudget(inout uint bounces, uint shift) {
+    bounces += 1u << shift;
+    let n = (bounces >> shift) & 0xFFu;
+    let limit = shift == 0u ? MAX_DIFFUSE_BOUNCES
+                            : (shift == 8u ? MAX_SPECULAR_BOUNCES : MAX_TRANSMISSION_BOUNCES);
+    return n <= limit;
+}
+
+// A counter word in 8 bits (diffuse 2, specular 3, transmission 3, saturating): the mirror and
+// glass chain in front of a primary vertex, kept in its surface record for replay.
+uint packBounces(uint b) {
+    return min(b & 0xFFu, 3u) | (min((b >> 8) & 0xFFu, 7u) << 2) | (min((b >> 16) & 0xFFu, 7u) << 5);
+}
+
+uint unpackBounces(uint p) {
+    return (p & 3u) | (((p >> 2) & 7u) << 8) | (((p >> 5) & 7u) << 16);
 }
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
@@ -1181,6 +1223,8 @@ struct PtReplay {
     bool ok;
     PtVertex last;
     float3 T;
+    // The bounce counters reaching `last` (from the primary vertex's chain on).
+    uint bounces;
 };
 
 PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
@@ -1189,6 +1233,8 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
     res.ok = false;
     res.T = float3(1.0);
     res.last = p;
+    // The budgets bind the replay as they bound the path: past one, `main` would have stopped.
+    var bounces = unpackBounces(s.throughput_b_mask >> 24);
     if (!ptReplayable(0.0, p.lob)) {
         return res;
     }
@@ -1206,6 +1252,9 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         }
         let through = dot(dir, p.n) < 0.0;
         if (through ? dot(dir, p.ng) >= 0.0 : dot(dir, p.ng) <= 0.0) {
+            return res;
+        }
+        if (!bounceWithinBudget(bounces, bounceKind(lobe, through, p.mat.roughness, p.lob.coat_alpha))) {
             return res;
         }
         res.T *= weight;
@@ -1246,6 +1295,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         rough = q_rough;
     }
     res.last = p;
+    res.bounces = bounces;
     res.ok = rough;
     return res;
 }
@@ -1303,6 +1353,11 @@ PtShift ptShift(RestirSurface s, float thr, GiCandidate c) {
         return r;
     }
     let from = rp.last;
+    // The reconnection is x_{k-1}'s scatter: diffuse (it is rough), or through it.
+    var bounces = rp.bounces;
+    if (!bounceWithinBudget(bounces, dot(c.x_s - from.x, from.n) < 0.0 ? 16u : 0u)) {
+        return r;
+    }
     let T = rp.T;
     float geo;
     let n_s = oct_to_float32x3(unpackHalf2(c.n_s_oct));
@@ -1841,6 +1896,8 @@ void main() {
         var mask = float3(1.0);
         // The path's flags, one word (PATH_*, each explained where it would have been declared).
         var path = PATH_WANT_SUN | PATH_CAMERA | PATH_PT_CHAIN;
+        // Scatters so far by kind (bounceKind's packed word).
+        var bounces = 0u;
         // PATH_WANT_SUN: the camera ray and pure-specular continuations may see the sun disc directly; after a
         // BRDF-sampled bounce the sun comes from next-event estimation only.
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
@@ -2146,11 +2203,14 @@ void main() {
                 && (path & (PATH_PT_CHAIN | PATH_GI_VERTEX)) == PATH_PT_CHAIN
                 && ptReplayable(transmission, lob) && !hitPayloadGetMasked(payload)) {
                 if (!resumed && pc.restir_surfaces != nullptr) {
-                    restirSurfaceStore(pc.restir_surfaces + prim_at, restirSurfacePack(
+                    var rs = restirSurfacePack(
                         origin, pc.uniforms.frame, payload.prev_world_pos,
                         mat4MulVecAt(&pc.uniforms.view_proj[0], float4(origin, 1.0)).w,
                         payload.color.rgb, metallic, roughness, payload.lobes, mask, ray_mask,
-                        world_normal, surface_normal, -direction));
+                        world_normal, surface_normal, -direction);
+                    // The chain's bounces, for replay's budgets.
+                    rs.throughput_b_mask |= packBounces(bounces) << 24;
+                    restirSurfaceStore(pc.restir_surfaces + prim_at, rs);
                 }
                 path = (path | PATH_GI_VERTEX | PATH_PT_SEARCH) & ~PATH_PT_CHAIN;
                 path = ptRough(roughness, transmission, lob) ? (path | PATH_PT_PREV_ROUGH)
@@ -2183,11 +2243,11 @@ void main() {
                 q.diffuse = payload.color.rgb * (1.0 - metallic);
                 q.specular = lerp(float3(0.04), payload.color.rgb, metallic);
                 // The path's last vertex ends in the cache too, training or not: what lies past
-                // max_bounces comes back (self-training, Müller et al. 2021 sec. 5: training
+                // the bounce budgets comes back (self-training, Müller et al. 2021 sec. 5: training
                 // targets then carry every bounce).
                 // A path still searching at its last vertex found no x_k (its light stays in the
                 // pixel), so the cache may end it too: glass in front had used up its bounces.
-                let last = bounce_idx + 1u >= MAX_BOUNCES;
+                let last = (bounces & 0xFFu) >= MAX_DIFFUSE_BOUNCES || bounce_idx + 1u >= MAX_BOUNCES;
                 let pt_past = ((path & PATH_PT_SEARCH) == 0u || last)
                     && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
                 let spread_out = nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0;
@@ -2448,8 +2508,12 @@ void main() {
             } else {
                 cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
             }
+            // The bounce budgets (Falcor's): past its kind's, the path ends here.
+            if (!bounceWithinBudget(bounces, bounceKind(lobe, through, roughness, lob.coat_alpha))) {
+                break;
+            }
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
-            // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
+            // 1/q more (unbiased). Paths otherwise ran to their bounce budgets however little they
             // carried; the indirect bounces were most of the trace.
             // Not off ReSTIR PT's primary vertex: the bounce reuse shares (killed there, 60 % of
             // Northshire's paths never reached a reconnection vertex).

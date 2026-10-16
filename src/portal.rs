@@ -11,7 +11,7 @@
 //! ray (`portalRedirect` in raygen.slang), reading both transforms from the live
 //! `cur_instances` rows -- portals on moving parents stay exact with no CPU reads. Because
 //! the redirect happens in the continued ray, recursion is free: portals seen through
-//! portals, portals in reflections, portals through glass, bounded by `max_bounces`.
+//! portals, portals in reflections, portals through glass, bounded by the bounce budgets.
 //! Light is NOT transported -- portals carry the view, not next-event estimation, so each
 //! side is lit by its own surroundings (and a portal surface still occludes shadow rays).
 //!

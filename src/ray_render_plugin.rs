@@ -55,7 +55,7 @@ pub struct UniformData {
     /// Free-running frame counter: the RNG seed, so every frame's noise is new for the
     /// temporal denoiser.
     frame: u32,
-    /// Free: samples, max_bounces and the firefly clamp moved to the pipeline's specialization
+    /// Free: samples, the bounce budgets and the firefly clamp moved to the pipeline's specialization
     /// constants or went.
     pad_paths: [u32; 3],
     /// Post-process vignette strength (0 = off).
