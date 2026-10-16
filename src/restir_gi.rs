@@ -1,22 +1,23 @@
-//! ReSTIR GI: reservoir resampling of the first indirect bounce at sample 0's primary vertex
-//! (Ouyang et al. 2021), as passes beside ReSTIR DI (docs/plans/restir-gi.html).
+//! ReSTIR PT (docs/plans/restir-pt.html): reservoir resampling of whole paths at sample 0's
+//! primary vertex (Lin et al. 2022), grown out of ReSTIR GI (whose names the passes keep).
 //!
-//! The path tracer (raygen.slang `main`) writes, for each pixel whose primary vertex is rough
-//! and not glass, a candidate ([`GiCandidate`] in rt_types.slang): the secondary hit, the
-//! radiance the rest of the path gathered there toward the vertex, and the direction's pdf; that
-//! light leaves its colour. Per view, after the trace:
+//! The path tracer (raygen.slang `main`) writes, for each pixel whose primary vertex takes part
+//! and whose path found a reconnection vertex x_k, a sample ([`GiCandidate`] in rt_types.slang):
+//! x_k, the radiance the rest of the path gathered there toward x_{k-1}, the density of the
+//! direction that reached it, the seed its BSDF samples came from, the path weight at x_k and
+//! the reconnection's geometry term; that light leaves its colour. Per view, after the trace:
 //!
-//! 1. `gi_candidates` (compute): each candidate completed in place as a reservoir of one; without
+//! 1. `gi_candidates` (compute): each sample completed in place as a reservoir of one; without
 //!    spatial reuse (the default) that is the final reservoir.
-//! 2. `gi_spatial` (compute, `restir_gi_spatial_samples` > 0): pairwise MIS over random
-//!    neighbours' candidates (reconnection shift, Jacobian-weighted).
-//! 3. `gi_shade` (raygen.slang): the winner's light at the vertex through one visibility ray,
-//!    added to the noisy colour and the exposure meter.
+//! 2. `gi_spatial` (raygen.slang, `restir_gi_spatial_samples` > 0): pairwise MIS over random
+//!    neighbours' samples through the hybrid shift (random replay of x_1 .. x_{k-1} from this
+//!    pixel's vertex, then reconnection to x_k).
+//! 3. `gi_shade` (raygen.slang): the winner's light through one visibility ray (its
+//!    reconnection segment), added to the noisy colour and the exposure meter.
 //!
-//! No temporal reuse: samples held across frames read to Ray Reconstruction as detail and boil.
-//! Buffers live at trace resolution per view and exist only while GI is on: the candidates and
-//! the final reservoirs (64 B/px). GI uses ReSTIR DI's surface buffer when DI runs, else a
-//! surface buffer of its own.
+//! No temporal reuse yet. Buffers live at trace resolution per view and exist only while it is
+//! on: the samples and the final reservoirs (96 B/px). It uses ReSTIR DI's surface buffer when
+//! DI runs, else a surface buffer of its own.
 
 use ash::vk;
 use bevy::prelude::*;
@@ -33,8 +34,8 @@ use crate::{
 };
 
 /// `GiCandidate`, `GiReservoir` and `RestirSurface` in rt_types.slang.
-const CANDIDATE_BYTES: u64 = 32;
-const RESERVOIR_BYTES: u64 = 32;
+const CANDIDATE_BYTES: u64 = 80;
+const RESERVOIR_BYTES: u64 = 48;
 const SURFACE_BYTES: u64 = 64;
 
 /// `GiFrame` in restir_gi.slang.
@@ -80,6 +81,8 @@ pub struct GiAddresses {
     pub surfaces: u64,
     pub candidates: u64,
     pub final_: u64,
+    /// The per-view block (`GiFrame`): the spatial pass's parameters.
+    pub frame: u64,
     /// The buffers were (re)made and cleared by this call: with the clears on the async compute
     /// queue, the frame runs without GI.
     pub fresh: bool,
@@ -216,12 +219,18 @@ impl RestirGiState {
             surfaces: if own_surfaces { surfaces } else { 0 },
             candidates: view.candidates.address,
             final_,
+            frame: view.frame.address,
             fresh,
         }
     }
 
-    /// Records the candidate pass and (when on) the spatial pass for view `slot`, after the path
-    /// tracer wrote its candidates and before `gi_shade` shades the winners.
+    /// Whether view `slot` resamples spatially (raygen.slang `gi_spatial`, after the candidates).
+    pub fn spatial(&self, slot: usize) -> bool {
+        self.views[slot].spatial && self.views[slot].frame.address != 0
+    }
+
+    /// Records the candidate pass for view `slot`, after the path tracer wrote its samples and
+    /// before `gi_spatial` / `gi_shade`.
     pub fn record_passes(
         &self,
         rd: &RenderDevice,
@@ -260,12 +269,6 @@ impl RestirGiState {
         record_dispatch(rd, cmd, module, "gi_candidates", &push, view.threads, base);
         prof.end(rd, cmd, scope);
         barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
-        if view.spatial {
-            let scope = prof.begin(rd, cmd, "gi spatial");
-            record_dispatch(rd, cmd, module, "gi_spatial", &push, view.threads, base);
-            prof.end(rd, cmd, scope);
-            barrier(vk::PipelineStageFlags2::COMPUTE_SHADER);
-        }
         true
     }
 
@@ -289,7 +292,7 @@ impl Plugin for RestirGiPlugin {
     fn build(&self, app: &mut App) {
         let asset_server = app.world().resource::<AssetServer>();
         let shader = asset_server.load(aurora_asset("shaders/restir_gi.slang"));
-        let module = asset_server.add(ComputeModule::new(shader, &["gi_candidates", "gi_spatial"]));
+        let module = asset_server.add(ComputeModule::new(shader, &["gi_candidates"]));
         app.insert_resource(RestirGiState {
             module,
             views: std::array::from_fn(|_| GiView::default()),

@@ -383,46 +383,99 @@ public struct SharcEntry {
     public float res_b;
     public uint pad;
 };
-// ReSTIR GI's candidate (src/restir_gi.rs), written by the path tracer per traced pixel whose
-// primary vertex takes part: the secondary hit, the radiance leaving it toward the primary
-// vertex and the direction's pdf there (0 = a null candidate). 32 bytes. gi_candidates turns
-// it into a reservoir of one in place: `pdf` becomes W, `phat` is filled.
+// ReSTIR PT's sample (src/restir_gi.rs; docs/plans/restir-pt.html), written by the path tracer per
+// traced pixel whose primary vertex takes part and whose path found a reconnection vertex x_k: the
+// first vertex k >= 1 where x_{k-1} and x_k are both rough and far apart. What x_k sends back is
+// kept so its BSDF can be evaluated again for another incoming direction (a shifted x_{k-1}): its
+// material and shading normal, and the light it received along its two directions -- its
+// next-event sample (MIS-weighted, over its pdf) and its BSDF continuation (everything the rest of
+// the path gathered, over the direction's pdf), each as radiance over f cos at the direction the
+// path came from. Also the density the path drew x_{k-1} -> x_k with (0 = a null candidate), the
+// seed its BSDF samples came from (random replay rebuilds x_1 .. x_{k-1} from another primary
+// vertex), the path weight reaching x_k over the primary vertex's (T) and x_k's cosine toward
+// x_{k-1} over their squared distance (the reconnection Jacobian's source half). 80 bytes.
+// gi_candidates completes it in place: `pdf` becomes W, `phat` is filled.
 public struct GiCandidate {
     public float3 x_s;
-    // The secondary hit's geometric normal, toward the primary vertex (oct 2xf16).
+    // x_k's geometric normal, toward x_{k-1} (oct 2xf16).
     public uint n_s_oct;
-    // RGB9E5, nits.
+    // RGB9E5: what the continuation sent from x_k toward the path's own direction (nits).
     public uint L;
     public float pdf;
     public uint frame;
     // Its target at its own vertex (gi_candidates, in place).
     public float phat;
+    public uint seed;
+    // k (bits 0-3).
+    public uint k;
+    // RGB9E5: the path weight at x_k over the primary vertex's.
+    public uint T;
+    // |cos theta_k| / d_k^2 on the path that found it.
+    public float geo;
+    // RGB9E5: what the next-event sample sent from x_k toward the path's own direction (nits).
+    public uint L_nee;
+    // The continuation's and the next-event sample's directions, x_k's shading normal (oct 2xf16).
+    public uint wi_c;
+    public uint wi_n;
+    public uint n_k;
+    // x_k's material: sqrt albedo (unorm8 x3) and metallic (unorm8); perceptual roughness.
+    public uint albedo_metallic;
+    public float roughness;
+    // The direction x_k -> x_{k-1} on the path that found it (oct 2xf16).
+    public uint wo;
+    public uint pad;
 };
 
 public GiCandidate giCandidateLoad(GiCandidate* p) {
     let d = (uint4*)p;
     let a = loadAligned<16>(d);
     let b = loadAligned<16>(d + 1);
-    GiCandidate c;
-    c.x_s = asfloat(a.xyz);
-    c.n_s_oct = a.w;
-    c.L = b.x;
-    c.pdf = asfloat(b.y);
-    c.frame = b.z;
-    c.phat = asfloat(b.w);
-    return c;
+    let c = loadAligned<16>(d + 2);
+    GiCandidate r;
+    r.x_s = asfloat(a.xyz);
+    r.n_s_oct = a.w;
+    r.L = b.x;
+    r.pdf = asfloat(b.y);
+    r.frame = b.z;
+    r.phat = asfloat(b.w);
+    r.seed = c.x;
+    r.k = c.y;
+    r.T = c.z;
+    r.geo = asfloat(c.w);
+    let e = loadAligned<16>(d + 3);
+    let g = loadAligned<16>(d + 4);
+    r.L_nee = e.x;
+    r.wi_c = e.y;
+    r.wi_n = e.z;
+    r.n_k = e.w;
+    r.albedo_metallic = g.x;
+    r.roughness = asfloat(g.y);
+    r.wo = g.z;
+    r.pad = 0u;
+    return r;
 }
 
-// ReSTIR GI's final reservoir, one per traced pixel: the sample gi_shade shades. 32 bytes.
+public uint ptPackAlbedoMetallic(float3 albedo, float metallic) {
+    let a = sqrt(saturate(albedo));
+    return uint(a.r * 255.0 + 0.5) | (uint(a.g * 255.0 + 0.5) << 8) | (uint(a.b * 255.0 + 0.5) << 16)
+        | (uint(saturate(metallic) * 255.0 + 0.5) << 24);
+}
+
+// ReSTIR PT's final reservoir, one per traced pixel: what gi_shade shades. The winner's
+// contribution at this pixel (its target vector, RGB9E5), its unbiased contribution weight, and
+// the reconnection segment to test (from the replayed x_{k-1} to x_k). 48 bytes.
 public struct GiReservoir {
-    public float3 x_s;
-    public uint n_s_oct;
-    public uint L;
+    public float3 from_;
+    public uint C;
+    public float3 to;
     // Unbiased contribution weight (gi_shade zeroes it when the winner is occluded).
     public float W;
     public uint frame;
     // GI_FRESH: the winner is this frame's own candidate (traced from here: no visibility ray).
     public uint flags;
+    // The segment's end normals (oct 2xf16): the visibility ray leaves and arrives along them.
+    public uint n_from;
+    public uint n_to;
 };
 
 public static const uint GI_FRESH = 1u;
@@ -450,21 +503,40 @@ public GiReservoir giReservoirLoad(GiReservoir* p) {
     let d = (uint4*)p;
     let a = loadAligned<16>(d);
     let b = loadAligned<16>(d + 1);
+    let c = loadAligned<16>(d + 2);
     GiReservoir r;
-    r.x_s = asfloat(a.xyz);
-    r.n_s_oct = a.w;
-    r.L = b.x;
-    r.W = asfloat(b.y);
-    r.frame = b.z;
-    r.flags = b.w;
+    r.from_ = asfloat(a.xyz);
+    r.C = a.w;
+    r.to = asfloat(b.xyz);
+    r.W = asfloat(b.w);
+    r.frame = c.x;
+    r.flags = c.y;
+    r.n_from = c.z;
+    r.n_to = c.w;
     return r;
 }
 
 public void giReservoirStore(GiReservoir* p, GiReservoir r) {
     let d = (uint4*)p;
-    storeAligned<16>(d, uint4(asuint(r.x_s), r.n_s_oct));
-    storeAligned<16>(d + 1, uint4(r.L, asuint(r.W), r.frame, r.flags));
+    storeAligned<16>(d, uint4(asuint(r.from_), r.C));
+    storeAligned<16>(d + 1, uint4(asuint(r.to), asuint(r.W)));
+    storeAligned<16>(d + 2, uint4(r.frame, r.flags, r.n_from, r.n_to));
 }
+
+// `GiFrameGpu` in src/restir_gi.rs (scalar layout; pointers first): ReSTIR PT's per-view block.
+public struct GiFrame {
+    public GiCandidate* candidates;
+    public RestirSurface* surfaces;
+    public GiReservoir* final_;
+    public uint64_t pad_ptr;
+    public uint width;
+    public uint height;
+    public uint frame;
+    public uint spatial_samples;
+    public float spatial_radius;
+    public float boiling;
+    public uint pad[2];
+};
 
 // A world position's pixel in a frame with view-projection `m` (column-major) at `width` x
 // `height`, or (-1, -1) behind it. The raygen's pixel centre is (x, H - 1 - y) + 0.5.
@@ -761,6 +833,8 @@ public struct PushConstants {
     public float4* reference;
     // Radiance-cache entries (valid whenever uniforms.sharc != 0).
     public SharcEntry* sharc;
+    // ReSTIR PT's per-view block (restir_gi.rs; null when off): the spatial pass's parameters.
+    public GiFrame* gi_frame;
 };
 [[vk::push_constant]] public ConstantBuffer<PushConstants> pc;
 

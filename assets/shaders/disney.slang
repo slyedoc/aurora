@@ -161,14 +161,15 @@ float specularProbability(DisneyMaterial mat, float NoV) {
 // carries nothing and must end.
 static const float4 BRDF_SAMPLE_FAILED = float4(0.0, 0.0, 0.0, -1.0);
 
-public float4 sampleDisneyBRDF(float4 noise, float3 v, float3 n, DisneyMaterial mat, inout float3 l) {
+// `u_lobe` picks the lobe (replay passes the path's own number for it).
+public float4 sampleDisneyBRDF(float4 noise, float u_lobe, float3 v, float3 n, DisneyMaterial mat, inout float3 l) {
     let alpha = mat.roughness * mat.roughness;
     let NoV = dot(n, v);
     if (NoV <= 0.0) {
         return BRDF_SAMPLE_FAILED;
     }
     let p_spec = specularProbability(mat, NoV);
-    if (randf() < p_spec) {
+    if (u_lobe < p_spec) {
         if (alpha < DELTA_ALPHA) {
             // Mirror: h == n, so F is the weight and there is no pdf to divide by.
             l = reflect(-v, n);

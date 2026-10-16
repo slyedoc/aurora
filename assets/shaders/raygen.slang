@@ -44,17 +44,41 @@ import fog;
 [vk::constant_id(6)] const float SPEC_HIT_ROUGHNESS = 0.3;
 // Russian roulette from this bounce on (0 = off).
 [vk::constant_id(7)] const uint ROULETTE_FROM = 1;
-// ReSTIR GI (restir_gi.rs): sample 0's first indirect bounce goes to reservoirs and `gi_shade`.
+// ReSTIR PT (restir_gi.rs): sample 0's path from its reconnection vertex on goes to reservoirs,
+// `gi_spatial` and `gi_shade`.
 [vk::constant_id(8)] const bool GI_ON = false;
-// The glossiest primary vertex GI takes (perceptual roughness): below it the lobe is narrower
-// than the precision the reuse passes rebuild the vertex with (half-float octahedral normal and
-// view), and the mixture weight would no longer match the sampler.
-static const float GI_MIN_ROUGHNESS = 0.1;
-// A secondary hit closer to its primary vertex than this share of the vertex's camera distance
-// (~20 pixel footprints) is not shared (ReSTIR PT's reconnection criterion): there the camera's
-// sub-pixel jitter alone swings the reconnection Jacobian, and reused samples in corners and at
-// contacts ran hot (bright and coloured flecks) or failed their centimetre-long visibility ray.
+// A reconnection segment shorter than this share of the primary vertex's camera distance (~20
+// pixel footprints) is no reconnection: there the camera's sub-pixel jitter alone swings the
+// Jacobian, and reused samples in corners and at contacts ran hot (bright and coloured flecks)
+// or failed their centimetre-long visibility ray.
 static const float GI_RECONNECT_MIN = 0.03;
+// The deepest reconnection vertex (x_k, k counted from the primary vertex x_0): a replay traces
+// up to k - 1 rays, and the search holds Russian roulette back until it ends.
+static const uint PT_MAX_K = 3u;
+
+uint ptHash(uint v) {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// The path's BSDF random number `dim` at vertex `vertex`: stateless, so random replay draws the
+// same numbers from another primary vertex.
+float pathRandom(uint seed, uint vertex, uint dim) {
+    return float(ptHash(seed ^ ptHash(vertex * 16u + dim + 0x9e3779b9u)) >> 8) / 16777216.0;
+}
+
+// A vertex a reconnection may start or end at: rough, not glass, no thin layers (replay draws
+// the base lobe only).
+bool ptRough(float roughness, float transmission, Lobes lob) {
+    return roughness >= pc.uniforms.gi_roughness && transmission < 0.01
+        && lob.transmission <= 0.0 && lob.clearcoat <= 0.0;
+}
+
+// A replayable vertex: the base lobe only (no glass, no thin layers).
+bool ptReplayable(float transmission, Lobes lob) {
+    return transmission < 0.01 && lob.transmission <= 0.0 && lob.clearcoat <= 0.0;
+}
 
 // Specular hit distance of a reflection that reaches the sky: far enough to move like the
 // sky does (rotation only), and still a finite half float.
@@ -1132,11 +1156,10 @@ void primary() {
     guide_fog[px] = float4(min(veil, float3(65504.0)), fog_t);
 }
 
-// ReSTIR GI's shading (restir_gi.rs), one thread per traced pixel, after the path tracer and the
-// reuse passes: the final reservoir's secondary hit lights the primary vertex (layered BSDF x
-// cos x its radiance x W), through one visibility ray unless it is the pixel's own fresh
-// candidate, and is added to the noisy colour and the exposure meter as `main` would have. An
-// occluded winner zeroes its reservoir's W (its M stays: next frame's history).
+// ReSTIR PT's shading (restir_gi.rs), one thread per traced pixel after the reuse passes: the
+// final reservoir's contribution (its target vector at this pixel times W), through one visibility
+// ray along its reconnection segment unless it is the pixel's own fresh sample (traced), added to
+// the noisy colour and the exposure meter as `main` would have. An occluded winner zeroes W.
 [shader("raygeneration")]
 void gi_shade() {
     let launch_id = DispatchRaysIndex().xy;
@@ -1154,18 +1177,17 @@ void gi_shade() {
     if (r.frame != pc.uniforms.frame || !(r.W > 0.0 && r.W < 1.0e20)) {
         return;
     }
-    let s = restirSurfaceLoad(pc.restir_surfaces + idx);
-    let n_s = oct_to_float32x3(unpackHalf2(r.n_s_oct));
-    float cos_s, d2;
-    let c = giContribution(s, r.x_s, n_s, unpackRgb9e5(r.L), cos_s, d2);
+    let c = unpackRgb9e5(r.C);
     if (!(luma(c) > 0.0)) {
         return;
     }
+    let s = restirSurfaceLoad(pc.restir_surfaces + idx);
     if ((r.flags & GI_FRESH) == 0u) {
-        let ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
-        let to = offsetRay(r.x_s, n_s);
-        let d = to - s.position;
-        let start = leaveSurface(s.position, ng, d);
+        let n_from = oct_to_float32x3(unpackHalf2(r.n_from));
+        let n_to = oct_to_float32x3(unpackHalf2(r.n_to));
+        let to = offsetRay(r.to, n_to);
+        let d = to - r.from_;
+        let start = leaveSurface(r.from_, n_from, d);
         let dist = length(to - start);
         // A degenerate ray (the hit on the vertex, a non-finite position) is never traced: a NaN
         // direction can stall traversal.
@@ -1192,8 +1214,7 @@ void gi_shade() {
     dlss_color[px] = float4(min(col.rgb + gi * pc.ae.input_exposure, float3(65504.0)), col.a);
     if (debug != nullptr) {
         debug[2u + 2u * idx] = packRgb9e5(gi * pc.ae.input_exposure);
-        debug[3u + 2u * idx] = (r.flags & GI_FRESH) == 0u ? GI_STATE_NEIGHBOUR
-            : giShareable(r.n_s_oct) ? GI_STATE_OWN : GI_STATE_OWN_PRIVATE;
+        debug[3u + 2u * idx] = (r.flags & GI_FRESH) == 0u ? GI_STATE_NEIGHBOUR : GI_STATE_OWN;
     }
     // The meter as `main` writes it: the surface's light through the fog over its albedo.
     if (pc.lum != nullptr) {
@@ -1203,6 +1224,323 @@ void gi_shade() {
                 / max(meter_albedo, 0.04);
         }
     }
+}
+
+// ---- ReSTIR PT's hybrid shift ---------------------------------------------------------------
+
+// A vertex the shift evaluates the reconnection at: position, shading and geometric normals, the
+// view toward the previous vertex, the material.
+struct PtVertex {
+    float3 x;
+    float3 n;
+    float3 ng;
+    float3 v;
+    DisneyMaterial mat;
+    Lobes lob;
+};
+
+PtVertex ptPrimaryVertex(RestirSurface s) {
+    PtVertex p;
+    p.x = s.position;
+    p.n = oct_to_float32x3(unpackHalf2(s.normal_oct));
+    p.ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
+    p.v = oct_to_float32x3(unpackHalf2(s.view_oct));
+    p.mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
+    p.lob = unpackLobes(s.material);
+    return p;
+}
+
+// Random replay (Lin et al. 2022, RTXDI's hybrid shift): x_1 .. x_{k-1} rebuilt from primary
+// vertex `s` with the sample's seed, the BSDF numbers `main` drew. `T` is the replayed prefix's
+// weight (f cos / pdf per bounce: primary sample space, so the replay needs no Jacobian of its
+// own); `last` is x_{k-1}. False when the replayed path could not be the sample's: a vertex it
+// may not cross (glass, thin layers, alpha-tested, an emitter or the sky) or a reconnection pair
+// found before k, or x_{k-1} not rough.
+bool ptReplay(RestirSurface s, uint seed, uint k, float thr, out PtVertex last, out float3 T) {
+    var p = ptPrimaryVertex(s);
+    T = float3(1.0);
+    last = p;
+    if (!ptReplayable(0.0, p.lob)) {
+        return false;
+    }
+    var rough = ptRough(p.mat.roughness, 0.0, p.lob);
+    let ray_mask = restirRayMask(s);
+    for (uint i = 0u; i + 1u < k; i++) {
+        let noise = float4(pathRandom(seed, i, 0u), pathRandom(seed, i, 1u),
+                           pathRandom(seed, i, 2u), pathRandom(seed, i, 3u));
+        var dir = float3(0.0);
+        let brdf = sampleDisneyBRDF(noise, pathRandom(seed, i, 4u), p.v, p.n, p.mat, dir);
+        if (brdf.a < 0.0 || dot(dir, p.ng) <= 0.0) {
+            return false;
+        }
+        T *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
+        HitPayload payload = {};
+        payload.miss_flags = 0u;
+        payload.cone = float2(0.0, 0.01);
+        traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(p.x, p.ng, dir), 0.0, dir, 1.0e7, payload);
+        if (payload.t == 0.0 || any(payload.emission != float3(0.0)) || hitPayloadGetMasked(payload)) {
+            return false;
+        }
+        let transmission = hitPayloadGetTransmission(payload);
+        let lob = unpackLobes(payload.lobes);
+        let roughness = hitPayloadGetRoughness(payload);
+        PtVertex q;
+        q.x = p.x + dir * payload.t;
+        q.ng = oct_to_float32x3(payload.surface_and_world_normal.xy);
+        q.n = bendTowardViewer(oct_to_float32x3(payload.surface_and_world_normal.zw), -dir);
+        if (dot(q.ng, dir) > 0.0) {
+            q.ng = -q.ng;
+        }
+        q.v = -dir;
+        q.mat = disneyMaterial(payload.color.rgb, hitPayloadGetMetallic(payload), roughness);
+        q.lob = lob;
+        if (!ptReplayable(transmission, lob)) {
+            return false;
+        }
+        let q_rough = ptRough(roughness, transmission, lob);
+        // `main` would have reconnected here, before k.
+        if (rough && q_rough && length(q.x - p.x) > thr) {
+            return false;
+        }
+        p = q;
+        rough = q_rough;
+    }
+    last = p;
+    return rough;
+}
+
+// The sample's target vector at x_{k-1} = `p` with prefix weight `T`: the reconnection to x_k
+// (`x_s`, normal `n_s`, radiance `L`) through p's BSDF and cosine, and its geometry term
+// |cos theta_k| / d^2 (the Jacobian's half). Zero when x_k faces away or the segment is short.
+float3 ptReconnect(PtVertex p, float3 T, GiCandidate c, float3 x_s, float3 n_s, float thr,
+                   out float geo) {
+    geo = 0.0;
+    let d = x_s - p.x;
+    let d2 = max(dot(d, d), 1.0e-8);
+    let w = d * rsqrt(d2);
+    let cos_s = -dot(n_s, w);
+    if (cos_s <= 0.0 || sqrt(d2) <= thr) {
+        return float3(0.0);
+    }
+    let NoL = dot(p.n, w);
+    if (NoL <= 0.0 || dot(w, p.ng) <= 0.0) {
+        return float3(0.0);
+    }
+    geo = cos_s / d2;
+    return T * evalLayered(p.v, p.n, w, p.mat, p.lob, true) * NoL * ptSampleRadiance(c, -w);
+}
+
+// A sample shifted to primary vertex `s` (camera distance floor `thr`): its target vector there
+// (visibility of the reconnection segment included: the target is the integrand, so the reuse is
+// unbiased) and the Jacobian; `from` is the replayed x_{k-1}.
+float3 ptShift(RestirSurface s, float thr, GiCandidate c, out float J, out PtVertex from) {
+    J = 0.0;
+    float3 T;
+    let k = c.k & 15u;
+    if (k == 0u || !ptReplay(s, c.seed, k, thr, from, T)) {
+        return float3(0.0);
+    }
+    float geo;
+    let n_s = oct_to_float32x3(unpackHalf2(c.n_s_oct));
+    let f = ptReconnect(from, T, c, c.x_s, n_s, thr, geo);
+    if (!(luma(f) > 0.0)) {
+        return float3(0.0);
+    }
+    let to = offsetRay(c.x_s, n_s);
+    let start = leaveSurface(from.x, from.ng, to - from.x);
+    let dist = length(to - start);
+    if (!(dist > 1.0e-4 && dist < 1.0e7)
+        || !traceVisible(restirRayMask(s), start, 0.0, (to - start) / dist, dist * 0.999)) {
+        return float3(0.0);
+    }
+    J = c.geo > 0.0 ? geo / c.geo : 0.0;
+    return f;
+}
+
+static const uint PT_MAX_SPATIAL = 16u;
+// A shift is rejected when x_k's solid angle changes by more than this either way.
+static const float PT_MAX_JACOBIAN = 8.0;
+
+// Neighbour `i` of pixel `px` this frame: a random point of the disc, from a hash of the three
+// (so the same pixels come back on a second walk, with nothing held between).
+int2 ptNeighbourPixel(GiFrame* f, int2 px, uint i, uint seed) {
+    let h0 = ptHash((uint(px.y) * f.width + uint(px.x)) * PT_MAX_SPATIAL + i + seed);
+    let h1 = ptHash(h0);
+    let a = float(h0 >> 8u) * (2.0 * PI / 16777216.0);
+    let rad = f.spatial_radius * sqrt(float(h1 >> 8u) / 16777216.0);
+    return px + int2(int(cos(a) * rad), int(sin(a) * rad));
+}
+
+// The neighbour's index when it can be reused from (inside, not this pixel, taking part this
+// frame on a similar surface), else ~0.
+uint ptUsableNeighbour(GiFrame* f, RestirSurface s, int2 px, uint i, uint seed) {
+    let q = ptNeighbourPixel(f, px, i, seed);
+    if (any(q < int2(0)) || q.x >= int(f.width) || q.y >= int(f.height) || all(q == px)) {
+        return 0xFFFFFFFFu;
+    }
+    let qi = uint(q.y) * f.width + uint(q.x);
+    let qs = restirSurfaceLoad(f.surfaces + qi);
+    let cb = loadAligned<16>((uint4*)(f.candidates + qi) + 1);
+    if (qs.frame != f.frame || cb.z != f.frame || !restirSimilar(s, qs.normal_oct, qs.depth)) {
+        return 0xFFFFFFFFu;
+    }
+    return qi;
+}
+
+GiReservoir ptReservoir(float3 from_, float3 n_from, float3 to, float3 n_to, float3 C, float W,
+                        uint frame, uint flags) {
+    GiReservoir r;
+    r.from_ = from_;
+    r.C = packRgb9e5(C);
+    r.to = to;
+    r.W = W;
+    r.frame = frame;
+    r.flags = flags;
+    r.n_from = packHalf2(float32x3_to_oct(n_from));
+    r.n_to = packHalf2(float32x3_to_oct(n_to));
+    return r;
+}
+
+// ReSTIR PT's spatial resampling (restir_gi.rs), one thread per traced pixel after gi_candidates:
+// pairwise MIS (as restir.slang's restir_spatial) over random neighbours' samples, each moved
+// here by the hybrid shift (random replay of its prefix from this pixel's vertex, reconnection
+// to its x_k), every target compared in the canonical pixel's measure: a neighbour's sample here
+// weighs its own target against ours times the shift's Jacobian, and the canonical sample at a
+// neighbour likewise. The canonical target is the replayed one too, so every target here is the
+// same function. Each candidate is a reservoir of one (M = 1). No visibility in the shift
+// (gi_shade tests the winner's reconnection segment).
+[shader("raygeneration")]
+void gi_spatial() {
+    let launch_id = DispatchRaysIndex().xy;
+    let f = pc.gi_frame;
+    if (!GI_ON || f == nullptr) {
+        return;
+    }
+    let idx = launch_id.y * f.width + launch_id.x;
+    if (launch_id.x >= f.width || launch_id.y >= f.height) {
+        return;
+    }
+    let s = restirSurfaceLoad(f.surfaces + idx);
+    let own = giCandidateLoad(f.candidates + idx);
+    if (s.frame != f.frame || own.frame != f.frame) {
+        giReservoirStore(f.final_ + idx, ptReservoir(float3(0.0), float3(0.0, 1.0, 0.0), float3(0.0),
+                                                     float3(0.0, 1.0, 0.0), float3(0.0), 0.0,
+                                                     f.frame - 1u, 0u));
+        return;
+    }
+    let px = int2(launch_id);
+    initRandom(uint2(f.width, f.height), uint2(px), f.frame * 7u + 6u);
+    let seed = ptHash(f.frame);
+    let thr = GI_RECONNECT_MIN * length(s.position - cameraOrigin());
+    // After gi_candidates: `pdf` holds W.
+    let own_W = own.pdf;
+    let n_c = oct_to_float32x3(unpackHalf2(own.n_s_oct));
+
+    // The canonical sample's target here, replayed as every other.
+    PtVertex own_from;
+    float own_J;
+    var C_c = float3(0.0);
+    if (own_W > 0.0 && own_W < 1.0e20) {
+        C_c = ptShift(s, thr, own, own_J, own_from);
+    }
+    let pc_yc = luma(C_c);
+    let own_valid = pc_yc > 0.0;
+
+    let S = min(f.spatial_samples, PT_MAX_SPATIAL);
+    var usable = 0u;
+    for (uint i = 0u; i < S; i++) {
+        if (ptUsableNeighbour(f, s, px, i, seed) != 0xFFFFFFFFu) {
+            usable |= 1u << i;
+        }
+    }
+    let m = countbits(usable);
+    if (m == 0u) {
+        giReservoirStore(f.final_ + idx, ptReservoir(own_from.x, own_from.ng, own.x_s, n_c, C_c,
+                                                     own_valid ? own_W : 0.0, f.frame, GI_FRESH));
+        return;
+    }
+
+    var r_C = float3(0.0);
+    var r_from = float3(0.0);
+    var r_nfrom = float3(0.0, 1.0, 0.0);
+    var r_to = float3(0.0);
+    var r_nto = float3(0.0, 1.0, 0.0);
+    var r_wsum = 0.0;
+    var r_phat = 0.0;
+    var mc_sum = 0.0;
+    var neighbour_c = 0.0;
+    var fresh = false;
+    for (var bits = usable; bits != 0u; bits &= bits - 1u) {
+        let q = ptNeighbourPixel(f, px, firstbitlow(bits), seed);
+        let qi = uint(q.y) * f.width + uint(q.x);
+        let qs = restirSurfaceLoad(f.surfaces + qi);
+        let nr = giCandidateLoad(f.candidates + qi);
+        let nr_W = nr.pdf;
+        let thr_q = GI_RECONNECT_MIN * length(qs.position - cameraOrigin());
+        // The canonical sample at the neighbour, in our measure.
+        if (own_valid) {
+            float J_q;
+            PtVertex from_q;
+            let pi_c = luma(ptShift(qs, thr_q, own, J_q, from_q));
+            let ok = pi_c > 0.0 && J_q > 1.0 / PT_MAX_JACOBIAN && J_q < PT_MAX_JACOBIAN;
+            let den = (ok ? pi_c * J_q : 0.0) + pc_yc;
+            mc_sum += den > 0.0 ? pc_yc / den : 1.0;
+        }
+        // The neighbour's sample, shifted here.
+        if (!(nr_W > 0.0 && nr_W < 1.0e20) || !(nr.phat > 0.0)) {
+            continue;
+        }
+        float J;
+        PtVertex from;
+        let C_i = ptShift(s, thr, nr, J, from);
+        let pc_yi = luma(C_i);
+        if (!(pc_yi > 0.0) || !(J > 1.0 / PT_MAX_JACOBIAN && J < PT_MAX_JACOBIAN)) {
+            continue;
+        }
+        // Its target at its own pixel, replayed there as ours is here.
+        float J_self;
+        PtVertex from_self;
+        let pi_i = luma(ptShift(qs, thr_q, nr, J_self, from_self));
+        let den = pi_i + pc_yi * J;
+        let ai = den > 0.0 ? pi_i / den : 0.0;
+        let w = (ai / float(m)) * pc_yi * nr_W * J;
+        neighbour_c += pc_yi * nr_W * J;
+        r_wsum += w;
+        if (randf() * r_wsum < w) {
+            r_C = C_i;
+            r_from = from.x;
+            r_nfrom = from.ng;
+            r_to = nr.x_s;
+            r_nto = oct_to_float32x3(unpackHalf2(nr.n_s_oct));
+            r_phat = pc_yi;
+            fresh = false;
+        }
+    }
+    if (own_valid) {
+        let w = (mc_sum / float(m)) * pc_yc * own_W;
+        r_wsum += w;
+        if (randf() * r_wsum < w) {
+            r_C = C_c;
+            r_from = own_from.x;
+            r_nfrom = own_from.ng;
+            r_to = own.x_s;
+            r_nto = n_c;
+            r_phat = pc_yc;
+            fresh = true;
+        }
+    }
+
+    // Boiling filter (restir_spatial's): a winner far hotter than its neighbourhood is dropped.
+    if (f.boiling > 0.0 && m >= 3u && own_valid && fresh) {
+        let mean = neighbour_c / float(m);
+        if (pc_yc * own_W > mean / f.boiling) {
+            r_phat = 0.0;
+        }
+    }
+
+    let W = r_phat > 0.0 ? r_wsum / r_phat : 0.0;
+    giReservoirStore(f.final_ + idx, ptReservoir(r_from, r_nfrom, r_to, r_nto, r_C, W, f.frame,
+                                                 (W > 0.0 && fresh) ? GI_FRESH : 0u));
 }
 
 // The reference accumulation (reference.rs, docs/plans/reference-mode.html), one thread per traced
@@ -1309,11 +1647,13 @@ static const uint PATH_CAMERA = 2u;
 static const uint PATH_SHARC_TRAIN = 8u;
 static const uint PATH_FROM_ROUGH = 16u;
 static const uint PATH_CACHE_BLIND = 32u;
-// ReSTIR GI: the primary vertex takes part (its candidate is written at the path's end); the ray
-// toward the secondary hit is in flight; the secondary hit took part (the snapshot is live).
+// ReSTIR PT: the primary vertex takes part (its sample is written at the path's end); the path
+// is still looking for its reconnection vertex (BSDF numbers from the path seed, no roulette);
+// it found one (the snapshot is live); the vertex the path just left is rough.
 static const uint PATH_GI_VERTEX = 64u;
-static const uint PATH_GI_SEGMENT = 128u;
+static const uint PATH_PT_SEARCH = 128u;
 static const uint PATH_GI_LIVE = 256u;
+static const uint PATH_PT_PREV_ROUGH = 512u;
 
 [shader("raygeneration")]
 void main() {
@@ -1373,11 +1713,27 @@ void main() {
         float3 sh_mask[SHARC_VERTICES];
         float3 sh_acc[SHARC_VERTICES];
         var sh_n = 0u;
-        // ReSTIR GI's snapshots: the path weight leaving the primary vertex without its roulette
-        // boosts (the candidate's radiance is the rest of the path over it), and the radiance
-        // gathered when the secondary hit took part.
+        // ReSTIR PT's snapshots: the path weight reaching the reconnection vertex (the sample's
+        // radiance is the rest of the path over it) and the radiance gathered before it; while
+        // searching, the seed the BSDF numbers come from, the vertex just left, the reconnection
+        // distance floor and the primary vertex's weight.
         var gi_mask = float3(1.0);
         var gi_acc = float3(0.0);
+        var pt_seed = 0u;
+        var pt_prev_pos = float3(0.0);
+        var pt_thr = 0.0;
+        var pt_v0_mask = float3(1.0);
+        // The bounce the primary vertex was reached at (the primary pass may have used some):
+        // vertex indices count from it.
+        var pt_base = 0u;
+        // At the reconnection vertex: its bounce, the radiance gathered once its next-event
+        // sample was in, that sample's contribution and direction, the continuation's direction.
+        var pt_k_bounce = 0xFFFFFFFFu;
+        var pt_acc_mid = float3(0.0);
+        var pt_nee = float3(0.0);
+        var pt_nee_dir = float3(0.0, 1.0, 0.0);
+        var pt_cont_dir = float3(0.0, 1.0, 0.0);
+        var pt_nk = 0u;
         // PATH_SHARC_TRAIN: one path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
         // cache learns from (answered paths only pass on what it already knows).
         if (SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN) {
@@ -1460,7 +1816,7 @@ void main() {
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
-                    path &= ~PATH_GI_SEGMENT;
+                    path &= ~PATH_PT_SEARCH;
                     continue;
                 }
             }
@@ -1527,7 +1883,7 @@ void main() {
                 }
                 direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
-                path &= ~(PATH_WANT_SUN | PATH_GI_SEGMENT);
+                path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH);
                 continue;
             }
 
@@ -1573,36 +1929,61 @@ void main() {
             origin = origin + direction * payload.t;
             surf_n = surface_normal;
             if (pass_through) {
+                // Replay cannot draw the alpha coin again.
+                path &= ~PATH_PT_SEARCH;
                 continue;
             }
             path &= ~PATH_CAMERA;
 
-            // ReSTIR GI. The primary vertex takes part unless it is near-mirror or glass: its
-            // first bounce's light reflected at the secondary hit becomes the candidate. The
-            // secondary hit (the next accepted surface: no fog scatter, portal or emitter on the
-            // way) takes part unless it is glass; its position and the direction's pdf go to
-            // memory now, its radiance at the path's end. Only a rough secondary hit's sample is
-            // shared with other pixels (giShareable); a glossy one's radiance depends on where it
-            // is seen from, so it serves its own pixel. Either test failing leaves the light in
-            // the path (a null candidate).
-            if (GI_ON && (path & PATH_GI_SEGMENT) != 0u) {
-                path &= ~PATH_GI_SEGMENT;
-                if (transmission <= 0.0) {
-                    path |= PATH_GI_LIVE;
+            // ReSTIR PT. While the path searches, each vertex it reaches is tested as the
+            // reconnection vertex x_k: it and the vertex before are rough and farther apart than
+            // pt_thr. The first that passes takes x_k's position, normal, the direction's pdf,
+            // the seed, k, the path weight over the primary vertex's and the geometry term now;
+            // its radiance at the path's end. A vertex replay could not rebuild (glass, thin
+            // layers, an alpha-tested surface) or the depth limit ends the search: that path's
+            // light stays here.
+            if (GI_ON && (path & PATH_PT_SEARCH) != 0u) {
+                let rough_here = ptRough(roughness, transmission, lob) && !hitPayloadGetMasked(payload);
+                let d = length(origin - pt_prev_pos);
+                if ((path & PATH_PT_PREV_ROUGH) != 0u && rough_here && d > pt_thr) {
+                    path = (path & ~PATH_PT_SEARCH) | PATH_GI_LIVE;
                     gi_acc = acc;
+                    gi_mask = mask;
                     let ns = dot(surface_normal, direction) > 0.0 ? -surface_normal : surface_normal;
+                    let T = float3(pt_v0_mask.r > 1.0e-6 ? mask.r / pt_v0_mask.r : 0.0,
+                                   pt_v0_mask.g > 1.0e-6 ? mask.g / pt_v0_mask.g : 0.0,
+                                   pt_v0_mask.b > 1.0e-6 ? mask.b / pt_v0_mask.b : 0.0);
                     let cand = (uint4*)(pc.gi_candidates + prim_at);
-                    let x_v = asfloat(loadAligned<16>((uint4*)(pc.restir_surfaces + prim_at)).xyz);
-                    let far = length(origin - x_v) > GI_RECONNECT_MIN * length(x_v - cameraOrigin());
-                    storeAligned<16>(cand, uint4(asuint(origin),
-                                                 giPackHitNormal(ns, far && roughness >= pc.uniforms.gi_roughness)));
+                    storeAligned<16>(cand, uint4(asuint(origin), packHalf2(float32x3_to_oct(ns))));
+                    storeAligned<16>(cand + 2, uint4(pt_seed, bounce_idx - pt_base, packRgb9e5(T),
+                                                     asuint(abs(dot(ns, direction)) / max(d * d, 1.0e-8))));
                     pc.gi_candidates[prim_at].pdf = prev_pdf;
+                    // x_k's material and view: its BSDF is evaluated again for shifted paths.
+                    pt_k_bounce = bounce_idx;
+                    pt_acc_mid = acc;
+                    pt_nk = packHalf2(float32x3_to_oct(world_normal));
+                    storeAligned<16>(cand + 4, uint4(ptPackAlbedoMetallic(payload.color.rgb, metallic),
+                                                     asuint(roughness),
+                                                     packHalf2(float32x3_to_oct(-direction)), 0u));
+                } else if (bounce_idx - pt_base >= PT_MAX_K || hitPayloadGetMasked(payload)
+                           || !ptReplayable(transmission, lob)) {
+                    path &= ~PATH_PT_SEARCH;
+                } else {
+                    path = rough_here ? (path | PATH_PT_PREV_ROUGH) : (path & ~PATH_PT_PREV_ROUGH);
+                    pt_prev_pos = origin;
                 }
             }
+            // The primary vertex takes part unless replay could not start from it.
             if (GI_ON && resumed && sample_idx == 0u && pc.gi_candidates != nullptr
-                && roughness >= GI_MIN_ROUGHNESS && transmission <= 0.0) {
-                path |= PATH_GI_VERTEX;
-                gi_mask = mask;
+                && ptReplayable(transmission, lob) && !hitPayloadGetMasked(payload)) {
+                path |= PATH_GI_VERTEX | PATH_PT_SEARCH;
+                path = ptRough(roughness, transmission, lob) ? (path | PATH_PT_PREV_ROUGH)
+                                                             : (path & ~PATH_PT_PREV_ROUGH);
+                pt_v0_mask = mask;
+                pt_base = bounce_idx;
+                pt_prev_pos = origin;
+                pt_thr = GI_RECONNECT_MIN * length(origin - cameraOrigin());
+                pt_seed = ptHash(prim_at * 0x9e3779b9u ^ ptHash(pc.uniforms.frame + 0x632be5abu));
             }
 
             // refraction (glass): GGX microfacet transmission (Walter et al. 2007). The half
@@ -1691,7 +2072,7 @@ void main() {
             // Survival follows the path THROUGHPUT, not the local albedo: a path that has
             // already lost most of its energy in a valley of 0.4-albedo rock is not worth
             // another shadow ray, however bright the rock it just hit.
-            if (bounce_idx > 1) {
+            if (bounce_idx > 1 && (path & PATH_PT_SEARCH) == 0u) {
                 let pRussian = clamp(luma(mask), 0.03, 0.9);
                 if (randf() >= pRussian) {
                     break;
@@ -1711,7 +2092,11 @@ void main() {
                 && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
                 let slot = sharcSlot(origin, world_normal, cameraOrigin());
                 if (slot != 0xFFFFFFFFu) {
+                    // Not while ReSTIR PT searches: a cached answer there would end paths whose
+                    // reconnection lay further on, and a neighbour's sample shifted here would
+                    // count that light a second time.
                     if ((path & PATH_SHARC_TRAIN) == 0u && ((path & PATH_FROM_ROUGH) != 0u)
+                        && (path & PATH_PT_SEARCH) == 0u && bounce_idx != pt_k_bounce
                         && cone_width >= sharcVoxelSize(origin, cameraOrigin())) {
                         float3 cached;
                         if (sharcQuery(slot, cached)) {
@@ -1719,7 +2104,10 @@ void main() {
                             break;
                         }
                     }
-                    if (sh_n < SHARC_VERTICES) {
+                    // A ReSTIR PT path teaches the cache from past its reconnection vertex only:
+                    // its search vertices (no cached answers, no roulette) made the voxels read
+                    // brighter than the truth (measured; docs/plans/restir-pt-notes.md).
+                    if (sh_n < SHARC_VERTICES && (path & PATH_PT_SEARCH) == 0u && bounce_idx != pt_k_bounce) {
                         sh_slot[sh_n] = slot;
                         sh_mask[sh_n] = mask;
                         sh_acc[sh_n] = acc;
@@ -1877,7 +2265,13 @@ void main() {
                     }
                 }
             }
-            acc += pick.resolve(ray_mask, origin, surface_normal);
+            let nee = pick.resolve(ray_mask, origin, surface_normal);
+            acc += nee;
+            if (GI_ON && bounce_idx == pt_k_bounce) {
+                pt_nee = nee;
+                pt_nee_dir = pick.direction;
+                pt_acc_mid = acc;
+            }
 
             // Thin layers before the base: through the surface with probability `transmission`
             // (weight = albedo: a Lambertian lobe drawn by its own cosine), off the coat with
@@ -1890,10 +2284,6 @@ void main() {
                 let r2 = randf();
                 direction = sampleTransmission(world_normal, r1, r2);
                 mask *= disney_mat.albedo;
-                if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
-                    gi_mask *= disney_mat.albedo;
-                    path |= PATH_GI_SEGMENT;
-                }
                 prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                 path &= ~PATH_WANT_SUN;
                 cone_spread = max(cone_spread, 0.37);
@@ -1912,10 +2302,6 @@ void main() {
                     }
                     direction = l;
                     mask *= lob.clearcoat * w / q;
-                    if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
-                        gi_mask *= lob.clearcoat * w / q;
-                        path |= PATH_GI_SEGMENT;
-                    }
                     prev_pdf = layeredPdf(wo, world_normal, direction, disney_mat, lob);
                     path &= ~PATH_WANT_SUN;
                     cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
@@ -1925,14 +2311,28 @@ void main() {
             }
 
             // White noise from the PCG stream: Ray Reconstruction assumes independent samples,
-            // no pattern shared across the screen (DLSS-RR Integration Guide 3.5).
-            let n0 = randf();
-            let n1 = randf();
-            let n2 = randf();
-            let n3 = randf();
-            let noise = float4(n0, n1, n2, n3);
+            // no pattern shared across the screen (DLSS-RR Integration Guide 3.5). While ReSTIR PT
+            // searches, the path seed's numbers instead, which replay draws again.
+            float4 noise;
+            float u_lobe;
+            if (GI_ON && (path & PATH_PT_SEARCH) != 0u) {
+                let vi = bounce_idx - pt_base;
+                noise = float4(pathRandom(pt_seed, vi, 0u), pathRandom(pt_seed, vi, 1u),
+                               pathRandom(pt_seed, vi, 2u), pathRandom(pt_seed, vi, 3u));
+                u_lobe = pathRandom(pt_seed, vi, 4u);
+            } else {
+                let n0 = randf();
+                let n1 = randf();
+                let n2 = randf();
+                let n3 = randf();
+                noise = float4(n0, n1, n2, n3);
+                u_lobe = randf();
+            }
 
-            let brdf = sampleDisneyBRDF(noise, -direction, world_normal, disney_mat, direction);
+            let brdf = sampleDisneyBRDF(noise, u_lobe, -direction, world_normal, disney_mat, direction);
+            if (GI_ON && bounce_idx == pt_k_bounce && brdf.a > 0.0) {
+                pt_cont_dir = direction;
+            }
             // A mirror bounce still sees the sun disc: its delta lobe is no part of next-event
             // estimation (evalDisneyBRDF leaves it out), so the disc is how the sun reaches it.
             if (brdf.a != 0.0) {
@@ -1952,17 +2352,13 @@ void main() {
             }
 
             mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
-            if (GI_ON && resumed && (path & PATH_GI_VERTEX) != 0u) {
-                gi_mask *= brdf.a > 0.0001 ? brdf.rgb / brdf.a : brdf.rgb;
-                path |= PATH_GI_SEGMENT;
-            }
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
             path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
             // carried; the indirect bounces were most of the trace.
-            if (ROULETTE_FROM > 0u && bounce_idx + 1u >= ROULETTE_FROM) {
+            if (ROULETTE_FROM > 0u && bounce_idx + 1u >= ROULETTE_FROM && (path & PATH_PT_SEARCH) == 0u) {
                 let q = clamp(max(mask.r, max(mask.g, mask.b)), 0.25, 1.0);
                 if (randf() >= q) {
                     break;
@@ -1982,21 +2378,29 @@ void main() {
                 m.g > 1.0e-6 ? delta.g / m.g : 0.0,
                 m.b > 1.0e-6 ? delta.b / m.b : 0.0));
         }
-        // ReSTIR GI's candidate: what the path gathered from the secondary hit on, over the
-        // weight that reached it, leaves the path for gi_shade (null: the light stays here).
+        // ReSTIR PT's sample: what the path gathered from the reconnection vertex on, over the
+        // weight that reached it, leaves the path for the reuse passes (null: none was found, the
+        // light stays here).
         if (GI_ON && (path & PATH_GI_VERTEX) != 0u) {
-            var L = float3(0.0);
+            var Lc = float3(0.0);
+            var Ln = float3(0.0);
             if ((path & PATH_GI_LIVE) != 0u) {
-                let delta = max(acc - gi_acc, float3(0.0));
-                L = float3(
-                    gi_mask.r > 1.0e-6 ? delta.r / gi_mask.r : 0.0,
-                    gi_mask.g > 1.0e-6 ? delta.g / gi_mask.g : 0.0,
-                    gi_mask.b > 1.0e-6 ? delta.b / gi_mask.b : 0.0);
+                // Each part over the weight that reached x_k: what x_k sent toward x_{k-1}.
+                let cont = max(acc - pt_acc_mid, float3(0.0));
+                Lc = float3(gi_mask.r > 1.0e-6 ? cont.r / gi_mask.r : 0.0,
+                            gi_mask.g > 1.0e-6 ? cont.g / gi_mask.g : 0.0,
+                            gi_mask.b > 1.0e-6 ? cont.b / gi_mask.b : 0.0);
+                Ln = float3(gi_mask.r > 1.0e-6 ? pt_nee.r / gi_mask.r : 0.0,
+                            gi_mask.g > 1.0e-6 ? pt_nee.g / gi_mask.g : 0.0,
+                            gi_mask.b > 1.0e-6 ? pt_nee.b / gi_mask.b : 0.0);
                 acc = gi_acc;
+                storeAligned<16>((uint4*)(pc.gi_candidates + prim_at) + 3,
+                                 uint4(packRgb9e5(Ln), packHalf2(float32x3_to_oct(pt_cont_dir)),
+                                       packHalf2(float32x3_to_oct(pt_nee_dir)), pt_nk));
             } else {
                 pc.gi_candidates[prim_at].pdf = 0.0;
             }
-            pc.gi_candidates[prim_at].L = packRgb9e5(L);
+            pc.gi_candidates[prim_at].L = packRgb9e5(Lc);
             pc.gi_candidates[prim_at].frame = pc.uniforms.frame;
         }
     }

@@ -443,3 +443,36 @@ public float3 giContribution(RestirSurface s, float3 x_s, float3 n_s, float3 L, 
     let mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
     return evalLayered(v, n, w, mat, lob, true) * abs(NoL) * L;
 }
+
+// ReSTIR PT: the radiance a sample's reconnection vertex x_k sends toward `wo` (x_k -> x_{k-1}),
+// its BSDF evaluated again for that direction over the two directions it received light along:
+// the continuation and the next-event sample, each stored as what it sent toward the path's own
+// direction (`c.wo`) and scaled by the BSDF's ratio between the two views. The pdfs and MIS
+// weights inside stay the path's -- fixed functions of the directions, so for any `wo` this is an
+// unbiased estimate of what x_k sends there. (Stored as radiance over pdf the sun's next-event
+// term overflowed RGB9E5.)
+public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
+    let n = oct_to_float32x3(unpackHalf2(c.n_k));
+    let a = float3(float(c.albedo_metallic & 0xFFu), float((c.albedo_metallic >> 8) & 0xFFu),
+                   float((c.albedo_metallic >> 16) & 0xFFu)) / 255.0;
+    let mat = disneyMaterial(a * a, float(c.albedo_metallic >> 24) / 255.0, c.roughness);
+    let wo_src = oct_to_float32x3(unpackHalf2(c.wo));
+    var L = float3(0.0);
+    let Lc = unpackRgb9e5(c.L);
+    if (any(Lc > float3(0.0))) {
+        let wi = oct_to_float32x3(unpackHalf2(c.wi_c));
+        let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
+        let f1 = evalDisneyBRDF(wo, n, wi, mat);
+        L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
+                    f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
+    }
+    let Ln = unpackRgb9e5(c.L_nee);
+    if (any(Ln > float3(0.0))) {
+        let wi = oct_to_float32x3(unpackHalf2(c.wi_n));
+        let f0 = evalDisneyBRDF(wo_src, n, wi, mat);
+        let f1 = evalDisneyBRDF(wo, n, wi, mat);
+        L += float3(f0.r > 0.0 ? f1.r / f0.r : 0.0, f0.g > 0.0 ? f1.g / f0.g : 0.0,
+                    f0.b > 0.0 ? f1.b / f0.b : 0.0) * Ln;
+    }
+    return L;
+}

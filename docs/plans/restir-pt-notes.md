@@ -32,9 +32,47 @@ Plan: `restir-pt.html`. Newest last.
 - Debugging lesson: the sealed-window test rebuilt the example and later runs used that binary until a
   rebuild (three black captures). Rebuild after reverting an example.
 
+- 2026-10-15: phases 1-2. PT grew out of GI in place (restir_gi.rs, restir_gi.slang, raygen.slang; names
+  kept until phase 4). Design checked against RTXDI's ReSTIR PT (/mnt/code/f/RTXDI, read only: its
+  library is under the NVIDIA RTX SDKs license, so nothing is copied): replay in primary sample space
+  (the replayed prefix's own f cos / pdf is the target; only the reconnection has a Jacobian).
+  - Sample (80 B): x_k at the first k >= 1 where x_{k-1} and x_k are rough (>= restir_gi_roughness), not
+    glass, no thin layers, and farther apart than 3 % of the primary vertex's camera distance; k <= 3. Light
+    before x_k stays in the pixel's path. Stored: x_k, its material and shading normal, the source view,
+    what x_k sent toward x_{k-1} split by direction (its next-event sample, its BSDF continuation), the
+    density of x_{k-1} -> x_k, the seed, k, the path weight T, the geometry term.
+  - BSDF numbers while searching come from a stateless hash of (seed, vertex, dimension); no Russian
+    roulette and no radiance-cache answers until the search ends (replay must match the source prefix).
+  - gi_spatial is a raygen (replay traces): pairwise MIS over random neighbours, every target the same
+    function (the canonical replayed too), visibility of the reconnection segment in the target.
+  - x_k's BSDF is evaluated again for the shifted incoming direction: each stored part scaled by
+    f(wo')/f(wo_src) (the pdfs and MIS weights inside stay the path's, fixed functions of the directions).
+    Storing radiance over pdf instead overflowed RGB9E5 (the sun's next-event term).
+- Bugs on the way: the final reservoir's segment normals were stored as zero (gi_shade's visibility ray
+  left along (0, 0, 1) and hit its own surface on the west wall and floor: -15 %); a splice cut 99 lines of
+  the primary pass (restored from HEAD).
+- Measured (sun room 960x540, references against no PT and no SHaRC, the truth):
+  | config | bias block error (floor ~0.017) | input black | RR block error | RR change/frame |
+  | no PT, SHaRC | 0.018 | 61 % | 0.089 | 0.070 |
+  | PT own only | 0.018 | 60 % | - | - |
+  | PT 3 neighbours | 0.027 | 60 % | 0.105 | 0.034 |
+  | PT 8 | 0.021 | 39 % | 0.106 | 0.031 |
+  | PT 16 | 0.017 | 25 % | 0.071 | 0.023 |
+  Before x_k's BSDF was re-evaluated, reuse ran bright (+1.2 %, 0.045: RIS favoured samples whose radiance
+  was high toward their own pixel). RR's output still reads ~0.72 of the reference (its energy loss on
+  sparse input is not solved by spatial reuse; temporal reuse is phase 3).
+
 ## Deviations
 
 - Phase 0, procedural spheres in the primary record: deferred. Recording them needs MakeHit with the
   sphere's attribute type and a marker other than hit_kind != 0; the sun room's spheres are metal (a
   mirror and roughness 0.2), outside GI/PT eligibility anyway. Sphere pixels keep re-tracing from the
   camera (no ReSTIR surface; their direct light comes from the path's NEE).
+- Layered primary vertices (thin translucency, clear coat) take no part: replay draws the base lobe only.
+  GI took them for k = 1.
+- SHaRC: a PT path teaches the cache only from past x_k. Its search vertices (no cached answers, no
+  roulette) made the voxels read brighter than the truth (own-only PT 0.035 against the truth; 0.018 with
+  the restriction). The mechanism is not identified. Letting the cache answer at x_k (as a
+  direction-free part) densified the input (30 % black) but read 1.3 % dark (0.064): not taken.
+- restir_gi_spatial_samples stays 0 by default until the cost is measured (phase 3).
+

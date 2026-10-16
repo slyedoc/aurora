@@ -104,6 +104,7 @@ pub struct CompiledRaytracingPipeline {
     pub stack_primary: u32,
     pub stack_gi_shade: u32,
     pub stack_accumulate: u32,
+    pub stack_gi_spatial: u32,
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
@@ -113,6 +114,8 @@ pub struct CompiledRaytracingPipeline {
     pub gi_shade_handle: RTGroupHandle,
     /// The reference accumulation's raygen (reference.rs).
     pub accumulate_handle: RTGroupHandle,
+    /// ReSTIR PT's spatial resampling raygen (restir_gi.rs).
+    pub gi_spatial_handle: RTGroupHandle,
     pub miss_handle: RTGroupHandle,
     /// Miss index 1: shadow rays.
     pub shadow_miss_handle: RTGroupHandle,
@@ -184,6 +187,8 @@ pub struct RaytracingPushConstants {
     pub reference: u64,
     /// Radiance-cache entries (`sharc`; 0 until first enabled).
     pub sharc: u64,
+    /// ReSTIR PT's per-view block (`restir_gi`; 0 when off).
+    pub gi_frame: u64,
 }
 
 /// The trace's push data: the shaders' push-constant block, then what a descriptor set used to
@@ -506,6 +511,27 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
+        // ReSTIR PT's spatial resampling (raygen.slang `gi_spatial`): its shift replays prefixes.
+        let gi_spatial_group = shader_group.len();
+        let gi_spatial_stage = shader_stages.len() as u32;
+        shader_stages.push(
+            render_device
+                .load_shader_entry(
+                    raygen_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                    c"gi_spatial",
+                )
+                .specialization_info(&spec),
+        );
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(gi_spatial_stage)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
         // The shadow rays' miss shader (miss index 1, miss.slang `shadow_miss`), last.
         let shadow_miss_group = shader_group.len();
         let shadow_miss_stage = shader_stages.len() as u32;
@@ -660,6 +686,7 @@ impl VulkanAsset for RaytracingPipeline {
         let primary_handle = handles[primary_group];
         let gi_shade_handle = handles[gi_shade_group];
         let accumulate_handle = handles[accumulate_group];
+        let gi_spatial_handle = handles[gi_spatial_group];
         let shadow_miss_handle = handles[shadow_miss_group];
         let shadow_hit_handle = handles[shadow_hit_group];
         let shadow_empty_handle = handles[shadow_empty_group];
@@ -708,6 +735,8 @@ impl VulkanAsset for RaytracingPipeline {
         let stack_gi_shade =
             group_stack(gi_shade_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         let stack_accumulate = group_stack(accumulate_group, vk::ShaderGroupShaderKHR::GENERAL);
+        let stack_gi_spatial =
+            group_stack(gi_spatial_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         log::debug!(
             "Raytracing pipeline compiled in {:?}, raygen stack {raygen_stack} B; per thread: main \
              {stack_main}, fog grid {stack_fog_grid}, primary {stack_primary}, gi shade \
@@ -723,11 +752,13 @@ impl VulkanAsset for RaytracingPipeline {
             stack_primary,
             stack_gi_shade,
             stack_accumulate,
+            stack_gi_spatial,
             raygen_handle,
             fog_grid_handle,
             primary_handle,
             gi_shade_handle,
             accumulate_handle,
+            gi_spatial_handle,
             miss_handle,
             shadow_miss_handle,
             shadow_hit_handle,
