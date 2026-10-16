@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one, and a clear glass sphere.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--glass R] [--no-glass] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--nrc-lr L] [--glass R] [--no-glass] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -92,6 +92,11 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             "--no-sharc" => settings.sharc = false,
             "--sharc" => settings.sharc = true,
             "--nrc" => settings.nrc = true,
+            "--nrc-lr" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    settings.nrc_learning_rate = v;
+                }
+            }
             "--bounces" => {
                 if let Some(n) = args.get(i + 1).and_then(|n| n.parse().ok()) {
                     settings.max_bounces = n;

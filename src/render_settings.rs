@@ -183,9 +183,9 @@ impl Default for RenderSettings {
             rr_preset: RrPreset::current(),
             low_latency: crate::latency::LowLatency::On,
             jitter_scale: 1.0,
-            local_tonemap: 0.4,
-            bloom: 0.06,
-            tonemap: true,
+            local_tonemap: 0.0,
+            bloom: 0.0,
+            tonemap: false,
         }
     }
 }
