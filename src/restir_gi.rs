@@ -36,6 +36,8 @@ use crate::{
 /// `GiCandidate`, `GiReservoir` and `RestirSurface` in rt_types.slang.
 const CANDIDATE_BYTES: u64 = 80;
 const RESERVOIR_BYTES: u64 = 48;
+/// `PtHistory` in rt_types.slang.
+const HISTORY_BYTES: u64 = 128;
 const SURFACE_BYTES: u64 = 64;
 
 /// `GiFrame` in restir_gi.slang.
@@ -45,14 +47,15 @@ struct GiFrameGpu {
     candidates: u64,
     surfaces: u64,
     final_: u64,
-    pad_ptr: u64,
+    history: u64,
     width: u32,
     height: u32,
     frame: u32,
     spatial_samples: u32,
     spatial_radius: f32,
     boiling: f32,
-    pad: [u32; 2],
+    history_cap: f32,
+    pad: u32,
 }
 
 /// `GiPush` in restir_gi.slang.
@@ -92,12 +95,15 @@ pub struct GiAddresses {
 struct GiView {
     candidates: Buffer<u8>,
     reservoirs: Buffer<u8>,
+    /// Last frame's final reservoirs (temporal reuse).
+    history: Buffer<u8>,
     /// Only while ReSTIR DI is off.
     surfaces: Buffer<u8>,
     frame: Buffer<GiFrameGpu>,
     pixels: u64,
     threads: u32,
     spatial: bool,
+    temporal: bool,
 }
 
 impl GiView {
@@ -105,6 +111,7 @@ impl GiView {
         for handle in [
             self.candidates.handle,
             self.reservoirs.handle,
+            self.history.handle,
             self.surfaces.handle,
             self.frame.handle,
         ] {
@@ -141,6 +148,7 @@ impl RestirGiState {
             view.release(rd);
             view.candidates = rd.create_device_buffer(pixels * CANDIDATE_BYTES, usage);
             view.reservoirs = rd.create_device_buffer(pixels * RESERVOIR_BYTES, usage);
+            view.history = rd.create_device_buffer(pixels * HISTORY_BYTES, usage);
             view.frame = rd.create_device_buffer(1, usage);
             view.pixels = pixels;
             log::debug!(
@@ -148,7 +156,7 @@ impl RestirGiState {
                 input.slot,
                 input.extent.width,
                 input.extent.height,
-                pixels * (CANDIDATE_BYTES + RESERVOIR_BYTES) / (1024 * 1024)
+                pixels * (CANDIDATE_BYTES + RESERVOIR_BYTES + HISTORY_BYTES) / (1024 * 1024)
             );
         }
         let surfaces_made = own_surfaces && view.surfaces.handle == vk::Buffer::null();
@@ -163,6 +171,7 @@ impl RestirGiState {
             if fresh {
                 handles.push(view.candidates.handle);
                 handles.push(view.reservoirs.handle);
+                handles.push(view.history.handle);
             }
             if surfaces_made {
                 handles.push(view.surfaces.handle);
@@ -188,19 +197,25 @@ impl RestirGiState {
         };
         let final_ = view.reservoirs.address;
         view.spatial = settings.restir_gi_spatial_samples > 0;
+        view.temporal = settings.restir_pt_history >= 1.0;
         view.threads = pixels as u32;
         let gpu = GiFrameGpu {
             candidates: view.candidates.address,
             surfaces,
             final_,
-            pad_ptr: 0,
+            history: view.history.address,
             width: input.extent.width,
             height: input.extent.height,
             frame: input.frame,
             spatial_samples: settings.restir_gi_spatial_samples.min(16),
             spatial_radius: settings.restir_gi_spatial_radius.max(1.0),
             boiling: settings.restir_boiling.clamp(0.0, 1.0),
-            pad: [0; 2],
+            history_cap: if view.temporal {
+                settings.restir_pt_history.min(32.0)
+            } else {
+                0.0
+            },
+            pad: 0,
         };
         // Recorded, not written through a mapping: the previous frame may still read it.
         unsafe {
@@ -227,6 +242,12 @@ impl RestirGiState {
     /// Whether view `slot` resamples spatially (raygen.slang `gi_spatial`, after the candidates).
     pub fn spatial(&self, slot: usize) -> bool {
         self.views[slot].spatial && self.views[slot].frame.address != 0
+    }
+
+    /// Whether view `slot` reuses last frame's reservoirs (raygen.slang `gi_temporal`, before the
+    /// spatial pass).
+    pub fn temporal(&self, slot: usize) -> bool {
+        self.views[slot].temporal && self.views[slot].frame.address != 0
     }
 
     /// Records the candidate pass for view `slot`, after the path tracer wrote its samples and

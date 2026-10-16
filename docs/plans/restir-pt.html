@@ -110,6 +110,18 @@ reservoir: sample + W, M, phat, frame  -> 64 B; candidate + final (+ last frame'
 <tr><td>4. Remove ReSTIR GI</td><td>builds; PT covers its scenes at least as well</td></tr>
 </table>
 
+<h2>Status (2026-10-16)</h2>
+<table>
+<tr><th>phase</th><th>outcome</th></tr>
+<tr><td>0</td><td>done: exact BSDF pdf (and a shading-normal bug found against Cycles); procedural spheres in the primary record deferred</td></tr>
+<tr><td>1</td><td>done: samples with x_k at k &le; 3, path seed, radiance split by direction at x_k; own shading unbiased</td></tr>
+<tr><td>2</td><td>done: hybrid shift (replay + reconnection, visibility in the target, x_k's BSDF re-evaluated); unbiased; 4 neighbours ~1.5 ms at 1080p, on by default</td></tr>
+<tr><td>3</td><td>done: temporal reuse with confidence; unbiased, but fails the RR gate (correlated input), so off by default (restir_pt_history)</td></tr>
+<tr><td>4</td><td>done: GI replaced in place (public names kept)</td></tr>
+</table>
+<p>D7 revisited: with the exposure pinned, Ray Reconstruction's output is within 1 % of the reference
+with or without PT; its 0.58-0.85 came with auto-exposure (open). Details: restir-pt-notes.md.</p>
+
 <h2>Risks</h2>
 <ul>
 <li>RR and correlation: the central risk (GI's lesson). Measured every phase; if reuse cannot pass RR's gate, the fallback

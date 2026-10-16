@@ -71,6 +71,8 @@ pub struct SBT {
     pub accumulate_region: vk::StridedDeviceAddressRegionKHR,
     /// ReSTIR PT's spatial resampling raygen record, after the accumulation's.
     pub gi_spatial_region: vk::StridedDeviceAddressRegionKHR,
+    /// ReSTIR PT's temporal resampling raygen record, after the spatial one's.
+    pub gi_temporal_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
     /// One table per frame parity: the frame being recorded writes its own while the previous
@@ -152,6 +154,8 @@ fn update_sbt(
     sbt.accumulate_region.size = sbt.raygen_region.stride;
     sbt.gi_spatial_region.stride = sbt.raygen_region.stride;
     sbt.gi_spatial_region.size = sbt.raygen_region.stride;
+    sbt.gi_temporal_region.stride = sbt.raygen_region.stride;
+    sbt.gi_temporal_region.size = sbt.raygen_region.stride;
 
     sbt.miss_region.stride =
         vk_utils::aligned_size(handle_size_aligned, aligments.shader_group_base_alignment);
@@ -175,6 +179,7 @@ fn update_sbt(
         + sbt.gi_shade_region.size
         + sbt.accumulate_region.size
         + sbt.gi_spatial_region.size
+        + sbt.gi_temporal_region.size
         + sbt.miss_region.size
         + sbt.hit_region.size;
 
@@ -234,6 +239,10 @@ fn update_sbt(
                 handle: rtx_pipeline.gi_spatial_handle,
             });
             dst = dst.add(sbt.gi_spatial_region.size as usize);
+            (dst as *mut SBTRegionRaygen).write(SBTRegionRaygen {
+                handle: rtx_pipeline.gi_temporal_handle,
+            });
+            dst = dst.add(sbt.gi_temporal_region.size as usize);
 
             // miss region (also only a hanlde, comes after the raygen region)
             (dst as *mut SBTRegionMiss).write(SBTRegionMiss {
@@ -349,8 +358,10 @@ fn update_sbt(
         sbt.gi_shade_region.device_address + sbt.gi_shade_region.size;
     sbt.gi_spatial_region.device_address =
         sbt.accumulate_region.device_address + sbt.accumulate_region.size;
-    sbt.miss_region.device_address =
+    sbt.gi_temporal_region.device_address =
         sbt.gi_spatial_region.device_address + sbt.gi_spatial_region.size;
+    sbt.miss_region.device_address =
+        sbt.gi_temporal_region.device_address + sbt.gi_temporal_region.size;
     sbt.hit_region.device_address = sbt.miss_region.device_address + sbt.miss_region.size;
 }
 

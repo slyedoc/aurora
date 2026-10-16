@@ -83,6 +83,36 @@ Plan: `restir-pt.html`. Newest last.
   4 neighbours 8.2 -> 1.5 ms, 8 -> 2.8 ms. PT overhead at 4 neighbours ~3 ms (trace +1.0, candidates 0.26,
   spatial 1.5, shade 0.3) on a 7.4 ms frame.
 
+- 2026-10-16: phase 3, temporal reuse, and the Ray Reconstruction gate.
+  - Ray Reconstruction is faithful once the exposure is pinned: no PT, RR's output against the reference
+    1.008 (block error 0.035, change/frame 0.004) at --ev100 9, against 0.67-0.75 under auto-exposure.
+    The darkening every earlier measurement blamed on RR (the plan's "0.58-0.85") comes with
+    auto-exposure: in the brightest bands (window, sunlit patch) RR kept ~0.6 though the averaged input
+    matched the reference. Either the metered exposure varies between frames (RR's history is in
+    pre-exposed units) or the capture's conversion back to nits uses a different exposure: open, outside PT.
+    RR gates below are at a pinned exposure.
+  - gi_temporal (raygen): this pixel's sample against last frame's final reservoir at the reprojected pixel
+    (confidence capped by restir_pt_history), pairwise MIS with confidence weights, both shifts (last
+    frame's sample here, ours to last frame's vertex, from a compact copy of it in the history). The result
+    replaces the candidate in place (W, M, target, geometry term from here) for gi_spatial, which weighs
+    neighbours by confidence and writes the history (128 B/px). gi_shade no longer tests visibility: every
+    target includes it.
+  - Bug on the way: the temporal winner kept last frame's `frame` stamp in the candidate slot, so gi_spatial
+    dropped the pixel (53 % black, 0.954).
+  | config (sun room 960x540, DLAA, --ev100 9) | bias vs truth | input black | RR block error | RR change |
+  | no PT | - | 61 % | 0.035 | 0.004 |
+  | PT own | 0.019 | 61 % | 0.035 | 0.004 |
+  | PT 4 neighbours | 0.018 | 21 % | 0.027 | 0.003 |
+  | PT temporal 8 | 0.020 | 4 % | 0.114 | 0.013 |
+  | PT temporal 8 + 4 neighbours | 0.018 | 3 % | 0.036 | 0.003 |
+  Temporal reuse is unbiased and densest but RR keeps its correlation (boiling): D4's gate fails, so it
+  ships off (restir_pt_history 0). Spatial 4 is the default (restir_gi_spatial_samples 4).
+  - many_lights: PT unbiased (0.003 against no PT); its light is mostly direct (ReSTIR DI), the input barely
+    changes, RR's block error 0.099 -> 0.074.
+- Phase 4: ReSTIR GI is gone (PT replaced it in place). Its names stay where they are public
+  (RenderSettings restir_gi*, restir_gi.rs, gi_* passes, the Gi / GiReuse debug views); the GI-only helpers
+  (giContribution, giShareable) are removed.
+
 ## Deviations
 
 - Phase 0, procedural spheres in the primary record: deferred. Recording them needs MakeHit with the
@@ -97,4 +127,7 @@ Plan: `restir-pt.html`. Newest last.
 - A k >= 2 sample's own target is its path's T L pdf, not a replay from the stored primary vertex (they
   differ by that vertex's stored precision): the pairwise weights' targets are one function only up to that.
 - restir_gi_spatial_samples stays 0 by default until the cost is measured (phase 3).
+- Names: PT kept ReSTIR GI's (settings, module, passes, debug views) rather than renaming public API
+  (Zero sets restir_gi); phase 4's "remove GI" is the replacement, not a rename.
+- Untested: Northshire (Zero has no capture yet; its default now runs PT with 4 neighbours), XR.
 

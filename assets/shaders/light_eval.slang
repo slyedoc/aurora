@@ -417,33 +417,6 @@ public float restirLuma(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-// The light reflected at the primary vertex `s` from a secondary hit (x_s, n_s) sending `L`
-// toward it: layered BSDF x |cos| x L (0 when the hit faces away or the direction leaves the
-// wrong side of the surface). `cos_s` and `d2`: the hit's cosine toward the vertex and their
-// squared distance, for the reconnection Jacobian.
-public float3 giContribution(RestirSurface s, float3 x_s, float3 n_s, float3 L, out float cos_s,
-                             out float d2) {
-    let d = x_s - s.position;
-    d2 = max(dot(d, d), 1.0e-8);
-    let w = d * rsqrt(d2);
-    cos_s = -dot(n_s, w);
-    if (cos_s <= 0.0) {
-        return float3(0.0);
-    }
-    let n = oct_to_float32x3(unpackHalf2(s.normal_oct));
-    let ng = oct_to_float32x3(unpackHalf2(s.geo_normal_oct));
-    let v = oct_to_float32x3(unpackHalf2(s.view_oct));
-    let lob = unpackLobes(s.material);
-    let NoL = dot(n, w);
-    let above = NoL > 0.0 && dot(w, ng) > 0.0;
-    let through = lob.transmission > 0.0 && NoL < 0.0 && dot(w, ng) < 0.0;
-    if (!above && !through) {
-        return float3(0.0);
-    }
-    let mat = disneyMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
-    return evalLayered(v, n, w, mat, lob, true) * abs(NoL) * L;
-}
-
 // ReSTIR PT: the radiance a sample's reconnection vertex x_k sends toward `wo` (x_k -> x_{k-1}),
 // its BSDF evaluated again for that direction over the two directions it received light along:
 // the continuation and the next-event sample, each stored as what it sent toward the path's own

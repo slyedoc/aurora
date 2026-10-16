@@ -1205,9 +1205,8 @@ void primary() {
 }
 
 // ReSTIR PT's shading (restir_gi.rs), one thread per traced pixel after the reuse passes: the
-// final reservoir's contribution (its target vector at this pixel times W), through one visibility
-// ray along its reconnection segment unless it is the pixel's own fresh sample (traced), added to
-// the noisy colour and the exposure meter as `main` would have. An occluded winner zeroes W.
+// final reservoir's contribution (its target vector at this pixel times W), added to the noisy
+// colour and the exposure meter as `main` would have.
 [shader("raygeneration")]
 void gi_shade() {
     let launch_id = DispatchRaysIndex().xy;
@@ -1229,27 +1228,9 @@ void gi_shade() {
     if (!(luma(c) > 0.0)) {
         return;
     }
+    // No visibility ray: every target the reuse passes resample includes the reconnection's
+    // visibility (an own sample is visible by construction).
     let s = restirSurfaceLoad(pc.restir_surfaces + idx);
-    if ((r.flags & GI_FRESH) == 0u) {
-        let n_from = oct_to_float32x3(unpackHalf2(r.n_from));
-        let n_to = oct_to_float32x3(unpackHalf2(r.n_to));
-        let to = offsetRay(r.to, n_to);
-        let d = to - r.from_;
-        let start = leaveSurface(r.from_, n_from, d);
-        let dist = length(to - start);
-        // A degenerate ray (the hit on the vertex, a non-finite position) is never traced: a NaN
-        // direction can stall traversal.
-        if (!(dist > 1.0e-4 && dist < 1.0e7)) {
-            return;
-        }
-        if (!traceVisible(restirRayMask(s), start, 0.0, (to - start) / dist, dist * 0.999)) {
-            pc.gi_final[idx].W = 0.0;
-            if (debug != nullptr) {
-                debug[3u + 2u * idx] = GI_STATE_OCCLUDED;
-            }
-            return;
-        }
-    }
     var gi = c * r.W * restirThroughput(s) / float(SAMPLES);
     if (!(luma(gi) < 1.0e20)) {
         return;
@@ -1481,6 +1462,116 @@ GiReservoir ptReservoir(float3 from_, float3 n_from, float3 to, float3 n_to, flo
     return r;
 }
 
+// A sample as the reservoir a resampling pass writes back: W, confidence M, its target vector's
+// luminance at this pixel and its geometry term from this pixel's x_{k-1}.
+GiCandidate ptAsReservoir(GiCandidate c, float W, float M, float phat, float geo) {
+    var r = c;
+    r.pdf = W;
+    r.q = M;
+    r.phat = phat;
+    r.geo = geo;
+    return r;
+}
+
+// ReSTIR PT's temporal resampling (restir_gi.rs), one thread per traced pixel after gi_candidates:
+// this pixel's own sample (confidence 1) against last frame's final reservoir at the reprojected
+// pixel (confidence capped at history_cap), pairwise MIS with confidence weights: each sample's
+// target in its own domain times its confidence against the other's target there times the shift's
+// Jacobian. Last frame's sample moves here by the hybrid shift; ours moves to last frame's vertex for
+// its weight. The result replaces this pixel's candidate in place (`pdf` = W, `q` = M, `phat` = its
+// target here, `geo` from here) for the spatial pass, and its target vector goes to the final
+// reservoir (the final answer when there is no spatial pass, which then also writes the history).
+[shader("raygeneration")]
+void gi_temporal() {
+    let launch_id = DispatchRaysIndex().xy;
+    let f = pc.gi_frame;
+    if (!GI_ON || f == nullptr || launch_id.x >= f.width || launch_id.y >= f.height) {
+        return;
+    }
+    let idx = launch_id.y * f.width + launch_id.x;
+    let s = restirSurfaceLoad(f.surfaces + idx);
+    let own = giCandidateLoad(f.candidates + idx);
+    let spatial = f.spatial_samples > 0u;
+    if (s.frame != f.frame || own.frame != f.frame) {
+        giReservoirStore(f.final_ + idx, ptReservoir(float3(0.0), float3(0.0, 1.0, 0.0), float3(0.0),
+                                                     float3(0.0, 1.0, 0.0), float3(0.0), 0.0, f.frame - 1u, 0u));
+        if (!spatial) {
+            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u);
+        }
+        return;
+    }
+    initRandom(uint2(f.width, f.height), uint2(launch_id), f.frame * 7u + 5u);
+    let thr = GI_RECONNECT_MIN * length(s.position - cameraOrigin());
+    let own_W = own.pdf;
+    var own_pdf = own;
+    own_pdf.pdf = (own_W > 0.0 && own.q > 0.0) ? 1.0 / (own_W * own.q) : 0.0;
+    let C_c = (own_W > 0.0 && own_W < 1.0e20) ? ptOwnTarget(s, own_pdf) : float3(0.0);
+    let pc_c = luma(C_c);
+    let own_valid = pc_c > 0.0;
+
+    var r_sample = own;
+    var r_C = own_valid ? C_c : float3(0.0);
+    var r_phat = own_valid ? pc_c : 0.0;
+    var r_geo = own.geo;
+    var r_wsum = own_valid ? pc_c * own_W : 0.0;
+    var M = 1.0;
+    var fresh = true;
+
+    let pp = restirReproject(&pc.uniforms.prev_view_proj[0], f.width, f.height, s.prev_position);
+    if (all(pp >= int2(0)) && pp.x < int(f.width) && pp.y < int(f.height)) {
+        let hi = uint(pp.y) * f.width + uint(pp.x);
+        uint hframe;
+        let ps = ptHistorySurface(f.history + hi, hframe);
+        let hs = ptHistorySample(f.history + hi);
+        let M_t = min(hs.q, f.history_cap);
+        if (hframe == f.frame - 1u && M_t > 0.0 && hs.pdf > 0.0 && hs.pdf < 1.0e20 && hs.phat > 0.0
+            && restirSimilar(s, ps.normal_oct, ps.depth)) {
+            let thr_p = GI_RECONNECT_MIN * length(ps.position - cameraOrigin());
+            // Ours at last frame's vertex, in our measure.
+            var m_c = 1.0;
+            if (own_valid) {
+                let at_p = ptShift(ps, thr_p, own);
+                let ok = luma(at_p.f) > 0.0 && at_p.J > 1.0 / PT_MAX_JACOBIAN && at_p.J < PT_MAX_JACOBIAN;
+                let den = pc_c + (ok ? M_t * luma(at_p.f) * at_p.J : 0.0);
+                m_c = den > 0.0 ? pc_c / den : 1.0;
+            }
+            // Last frame's, here.
+            let here = ptShift(s, thr, hs);
+            let p_here = luma(here.f);
+            var w_t = 0.0;
+            if (p_here > 0.0 && here.J > 1.0 / PT_MAX_JACOBIAN && here.J < PT_MAX_JACOBIAN) {
+                let den = M_t * hs.phat + p_here * here.J;
+                let m_t = den > 0.0 ? M_t * hs.phat / den : 0.0;
+                w_t = m_t * p_here * hs.pdf * here.J;
+            }
+            let w_c = own_valid ? m_c * pc_c * own_W : 0.0;
+            r_wsum = w_c;
+            r_sample = own;
+            if (w_t > 0.0) {
+                r_wsum += w_t;
+                if (randf() * r_wsum < w_t) {
+                    r_sample = hs;
+                    r_C = here.f;
+                    r_phat = p_here;
+                    r_geo = here.J * hs.geo;
+                    fresh = false;
+                }
+            }
+            M = min(1.0 + M_t, f.history_cap + 1.0);
+        }
+    }
+    let W = r_phat > 0.0 ? r_wsum / r_phat : 0.0;
+    var res = ptAsReservoir(r_sample, W, M, r_phat, r_geo);
+    // This frame's, whichever sample won (last frame's carries its own frame number).
+    res.frame = f.frame;
+    giCandidateStore(f.candidates + idx, res);
+    giReservoirStore(f.final_ + idx, ptReservoir(s.position, float3(0.0, 1.0, 0.0), r_sample.x_s,
+                                                 float3(0.0, 1.0, 0.0), r_C, W, f.frame, fresh ? GI_FRESH : 0u));
+    if (!spatial) {
+        ptHistoryStore(f.history + idx, res, s, f.frame);
+    }
+}
+
 // ReSTIR PT's spatial resampling (restir_gi.rs), one thread per traced pixel after gi_candidates:
 // pairwise MIS (as restir.slang's restir_spatial) over random neighbours' samples, each moved
 // here by the hybrid shift (random replay of its prefix from this pixel's vertex, reconnection
@@ -1502,10 +1593,14 @@ void gi_spatial() {
     }
     let s = restirSurfaceLoad(f.surfaces + idx);
     let own = giCandidateLoad(f.candidates + idx);
+    let temporal = f.history_cap > 0.0;
     if (s.frame != f.frame || own.frame != f.frame) {
         giReservoirStore(f.final_ + idx, ptReservoir(float3(0.0), float3(0.0, 1.0, 0.0), float3(0.0),
                                                      float3(0.0, 1.0, 0.0), float3(0.0), 0.0,
                                                      f.frame - 1u, 0u));
+        if (temporal) {
+            ptHistoryStore(f.history + idx, ptAsReservoir(own, 0.0, 0.0, 0.0, 0.0), s, 0u);
+        }
         return;
     }
     let px = int2(launch_id);
@@ -1516,11 +1611,22 @@ void gi_spatial() {
     let own_W = own.pdf;
     let n_c = oct_to_float32x3(unpackHalf2(own.n_s_oct));
 
-    // The canonical sample's target here (gi_candidates' `phat`: light_eval.slang ptOwnTarget),
-    // its density recovered from W = 1 / (pdf q).
-    var own_pdf = own;
-    own_pdf.pdf = (own_W > 0.0 && own.q > 0.0) ? 1.0 / (own_W * own.q) : 0.0;
-    let C_c = (own_W > 0.0 && own_W < 1.0e20) ? ptOwnTarget(s, own_pdf) : float3(0.0);
+    // The canonical reservoir's target here: after gi_temporal its vector is in the final
+    // reservoir and its confidence in `q`; else this pixel's own sample (gi_candidates' `phat`:
+    // light_eval.slang ptOwnTarget, its density recovered from W = 1 / (pdf q)).
+    var C_c = float3(0.0);
+    var M_c = 1.0;
+    if (temporal) {
+        C_c = unpackRgb9e5(giReservoirLoad(f.final_ + idx).C);
+        M_c = max(own.q, 1.0);
+    } else if (own_W > 0.0 && own_W < 1.0e20) {
+        var own_pdf = own;
+        own_pdf.pdf = own.q > 0.0 ? 1.0 / (own_W * own.q) : 0.0;
+        C_c = ptOwnTarget(s, own_pdf);
+    }
+    if (!(own_W > 0.0 && own_W < 1.0e20)) {
+        C_c = float3(0.0);
+    }
     let pc_yc = luma(C_c);
     let own_valid = pc_yc > 0.0;
 
@@ -1535,6 +1641,10 @@ void gi_spatial() {
     if (m == 0u) {
         giReservoirStore(f.final_ + idx, ptReservoir(s.position, n_c, own.x_s, n_c, C_c,
                                                      own_valid ? own_W : 0.0, f.frame, GI_FRESH));
+        if (temporal) {
+            ptHistoryStore(f.history + idx, ptAsReservoir(own, own_valid ? own_W : 0.0, M_c, pc_yc, own.geo), s,
+                           f.frame);
+        }
         return;
     }
 
@@ -1548,6 +1658,9 @@ void gi_spatial() {
     var mc_sum = 0.0;
     var neighbour_c = 0.0;
     var fresh = false;
+    var M_sum = M_c;
+    var r_sample = own;
+    var r_geo = own.geo;
     for (var bits = usable; bits != 0u; bits &= bits - 1u) {
         let q = ptNeighbourPixel(f, px, firstbitlow(bits), seed);
         let qi = uint(q.y) * f.width + uint(q.x);
@@ -1555,14 +1668,17 @@ void gi_spatial() {
         let nr = giCandidateLoad(f.candidates + qi);
         let nr_W = nr.pdf;
         let thr_q = GI_RECONNECT_MIN * length(qs.position - cameraOrigin());
+        // Its confidence (after gi_temporal its reservoir's M; else 1).
+        let M_i = temporal ? max(nr.q, 1.0) : 1.0;
+        M_sum += (nr_W > 0.0 && nr_W < 1.0e20) ? M_i : 0.0;
         // The canonical sample at the neighbour, in our measure.
         if (own_valid) {
             let at_q = ptShift(qs, thr_q, own);
             let pi_c = luma(at_q.f);
             let J_q = at_q.J;
             let ok = pi_c > 0.0 && J_q > 1.0 / PT_MAX_JACOBIAN && J_q < PT_MAX_JACOBIAN;
-            let den = (ok ? pi_c * J_q : 0.0) + pc_yc;
-            mc_sum += den > 0.0 ? pc_yc / den : 1.0;
+            let den = (ok ? M_i * pi_c * J_q : 0.0) + M_c * pc_yc;
+            mc_sum += den > 0.0 ? M_c * pc_yc / den : 1.0;
         }
         // The neighbour's sample, shifted here.
         if (!(nr_W > 0.0 && nr_W < 1.0e20) || !(nr.phat > 0.0)) {
@@ -1577,8 +1693,8 @@ void gi_spatial() {
         }
         // Its target at its own pixel (gi_candidates).
         let pi_i = nr.phat;
-        let den = pi_i + pc_yi * J;
-        let ai = den > 0.0 ? pi_i / den : 0.0;
+        let den = M_i * pi_i + M_c * pc_yi * J;
+        let ai = den > 0.0 ? M_i * pi_i / den : 0.0;
         let w = (ai / float(m)) * pc_yi * nr_W * J;
         neighbour_c += pc_yi * nr_W * J;
         r_wsum += w;
@@ -1590,6 +1706,8 @@ void gi_spatial() {
             r_nto = oct_to_float32x3(unpackHalf2(nr.n_s_oct));
             r_phat = pc_yi;
             fresh = false;
+            r_sample = nr;
+            r_geo = J * nr.geo;
         }
     }
     if (own_valid) {
@@ -1604,6 +1722,8 @@ void gi_spatial() {
             r_nto = n_c;
             r_phat = pc_yc;
             fresh = true;
+            r_sample = own;
+            r_geo = own.geo;
         }
     }
 
@@ -1618,6 +1738,10 @@ void gi_spatial() {
     let W = r_phat > 0.0 ? r_wsum / r_phat : 0.0;
     giReservoirStore(f.final_ + idx, ptReservoir(r_from, r_nfrom, r_to, r_nto, r_C, W, f.frame,
                                                  (W > 0.0 && fresh) ? GI_FRESH : 0u));
+    if (temporal) {
+        ptHistoryStore(f.history + idx, ptAsReservoir(r_sample, W, min(M_sum, f.history_cap), r_phat, r_geo),
+                       s, f.frame);
+    }
 }
 
 // The reference accumulation (reference.rs, docs/plans/reference-mode.html), one thread per traced

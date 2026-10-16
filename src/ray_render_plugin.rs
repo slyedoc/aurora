@@ -1781,6 +1781,34 @@ fn render_frame(
                             )
                         {
                             push_trace(trace_constants);
+                            if restir_gi.temporal(view.slot) {
+                                let scope = prof.begin(&render_device, cmd.get(), "gi temporal");
+                                render_device
+                                    .ext_rtx_pipeline
+                                    .cmd_set_ray_tracing_pipeline_stack_size(
+                                        cmd.get(),
+                                        rtx_pipeline.stack_gi_temporal,
+                                    );
+                                render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                    cmd.get(),
+                                    &sbt.gi_temporal_region,
+                                    &sbt.miss_region,
+                                    &sbt.hit_region,
+                                    &vk::StridedDeviceAddressRegionKHR::default(),
+                                    plan.render.width,
+                                    plan.render.height,
+                                    1,
+                                );
+                                prof.end(&render_device, cmd.get(), scope);
+                                crate::compute::memory_barrier(
+                                    &render_device,
+                                    cmd.get(),
+                                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                    vk::AccessFlags2::SHADER_WRITE,
+                                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                                );
+                            }
                             if restir_gi.spatial(view.slot) {
                                 let scope = prof.begin(&render_device, cmd.get(), "gi spatial");
                                 render_device

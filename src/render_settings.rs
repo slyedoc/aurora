@@ -68,26 +68,28 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
-    /// ReSTIR GI (restir_gi.rs): the first indirect bounce at the primary vertex reused across
-    /// neighbouring pixels (reservoirs of secondary hits), shaded by a pass of its own. Needs no
-    /// lights: a sun-only scene gets it too. On by default: at 1 spp without it Ray
-    /// Reconstruction drops the rare bright indirect paths (Northshire's abbey 7 % dark against
-    /// a 4 spp reference); with it within 1 %, local error 7.1 % -> 5.5 %, for ~0.9 ms at
-    /// 3840x1080. It replaced a radiance cache (SHaRC), which held the brightness but with more
-    /// local error (8.8 %) and bias.
+    /// ReSTIR PT (restir_gi.rs; docs/plans/restir-pt.html; the setting keeps ReSTIR GI's name,
+    /// which it replaced): sample 0's path from its reconnection vertex on resampled across
+    /// neighbouring pixels (and, with `restir_pt_history`, frames) by the hybrid shift, shaded by
+    /// a pass of its own. Unbiased against the plain path tracer (sun room references).
     pub restir_gi: bool,
-    /// Perceptual roughness from which a secondary hit's sample is shared with other pixels
-    /// (reconnection); a glossier hit's sample serves only its own pixel. Every primary vertex
-    /// but near-mirrors (perceptual roughness < 0.1) and glass takes part.
+    /// Perceptual roughness from which a vertex may begin or end a reconnection (both ends of
+    /// the reconnection segment must be at least this rough).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_gi_roughness: f32,
-    /// Neighbours merged by GI's spatial pass (0 = none, the default) and their disc (pixels).
-    /// Spatial reuse spreads bright samples into clumps that Ray Reconstruction turns into moving
-    /// blotches; each pixel's own candidate alone gives the plain path's noise.
+    /// Neighbours merged by the spatial pass (0 = none) and their disc (pixels). 4 by default:
+    /// sun room at DLAA, Ray Reconstruction's error against the reference 0.035 -> 0.027 and
+    /// black input pixels 61 -> 21 %, for ~1.5 ms at 1920x1080.
     #[reflect(@0.0..=16.0_f32)]
     pub restir_gi_spatial_samples: u32,
     #[reflect(@1.0..=64.0_f32)]
     pub restir_gi_spatial_radius: f32,
+    /// ReSTIR PT's temporal reuse: the confidence (samples) last frame's reservoir may carry into
+    /// this frame's (0 = none, the default). Unbiased and it densifies the input (3 % black), but
+    /// Ray Reconstruction keeps its frame-to-frame correlation: alone its error against the
+    /// reference triples (0.035 -> 0.114), with spatial reuse it is no better than none.
+    #[reflect(@0.0..=32.0_f32)]
+    pub restir_pt_history: f32,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
     /// under test take their old path at 0 and the new one at 1.
     pub ab: u32,
@@ -149,8 +151,9 @@ impl Default for RenderSettings {
             restir_boiling: 0.0,
             restir_gi: true,
             restir_gi_roughness: 0.35,
-            restir_gi_spatial_samples: 0,
+            restir_gi_spatial_samples: 4,
             restir_gi_spatial_radius: 30.0,
+            restir_pt_history: 0.0,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,

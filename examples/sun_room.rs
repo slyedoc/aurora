@@ -1,11 +1,12 @@
 //! A closed room lit by the sun through one small window: the patch of sunlight on the floor is
 //! the only direct light, everything else is bounce light -- the case 1-spp path tracing handles
-//! worst and ReSTIR GI is for. A red block and a blue cabinet for colour bleed, a mirror sphere
+//! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one.
 //!
 //!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
-//!       [--gi-spatial N] [--gi-radius R] [--bloom B] [--local-tonemap T]
+//!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
+//!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
 //!
 //! The flags change `RenderSettings` at startup (and pin the exposure), for comparing against a
 //! reference (e.g. `--no-gi --samples 4 --ev100 6`).
@@ -124,6 +125,11 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
             "--boiling" => {
                 if let Some(b) = args.get(i + 1).and_then(|b| b.parse().ok()) {
                     settings.restir_boiling = b;
+                }
+            }
+            "--pt-history" => {
+                if let Some(m) = args.get(i + 1).and_then(|m| m.parse().ok()) {
+                    settings.restir_pt_history = m;
                 }
             }
             "--gi-radius" => {

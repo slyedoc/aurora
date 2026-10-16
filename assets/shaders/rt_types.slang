@@ -460,6 +460,68 @@ public GiCandidate giCandidateLoad(GiCandidate* p) {
 // toward every direction (the cache's own assumption).
 public static const uint PT_NO_DIRECTION = 0xFFFFFFFFu;
 
+// A sample written back whole (the temporal pass replaces a pixel's candidate with its reservoir in
+// place: `pdf` holds W, `q` its confidence M, `phat` its target here, `geo` its geometry term from
+// this pixel's x_{k-1}).
+public void giCandidateStore(GiCandidate* p, GiCandidate c) {
+    let d = (uint4*)p;
+    storeAligned<16>(d, uint4(asuint(c.x_s), c.n_s_oct));
+    storeAligned<16>(d + 1, uint4(c.L, asuint(c.pdf), c.frame, asuint(c.phat)));
+    storeAligned<16>(d + 2, uint4(c.seed, c.k, c.T, asuint(c.geo)));
+    storeAligned<16>(d + 3, uint4(c.L_nee, c.wi_c, c.wi_n, c.n_k));
+    storeAligned<16>(d + 4, uint4(c.albedo_metallic, asuint(c.roughness), c.wo, asuint(c.q)));
+}
+
+// ReSTIR PT's history, one per traced pixel: last frame's final reservoir there (its sample as
+// giCandidateStore writes one: W, M, its target there, its geometry term from there) and that
+// pixel's primary vertex, enough of it for a shift to it (the temporal pass's pairwise weight).
+// 128 bytes.
+public struct PtHistory {
+    public GiCandidate sample;
+    public float3 position;
+    public uint normal_oct;
+    public uint geo_normal_oct;
+    public uint view_oct;
+    public uint albedo_metallic;
+    public uint material;
+    public float depth;
+    // throughput_b_mask's ray-mask byte (bits 16-23).
+    public uint mask;
+    public uint frame;
+    public uint pad;
+};
+
+public GiCandidate ptHistorySample(PtHistory* p) {
+    return giCandidateLoad((GiCandidate*)p);
+}
+
+// The history's primary vertex as a surface (the fields a shift reads).
+public RestirSurface ptHistorySurface(PtHistory* p, out uint frame) {
+    let d = (uint4*)p;
+    let a = loadAligned<16>(d + 5);
+    let b = loadAligned<16>(d + 6);
+    let c = loadAligned<16>(d + 7);
+    RestirSurface s = {};
+    s.position = asfloat(a.xyz);
+    s.normal_oct = a.w;
+    s.geo_normal_oct = b.x;
+    s.view_oct = b.y;
+    s.albedo_metallic = b.z;
+    s.material = b.w;
+    s.depth = asfloat(c.x);
+    s.throughput_b_mask = c.y;
+    frame = c.z;
+    return s;
+}
+
+public void ptHistoryStore(PtHistory* p, GiCandidate c, RestirSurface s, uint frame) {
+    giCandidateStore((GiCandidate*)p, c);
+    let d = (uint4*)p;
+    storeAligned<16>(d + 5, uint4(asuint(s.position), s.normal_oct));
+    storeAligned<16>(d + 6, uint4(s.geo_normal_oct, s.view_oct, s.albedo_metallic, s.material));
+    storeAligned<16>(d + 7, uint4(asuint(s.depth), s.throughput_b_mask & 0x00FF0000u, frame, 0u));
+}
+
 public uint ptPackAlbedoMetallic(float3 albedo, float metallic) {
     let a = sqrt(saturate(albedo));
     return uint(a.r * 255.0 + 0.5) | (uint(a.g * 255.0 + 0.5) << 8) | (uint(a.b * 255.0 + 0.5) << 16)
@@ -488,21 +550,8 @@ public static const uint GI_FRESH = 1u;
 // AuroraDebugView::GiReuse's codes (gi_shade writes them, quad.slang colours them).
 public static const uint GI_STATE_OFF = 0u;
 public static const uint GI_STATE_EMPTY = 1u;
-public static const uint GI_STATE_OWN_PRIVATE = 2u;
 public static const uint GI_STATE_OWN = 3u;
 public static const uint GI_STATE_NEIGHBOUR = 4u;
-public static const uint GI_STATE_OCCLUDED = 5u;
-
-// A sample's `n_s_oct` low bit: its secondary hit is rough enough (and the radiance it sends close
-// enough to the same in every direction) to reconnect to another pixel's vertex. Without it the
-// sample serves only the pixel that traced it. One ulp of a half, below the normal's precision.
-public uint giPackHitNormal(float3 n, bool shareable) {
-    return (packHalf2(float32x3_to_oct(n)) & ~1u) | (shareable ? 1u : 0u);
-}
-
-public bool giShareable(uint n_s_oct) {
-    return (n_s_oct & 1u) != 0u;
-}
 
 public GiReservoir giReservoirLoad(GiReservoir* p) {
     let d = (uint4*)p;
@@ -533,14 +582,17 @@ public struct GiFrame {
     public GiCandidate* candidates;
     public RestirSurface* surfaces;
     public GiReservoir* final_;
-    public uint64_t pad_ptr;
+    // Last frame's final reservoirs (temporal reuse; read before, written after this frame's).
+    public PtHistory* history;
     public uint width;
     public uint height;
     public uint frame;
     public uint spatial_samples;
     public float spatial_radius;
     public float boiling;
-    public uint pad[2];
+    // The temporal history's confidence cap (0 = no temporal reuse).
+    public float history_cap;
+    public uint pad;
 };
 
 // A world position's pixel in a frame with view-projection `m` (column-major) at `width` x
