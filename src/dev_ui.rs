@@ -20,6 +20,7 @@ use bevy::{
     },
     prelude::*,
     ui::{Display, GlobalZIndex},
+    ui_widgets::ScrollArea,
 };
 
 use crate::{
@@ -177,10 +178,14 @@ fn spawn_panel(world: &mut World) {
             ThemeBackgroundColor(tokens::WINDOW_BG)
             DevUIPanel
             Children [
+                // The inspectors scroll (mouse wheel): RenderSettings alone outgrows the window.
                 Node {
                     flex_direction: FlexDirection::Column,
                     align_self: AlignSelf::Stretch,
+                    max_height: vh(80),
+                    overflow: Overflow::scroll_y(),
                 }
+                ScrollArea
                 DevUIInspectorHost
                 --
                 @caption("centre: -") DevUIProbe
