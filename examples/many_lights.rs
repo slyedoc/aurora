@@ -2,7 +2,7 @@
 //! (bevy's solari_many_lights, ported). Lamp light, bounce light and nothing else: the scene for
 //! judging ReSTIR DI and GI (no sun or sky to hide the indirect).
 //!
-//!   cargo run --release --example many_lights [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example many_lights [-- --no-gi] [--no-restir] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!
 //! The flags change `RenderSettings` at startup, for comparing against a reference (e.g.
@@ -105,8 +105,6 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
         match arg.as_str() {
             "--no-gi" => settings.restir_gi = false,
             "--no-restir" => settings.restir = false,
-            "--no-sharc" => settings.sharc = false,
-            "--sharc" => settings.sharc = true,
             // No post-processing: the traced image exposed and shown linearly (fog is off
             // anyway: these environments have no `Fog`).
             "--raw" => {

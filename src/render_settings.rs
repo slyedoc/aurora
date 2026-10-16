@@ -100,14 +100,6 @@ pub struct RenderSettings {
     pub light_grid_cell: f32,
     #[reflect(@1.0..=64.0_f32)]
     pub light_grid_samples: u32,
-    /// Radiance cache (SHaRC-style): indirect paths end in converged voxels from the first bounce
-    /// on (a few train it to the end). Off by default: the stopgap before ReSTIR PT, which now
-    /// gives Ray Reconstruction the dense input (sun room with PT: RR error 0.017 with it, 0.020
-    /// without, within noise) and is faster without it (trace 1.9 -> 1.6 ms at 1080p).
-    pub sharc: bool,
-    /// Cache voxel size at the camera (meters); doubles per distance octave past 8m.
-    #[reflect(@0.05..=2.0_f32)]
-    pub sharc_voxel: f32,
     /// Neural radiance cache (nrc.rs; off on a device without VK_NV_cooperative_vector): paths
     /// that have spread far end in a small network's answer, trained online from the frame's own
     /// paths (docs/plans/nrc.html). A no-cache truth for comparisons turns it off.
@@ -173,8 +165,6 @@ impl Default for RenderSettings {
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,
-            sharc: false,
-            sharc_voxel: 0.25,
             nrc: true,
             nrc_spread: 0.01,
             nrc_train_fraction: 0.03,

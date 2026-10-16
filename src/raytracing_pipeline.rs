@@ -42,7 +42,6 @@ pub struct ExtractedRaytracingPipeline {
 /// registers included. Changing one rebuilds the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PipelineFeatures {
-    pub sharc: bool,
     pub restir: bool,
     pub restir_gi: bool,
     /// Some environment's sky is the atmosphere.
@@ -63,7 +62,6 @@ impl PipelineFeatures {
         let d = crate::render_settings::RenderSettings::default();
         let s = settings.unwrap_or(&d);
         Self {
-            sharc: settings.is_some_and(|s| s.sharc),
             restir: settings.is_some_and(|s| s.restir),
             restir_gi: settings.is_some_and(|s| s.restir_gi),
             atmosphere: skies.is_some_and(|s| s.atmosphere.is_some()),
@@ -188,8 +186,6 @@ pub struct RaytracingPushConstants {
     pub gi_debug: u64,
     /// The reference accumulation (`reference`; 0 unless on).
     pub reference: u64,
-    /// Radiance-cache entries (`sharc`; 0 until first enabled).
-    pub sharc: u64,
     /// ReSTIR PT's per-view block (`restir_gi`; 0 when off).
     pub gi_frame: u64,
     /// The neural radiance cache's per-view block (`nrc`; 0 when off).
@@ -306,11 +302,11 @@ impl VulkanAsset for RaytracingPipeline {
             surface_groups,
             features,
         } = asset;
-        // raygen.slang's `constant_id`s, 4 bytes each: 0 SHARC_ON, 1 RESTIR_ON, 2 ATMOSPHERE_ON
+        // raygen.slang's `constant_id`s, 4 bytes each: 0 free, 1 RESTIR_ON, 2 ATMOSPHERE_ON
         // (miss.slang's too), 3 SAMPLES, 4 MAX_BOUNCES, 5 LIGHT_CANDIDATES, 6 SPEC_HIT_ROUGHNESS
         // (f32), 7 ROULETTE_FROM, 8 GI_ON.
         let spec_data = [
-            features.sharc as u32,
+            0,
             features.restir as u32,
             features.atmosphere as u32,
             features.samples,

@@ -29,9 +29,8 @@ import nrc;
 
 // Settings fixed when the pipeline is built (raytracing_pipeline.rs `PipelineFeatures`, from
 // `RenderSettings`; changing one rebuilds it): the driver folds them, so a feature that is off
-// is gone from the shader, registers and all, and loops get constant bounds. SHARC's and
-// ReSTIR's uniforms still switch them per frame within a build that has them.
-[vk::constant_id(0)] const bool SHARC_ON = false;
+// is gone from the shader, registers and all, and loops get constant bounds. ReSTIR's uniforms
+// still switch it per frame within a build that has it. (Constant 0 is free.)
 [vk::constant_id(1)] const bool RESTIR_ON = false;
 // Some environment's sky is the atmosphere (sky.rs `EnvironmentSkies::atmosphere`).
 [vk::constant_id(2)] const bool ATMOSPHERE_ON = false;
@@ -409,112 +408,6 @@ LightCtx lightCtx() {
     ctx.emissive_boost = pc.uniforms.emissive_boost;
     return ctx;
 }
-
-// ---- Radiance cache (SHaRC-style; see src/sharc.rs) ---------------------------------------
-
-// Must match SHARC_ENTRIES in src/sharc.rs.
-static const uint SHARC_ENTRIES = 1u << 20;
-// The share of paths that never query the cache (they train it).
-static const float SHARC_TRAIN = 0.125;
-// Cache vertices a path records (its vertices past the camera's): all of max_bounces 4's.
-// Deeper paths' later vertices only read the cache. Every slot is live across every trace,
-// and the raygen's stack is what the trace's time follows (4 slots: +0.17 ms at 3840x1080).
-static const uint SHARC_VERTICES = 3u;
-
-// The voxel size at a point: `sharc_voxel` near the camera, doubling per distance octave
-// past 8 m.
-float sharcLevel(float3 pos, float3 cam) {
-    return floor(log2(max(max(length(pos - cam), 1.0e-3) / 8.0, 1.0)));
-}
-
-float sharcVoxelSize(float3 pos, float3 cam) {
-    return max(pc.uniforms.sharc_voxel, 1.0e-3) * exp2(sharcLevel(pos, cam));
-}
-
-// Voxel key: position quantized at a distance-scaled size, level, dominant face normal.
-uint4 sharcKey(float3 pos, float3 n, float3 cam) {
-    let level = sharcLevel(pos, cam);
-    let s = sharcVoxelSize(pos, cam);
-    let c = int3(floor(pos / s));
-    var axis = abs(n.x) > abs(n.y) ? (abs(n.x) > abs(n.z) ? 0u : 2u)
-                                   : (abs(n.y) > abs(n.z) ? 1u : 2u);
-    axis = axis * 2u + (n[axis] < 0.0 ? 1u : 0u);
-    return uint4(uint(c.x), uint(c.y), uint(c.z), (uint(level) << 3) | axis);
-}
-
-uint sharcHash(uint4 k) {
-    var h = k.x * 0x8da6b343u ^ k.y * 0xd8163841u ^ k.z * 0xcb1ab31fu ^ k.w * 0x165667b1u;
-    h ^= h >> 16;
-    h *= 0x7feb352du;
-    h ^= h >> 15;
-    h *= 0x846ca68bu;
-    h ^= h >> 16;
-    return h;
-}
-
-// Find-or-insert the entry for a voxel key: linear probe with a tag compare, claiming an
-// empty slot atomically. Returns ~0 when the neighbourhood is full (the path just traces on).
-uint sharcSlot(float3 pos, float3 n, float3 cam) {
-    let key = sharcKey(pos, n, cam);
-    let h = sharcHash(key);
-    let tag = (sharcHash(key.wxyz) | 1u);
-    for (uint i = 0u; i < 8u; i++) {
-        let slot = (h + i) & (SHARC_ENTRIES - 1u);
-        let t = pc.sharc[slot].tag;
-        if (t == tag) {
-            return slot;
-        }
-        if (t == 0u) {
-            uint prev;
-            InterlockedCompareExchange(pc.sharc[slot].tag, 0u, tag, prev);
-            if (prev == 0u || prev == tag) {
-                return slot;
-            }
-        }
-    }
-    return 0xFFFFFFFFu;
-}
-
-// The resolved radiance, if the entry has folded in enough samples to be trusted.
-// Finite and non-negative, by bit pattern (fast-math may fold isnan away): exponent all ones
-// is NaN or infinity, the sign bit is negative.
-bool sharcSane(float3 v) {
-    let b = asuint(v);
-    return all((b & 0x7f800000u) != 0x7f800000u) && all((b & 0x80000000u) == 0u);
-}
-
-bool sharcQuery(uint slot, out float3 radiance) {
-    radiance = float3(pc.sharc[slot].res_r, pc.sharc[slot].res_g, pc.sharc[slot].res_b);
-    return pc.sharc[slot].conf >= 16.0 && sharcSane(radiance);
-}
-
-// One path sample of the voxel's outgoing radiance (nits; fixed point at 1/65536 nit, so a
-// moonlit voxel is not rounded to black).
-// A NaN from one degenerate hit (the camera inside a wall, a mirror up close) cast to an
-// integer poisoned a whole voxel's channel: it glowed red, blue or yellow until it washed out.
-void sharcDeposit(uint slot, float3 radiance) {
-    if (!sharcSane(radiance)) {
-        return;
-    }
-    let r = min(radiance, float3(1.0e5)) * 65536.0;
-    InterlockedAdd(pc.sharc[slot].acc_r, uint64_t(r.r));
-    InterlockedAdd(pc.sharc[slot].acc_g, uint64_t(r.g));
-    InterlockedAdd(pc.sharc[slot].acc_b, uint64_t(r.b));
-    InterlockedAdd(pc.sharc[slot].acc_n, 1u);
-    pc.sharc[slot].frame = pc.uniforms.frame;
-}
-
-
-
-
-
-
-
-
-
-
-
-
 
 // The shading normal bent the least amount into the viewer's hemisphere: n' = n + v * (eps - n.v)
 // leaves n untouched when it already faces v and otherwise gives n'.v = eps (before the
@@ -1894,8 +1787,6 @@ void lensRay(float2 lens, uint2 launch_id, uint2 launch_size, out float3 origin,
 // The camera path's flags (main's `path`).
 static const uint PATH_WANT_SUN = 1u;
 static const uint PATH_CAMERA = 2u;
-static const uint PATH_SHARC_TRAIN = 8u;
-static const uint PATH_FROM_ROUGH = 16u;
 static const uint PATH_CACHE_BLIND = 32u;
 // ReSTIR PT: the primary vertex takes part (its sample is written at the path's end); the path
 // is still looking for its reconnection vertex (BSDF numbers from the path seed, no roulette);
@@ -1964,13 +1855,6 @@ void main() {
         var surf_n = float3(0.0);
         // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
-        // Radiance-cache update targets along this path: the voxel and, per vertex, snapshots
-        // of the running mask / radiance so the vertex's outgoing radiance falls out as a delta
-        // once the path ends.
-        uint sh_slot[SHARC_VERTICES];
-        float3 sh_mask[SHARC_VERTICES];
-        float3 sh_acc[SHARC_VERTICES];
-        var sh_n = 0u;
         // Neural radiance cache: the path's footprint (the sum of square roots of its spread so far
         // and the primary vertex's spread, Müller et al. 2021 sec. 5) and, on a training path, each
         // recorded vertex's ring slot with the mask and radiance it was reached with.
@@ -2009,22 +1893,12 @@ void main() {
         var pt_nee_dir = float3(0.0, 1.0, 0.0);
         var pt_cont_dir = float3(0.0, 1.0, 0.0);
         var pt_nk = 0u;
-        // The radiance cache answered at the reconnection vertex: its light is the cache's, the
-        // same toward every direction (the cache's own assumption).
-        var pt_cached = false;
         // The chance the search's prefix survived Russian roulette: the sample's density includes it,
         // its weight T does not (replay rolls no dice).
         var pt_q = 1.0;
-        // PATH_SHARC_TRAIN: one path in SHARC_TRAIN never asks the cache: traced to its end, it is what the
-        // cache learns from (answered paths only pass on what it already knows).
-        if (SHARC_ON && pc.uniforms.sharc != 0u && randf() < SHARC_TRAIN) {
-            path |= PATH_SHARC_TRAIN;
-        }
-        // PATH_FROM_ROUGH: the ray being traced left a rough surface: only then may the cache answer for what it
-        // hits (a mirror's or a glossy floor's reflection is traced, never the cache's cells).
         // PATH_CACHE_BLIND: the camera ray met the back of a solid surface first: the camera is inside geometry
         // (a wall it clipped through). Such a path sees unlit insides and must not teach the
-        // cache -- it poisoned the voxels of the room side, which glowed until washed out.
+        // neural radiance cache.
         // Ray cone for texture level of detail (surface.slang): width at the ray's origin
         // and spread angle. The camera ray opens by one pixel; a scattered bounce opens it by the
         // lobe it was drawn from, so indirect hits read blurrier levels (less noise too).
@@ -2370,41 +2244,6 @@ void main() {
             let surf_mat = surfaceMaterial(payload.color.rgb, metallic, roughness, transmission,
                                            inside ? ior : 1.0 / ior);
 
-            // Radiance cache: diffuse-ish vertices past the primary hit take part. At the first
-            // indirect hit on, a converged voxel ends the path with its cached outgoing
-            // radiance -- when the ray came off a rough surface and its footprint (the cone's width
-            // here) covers a voxel: a mirror's reflection or a close contact showed the cache's
-            // cells as blocks and leaked light. Training paths never ask. Every participating
-            // vertex of a traced path is an update target.
-            if (SHARC_ON && pc.uniforms.sharc != 0u && bounce_idx > 0
-                && roughness >= 0.35 && metallic <= 0.5 && transmission < 0.01) {
-                let slot = sharcSlot(origin, world_normal, cameraOrigin());
-                if (slot != 0xFFFFFFFFu) {
-                    // Not while ReSTIR PT searches: a cached answer there would end paths whose
-                    // reconnection lay further on, and a neighbour's sample shifted here would
-                    // count that light a second time.
-                    if ((path & PATH_SHARC_TRAIN) == 0u && ((path & PATH_FROM_ROUGH) != 0u)
-                        && (path & PATH_PT_SEARCH) == 0u
-                        && cone_width >= sharcVoxelSize(origin, cameraOrigin())) {
-                        float3 cached;
-                        if (sharcQuery(slot, cached)) {
-                            acc += mask * cached;
-                            pt_cached = bounce_idx == pt_k_bounce;
-                            break;
-                        }
-                    }
-                    // A ReSTIR PT path teaches the cache from past its reconnection vertex only:
-                    // its search vertices (no cached answers, no roulette) made the voxels read
-                    // brighter than the truth (measured; docs/plans/restir-pt-notes.md).
-                    if (sh_n < SHARC_VERTICES && (path & PATH_PT_SEARCH) == 0u) {
-                        sh_slot[sh_n] = slot;
-                        sh_mask[sh_n] = mask;
-                        sh_acc[sh_n] = acc;
-                        sh_n++;
-                    }
-                }
-            }
-
             // Direct light from the emissive-triangle table. At the primary vertex of sample 0,
             // with ReSTIR DI on, its passes do it (light grid, initial + temporal and spatial
             // reuse, one shadow ray: src/restir.rs); everywhere else it is RIS over CDF
@@ -2602,13 +2441,10 @@ void main() {
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             if (through) {
                 cone_spread = max(cone_spread, 0.37);
-                path |= PATH_FROM_ROUGH;
             } else if ((lobe & LOBE_MASK) == LOBE_COAT) {
                 cone_spread = max(cone_spread, 0.02 + 0.35 * lob.coat_alpha);
-                path = (lob.coat_alpha >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             } else {
                 cone_spread = max(cone_spread, 0.02 + 0.35 * roughness * roughness);
-                path = (roughness >= 0.35) ? path | PATH_FROM_ROUGH : path & ~PATH_FROM_ROUGH;
             }
             // Russian roulette: a dim path ends here with probability 1 - q, a survivor carries
             // 1/q more (unbiased). Paths otherwise ran to max_bounces however little they
@@ -2641,17 +2477,6 @@ void main() {
         if (nrc_ended) {
             acc = nrc_render;
         }
-        // The path ended: everything gathered after each cache vertex, divided by its mask
-        // snapshot, is one sample of that voxel's outgoing radiance (zero radiance included --
-        // darkness is learned too).
-        for (uint si = 0u; si < ((path & PATH_CACHE_BLIND) != 0u ? 0u : sh_n); si++) {
-            let delta = max(acc - sh_acc[si], float3(0.0));
-            let m = sh_mask[si];
-            sharcDeposit(sh_slot[si], float3(
-                m.r > 1.0e-6 ? delta.r / m.r : 0.0,
-                m.g > 1.0e-6 ? delta.g / m.g : 0.0,
-                m.b > 1.0e-6 ? delta.b / m.b : 0.0));
-        }
         // ReSTIR PT's sample: what the path gathered from the reconnection vertex on, over the
         // weight that reached it, leaves the path for the reuse passes (null: none was found, the
         // light stays here).
@@ -2667,16 +2492,10 @@ void main() {
                 Ln = float3(gi_mask.r > 1.0e-6 ? pt_nee.r / gi_mask.r : 0.0,
                             gi_mask.g > 1.0e-6 ? pt_nee.g / gi_mask.g : 0.0,
                             gi_mask.b > 1.0e-6 ? pt_nee.b / gi_mask.b : 0.0);
-                var wi_n = packHalf2(float32x3_to_oct(pt_nee_dir));
-                if (pt_cached) {
-                    // The cache's answer: all of x_k's light, in the next-event slot, no direction.
-                    Ln = Lc;
-                    Lc = float3(0.0);
-                    wi_n = PT_NO_DIRECTION;
-                }
                 acc = gi_acc;
                 storeAligned<16>((uint4*)(pc.gi_candidates + prim_at) + 3,
-                                 uint4(packRadiance(Ln), packHalf2(float32x3_to_oct(pt_cont_dir)), wi_n, pt_nk));
+                                 uint4(packRadiance(Ln), packHalf2(float32x3_to_oct(pt_cont_dir)),
+                                       packHalf2(float32x3_to_oct(pt_nee_dir)), pt_nk));
             } else {
                 pc.gi_candidates[prim_at].pdf = 0.0;
             }

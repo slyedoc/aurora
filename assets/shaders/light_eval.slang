@@ -444,9 +444,6 @@ public float3 ptSampleRadiance(GiCandidate c, float3 wo) {
                     f0.b > 0.0 ? f1.b / f0.b : 0.0) * Lc;
     }
     let Ln = unpackRadiance(c.L_nee);
-    if (c.wi_n == PT_NO_DIRECTION) {
-        return L + Ln;
-    }
     if (any(Ln > float3(0.0))) {
         let wi = oct_to_float32x3(unpackHalf2(c.wi_n));
         let f0 = surfaceEval(wo_src, n, wi, mat, lob);

@@ -171,10 +171,8 @@ public struct UniformData {
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
     public float restir_m_clamp;
-    // Radiance cache: 0 = off; else paths may terminate into it.
-    public uint sharc;
-    // Base voxel size (meters) at the camera; doubles with each distance octave past 8m.
-    public float sharc_voxel;
+    public uint pad_cache0;
+    public uint pad_cache1;
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -380,23 +378,6 @@ public float3 unpackRadiance(uint p) {
     return unpackRgb9e5(p) * PT_RADIANCE_SCALE;
 }
 
-// One radiance-cache entry (src/sharc.rs; resolved by sharc.slang). 32 bytes; resolved
-// values are packed f16 pairs.
-public struct SharcEntry {
-    public uint tag;      // 0 = empty; hash tag of the voxel key otherwise.
-    public uint frame;    // Last frame the entry was deposited into or queried.
-    // Radiance accumulated this frame, fixed point at SHARC_UNIT (1/65536 nit): 64-bit so a
-    // moonlit voxel keeps its precision and a sunlit one cannot overflow.
-    public uint64_t acc_r;
-    public uint64_t acc_g;
-    public uint64_t acc_b;
-    public uint acc_n;    // Samples accumulated this frame.
-    public float conf;    // Samples folded into the resolved value.
-    public float res_r;   // Resolved outgoing radiance (nits).
-    public float res_g;
-    public float res_b;
-    public uint pad;
-};
 // ReSTIR PT's sample (src/restir_gi.rs; docs/plans/restir-pt.html), written by the path tracer per
 // traced pixel whose primary vertex takes part and whose path found a reconnection vertex x_k: the
 // first vertex k >= 1 where x_{k-1} and x_k are both rough and far apart. What x_k sends back is
@@ -470,10 +451,6 @@ public GiCandidate giCandidateLoad(GiCandidate* p) {
     r.q = asfloat(g.w);
     return r;
 }
-
-// A sample's `wi_n` when its next-event slot holds the radiance cache's answer at x_k: the same
-// toward every direction (the cache's own assumption).
-public static const uint PT_NO_DIRECTION = 0xFFFFFFFFu;
 
 // A sample written back whole (the temporal pass replaces a pixel's candidate with its reservoir in
 // place: `pdf` holds W, `q` its confidence M, `phat` its target here, `geo` its geometry term from
@@ -944,8 +921,6 @@ public struct PushConstants {
     // The reference accumulation (reference.rs; null unless on): per traced pixel the summed
     // radiance (nits) and the frame count.
     public float4* reference;
-    // Radiance-cache entries (valid whenever uniforms.sharc != 0).
-    public SharcEntry* sharc;
     // ReSTIR PT's per-view block (restir_gi.rs; null when off): the spatial pass's parameters.
     public GiFrame* gi_frame;
     // The neural radiance cache (nrc.rs; null when off).

@@ -3,7 +3,7 @@
 //! worst and ReSTIR PT is for. A red block and a blue cabinet for colour bleed, a mirror sphere
 //! and a glossy one, and a clear glass sphere.
 //!
-//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--no-sharc] [--sharc] [--nrc] [--no-nrc] [--nrc-lr L] [--glass R] [--no-glass] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
+//!   cargo run --release --example sun_room [-- --no-gi] [--no-restir] [--nrc] [--no-nrc] [--nrc-lr L] [--glass R] [--no-glass] [--matte-spheres] [--fog D] [--samples N] [--ev100 E] [--fullscreen] [--raw]
 //!       [--capture DIR --size WxH --frames N --noisy K]
 //!       [--gi-spatial N] [--gi-radius R] [--pt-history M] [--bloom B] [--local-tonemap T]
 //!       [--flat-sky] [--no-sun] [--no-ground] [--bounces N] [--camera x,y,z]
@@ -89,8 +89,6 @@ fn apply_flags(mut settings: ResMut<RenderSettings>) {
         match arg.as_str() {
             "--no-gi" => settings.restir_gi = false,
             "--no-restir" => settings.restir = false,
-            "--no-sharc" => settings.sharc = false,
-            "--sharc" => settings.sharc = true,
             "--nrc" => settings.nrc = true,
             "--no-nrc" => settings.nrc = false,
             "--nrc-lr" => {

@@ -72,10 +72,7 @@ pub struct UniformData {
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
-    /// Radiance cache: 0 = off (also while accumulating).
-    sharc: u32,
-    /// Base cache voxel size (meters) at the camera.
-    sharc_voxel: f32,
+    pad_cache: [u32; 2],
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -497,7 +494,6 @@ fn render_frame(
         Res<crate::fog_volume::FogVolumeTable>,
         ResMut<crate::fog_grid::FogGridState>,
         ResMut<crate::compute::FrameCommands>,
-        ResMut<crate::sharc::SharcState>,
     ),
     camera: Query<
         (
@@ -569,7 +565,6 @@ fn render_frame(
         fog_volumes,
         mut fog_grid,
         mut frame_commands,
-        mut sharc,
     ) = gpu;
     let (
         mut dlss,
@@ -1046,8 +1041,7 @@ fn render_frame(
             gi_roughness: settings.restir_gi_roughness.clamp(0.0, 1.0),
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
-            sharc: settings.sharc as u32,
-            sharc_voxel: settings.sharc_voxel.max(0.01),
+            pad_cache: [0; 2],
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
@@ -1314,7 +1308,6 @@ fn render_frame(
         let light_entries = lights.active_entries;
         let light_epoch = lights.epoch;
         let light_header = lights.header_address();
-        let sharc_address = sharc.address();
         let atmo_address = atmo.address();
         let rtx_pipeline = rtx_pipelines.get(&render_config.rtx_pipeline);
         let sbt_ready = sbt.data().address != 0;
@@ -1387,18 +1380,6 @@ fn render_frame(
             let scope = prof.begin(&render_device, skin_cmd, "skins");
             let skinned = skins.record(&render_device, skin_cmd, &modules, &transforms);
             prof.end(&render_device, skin_cmd, scope);
-            drop(section);
-            let section = info_span!("record_sharc").entered();
-            let sharc_cmd = compute_cmd.unwrap_or(cmd_buffer);
-            let scope = prof.begin(&render_device, sharc_cmd, "sharc");
-            sharc.record(
-                &render_device,
-                sharc_cmd,
-                &modules,
-                *frame_counter,
-                settings.sharc,
-            );
-            prof.end(&render_device, sharc_cmd, scope);
             drop(section);
             if let Some(compute) = compute_cmd {
                 render_device.end_command_buffer(compute).unwrap();
@@ -1653,7 +1634,6 @@ fn render_frame(
                             0
                         },
                         reference: view.reference.accum.1,
-                        sharc: sharc_address,
                         gi_frame: gi_addresses.frame,
                         nrc: nrc_address,
                     };
@@ -2970,7 +2950,7 @@ mod tests {
         assert_eq!(offset_of!(U, view), 144);
         assert_eq!(offset_of!(U, prev_view_proj), 272);
         assert_eq!(offset_of!(U, frame), 344);
-        assert_eq!(offset_of!(U, sharc_voxel), 396);
+        assert_eq!(offset_of!(U, pad_cache), 392);
         assert_eq!(offset_of!(U, portals), 400);
         assert_eq!(offset_of!(U, camera_mask), 416);
         assert_eq!(offset_of!(U, primary_hidden), 420);

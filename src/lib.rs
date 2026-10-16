@@ -60,7 +60,6 @@ pub mod restir;
 pub mod restir_gi;
 pub mod sbt;
 pub mod shader;
-pub mod sharc;
 pub mod skinning;
 pub mod sky;
 pub mod sky_gen;
@@ -186,7 +185,6 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::restir::RestirPlugin);
         group = group.add(crate::restir_gi::RestirGiPlugin);
         group = group.add(crate::reference::ReferencePlugin);
-        group = group.add(crate::sharc::SharcPlugin);
         group = group.add(crate::nrc::NrcPlugin);
         group = group.add(crate::fog_grid::FogGridPlugin);
         group = group.add(crate::post_prep::PostPrepPlugin);
