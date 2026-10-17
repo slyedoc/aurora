@@ -2,9 +2,11 @@
 //! scattered outgoing radiance at a surface point from the frame's own paths, so a path that has
 //! spread far can end in the network's answer. Plan and gates: docs/plans/nrc.html.
 //!
-//! [`NrcNetwork`] is the network and its training state (assets/shaders/nrc_kernels.slang):
-//! six 64 x 64 layers whose f16 copies feed the tensor cores (cooperative vectors), an f32
-//! master copy with Adam's moments, and a ring of training records.
+//! [`NrcNetwork`] is the network and its training state (assets/shaders/nrc_kernels.slang): the
+//! position's multiresolution hash grid and three 64 x 64 layers whose f16 copies feed the tensor
+//! cores (cooperative vectors), f32 master copies with Adam's moments, and a ring of training
+//! records. [`NrcState`] runs it each frame: the trace writes queries, `nrc_infer` answers them,
+//! the raygen's `nrc_resolve` adds the answers, and training follows.
 
 use ash::vk;
 use bevy::prelude::*;
@@ -24,7 +26,7 @@ use crate::{
 };
 
 pub const NRC_WIDTH: u64 = 64;
-pub const NRC_LAYERS: u64 = 6;
+pub const NRC_LAYERS: u64 = 3;
 pub const NRC_MATRIX: u64 = NRC_WIDTH * NRC_WIDTH;
 /// Weights, then biases (the master copy's layout).
 pub const NRC_PARAMS: u64 = NRC_LAYERS * (NRC_MATRIX + NRC_WIDTH);
@@ -32,6 +34,16 @@ pub const NRC_PARAMS: u64 = NRC_LAYERS * (NRC_MATRIX + NRC_WIDTH);
 pub const NRC_CHUNK: u32 = 256;
 /// Must match NrcRecord in nrc.slang.
 pub const NRC_RECORD_BYTES: u64 = 48;
+/// The position's hash grid (nrc.slang NrcGrid): levels of features (NRC_GRID_LEVELS x
+/// NRC_GRID_FEATURES there) and entries per level, Instant-NGP's NRC configuration; its cells
+/// double per level from the extent / 2^19 to the extent / 16 (NrcTraining::grid_extent).
+pub const NRC_GRID_LEVELS: u64 = 16;
+pub const NRC_GRID_FEATURES: u64 = 2;
+pub const GRID_SIZE: u32 = 1 << 15;
+const GRID_GROWTH: f32 = 2.0;
+const GRID_FINEST_DIVISOR: f32 = (1u32 << 19) as f32;
+/// Hash grid parameters (every level's entries' features).
+pub const NRC_GRID_PARAMS: u64 = NRC_GRID_LEVELS * GRID_SIZE as u64 * NRC_GRID_FEATURES;
 
 /// Must match NrcNet in nrc_kernels.slang.
 #[repr(C)]
@@ -57,6 +69,18 @@ pub struct NrcNetGpu {
     pub radiance_scale: f32,
     pub loss_scale: f32,
     pub ema_decay: f32,
+    pub grid_table: u64,
+    pub grid_table_ema: u64,
+    pub grid_params: u64,
+    pub grid_m: u64,
+    pub grid_v: u64,
+    pub grid_ema: u64,
+    pub grid_grad: u64,
+    pub grid_size: u32,
+    pub grid_finest: f32,
+    pub grid_growth: f32,
+    pub pad: f32,
+    pub grid_grad16: u64,
 }
 
 /// Must match NrcPush in nrc_kernels.slang.
@@ -69,6 +93,7 @@ struct NrcPush {
     offset: u32,
     step: u32,
     pad: u32,
+    frame: u64,
 }
 
 /// Training hyperparameters.
@@ -79,6 +104,8 @@ pub struct NrcTraining {
     pub loss_scale: f32,
     /// Per Adam step (four a frame): 0.99 averages the last ~100 steps.
     pub ema_decay: f32,
+    /// What the hash grid spans (metres; the gym's unit box: 1).
+    pub grid_extent: f32,
 }
 
 impl Default for NrcTraining {
@@ -88,6 +115,7 @@ impl Default for NrcTraining {
             radiance_scale: 1.0,
             loss_scale: 1.0 / 16.0,
             ema_decay: 0.99,
+            grid_extent: 2048.0,
         }
     }
 }
@@ -108,6 +136,21 @@ pub struct NrcNetwork {
     pub ema: Buffer<u8>,
     pub weights_ema: Buffer<u8>,
     pub biases_ema: Buffer<u8>,
+    /// The moving average's weights in the driver's inferencing-optimal layout, one
+    /// `opt_layer`-byte matrix per layer: what inference reads (nrc_kernels.slang `nrc_infer`).
+    pub weights_opt: Buffer<u8>,
+    /// The hash grid (nrc_kernels.slang NrcNet `grid_*`): f16 tables (trained, averaged), the
+    /// f32 master, Adam's moments, the average and the step's gradient.
+    pub grid_table: Buffer<u8>,
+    pub grid_table_ema: Buffer<u8>,
+    pub grid_params: Buffer<u8>,
+    pub grid_m: Buffer<u8>,
+    pub grid_v: Buffer<u8>,
+    pub grid_ema: Buffer<u8>,
+    pub grid_grad: Buffer<u8>,
+    pub grid_grad16: Buffer<u8>,
+    pub opt_layer: u64,
+    coopvec: ash::nv::cooperative_vector::Device,
     pub net: Buffer<NrcNetGpu>,
     pub batch: u32,
     pub ring: u32,
@@ -126,6 +169,14 @@ pub fn initial_params(seed: u64) -> Vec<f32> {
         *w = rng.gen_range(-bound..bound);
     }
     params
+}
+
+/// The hash grid's initial features: uniform in +-1e-4 (Instant-NGP), from `seed`.
+pub fn initial_grid(seed: u64) -> Vec<f32> {
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed ^ 0x9e37_79b9);
+    (0..NRC_GRID_PARAMS)
+        .map(|_| rng.gen_range(-1.0e-4..1.0e-4))
+        .collect()
 }
 
 /// The f16 copies ([layer][out][in] weights, then biases) of `params`.
@@ -150,6 +201,14 @@ impl NrcNetwork {
             | vk::BufferUsageFlags::TRANSFER_SRC;
         let chunks = batch.div_ceil(NRC_CHUNK) as u64;
         let rows = batch as u64 * NRC_LAYERS * NRC_WIDTH;
+        let coopvec = ash::nv::cooperative_vector::Device::load(&rd.instance, &rd.device);
+        let opt_layer = optimal_matrix_bytes(&coopvec);
+        // nrc.slang nrcForward steps a row-major layer's size between layers.
+        assert_eq!(
+            opt_layer,
+            NRC_MATRIX * 2,
+            "an inferencing-optimal layer's size"
+        );
         let mut this = Self {
             weights: rd.create_device_buffer(NRC_LAYERS * NRC_MATRIX * 2, usage),
             biases: rd.create_device_buffer(NRC_LAYERS * NRC_WIDTH * 2, usage),
@@ -161,10 +220,21 @@ impl NrcNetwork {
             dz: rd.create_device_buffer(rows * 2, usage),
             loss: rd.create_device_buffer(batch as u64 * 4, usage),
             records: rd.create_device_buffer(ring as u64 * NRC_RECORD_BYTES, usage),
-            counter: rd.create_device_buffer(4, usage),
+            counter: rd.create_device_buffer(8, usage),
             ema: rd.create_device_buffer(NRC_PARAMS * 4, usage),
             weights_ema: rd.create_device_buffer(NRC_LAYERS * NRC_MATRIX * 2, usage),
             biases_ema: rd.create_device_buffer(NRC_LAYERS * NRC_WIDTH * 2, usage),
+            weights_opt: rd.create_device_buffer(NRC_LAYERS * opt_layer, usage),
+            grid_table: rd.create_device_buffer(NRC_GRID_PARAMS * 2, usage),
+            grid_table_ema: rd.create_device_buffer(NRC_GRID_PARAMS * 2, usage),
+            grid_params: rd.create_device_buffer(NRC_GRID_PARAMS * 4, usage),
+            grid_m: rd.create_device_buffer(NRC_GRID_PARAMS * 4, usage),
+            grid_v: rd.create_device_buffer(NRC_GRID_PARAMS * 4, usage),
+            grid_ema: rd.create_device_buffer(NRC_GRID_PARAMS * 4, usage),
+            grid_grad: rd.create_device_buffer(NRC_GRID_PARAMS * 4, usage),
+            grid_grad16: rd.create_device_buffer(NRC_GRID_PARAMS * 2, usage),
+            opt_layer,
+            coopvec,
             net: rd.create_device_buffer(1, usage),
             batch,
             ring,
@@ -180,13 +250,19 @@ impl NrcNetwork {
     pub fn reset(&mut self, rd: &RenderDevice, seed: u64) {
         let params = initial_params(seed);
         let (weights, biases) = half_copies(&params);
-        let uploads: [(&Buffer<u8>, &[u8]); 6] = [
+        let grid = initial_grid(seed);
+        let grid_half: Vec<f16> = grid.iter().map(|&g| f16::from_f32(g)).collect();
+        let uploads: [(&Buffer<u8>, &[u8]); 10] = [
             (&self.params, bytemuck::cast_slice(&params)),
             (&self.weights, bytemuck::cast_slice(&weights)),
             (&self.biases, bytemuck::cast_slice(&biases)),
             (&self.ema, bytemuck::cast_slice(&params)),
             (&self.weights_ema, bytemuck::cast_slice(&weights)),
             (&self.biases_ema, bytemuck::cast_slice(&biases)),
+            (&self.grid_params, bytemuck::cast_slice(&grid)),
+            (&self.grid_ema, bytemuck::cast_slice(&grid)),
+            (&self.grid_table, bytemuck::cast_slice(&grid_half)),
+            (&self.grid_table_ema, bytemuck::cast_slice(&grid_half)),
         ];
         let total: usize = uploads.iter().map(|(_, b)| b.len()).sum();
         let mut staging: Buffer<u8> =
@@ -211,7 +287,16 @@ impl NrcNetwork {
                 );
                 at += data.len() as u64;
             }
-            for buffer in [&self.adam_m, &self.adam_v, &self.records, &self.counter] {
+            for buffer in [
+                &self.adam_m,
+                &self.adam_v,
+                &self.records,
+                &self.counter,
+                &self.grid_m,
+                &self.grid_v,
+                &self.grid_grad,
+                &self.grid_grad16,
+            ] {
                 rd.device
                     .cmd_fill_buffer(cmd, buffer.handle, 0, vk::WHOLE_SIZE, 0);
             }
@@ -227,11 +312,13 @@ impl NrcNetwork {
             old.radiance_scale,
             old.loss_scale,
             old.ema_decay,
+            old.grid_extent,
         ) != (
             training.learning_rate,
             training.radiance_scale,
             training.loss_scale,
             training.ema_decay,
+            training.grid_extent,
         ) {
             self.training = training;
             self.dirty = true;
@@ -260,6 +347,18 @@ impl NrcNetwork {
             radiance_scale: self.training.radiance_scale,
             loss_scale: self.training.loss_scale,
             ema_decay: self.training.ema_decay,
+            grid_table: self.grid_table.address,
+            grid_table_ema: self.grid_table_ema.address,
+            grid_params: self.grid_params.address,
+            grid_m: self.grid_m.address,
+            grid_v: self.grid_v.address,
+            grid_ema: self.grid_ema.address,
+            grid_grad: self.grid_grad.address,
+            grid_size: GRID_SIZE,
+            grid_finest: self.training.grid_extent / GRID_FINEST_DIVISOR,
+            grid_growth: GRID_GROWTH,
+            pad: 0.0,
+            grid_grad16: self.grid_grad16.address,
         }
     }
 
@@ -285,6 +384,7 @@ impl NrcNetwork {
             offset,
             step,
             pad: 0,
+            frame: 0,
         }
     }
 
@@ -313,6 +413,15 @@ impl NrcNetwork {
         record_dispatch(rd, cmd, module, "nrc_train_grads", &push, groups * 64, base);
         barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
         record_dispatch(rd, cmd, module, "nrc_adam", &push, NRC_PARAMS as u32, base);
+        record_dispatch(
+            rd,
+            cmd,
+            module,
+            "nrc_grid_adam",
+            &push,
+            NRC_GRID_PARAMS as u32,
+            base,
+        );
         barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
     }
 
@@ -367,6 +476,15 @@ impl NrcNetwork {
         let push = self.push(0, 0, self.step);
         let base = Some(std::mem::offset_of!(NrcPush, base));
         record_dispatch(rd, cmd, module, "nrc_adam", &push, NRC_PARAMS as u32, base);
+        record_dispatch(
+            rd,
+            cmd,
+            module,
+            "nrc_grid_adam",
+            &push,
+            NRC_GRID_PARAMS as u32,
+            base,
+        );
         barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
     }
 
@@ -402,6 +520,46 @@ impl NrcNetwork {
         barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
     }
 
+    /// Converts the moving average's weights into `weights_opt` (after the last training, before
+    /// the trace reads them).
+    pub fn record_convert(&self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
+            vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        let mut sizes = [self.opt_layer as usize; NRC_LAYERS as usize];
+        let infos: Vec<_> = sizes
+            .iter_mut()
+            .enumerate()
+            .map(|(l, size)| {
+                matrix_info(size)
+                    .src_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: self.weights_ema.address + l as u64 * NRC_MATRIX * 2,
+                    })
+                    .dst_data(vk::DeviceOrHostAddressKHR {
+                        device_address: self.weights_opt.address + l as u64 * self.opt_layer,
+                    })
+            })
+            .collect();
+        unsafe {
+            self.coopvec
+                .cmd_convert_cooperative_vector_matrix(cmd, &infos);
+        }
+        memory_barrier(
+            rd,
+            cmd,
+            vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
+    }
+
     pub fn destroy(&mut self, rd: &RenderDevice) {
         for handle in [
             self.weights.handle,
@@ -418,6 +576,15 @@ impl NrcNetwork {
             self.ema.handle,
             self.weights_ema.handle,
             self.biases_ema.handle,
+            self.weights_opt.handle,
+            self.grid_table.handle,
+            self.grid_table_ema.handle,
+            self.grid_params.handle,
+            self.grid_m.handle,
+            self.grid_v.handle,
+            self.grid_ema.handle,
+            self.grid_grad.handle,
+            self.grid_grad16.handle,
             self.net.handle,
         ] {
             if handle != vk::Buffer::null() {
@@ -425,6 +592,36 @@ impl NrcNetwork {
             }
         }
     }
+}
+
+/// One layer's conversion from row-major f16 into the inferencing-optimal layout.
+fn matrix_info(dst_size: &mut usize) -> vk::ConvertCooperativeVectorMatrixInfoNV<'_> {
+    vk::ConvertCooperativeVectorMatrixInfoNV {
+        src_size: (NRC_MATRIX * 2) as usize,
+        p_dst_size: dst_size,
+        src_component_type: vk::ComponentTypeKHR::FLOAT16,
+        dst_component_type: vk::ComponentTypeKHR::FLOAT16,
+        num_rows: NRC_WIDTH as u32,
+        num_columns: NRC_WIDTH as u32,
+        src_layout: vk::CooperativeVectorMatrixLayoutNV::ROW_MAJOR,
+        src_stride: (NRC_WIDTH * 2) as usize,
+        dst_layout: vk::CooperativeVectorMatrixLayoutNV::INFERENCING_OPTIMAL,
+        dst_stride: 0,
+        ..Default::default()
+    }
+}
+
+/// Bytes of one layer in the inferencing-optimal layout (the driver's answer).
+fn optimal_matrix_bytes(coopvec: &ash::nv::cooperative_vector::Device) -> u64 {
+    let src = vec![0u8; (NRC_MATRIX * 2) as usize];
+    let mut size = 0usize;
+    let info = matrix_info(&mut size).src_data(vk::DeviceOrHostAddressConstKHR {
+        host_address: src.as_ptr().cast(),
+    });
+    unsafe { coopvec.convert_cooperative_vector_matrix(&info) }
+        .expect("cooperative vector matrix size");
+    log::debug!("nrc: an inferencing-optimal 64x64 f16 layer is {size} bytes");
+    size as u64
 }
 
 /// Must match NrcFrame in rt_types.slang.
@@ -435,11 +632,13 @@ pub struct NrcFrameGpu {
     pub biases: u64,
     pub records: u64,
     pub counter: u64,
-    pub box_: [f32; 4],
     pub ring: u32,
     pub spread: f32,
     pub train_fraction: f32,
     pub flags: u32,
+    pub queries: u64,
+    pub query_base: u32,
+    pub query_extra: u32,
 }
 
 /// Training records in the ring.
@@ -447,12 +646,8 @@ const RING: u32 = 1 << 16;
 /// Records per training step, and steps per frame (the paper's 4 x 16k).
 const BATCH: u32 = 1 << 14;
 const STEPS: u32 = 4;
-/// The cache's anchor (D5): positions within RADIUS of it are encoded at full resolution, those
-/// beyond contracted toward the box's walls (nrc.slang `nrcBoxPosition`). It snaps to a GRID near
-/// the camera and moves once the camera is RECENTRE from it.
-const RADIUS: f32 = 16.0;
-const GRID: f32 = 16.0;
-const RECENTRE: f32 = 12.0;
+/// Query slots past the per-pixel ones, for training paths' tails.
+const QUERY_EXTRA: u32 = RING;
 /// Vertices a training path records, about (training_fraction's cap).
 const VERTICES_PER_PATH: f32 = 3.0;
 
@@ -461,7 +656,11 @@ pub struct NrcState {
     module: Handle<ComputeModule>,
     network: Option<NrcNetwork>,
     frame: Buffer<NrcFrameGpu>,
-    centre: Option<Vec3>,
+    /// The frame's queries (rt_types.slang NrcFrame `queries`): a slot per pixel and sample of
+    /// the largest view, then QUERY_EXTRA; `query_base` of them per pixel this frame.
+    queries: Buffer<u8>,
+    query_capacity: u64,
+    query_base: u32,
     /// The Adam step this frame's training starts after (0 = no training this frame).
     first_step: u32,
 }
@@ -476,10 +675,11 @@ impl NrcState {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         settings: &RenderSettings,
-        camera: Vec3,
         pixels: u32,
+        largest_view: u32,
     ) -> u64 {
         self.first_step = 0;
+        self.query_base = 0;
         if !settings.nrc || !crate::render_device::cooperative_vector() {
             return 0;
         }
@@ -491,38 +691,45 @@ impl NrcState {
             .get_or_insert_with(|| NrcNetwork::new(rd, BATCH, RING, 1));
         network.set_training(NrcTraining {
             learning_rate: settings.nrc_learning_rate,
+            grid_extent: settings.nrc_grid_extent,
             ..default()
         });
         network.record_block(rd, cmd);
+        network.record_convert(rd, cmd);
         if self.frame.handle == vk::Buffer::null() {
             self.frame = rd.create_device_buffer(
                 1,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             );
         }
-        let snap = |p: Vec3| (p / GRID).round() * GRID;
-        let centre = match self.centre {
-            Some(c) if (camera - c).abs().max_element() < RECENTRE => c,
-            _ => {
-                let c = snap(camera);
-                log::debug!("nrc: cache anchored at {c}");
-                c
+        let query_base = largest_view * settings.samples.max(1);
+        let slots = query_base as u64 + QUERY_EXTRA as u64;
+        if slots > self.query_capacity {
+            if self.queries.handle != vk::Buffer::null() {
+                rd.destroyer.destroy_buffer(self.queries.handle);
             }
-        };
-        self.centre = Some(centre);
+            self.queries = rd.create_device_buffer(
+                slots * NRC_RECORD_BYTES,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            );
+            self.query_capacity = slots;
+        }
+        self.query_base = query_base;
         let train_fraction = settings
             .nrc_train_fraction
             .min(RING as f32 / (pixels.max(1) as f32 * VERTICES_PER_PATH));
         let gpu = NrcFrameGpu {
-            weights: network.weights_ema.address,
+            weights: network.weights_opt.address,
             biases: network.biases_ema.address,
             records: network.records.address,
             counter: network.counter.address,
-            box_: [centre.x, centre.y, centre.z, 1.0 / RADIUS],
             ring: RING,
             spread: settings.nrc_spread,
             train_fraction,
-            flags: NRC_FLAG_INLINE,
+            flags: 0,
+            queries: self.queries.address,
+            query_base,
+            query_extra: QUERY_EXTRA,
         };
         unsafe {
             rd.device
@@ -534,6 +741,33 @@ impl NrcState {
         self.first_step = network.step + 1;
         network.step += STEPS;
         self.frame.address
+    }
+
+    /// Records the cache's answers to the queries the view's trace wrote (nrc_kernels.slang
+    /// `nrc_infer`), for the resolve that follows. False when the cache is off this frame (the
+    /// caller's pipeline is still bound).
+    pub fn record_inference(
+        &self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        modules: &ComputeModules,
+    ) -> bool {
+        let (Some(network), Some(module)) = (&self.network, modules.get(&self.module)) else {
+            return false;
+        };
+        if self.query_base == 0 {
+            return false;
+        }
+        barrier(rd, cmd, vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR);
+        let push = NrcPush {
+            frame: self.frame.address,
+            ..network.push(0, 0, 0)
+        };
+        let base = Some(std::mem::offset_of!(NrcPush, base));
+        let slots = self.query_base + QUERY_EXTRA;
+        record_dispatch(rd, cmd, module, "nrc_infer", &push, slots, base);
+        barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        true
     }
 
     /// Records this frame's training on the records the trace wrote (after it, on the same
@@ -551,15 +785,19 @@ impl NrcState {
             return false;
         }
         barrier(rd, cmd, vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR);
+        let push = NrcPush {
+            frame: self.frame.address,
+            ..network.push(0, 0, 0)
+        };
+        let base = Some(std::mem::offset_of!(NrcPush, base));
+        record_dispatch(rd, cmd, module, "nrc_targets", &push, RING, base);
+        barrier(rd, cmd, vk::PipelineStageFlags2::COMPUTE_SHADER);
         for s in 0..STEPS {
             network.record_step_at(rd, cmd, module, s * BATCH, self.first_step + s);
         }
         true
     }
 }
-
-/// Must match NRC_FLAG_INLINE in rt_types.slang.
-const NRC_FLAG_INLINE: u32 = 1;
 
 fn cleanup_nrc(mut nrc: ResMut<NrcState>, rd: Res<RenderDevice>) {
     if let Some(mut network) = nrc.network.take() {
@@ -569,6 +807,11 @@ fn cleanup_nrc(mut nrc: ResMut<NrcState>, rd: Res<RenderDevice>) {
         rd.destroyer.destroy_buffer(nrc.frame.handle);
     }
     nrc.frame = Buffer::default();
+    if nrc.queries.handle != vk::Buffer::null() {
+        rd.destroyer.destroy_buffer(nrc.queries.handle);
+    }
+    nrc.queries = Buffer::default();
+    nrc.query_capacity = 0;
 }
 
 pub struct NrcPlugin;
@@ -585,13 +828,18 @@ impl Plugin for NrcPlugin {
                 "nrc_adam",
                 "nrc_eval",
                 "nrc_gym_records",
+                "nrc_infer",
+                "nrc_targets",
+                "nrc_grid_adam",
             ],
         ));
         app.insert_resource(NrcState {
             module,
             network: None,
             frame: Buffer::default(),
-            centre: None,
+            queries: Buffer::default(),
+            query_capacity: 0,
+            query_base: 0,
             first_step: 0,
         });
         app.add_systems(TeardownSchedule, cleanup_nrc.before(on_shutdown));
@@ -599,11 +847,20 @@ impl Plugin for NrcPlugin {
 }
 
 fn barrier(rd: &RenderDevice, cmd: vk::CommandBuffer, src: vk::PipelineStageFlags2) {
+    let mut written = vk::AccessFlags2::empty();
+    if src.intersects(
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+    ) {
+        written |= vk::AccessFlags2::SHADER_WRITE;
+    }
+    if src.intersects(vk::PipelineStageFlags2::ALL_TRANSFER) {
+        written |= vk::AccessFlags2::TRANSFER_WRITE;
+    }
     memory_barrier(
         rd,
         cmd,
         src,
-        vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+        written,
         vk::PipelineStageFlags2::COMPUTE_SHADER
             | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
             | vk::PipelineStageFlags2::TRANSFER,
@@ -619,11 +876,13 @@ mod tests {
 
     #[test]
     fn layouts_match_the_shaders() {
-        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 136);
+        assert_eq!(std::mem::size_of::<NrcNetGpu>(), 216);
+        assert_eq!(std::mem::offset_of!(NrcNetGpu, grid_table), 136);
         assert_eq!(std::mem::offset_of!(NrcNetGpu, ring), 112);
-        assert_eq!(std::mem::size_of::<NrcPush>(), 32);
+        assert_eq!(std::mem::size_of::<NrcPush>(), 40);
         assert_eq!(std::mem::size_of::<NrcFrameGpu>(), 64);
-        assert_eq!(std::mem::offset_of!(NrcFrameGpu, ring), 48);
+        assert_eq!(std::mem::offset_of!(NrcFrameGpu, queries), 48);
+        assert_eq!(std::mem::offset_of!(NrcFrameGpu, ring), 32);
     }
 
     #[test]

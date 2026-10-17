@@ -1289,18 +1289,17 @@ fn render_frame(
         prof.end(&render_device, view_cmd, scope);
         drop(section);
         let scope = prof.begin(&render_device, view_cmd, "nrc");
-        let nrc_pixels = views
+        let nrc_view_pixels = views
             .iter()
             .filter_map(|v| v.plan)
-            .map(|p| p.render.width * p.render.height)
-            .sum();
+            .map(|p| p.render.width * p.render.height);
         let nrc_address = nrc.prepare(
             &render_device,
             view_cmd,
             &modules,
             &settings,
-            camera.map_or(Vec3::ZERO, |c| c.2.translation()),
-            nrc_pixels,
+            nrc_view_pixels.clone().sum(),
+            nrc_view_pixels.max().unwrap_or(0),
         );
         prof.end(&render_device, view_cmd, scope);
 
@@ -1781,6 +1780,45 @@ fn render_frame(
                             1,
                         );
                         prof.end(&render_device, cmd.get(), scope);
+                        // The neural radiance cache answers the queries the trace wrote, and its
+                        // answers join the colour and the ReSTIR PT samples (before ReSTIR GI reads
+                        // them, and before the next view's trace writes the slots again).
+                        if nrc_address != 0 {
+                            let scope = prof.begin(&render_device, cmd.get(), "nrc inference");
+                            if nrc.record_inference(&render_device, cmd.get(), &modules) {
+                                prof.end(&render_device, cmd.get(), scope);
+                                let scope = prof.begin(&render_device, cmd.get(), "nrc resolve");
+                                push_trace(trace_constants);
+                                render_device
+                                    .ext_rtx_pipeline
+                                    .cmd_set_ray_tracing_pipeline_stack_size(
+                                        cmd.get(),
+                                        rtx_pipeline.stack_nrc_resolve,
+                                    );
+                                render_device.ext_rtx_pipeline.cmd_trace_rays(
+                                    cmd.get(),
+                                    &sbt.nrc_resolve_region,
+                                    &sbt.miss_region,
+                                    &sbt.hit_region,
+                                    &vk::StridedDeviceAddressRegionKHR::default(),
+                                    plan.render.width,
+                                    plan.render.height,
+                                    1,
+                                );
+                                crate::compute::memory_barrier(
+                                    &render_device,
+                                    cmd.get(),
+                                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                                    vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ,
+                                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                                );
+                                prof.end(&render_device, cmd.get(), scope);
+                            } else {
+                                prof.end(&render_device, cmd.get(), scope);
+                            }
+                        }
                         // The neural radiance cache learns from the records the trace wrote (one
                         // network: the first view's records).
                         if nrc_address != 0 && views.first().map(|v| v.slot) == Some(view.slot) {

@@ -34,7 +34,34 @@ struct NrcNet {
     float radiance_scale;
     float loss_scale;
     float ema_decay;
+    // The position's hash grid (nrc.slang NrcGrid): its f16 table (what training reads) and the
+    // moving average's (what inference reads), the f32 master, Adam's moments, the average and
+    // the step's gradient (atomic sums, cleared by nrc_grid_adam), NRC_GRID_LEVELS x grid_size x
+    // NRC_GRID_FEATURES each.
+    half* grid_table;
+    half* grid_table_ema;
+    float* grid_params;
+    float* grid_m;
+    float* grid_v;
+    float* grid_ema;
+    float* grid_grad;
+    uint grid_size;
+    float grid_finest;
+    float grid_growth;
+    float pad;
+    // The step's gradient where an entry sums a few rows, f16 pairs (nrcGridBackward's per-lane
+    // adds); nrc_grid_adam adds it to `grid_grad` and clears both.
+    half* grid_grad16;
 };
+
+NrcGrid nrcGridOf(NrcNet* net, bool ema) {
+    NrcGrid g;
+    g.table = ema ? net.grid_table_ema : net.grid_table;
+    g.size = net.grid_size;
+    g.finest = net.grid_finest;
+    g.growth = net.grid_growth;
+    return g;
+}
 
 struct NrcPush {
     NrcNet* net;
@@ -43,6 +70,7 @@ struct NrcPush {
     uint offset;      // the batch's first record in the ring
     uint step;        // Adam's step (from 1); the gym's seed
     uint pad;
+    NrcFrame* frame;  // the frame's queries (nrc_infer, nrc_targets)
 };
 [[vk::push_constant]] ConstantBuffer<NrcPush> push;
 
@@ -77,18 +105,51 @@ CoopVec<half, NRC_WIDTH> nrcLayer(NrcRow r, uint l, CoopVec<half, NRC_WIDTH> x) 
 }
 
 // The layer's output gradient kept for the weight gradients; the input's is W^T dy: the same
-// matrix read column-major. Layer 0's input is the encoding, which needs none.
+// matrix read column-major (layer 0's: the hash grid's features, nrcGridBackward).
 void nrcLayerBwd(NrcRow r, uint l, inout DifferentialPair<CoopVec<half, NRC_WIDTH>> x,
                  CoopVec<half, NRC_WIDTH> dy) {
     dy.store(r.net.dz, int(l) * r.layer + r.row);
-    var dx = CoopVec<half, NRC_WIDTH>(half(0.0));
-    if (l > 0u) {
-        dx = coopVecMatMul<half, NRC_WIDTH>(
-            dy, CoopVecComponentType::Float16,
-            (void*)(r.net.weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
-            CoopVecMatrixLayout::ColumnMajor, false, NRC_WIDTH * 2u);
-    }
+    let dx = coopVecMatMul<half, NRC_WIDTH>(
+        dy, CoopVecComponentType::Float16,
+        (void*)(r.net.weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
+        CoopVecMatrixLayout::ColumnMajor, false, NRC_WIDTH * 2u);
     x = diffPair(x.p, dx);
+}
+
+// The encoding's gradient into the hash grid: each level's features are a trilinear blend of
+// eight entries, so each entry gets its weight times the features' gradient (summed over the
+// batch by atomic adds; a non-finite row adds nothing). Where the whole wave lands on one entry
+// (the coarse levels: one cell holds the room, thousands of rows) it sums first and one lane adds
+// in f32; elsewhere an entry sums a few rows, and one f16x2 add takes both features (half the
+// atomics; f16 holds a few rows' sum, not thousands).
+void nrcGridBackward(NrcNet* net, float3 position, CoopVec<half, NRC_WIDTH> dx) {
+    let g = nrcGridOf(net, false);
+    [ForceUnroll]
+    for (uint l = 0u; l < NRC_GRID_LEVELS; l++) {
+        var d = float2(float(dx[l * 2u]), float(dx[l * 2u + 1u]));
+        if (any(isnan(d)) || any(isinf(d))) {
+            d = float2(0.0);
+        }
+        int3 corner;
+        float3 f;
+        nrcGridCell(g, l, position, corner, f);
+        [ForceUnroll]
+        for (uint k = 0u; k < 8u; k++) {
+            float w;
+            let e = nrcGridEntry(g, l, corner, f, k, w);
+            let v = w * d;
+            if (WaveActiveAllEqual(e)) {
+                let sum = WaveActiveSum(v);
+                if (WaveIsFirstLane() && any(sum != float2(0.0))) {
+                    InterlockedAdd(net.grid_grad[e * 2u], sum.x);
+                    InterlockedAdd(net.grid_grad[e * 2u + 1u], sum.y);
+                }
+            } else if (any(v != float2(0.0))) {
+                half2 old;
+                InterlockedAddF16x2((half2*)net.grid_grad16 + e, half2(v), old);
+            }
+        }
+    }
 }
 
 [Differentiable]
@@ -149,8 +210,9 @@ void nrc_train_forward(uint3 id: SV_DispatchThreadID) {
     let inp = nrcUnpackRecord(rec);
     let t = unpackRadiance(rec.target) * net.radiance_scale / nrcFactor(inp);
     NrcRow r = { net, int(row_index * NRC_WIDTH * 2u), int(net.batch * NRC_WIDTH * 2u) };
-    var x = diffPair(nrcEncode(inp));
+    var x = diffPair(nrcEncode(inp, nrcGridOf(net, false)));
     bwd_diff(nrcLoss)(r, x, t, row_index, net.loss_scale);
+    nrcGridBackward(net, inp.position, x.d);
 }
 
 groupshared float g_dz[32][NRC_WIDTH];
@@ -247,6 +309,43 @@ void nrc_adam(uint3 id: SV_DispatchThreadID) {
     }
 }
 
+// One thread per hash grid parameter: Adam on the entries this step touched (an untouched
+// entry keeps its moments and value, Instant-NGP's sparse update), its gradient cleared.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void nrc_grid_adam(uint3 id: SV_DispatchThreadID) {
+    let net = push.net;
+    let p = id.x + push.base;
+    if (p >= NRC_GRID_LEVELS * net.grid_size * NRC_GRID_FEATURES) {
+        return;
+    }
+    let raw = net.grid_grad[p] + float(net.grid_grad16[p]);
+    if (raw == 0.0) {
+        return;
+    }
+    net.grid_grad[p] = 0.0;
+    net.grid_grad16[p] = half(0.0);
+    let g = raw / (float(net.batch) * net.loss_scale);
+    if (isnan(g) || isinf(g)) {
+        return;
+    }
+    let b1 = 0.9;
+    let b2 = 0.99;
+    let m = b1 * net.grid_m[p] + (1.0 - b1) * g;
+    let v = b2 * net.grid_v[p] + (1.0 - b2) * g * g;
+    net.grid_m[p] = m;
+    net.grid_v[p] = v;
+    let step = float(push.step);
+    let mh = m / (1.0 - pow(b1, step));
+    let vh = v / (1.0 - pow(b2, step));
+    let w = clamp(net.grid_params[p] - net.learning_rate * mh / (sqrt(vh) + 1.0e-8), -6.0e4, 6.0e4);
+    net.grid_params[p] = w;
+    let e = lerp(w, net.grid_ema[p], net.ema_decay);
+    net.grid_ema[p] = e;
+    net.grid_table[p] = half(w);
+    net.grid_table_ema[p] = half(e);
+}
+
 // The network's raw output (factorized, scaled) for record `offset + i` of the ring, into
 // `out` (3 floats each).
 [shader("compute")]
@@ -258,7 +357,7 @@ void nrc_eval(uint3 id: SV_DispatchThreadID) {
         return;
     }
     let inp = nrcUnpackRecord(net.records[(push.offset + i) % net.ring]);
-    var x = nrcEncode(inp);
+    var x = nrcEncode(inp, nrcGridOf(net, false));
     [ForceUnroll]
     for (uint l = 0u; l < NRC_LAYERS; l++) {
         x = coopVecMatMulAdd<half, NRC_WIDTH>(
@@ -330,4 +429,42 @@ void nrc_gym_records(uint3 id: SV_DispatchThreadID) {
     if (i == 0u) {
         net.counter[0] = net.batch;
     }
+}
+
+// The frame's queries through the network (the inferencing-optimal weights), the answers into
+// their records (d, pre-exposed). Every slot up to the tails written runs the matrix products,
+// asked or not (they run with the whole warp); an empty one skips the grid's lookups.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void nrc_infer(uint3 id: SV_DispatchThreadID) {
+    let f = push.frame;
+    let i = id.x + push.base;
+    if (i >= f.query_base + min(f.counter[1], f.query_extra)) {
+        return;
+    }
+    let r = f.queries[i];
+    let asked = r.target != NRC_DEST_NONE;
+    let y = nrcQuery(f, nrcGridOf(push.net, true), nrcUnpackRecord(r), asked);
+    if (asked) {
+        f.queries[i].d = packRadiance(y);
+    }
+}
+
+// A training record's target finished: plus its path's tail answer times the tail's weight over
+// the vertex's (the raygen wrote what the path gathered itself).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void nrc_targets(uint3 id: SV_DispatchThreadID) {
+    let net = push.net;
+    let i = id.x + push.base;
+    if (i >= min(net.counter[0], net.ring)) {
+        return;
+    }
+    let rec = net.records + i;
+    let tail = rec.b;
+    if (tail == NRC_NO_SLOT) {
+        return;
+    }
+    let answer = unpackRadiance(push.frame.queries[tail].d);
+    rec.target = packRadiance(unpackRadiance(rec.target) + nrcWeight(*rec) * answer);
 }

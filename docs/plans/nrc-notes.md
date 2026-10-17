@@ -81,15 +81,85 @@ Plan: `nrc.html`. Newest last.
   "sun room reads 1.014-1.018" above was the 4-bounce truth's missing light: judge NRC against a
   16-bounce truth or Cycles, and the scaled (unclipped) gradient stands.
 
+- Cost (sun room, 3840x1080 DLAA, `--capture DIR --frames 0 --time 600`: util/capture.rs times every
+  profiler scope with the accumulation off). Trace: NRC off 17.3 ms, on 55.4. With the network's
+  answer stubbed (same paths and code, no matrix products) 16.4-17.5: running inference was the
+  38 ms (the NRC-off figure still carries the compiled-in network, below). Weights read RowMajor; converted each frame
+  (vkCmdConvertCooperativeVectorMatrixNV, nrc.rs `record_convert`) into InferencingOptimal: trace
+  27.3 ms (inference 10 ms), image unchanged (reference 1.001 / 0.011 against row-major). Asking
+  after the loop, the warp converged, made it worse both times (row-major 116 ms, optimal 65): the
+  pending inputs live across every TraceRay. gi spatial doubles with NRC (2.5 -> 5.3 ms) with the
+  answer stubbed too: more live samples to reuse (black input 90 -> 30 %), not the network.
+- The inline network's code costs the trace even with NRC off (sun room, 3840x1080, `--no-nrc`,
+  trace ms, two interleaved runs each): the raygen as is (Vulkan memory model, the NRC block, row-major)
+  29.9 / 28.1, optimal layout 25.4 / 24.5; the NRC block removed, the Vulkan model kept by a dead
+  CoopVec op 7.11 / 7.11; no NRC import (GLSL450) 7.04 / 7.03. The memory model is 1 %; the block
+  compiled in (its matrix products: registers or stack for the whole raygen, likely) is 3.5x. The
+  Northshire 2.63 -> 5.0 ms NRC-off trace is this. Inference belongs in a compute pass (4M queries
+  0.41 ms there, optimal layout, measured by a throwaway test of nrc_eval) with no CoopVec left in
+  the raygen.
+- Under motion (sun room, `--motion 1.5 / 4`): no haze or brightening; RR 1.005-1.013 / block
+  0.027-0.037 with NRC, 1.003-1.010 / 0.037-0.038 without, input unbiased. The reported 7-18 % is
+  not in this scene (Northshire: anchor snaps, fog, distance).
+
+- Inference out of the raygen (NVIDIA's NRC library's shape, RTXGI NrcGuide: query records,
+  QueryAndTrain, Resolve). The raygen imports nrc_record.slang (no CoopVec: back to the GLSL450
+  memory model, no network code). A path ending in the cache writes its input to its pixel and
+  sample's slot of `NrcFrame::queries`; after the sample, the route (pixel, or its ReSTIR PT
+  sample's light past x_k) and the f16 weight (mask / SAMPLES, or mask over the weight at x_k). A
+  training path's tail takes an extra slot (counter[1]); its records keep what the path gathered
+  and the tail's weight over theirs. `nrc_infer` (compute, optimal layout, every slot so the warp
+  stays whole) writes the answers; `nrc_resolve` (raygen, per pixel) adds them to dlss_color
+  (through the atmosphere) or the candidate's L before gi candidates; `nrc_targets` finishes the
+  training targets before training. Trace ms, 3840x1080 (two runs each):
+  | | NRC on before | on now | off before | off now |
+  |---|---|---|---|---|
+  | sun room trace | 27.3 (row-major 55) | 9.3, 8.8 | 17-25 | 8.8, 8.3 |
+  | Northshire lane trace | 34.9, 35.0 | 10.9, 10.3 | 13.6, 13.7 | 10.3, 9.6 |
+  | Northshire lane busy | 49.8, 49.9 | 28.0, 26.5 | 27.2, 27.3 | 25.9, 23.9 |
+  Inference + resolve 0.9 ms, training 0.45. Unchanged images: sun room reference 0.999 / 0.009
+  against inline, `--samples 2` 1.000 / 0.008; Northshire lane 1.000 / 0.005 (RR 1.012 / 0.018 both);
+  GI off against a 16-bounce truth 1.013 / 0.054 and 1.009 / 0.044 (inline 1.014 / 0.055: GI off,
+  the cache's regional bias wanders 5-15 % run to run, before and after).
+- Training paths inside the main dispatch cost nothing measurable (train_fraction 0: trace 8.6-9.0
+  vs 8.8), so no separate low-resolution update pass as NVIDIA's. Training recorded before ReSTIR
+  GI's ray tracing passes with compute-only barriers did not overlap them (timeline: gi spatial
+  starts when training ends); overlap needs the compute queue.
+
+- Position by a multiresolution hash grid (Müller et al. 2022, Instant-NGP, whose NRC task used
+  it: sharper than the triangle wave for +0.7 ms at 1080p), world space, no anchor: Instant-NGP's
+  NRC configuration, 16 levels x 2 features, 2^15 entries per level, cells doubling from
+  `nrc_grid_extent` / 2^19 to / 16 (default 2048 m: 4 mm to 128 m), and its network, 2 hidden
+  layers (the grid holds the detail). Training scatters the input gradient into the tables
+  (float atomic adds, VK_EXT_shader_atomic_float; wave-summed where a wave shares an entry: made no
+  difference, it is volume) and a sparse Adam updates the touched entries. Inference skips the
+  lookups for empty slots (they still join the warp's products: 2.1 -> 0.8 ms). Gym: loss 5.2 ->
+  0.005 at 2^17 and 5 hidden layers, 95 -> 0.032 at 2 (its field leans on direction).
+  | sun room against the 16-bounce truth (GI on) | ratio / block | RR |
+  |---|---|---|
+  | triangle wave, anchored box | 1.004 / 0.021 | 1.007 / 0.033 |
+  | grid 2^17, 5 hidden layers | 1.001 / 0.011 | 1.005 / 0.037 |
+  | grid 2^15, 2 hidden layers (default) | 1.002 / 0.013 | 1.004 / 0.031 |
+  Northshire lane static: unchanged (1.000 / 0.004 against the triangle wave's reference; RR 1.011 /
+  0.017). Cost, 3840x1080: Northshire inference 0.68 + resolve 0.22 ms (triangle wave 0.88
+  together), training 1.14 (0.45; the scatter is ~0.7 of it). At 2^17 / 5 hidden, before the empty
+  skip: inference 3.1, training 1.39. Motion reads better by eye (no anchor to snap).
+- Grid gradient scatter: where a wave shares an entry (coarse levels) one f32 add of the wave's
+  sum; elsewhere one f16x2 add of both features (VK_NV_shader_atomic_float16_vector, Slang
+  `InterlockedAddF16x2`; an entry there sums a few rows, which f16 holds); nrc_grid_adam adds the
+  two. Training 1.14 -> 0.67 ms (Northshire lane, 3840x1080), sun room 1.2 -> 0.71; sun room
+  against the truth 1.002 / 0.012 (f32: 0.013), gym loss 0.0326 (0.032). Validation clean.
+
 ## Deviations
 
 - D5: aurora traces in world space (not camera-relative, the plan assumed solari's convention), so
   nothing rebases. The fixed 512 m box was too coarse (sun room above); the box became a
-  contraction around an anchor snapped near the camera (Mip-NeRF 360, L-infinity): full resolution
-  within 16 m, coarser beyond, all of space inside. The hash grid remains the upgrade.
+  contraction around an anchor snapped near the camera (Mip-NeRF 360, L-infinity), then the hash
+  grid replaced both (world space, no anchor).
 - D2: self-training (paper sec. 5) added: every path's last vertex past x_k ends in the cache,
   so targets carry every bounce. Without it records near max_bounces taught "direct light only"
   and indirect-lit surfaces read 7 % dark.
-- D3: position by triangle wave x 12 (tiny-cuda-nn's NRC encoding), not sin/cos x 6.
+- D3: position by triangle wave x 12 (tiny-cuda-nn's NRC encoding), not sin/cos x 6; since
+  replaced by Instant-NGP's hash grid (log above).
 - Gates: the plan's truth (4 bounces) under-reads an all-bounce cache; NRC is judged against a
   16-bounce truth and Cycles (sun room).

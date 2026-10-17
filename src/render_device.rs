@@ -1148,18 +1148,32 @@ unsafe fn create_logical_device(
             device_extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
         }
         EXECUTABLE_STATISTICS.store(executable_stats, std::sync::atomic::Ordering::Relaxed);
-        // Cooperative vectors (nrc.rs). Slang lowers a CoopVec splat to a replicated composite.
+        // Cooperative vectors (nrc.rs). Slang lowers a CoopVec splat to a replicated composite;
+        // the cache's hash grid gathers its gradients with float atomic adds (f32, and f16x2
+        // where an entry sums a few rows: nrc_kernels.slang nrcGridBackward).
         let cooperative_vector = has(vk::NV_COOPERATIVE_VECTOR_NAME)
             && has(vk::EXT_SHADER_REPLICATED_COMPOSITES_NAME)
+            && has(vk::EXT_SHADER_ATOMIC_FLOAT_NAME)
+            && has(vk::NV_SHADER_ATOMIC_FLOAT16_VECTOR_NAME)
             && {
                 let mut query = vk::PhysicalDeviceCooperativeVectorFeaturesNV::default();
-                let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut query);
+                let mut atomics = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+                let mut atomics16 =
+                    vk::PhysicalDeviceShaderAtomicFloat16VectorFeaturesNV::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default()
+                    .push(&mut query)
+                    .push(&mut atomics)
+                    .push(&mut atomics16);
                 instance.get_physical_device_features2(physical_device, &mut features);
                 query.cooperative_vector == vk::TRUE
+                    && atomics.shader_buffer_float32_atomic_add == vk::TRUE
+                    && atomics16.shader_float16_vector_atomics == vk::TRUE
             };
         if cooperative_vector {
             device_extensions.push(vk::NV_COOPERATIVE_VECTOR_NAME.as_ptr());
             device_extensions.push(vk::EXT_SHADER_REPLICATED_COMPOSITES_NAME.as_ptr());
+            device_extensions.push(vk::EXT_SHADER_ATOMIC_FLOAT_NAME.as_ptr());
+            device_extensions.push(vk::NV_SHADER_ATOMIC_FLOAT16_VECTOR_NAME.as_ptr());
         }
         COOPERATIVE_VECTOR.store(cooperative_vector, std::sync::atomic::Ordering::Relaxed);
         log::info!("vulkan: cooperative vectors: {cooperative_vector}");
@@ -1288,10 +1302,17 @@ unsafe fn create_logical_device(
         let mut features_replicated =
             vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT::default()
                 .shader_replicated_composites(true);
+        let mut features_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
+            .shader_buffer_float32_atomic_add(true);
+        let mut features_atomic_float16 =
+            vk::PhysicalDeviceShaderAtomicFloat16VectorFeaturesNV::default()
+                .shader_float16_vector_atomics(true);
         let device_info = if cooperative_vector {
             device_info
                 .push(&mut features_cooperative_vector)
                 .push(&mut features_replicated)
+                .push(&mut features_atomic_float)
+                .push(&mut features_atomic_float16)
         } else {
             device_info
         };

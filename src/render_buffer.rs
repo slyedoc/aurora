@@ -157,7 +157,12 @@ impl BufferProvider for RenderDevice {
             let allocation = state
                 .allocate(&AllocationCreateDesc {
                     name: "Buffer Allocation",
-                    requirements: requirements.memory_requirements,
+                    // At least 64-byte aligned: cooperative vector matrices are converted from
+                    // and to device addresses on that alignment (nrc.rs record_convert).
+                    requirements: vk::MemoryRequirements {
+                        alignment: requirements.memory_requirements.alignment.max(64),
+                        ..requirements.memory_requirements
+                    },
                     location,
                     linear: true,
                     allocation_scheme,

@@ -69,7 +69,9 @@ pub struct SBT {
     pub gi_shade_region: vk::StridedDeviceAddressRegionKHR,
     /// The reference accumulation's raygen record, after gi_shade's.
     pub accumulate_region: vk::StridedDeviceAddressRegionKHR,
-    /// ReSTIR PT's spatial resampling raygen record, after the accumulation's.
+    /// The neural radiance cache's resolve raygen record, after the accumulation's.
+    pub nrc_resolve_region: vk::StridedDeviceAddressRegionKHR,
+    /// ReSTIR PT's spatial resampling raygen record, after the resolve's.
     pub gi_spatial_region: vk::StridedDeviceAddressRegionKHR,
     /// ReSTIR PT's temporal resampling raygen record, after the spatial one's.
     pub gi_temporal_region: vk::StridedDeviceAddressRegionKHR,
@@ -152,6 +154,8 @@ fn update_sbt(
     sbt.gi_shade_region.size = sbt.raygen_region.stride;
     sbt.accumulate_region.stride = sbt.raygen_region.stride;
     sbt.accumulate_region.size = sbt.raygen_region.stride;
+    sbt.nrc_resolve_region.stride = sbt.raygen_region.stride;
+    sbt.nrc_resolve_region.size = sbt.raygen_region.stride;
     sbt.gi_spatial_region.stride = sbt.raygen_region.stride;
     sbt.gi_spatial_region.size = sbt.raygen_region.stride;
     sbt.gi_temporal_region.stride = sbt.raygen_region.stride;
@@ -178,6 +182,7 @@ fn update_sbt(
         + sbt.primary_region.size
         + sbt.gi_shade_region.size
         + sbt.accumulate_region.size
+        + sbt.nrc_resolve_region.size
         + sbt.gi_spatial_region.size
         + sbt.gi_temporal_region.size
         + sbt.miss_region.size
@@ -235,6 +240,10 @@ fn update_sbt(
                 handle: rtx_pipeline.accumulate_handle,
             });
             dst = dst.add(sbt.accumulate_region.size as usize);
+            (dst as *mut SBTRegionRaygen).write(SBTRegionRaygen {
+                handle: rtx_pipeline.nrc_resolve_handle,
+            });
+            dst = dst.add(sbt.nrc_resolve_region.size as usize);
             (dst as *mut SBTRegionRaygen).write(SBTRegionRaygen {
                 handle: rtx_pipeline.gi_spatial_handle,
             });
@@ -361,8 +370,10 @@ fn update_sbt(
         sbt.primary_region.device_address + sbt.primary_region.size;
     sbt.accumulate_region.device_address =
         sbt.gi_shade_region.device_address + sbt.gi_shade_region.size;
-    sbt.gi_spatial_region.device_address =
+    sbt.nrc_resolve_region.device_address =
         sbt.accumulate_region.device_address + sbt.accumulate_region.size;
+    sbt.gi_spatial_region.device_address =
+        sbt.nrc_resolve_region.device_address + sbt.nrc_resolve_region.size;
     sbt.gi_temporal_region.device_address =
         sbt.gi_spatial_region.device_address + sbt.gi_spatial_region.size;
     sbt.miss_region.device_address =

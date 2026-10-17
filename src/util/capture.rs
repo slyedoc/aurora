@@ -5,7 +5,7 @@
 //! or move the camera.
 //!
 //!   app ... --capture DIR [--size WxH] [--frames N] [--noisy K] [--settle F] [--feed-reference]
-//!           [--motion SPEED] [--sun-motion DEG] [--sun-jump DEG [--after N]]
+//!           [--motion SPEED] [--sun-motion DEG] [--sun-jump DEG [--after N]] [--time T]
 //!
 //! `--motion SPEED`: each noisy frame ends a second of camera strafe (60 steps at SPEED m/s along
 //! the camera's right) at the captured pose, so RR's output and the reuse there come from a moving
@@ -13,6 +13,10 @@
 //! first directional light sweeps about the vertical at DEG per second into its pose.
 //! `--sun-jump DEG`: the light sits DEG off its pose for a second, then jumps to it N frames
 //! (`--after`, default 1) before the captured frame.
+//!
+//! `--time T`: before the capture, T settled frames with the accumulation off (its host-visible
+//! writes slow the trace), each GPU profiler scope's mean printed and written to `timing.json`;
+//! `--frames 0` stops after it.
 //!
 //! An example builds its app without `WinitPlugin` when [`CaptureArgs::from_args`] is some and
 //! hands it to [`run`] instead of `App::run`.
@@ -25,7 +29,7 @@ use std::{
 use bevy::{camera::RenderTarget, prelude::*};
 
 use crate::{
-    camera_target::camera_target_placeholder, reference::ReferenceState,
+    camera_target::camera_target_placeholder, gpu_profiler::GpuProfiler, reference::ReferenceState,
     render_device::RenderDevice,
 };
 
@@ -50,6 +54,8 @@ pub struct CaptureArgs {
     pub sun_motion: Option<f32>,
     /// `--sun-jump DEG` and `--after N`: the sun jumps DEG to its pose N frames before.
     pub sun_jump: Option<(f32, u32)>,
+    /// `--time T`: frames timed by the GPU profiler before the capture.
+    pub time: Option<u32>,
 }
 
 impl CaptureArgs {
@@ -89,6 +95,7 @@ impl CaptureArgs {
                         .max(1),
                 )
             }),
+            time: value("--time").and_then(|v| v.parse().ok()),
         })
     }
 }
@@ -190,6 +197,13 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         .camera
         .expect("a Camera3d to capture");
 
+    if let Some(frames) = args.time {
+        time(app, args, frames);
+        if args.frames == 0 {
+            crate::ray_render_plugin::shutdown_renderer(app.world_mut());
+            return;
+        }
+    }
     if args.feed {
         feed(app, args);
         return;
@@ -328,6 +342,59 @@ pub fn run(app: &mut App, args: &CaptureArgs) {
         args.noisy
     );
     crate::ray_render_plugin::shutdown_renderer(app.world_mut());
+}
+
+/// `--time T`: the mean of each GPU profiler scope over T frames, the accumulation off; `busy` is
+/// every scope inside `frame` summed (the bench's).
+fn time(app: &mut App, args: &CaptureArgs, frames: u32) {
+    app.world_mut().resource_mut::<ReferenceState>().capture = false;
+    for _ in 0..DRAIN * 4 {
+        app.update();
+    }
+    let mut sums: Vec<(&'static str, f64)> = Vec::new();
+    let mut seen = app.world().resource::<GpuProfiler>().frames_read;
+    let mut count = 0;
+    while count < frames {
+        app.update();
+        let profiler = app.world().resource::<GpuProfiler>();
+        if profiler.frames_read == seen {
+            continue;
+        }
+        seen = profiler.frames_read;
+        count += 1;
+        let busy: f64 = profiler
+            .last_frame
+            .iter()
+            .filter(|(name, _)| !matches!(*name, "frame" | "span" | "idle"))
+            .map(|(_, ms)| *ms)
+            .sum();
+        for (name, ms) in profiler.last_frame.iter().copied().chain([("busy", busy)]) {
+            match sums.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, total)) => *total += ms,
+                None => sums.push((name, ms)),
+            }
+        }
+    }
+    let means: Vec<_> = sums
+        .into_iter()
+        .map(|(name, total)| (name, total / count as f64))
+        .collect();
+    for (name, ms) in &means {
+        info!("time: {name:>16} {ms:7.3} ms");
+    }
+    let json = means
+        .iter()
+        .map(|(name, ms)| format!("  \"{name}\": {ms:.4}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    std::fs::write(
+        args.dir.join("timing.json"),
+        format!("{{\n  \"frames\": {count},\n{json}\n}}\n"),
+    )
+    .expect("timing.json");
+    let mut reference = app.world_mut().resource_mut::<ReferenceState>();
+    reference.capture = true;
+    reference.reset_next = true;
 }
 
 /// `--feed-reference`: accumulate N frames with RR fed the running mean, then capture its output

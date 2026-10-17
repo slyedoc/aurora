@@ -121,6 +121,10 @@ pub struct RenderSettings {
     /// The training's Adam step size.
     #[reflect(@0.0001..=0.02_f32)]
     pub nrc_learning_rate: f32,
+    /// The cache's hash grid spans cells from this / 16 to this / 2^19 metres, doubling per
+    /// level (Instant-NGP's NRC range over its unit scene box); changing it starts the grid over.
+    #[reflect(@1.0..=65536.0_f32)]
+    pub nrc_grid_extent: f32,
     /// Opacity micromaps on alpha-cutout meshes that carry a bake (off = any-hit alpha test).
     pub omm: bool,
     /// Ray Reconstruction model preset; changing it rebuilds the feature.
@@ -178,6 +182,7 @@ impl Default for RenderSettings {
             nrc_spread: 0.01,
             nrc_train_fraction: 0.03,
             nrc_learning_rate: 2.0e-3,
+            nrc_grid_extent: 2048.0,
             omm: true,
             rr_preset: RrPreset::current(),
             low_latency: crate::latency::LowLatency::On,

@@ -114,6 +114,7 @@ pub struct CompiledRaytracingPipeline {
     pub stack_primary: u32,
     pub stack_gi_shade: u32,
     pub stack_accumulate: u32,
+    pub stack_nrc_resolve: u32,
     pub stack_gi_spatial: u32,
     pub stack_gi_temporal: u32,
     pub raygen_handle: RTGroupHandle,
@@ -125,6 +126,8 @@ pub struct CompiledRaytracingPipeline {
     pub gi_shade_handle: RTGroupHandle,
     /// The reference accumulation's raygen (reference.rs).
     pub accumulate_handle: RTGroupHandle,
+    /// The neural radiance cache's resolve raygen (nrc.rs).
+    pub nrc_resolve_handle: RTGroupHandle,
     /// ReSTIR PT's spatial resampling raygen (restir_gi.rs).
     pub gi_spatial_handle: RTGroupHandle,
     /// ReSTIR PT's temporal resampling raygen (restir_gi.rs).
@@ -528,6 +531,27 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
+        // The neural radiance cache's answers into the colour (raygen.slang `nrc_resolve`).
+        let nrc_resolve_group = shader_group.len();
+        let nrc_resolve_stage = shader_stages.len() as u32;
+        shader_stages.push(
+            render_device
+                .load_shader_entry(
+                    raygen_shader.spirv.as_ref().unwrap(),
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                    c"nrc_resolve",
+                )
+                .specialization_info(&spec),
+        );
+        shader_group.push(
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(nrc_resolve_stage)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        );
+
         // ReSTIR PT's spatial resampling (raygen.slang `gi_spatial`): its shift replays prefixes.
         let gi_spatial_group = shader_group.len();
         let gi_spatial_stage = shader_stages.len() as u32;
@@ -724,6 +748,7 @@ impl VulkanAsset for RaytracingPipeline {
         let primary_handle = handles[primary_group];
         let gi_shade_handle = handles[gi_shade_group];
         let accumulate_handle = handles[accumulate_group];
+        let nrc_resolve_handle = handles[nrc_resolve_group];
         let gi_spatial_handle = handles[gi_spatial_group];
         let gi_temporal_handle = handles[gi_temporal_group];
         let shadow_miss_handle = handles[shadow_miss_group];
@@ -774,6 +799,7 @@ impl VulkanAsset for RaytracingPipeline {
         let stack_gi_shade =
             group_stack(gi_shade_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         let stack_accumulate = group_stack(accumulate_group, vk::ShaderGroupShaderKHR::GENERAL);
+        let stack_nrc_resolve = group_stack(nrc_resolve_group, vk::ShaderGroupShaderKHR::GENERAL);
         let stack_gi_spatial =
             group_stack(gi_spatial_group, vk::ShaderGroupShaderKHR::GENERAL) + callee;
         let stack_gi_temporal =
@@ -793,6 +819,7 @@ impl VulkanAsset for RaytracingPipeline {
             stack_primary,
             stack_gi_shade,
             stack_accumulate,
+            stack_nrc_resolve,
             stack_gi_spatial,
             stack_gi_temporal,
             raygen_handle,
@@ -800,6 +827,7 @@ impl VulkanAsset for RaytracingPipeline {
             primary_handle,
             gi_shade_handle,
             accumulate_handle,
+            nrc_resolve_handle,
             gi_spatial_handle,
             gi_temporal_handle,
             miss_handle,

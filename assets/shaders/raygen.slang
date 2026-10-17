@@ -7,7 +7,7 @@ import bsdf;
 import atmosphere_rt;
 import light_eval;
 import fog;
-import nrc;
+import nrc_record;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
 // primary hit of sample 0.
@@ -1746,6 +1746,37 @@ void accumulate() {
     }
 }
 
+// The cache's answers (nrc_kernels.slang nrc_infer), one thread per traced pixel after it: each
+// sample's query into the colour (pre-exposed, as the raygen wrote it, through the atmosphere) or
+// into its ReSTIR PT sample's light (nits), before ReSTIR GI reads the candidates.
+[shader("raygeneration")]
+void nrc_resolve() {
+    if (pc.nrc == nullptr) {
+        return;
+    }
+    let launch_id = DispatchRaysIndex().xy;
+    let prim_at = launch_id.y * DispatchRaysDimensions().x + launch_id.x;
+    var add = float3(0.0);
+    for (uint s = 0u; s < SAMPLES; s++) {
+        let q = pc.nrc.queries[prim_at * SAMPLES + s];
+        let c = nrcWeight(q) * unpackRadiance(q.d);
+        if (q.target == NRC_DEST_PIXEL) {
+            add += c;
+        } else if (q.target == NRC_DEST_GI && pc.gi_candidates != nullptr) {
+            let cand = pc.gi_candidates + prim_at;
+            cand.L = packRadiance(unpackRadiance(cand.L) + c / max(pc.ae.input_exposure, 1.0e-20));
+        }
+    }
+    if (any(add > float3(0.0))) {
+        if (ATMOSPHERE_ON && pc.uniforms.environments[pc.uniforms.environment].mode == 3u) {
+            add *= unpackRgb9e5(pc.nrc.queries[prim_at * SAMPLES].b);
+        }
+        let px = int2(launch_id);
+        let old = dlss_color[px];
+        dlss_color[px] = float4(clamp(old.rgb + add, float3(0.0), float3(65504.0)), old.a);
+    }
+}
+
 uint packUnorm16(float x) {
     return uint(saturate(x) * 65535.0 + 0.5);
 }
@@ -1926,6 +1957,13 @@ void main() {
         // fireflies Ray Reconstruction rejected among the cached pixels).
         var nrc_render = float3(0.0);
         var nrc_ended = false;
+        // The cache is asked after the trace (nrc_kernels.slang nrc_infer, then nrc_resolve):
+        // this sample's query slot is written where the path ends in it (the pixel's, or a
+        // training path's where its pixel did), and the query that ended a training path, whose
+        // answer finishes its targets.
+        let nrc_slot_px = prim_at * SAMPLES + sample_idx;
+        var nrc_asked = false;
+        var nrc_tail = NRC_NO_SLOT;
         if (pc.nrc != nullptr && sample_idx == 0u && randf() < pc.nrc.train_fraction) {
             path |= PATH_NRC_TRAIN;
         }
@@ -2236,7 +2274,7 @@ void main() {
             if (pc.nrc != nullptr && transmission < 0.01 && !hitPayloadGetMasked(payload)
                 && (path & PATH_CACHE_BLIND) == 0u) {
                 NrcInput q;
-                q.position = nrcBoxPosition(pc.nrc, origin);
+                q.position = origin;
                 q.dir = -direction;
                 q.normal = world_normal;
                 q.roughness = roughness;
@@ -2251,33 +2289,41 @@ void main() {
                 let pt_past = ((path & PATH_PT_SEARCH) == 0u || last)
                     && (!GI_ON || pt_k_bounce == 0xFFFFFFFFu || bounce_idx > pt_k_bounce);
                 let spread_out = nrc_spread * nrc_spread > pc.nrc.spread * nrc_a0;
-                if (nrcInBox(q.position) && (pc.nrc.flags & NRC_FLAG_INLINE) != 0u && pt_past
-                    && (last || spread_out) && !nrc_ended) {
-                    let cached = acc + mask * nrcQuery(pc.nrc, q) / max(pc.ae.input_exposure, 1.0e-20);
+                if (pt_past && (last || spread_out) && !nrc_ended) {
+                    // The weight for now: this vertex's mask (the route and its scale are known
+                    // once the sample is done).
+                    var r = nrcPackRecord(q);
+                    r.target = NRC_DEST_NONE;
+                    pc.nrc.queries[nrc_slot_px] = r;
+                    nrcSetWeight(pc.nrc.queries + nrc_slot_px, mask);
+                    nrc_asked = true;
                     if ((path & PATH_NRC_TRAIN) == 0u || last) {
-                        acc = cached;
+                        nrc_tail = nrc_slot_px;
                         break;
                     }
-                    nrc_render = cached;
+                    nrc_render = acc;
                     nrc_ended = true;
-                } else if (last && nrc_ended && nrcInBox(q.position)) {
+                } else if (last && nrc_ended) {
                     // The extension's own end: the cache's answer finishes its targets.
-                    acc += mask * nrcQuery(pc.nrc, q) / max(pc.ae.input_exposure, 1.0e-20);
+                    uint e;
+                    InterlockedAdd(pc.nrc.counter[1], 1u, e);
+                    if (e < pc.nrc.query_extra) {
+                        var r = nrcPackRecord(q);
+                        r.target = NRC_DEST_TAIL;
+                        nrc_tail = pc.nrc.query_base + e;
+                        pc.nrc.queries[nrc_tail] = r;
+                    }
                     break;
                 }
-                if (nrcInBox(q.position)) {
-                    if ((path & PATH_NRC_TRAIN) != 0u) {
-                        if (nrc_n < NRC_VERTICES) {
-                            uint slot;
-                            InterlockedAdd(pc.nrc.counter[0], 1u, slot);
-                            if (slot < pc.nrc.ring) {
-                                pc.nrc.records[slot] = nrcPackRecord(q);
-                                nrc_slot[nrc_n] = slot;
-                                nrc_mask[nrc_n] = mask;
-                                nrc_acc[nrc_n] = acc;
-                                nrc_n++;
-                            }
-                        }
+                if ((path & PATH_NRC_TRAIN) != 0u && nrc_n < NRC_VERTICES) {
+                    uint slot;
+                    InterlockedAdd(pc.nrc.counter[0], 1u, slot);
+                    if (slot < pc.nrc.ring) {
+                        pc.nrc.records[slot] = nrcPackRecord(q);
+                        nrc_slot[nrc_n] = slot;
+                        nrc_mask[nrc_n] = mask;
+                        nrc_acc[nrc_n] = acc;
+                        nrc_n++;
                     }
                 }
             }
@@ -2531,14 +2577,18 @@ void main() {
         }
 
         // A training path's records: each vertex's target is what the path gathered from it on,
-        // over the mask that reached it, pre-exposed like the network's answers.
+        // over the mask that reached it, pre-exposed like the network's answers; nrc_targets adds
+        // the tail's answer times its mask over the vertex's (`mask` is still the tail's: the
+        // path broke there).
         for (uint ni = 0u; ni < nrc_n; ni++) {
             let delta = max(acc - nrc_acc[ni], float3(0.0));
             let m = nrc_mask[ni];
-            let target = float3(m.r > 1.0e-6 ? delta.r / m.r : 0.0,
-                                m.g > 1.0e-6 ? delta.g / m.g : 0.0,
-                                m.b > 1.0e-6 ? delta.b / m.b : 0.0);
-            pc.nrc.records[nrc_slot[ni]].target = packRadiance(target * pc.ae.input_exposure);
+            let inv = float3(m.r > 1.0e-6 ? 1.0 / m.r : 0.0, m.g > 1.0e-6 ? 1.0 / m.g : 0.0,
+                             m.b > 1.0e-6 ? 1.0 / m.b : 0.0);
+            let rec = pc.nrc.records + nrc_slot[ni];
+            rec.target = packRadiance(delta * inv * pc.ae.input_exposure);
+            nrcSetWeight(rec, mask * inv);
+            rec.b = nrc_tail;
         }
         if (nrc_ended) {
             acc = nrc_render;
@@ -2568,6 +2618,35 @@ void main() {
             pc.gi_candidates[prim_at].L = packRadiance(Lc);
             pc.gi_candidates[prim_at].frame = pc.uniforms.frame;
         }
+        // This sample's query: its route and weight (the vertex's mask, times 1 / SAMPLES into
+        // the pixel, or over the weight that reached x_k into the sample's light, which a later
+        // sample's candidate replaces).
+        if (pc.nrc != nullptr) {
+            var dest = NRC_DEST_NONE;
+            var w = float3(0.0);
+            if (nrc_asked) {
+                let m = nrcWeight(pc.nrc.queries[nrc_slot_px]);
+                if (GI_ON && (path & PATH_GI_VERTEX) != 0u && (path & PATH_GI_LIVE) != 0u) {
+                    dest = NRC_DEST_GI;
+                    w = float3(gi_mask.r > 1.0e-6 ? m.r / gi_mask.r : 0.0,
+                               gi_mask.g > 1.0e-6 ? m.g / gi_mask.g : 0.0,
+                               gi_mask.b > 1.0e-6 ? m.b / gi_mask.b : 0.0);
+                } else {
+                    dest = NRC_DEST_PIXEL;
+                    w = m / float(SAMPLES);
+                }
+            }
+            if (GI_ON && (path & PATH_GI_VERTEX) != 0u) {
+                for (uint e = 0u; e < sample_idx; e++) {
+                    let earlier = pc.nrc.queries + prim_at * SAMPLES + e;
+                    if (earlier.target == NRC_DEST_GI) {
+                        earlier.target = NRC_DEST_NONE;
+                    }
+                }
+            }
+            pc.nrc.queries[nrc_slot_px].target = dest;
+            nrcSetWeight(pc.nrc.queries + nrc_slot_px, w);
+        }
     }
 
     var mean = acc / float(SAMPLES);
@@ -2578,9 +2657,12 @@ void main() {
         mean = atmoCompositeT(cameraOrigin(), pixelDirection(launch_id, launch_size),
                               pc.primary_hits[prim_at].primary_t,
                               atmoBayer(px), mean, surface_t);
-        // gi_shade's light reaches the camera through the same air.
+        // gi_shade's light reaches the camera through the same air, and so does the cache's.
         if (GI_ON && pc.gi_candidates != nullptr) {
             pc.restir_surfaces[prim_at].gi_view_t = packRgb9e5(surface_t);
+        }
+        if (pc.nrc != nullptr) {
+            pc.nrc.queries[prim_at * SAMPLES].b = packRgb9e5(surface_t);
         }
     }
     // Next frame's auto-exposure metering (auto_exposure.slang): the incident meter (< 0 =

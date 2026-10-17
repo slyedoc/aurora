@@ -842,7 +842,9 @@ public uint gridCell(RestirFrame* f, float3 p) {
 
 // One surface point the network is asked about or trained on (48 B; NRC_RECORD_BYTES in
 // src/nrc.rs). Training records carry the radiance measured leaving the point (packRadiance,
-// nits, its own emission excluded); queries carry where the answer goes.
+// pre-exposed) and, until nrc_targets completes it with the tail's answer, the tail's weight over
+// the vertex's (nrcWeight: a, c) and its query slot (b); queries carry where the answer goes
+// (target), its weight (a, c) and the answer (d).
 public struct NrcRecord {
     public float3 position;
     public uint dir;            // octahedral, 2 x unorm16
@@ -858,24 +860,26 @@ public struct NrcRecord {
 
 // The neural radiance cache's per-view block (nrc.slang). Must match NrcFrameGpu in src/nrc.rs.
 public struct NrcFrame {
-    // NRC_LAYERS matrices [out][in], row-major f16, then NRC_LAYERS x NRC_WIDTH f16 biases.
+    // NRC_LAYERS matrices in the inferencing-optimal layout, then NRC_LAYERS x NRC_WIDTH f16
+    // biases (inference: nrc_kernels.slang nrc_infer).
     public half* weights;
     public half* biases;
     // The training ring and the count of records written into it this frame.
     public NrcRecord* records;
     public uint* counter;
-    // The cache box (world position of its centre, 1 / its size): positions are encoded in it.
-    public float4 box;
     public uint ring;
     // A path ends in the cache once its spread exceeds this x the primary vertex's (Müller et
     // al. 2021, sec. 5), and this share of paths trains instead.
     public float spread;
     public float train_fraction;
-    // NRC_FLAG_*.
     public uint flags;
+    // Where paths ending in the cache ask it (nrc_record.slang: the destination in `target`, the
+    // weight by nrcWeight, the answer in `d`): a slot per pixel and sample from 0, then
+    // `query_extra` slots from `query_base` for training paths' tails (counter[1]).
+    public NrcRecord* queries;
+    public uint query_base;
+    public uint query_extra;
 };
-// The raygen asks the network itself at the termination vertex.
-public static const uint NRC_FLAG_INLINE = 1u;
 
 // `RaytracingPushConstants` in raytracing_pipeline.rs.
 public struct PushConstants {

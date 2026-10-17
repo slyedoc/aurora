@@ -5,7 +5,9 @@
 use ash::vk;
 use bevy_aurora::{
     compute::{CompiledComputeModule, ComputeModule},
-    nrc::{NRC_CHUNK, NRC_LAYERS, NRC_PARAMS, NRC_RECORD_BYTES, NRC_WIDTH, NrcNetwork},
+    nrc::{
+        NRC_CHUNK, NRC_LAYERS, NRC_PARAMS, NRC_RECORD_BYTES, NRC_WIDTH, NrcNetwork, NrcTraining,
+    },
     render_buffer::{Buffer, BufferProvider},
     render_device::{RenderDevice, cooperative_vector},
     shader::{Shader, compile_slang},
@@ -32,6 +34,7 @@ fn module(rd: &RenderDevice) -> CompiledComputeModule {
         "nrc_adam",
         "nrc_eval",
         "nrc_gym_records",
+        "nrc_grid_adam",
     ]
     .map(String::from)
     .to_vec();
@@ -112,6 +115,11 @@ fn nrc_gym() {
     let module = module(&rd);
     let batch = 4096u32;
     let mut net = NrcNetwork::new(&rd, batch, batch, 1);
+    // The gym's field lives in the unit box.
+    net.set_training(NrcTraining {
+        grid_extent: 1.0,
+        ..NrcTraining::default()
+    });
     let out: Buffer<u8> = rd.create_device_buffer(
         batch as u64 * 12,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,

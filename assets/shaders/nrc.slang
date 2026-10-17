@@ -1,26 +1,48 @@
-// Neural radiance cache (src/nrc.rs): the network's input encoding and its inference, shared by
-// the raygen and the compute kernels (nrc_kernels.slang). Cooperative vectors
-// (VK_NV_cooperative_vector): the matrix products run on the tensor cores.
+// Neural radiance cache (src/nrc.rs): the network's input encoding and its inference, for the
+// compute kernels (nrc_kernels.slang). Cooperative vectors (VK_NV_cooperative_vector): the matrix
+// products run on the tensor cores. Nothing the raygen imports may use them (nrc_record.slang):
+// their code in a ray tracing shader cost the whole trace 3.5x, run or not.
 import rt_types;
+__exported import nrc_record;
 
 public static const uint NRC_WIDTH = 64;
-// Input -> 5 hidden layers -> output: six 64 x 64 matrices; the output's first three rows are RGB.
-public static const uint NRC_LAYERS = 6;
-static const uint NRC_FREQS = 12u;
+// Input -> 2 hidden layers -> output (Instant-NGP's NRC network: the hash grid holds the detail):
+// three 64 x 64 matrices; the output's first three rows are RGB.
+public static const uint NRC_LAYERS = 3;
 public static const uint NRC_MATRIX_HALVES = NRC_WIDTH * NRC_WIDTH;
+// The position's multiresolution hash grid (Müller et al. 2022, Instant-NGP; its NRC task):
+// NRC_GRID_LEVELS levels of NRC_GRID_FEATURES trained features, from coarse to fine.
+public static const uint NRC_GRID_LEVELS = 16;
+public static const uint NRC_GRID_FEATURES = 2;
 
-
-// What the network sees of a surface point.
-public struct NrcInput {
-    // In the cache box, [0, 1]^3.
-    public float3 position;
-    // Outgoing direction (towards the viewer) and shading normal, unit.
-    public float3 dir;
-    public float3 normal;
-    public float roughness;
-    public float3 diffuse;
-    public float3 specular;
+// The hash grid as one pass reads it: its f16 table ([level][entry][feature]), entries per
+// level (a power of two), the finest level's cell (metres) and the ratio between levels' cells.
+public struct NrcGrid {
+    public half* table;
+    public uint size;
+    public float finest;
+    public float growth;
 };
+
+// One level's cell for a position: its lowest corner and where in it the position lies.
+public void nrcGridCell(NrcGrid g, uint l, float3 p, out int3 corner, out float3 f) {
+    let cell = g.finest * pow(g.growth, float(NRC_GRID_LEVELS - 1u - l));
+    let q = p / cell;
+    let base = floor(q);
+    corner = int3(base);
+    f = q - base;
+}
+
+// A corner's entry (Instant-NGP's spatial hash) and its trilinear weight; `k` picks the corner.
+public uint nrcGridEntry(NrcGrid g, uint l, int3 corner, float3 f, uint k, out float w) {
+    let o = uint3(k & 1u, (k >> 1u) & 1u, k >> 2u);
+    let c = uint3(corner) + o;
+    let wf = select(o != uint3(0u), f, 1.0 - f);
+    w = wf.x * wf.y * wf.z;
+    let h = c.x ^ (c.y * 2654435761u) ^ (c.z * 805459861u);
+    return l * g.size + (h & (g.size - 1u));
+}
+
 
 // Four one-blob bins of a value in [0, 1] (Müller et al. 2019): Gaussian bumps of width 1/4.
 void oneBlob(inout CoopVec<half, NRC_WIDTH> v, uint at, float x) {
@@ -31,20 +53,25 @@ void oneBlob(inout CoopVec<half, NRC_WIDTH> v, uint at, float x) {
     }
 }
 
-// 62 features, padded to 64 (tiny-cuda-nn's NRC encoding): position by a triangle wave at 12
-// frequencies (3 x 12, periods 2 to 2^-10 of the box), direction and normal octahedral and 1 - exp(-roughness) one-blob (5 x 4),
-// the two albedos raw (6).
-public CoopVec<half, NRC_WIDTH> nrcEncode(NrcInput i) {
+// 58 features, padded to 64: position by the hash grid (16 x 2, inputs 0-31), direction and
+// normal octahedral and 1 - exp(-roughness) one-blob (5 x 4, 36-55), the two albedos raw (56-61).
+public CoopVec<half, NRC_WIDTH> nrcEncode(NrcInput i, NrcGrid g, bool grid = true) {
     var v = CoopVec<half, NRC_WIDTH>(half(0.0));
+    let table = (uint*)g.table;
     [ForceUnroll]
-    for (uint a = 0u; a < 3u; a++) {
+    for (uint l = 0u; l < NRC_GRID_LEVELS && grid; l++) {
+        int3 corner;
+        float3 f;
+        nrcGridCell(g, l, i.position, corner, f);
+        var acc = float2(0.0);
         [ForceUnroll]
-        for (uint o = 0u; o < NRC_FREQS; o++) {
-            // Period 2 at the lowest frequency: every triangle is symmetric about its peaks, and
-            // with period 1 none told x from 1 - x.
-            let t = frac(i.position[a] * float(1u << o) * 0.5);
-            v[a * NRC_FREQS + o] = half(abs(4.0 * t - 2.0) - 1.0);
+        for (uint k = 0u; k < 8u; k++) {
+            float w;
+            let e = nrcGridEntry(g, l, corner, f, k, w);
+            acc += w * unpackHalf2(table[e]);
         }
+        v[l * 2u] = half(acc.x);
+        v[l * 2u + 1u] = half(acc.y);
     }
     let d = float32x3_to_oct(i.dir) * 0.5 + 0.5;
     let n = float32x3_to_oct(i.normal) * 0.5 + 0.5;
@@ -62,7 +89,8 @@ public CoopVec<half, NRC_WIDTH> nrcEncode(NrcInput i) {
     return v;
 }
 
-// The network's output for an encoded input: ReLU hidden layers, a linear output.
+// The network's output for an encoded input: ReLU hidden layers, a linear output. The weights
+// are in the inferencing-optimal layout, NRC_MATRIX_HALVES per layer (nrc.rs weights_opt).
 public float3 nrcForward(half* weights, half* biases, CoopVec<half, NRC_WIDTH> x) {
     var h = x;
     [ForceUnroll]
@@ -71,7 +99,7 @@ public float3 nrcForward(half* weights, half* biases, CoopVec<half, NRC_WIDTH> x
             h, CoopVecComponentType::Float16,
             (void*)(weights + l * NRC_MATRIX_HALVES), CoopVecComponentType::Float16,
             (void*)(biases + l * NRC_WIDTH), CoopVecComponentType::Float16,
-            CoopVecMatrixLayout::RowMajor, false, NRC_WIDTH * 2u);
+            CoopVecMatrixLayout::InferencingOptimal, false, 0u);
         if (l + 1u < NRC_LAYERS) {
             h = max(h, CoopVec<half, NRC_WIDTH>(half(0.0)));
         }
@@ -80,74 +108,9 @@ public float3 nrcForward(half* weights, half* biases, CoopVec<half, NRC_WIDTH> x
 }
 
 
-uint packOct16(float3 v) {
-    let e = saturate(float32x3_to_oct(v) * 0.5 + 0.5);
-    return uint(e.x * 65535.0 + 0.5) | (uint(e.y * 65535.0 + 0.5) << 16);
-}
-
-float3 unpackOct16(uint p) {
-    let e = float2(float(p & 0xFFFFu), float(p >> 16)) * (2.0 / 65535.0) - 1.0;
-    return oct_to_float32x3(e);
-}
-
-uint packUnorm8x4(float4 v) {
-    let u = uint4(saturate(v) * 255.0 + 0.5);
-    return u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);
-}
-
-float4 unpackUnorm8x4(uint p) {
-    return float4(float(p & 0xFFu), float((p >> 8) & 0xFFu), float((p >> 16) & 0xFFu),
-                  float(p >> 24)) * (1.0 / 255.0);
-}
-
-public NrcRecord nrcPackRecord(NrcInput i) {
-    NrcRecord r = {};
-    r.position = i.position;
-    r.dir = packOct16(i.dir);
-    r.normal = packOct16(i.normal);
-    r.rough_diffuse = packUnorm8x4(float4(i.roughness, i.diffuse));
-    r.specular = packUnorm8x4(float4(i.specular, 0.0));
-    return r;
-}
-
-public NrcInput nrcUnpackRecord(NrcRecord r) {
-    NrcInput i;
-    i.position = r.position;
-    i.dir = unpackOct16(r.dir);
-    i.normal = unpackOct16(r.normal);
-    let rd = unpackUnorm8x4(r.rough_diffuse);
-    i.roughness = rd.x;
-    i.diffuse = rd.yzw;
-    i.specular = unpackUnorm8x4(r.specular).xyz;
-    return i;
-}
-
-// Reflectance factorization (Müller et al. 2021, sec. 4.1): the network learns scattered
-// radiance over the surface's albedo, the lighting without the texture.
-public float3 nrcFactor(NrcInput i) {
-    return max(i.diffuse + i.specular, float3(0.05));
-}
-
 // The cache's scattered outgoing radiance at a surface point, in the training targets' units
 // (pre-exposed radiance: nits x the frame's input exposure).
-public float3 nrcQuery(NrcFrame* f, NrcInput i) {
-    let y = max(nrcForward(f.weights, f.biases, nrcEncode(i)), float3(0.0));
+public float3 nrcQuery(NrcFrame* f, NrcGrid g, NrcInput i, bool grid = true) {
+    let y = max(nrcForward(f.weights, f.biases, nrcEncode(i, g, grid)), float3(0.0));
     return y * nrcFactor(i);
-}
-
-// A world position in the cache box, [0, 1]^3: within the radius of the anchor (f.box: its world
-// position, 1 / the radius) linear, beyond contracted toward the walls (Mip-NeRF 360, by the
-// L-infinity norm): resolution falls with distance, as the footprints of the paths ending there
-// grow.
-public float3 nrcBoxPosition(NrcFrame* f, float3 p) {
-    var x = (p - f.box.xyz) * f.box.w;
-    let m = max(abs(x.x), max(abs(x.y), abs(x.z)));
-    if (m > 1.0) {
-        x *= (2.0 - 1.0 / m) / m;
-    }
-    return x * 0.25 + 0.5;
-}
-
-public bool nrcInBox(float3 q) {
-    return all(q >= float3(0.0)) && all(q <= float3(1.0));
 }
