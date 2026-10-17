@@ -92,11 +92,10 @@ pub struct RenderSettings {
     #[reflect(@1.0..=64.0_f32)]
     pub restir_gi_spatial_radius: f32,
     /// ReSTIR PT's temporal reuse: the confidence (samples) last frame's reservoir may carry into
-    /// this frame's (0 = none, the default), lowered as the history moves or the suns change.
-    /// Unbiased, but Ray Reconstruction takes the reused samples' correlation for signal: in a
-    /// sparse-lit interior (Northshire's abbey) its error against the reference rises (spatial
-    /// alone 0.113, cap 4 0.139, 9 % bright) and at 3840x1080 it costs 1.3 ms; in the sun room cap
-    /// 4 cut RR's error 0.031 -> 0.025.
+    /// this frame's (0 = none), lowered as the history moves or the suns change. With the neural
+    /// radiance cache it cuts Ray Reconstruction's error everywhere measured (sun room 0.028 ->
+    /// 0.021, Northshire lane 0.018 -> 0.014, abbey 0.104 -> 0.097); before the cache the abbey
+    /// read 9 % bright with it. ~1.3 ms at 3840x1080.
     #[reflect(@0.0..=32.0_f32)]
     pub restir_pt_history: f32,
     /// A/B switch for measuring a change in one run (benches/northshire.rs `--ab`): shaders
@@ -174,7 +173,7 @@ impl Default for RenderSettings {
             restir_gi_roughness: 0.35,
             restir_gi_spatial_samples: 4,
             restir_gi_spatial_radius: 30.0,
-            restir_pt_history: 0.0,
+            restir_pt_history: 4.0,
             ab: 0,
             light_grid_cell: 4.0,
             light_grid_samples: 16,

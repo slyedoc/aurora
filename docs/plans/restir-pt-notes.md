@@ -238,3 +238,11 @@ Plan: `restir-pt.html`. Newest last.
   16-bounce truth. tests/bsdf_check.rs: sampling weights vs eval (uniform sphere) within 1.9 %, pdf
   vs kept samples 1.8 %, bwd_diff vs finite differences 2e-4, replay exact. Glass keeps its own
   refraction code (Falcor's dielectric BSDF is the next step).
+
+- 2026-10-17: temporal reuse on by default again (restir_pt_history 4). With NRC (hash grid) the
+  input is denser and temporal reuse helps everywhere (960x540, 2048 frames, RR block error / ratio,
+  off -> on): sun room 0.028 / 1.002 -> 0.021 / 0.997, Northshire lane 0.018 / 1.012 -> 0.014 /
+  1.011, abbey 0.104 / 0.873 -> 0.097 / 0.896. Black input 30 -> 5 %, 32 -> 8 %, 53 -> 7 %.
+  Unbiased (references off vs on: lane 1.000 / 0.002, abbey 1.003 / 0.017). The abbey no longer
+  reads bright with it; it reads dark either way (NRC notes: open), and its 2048-frame references
+  are loose.
