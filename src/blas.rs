@@ -11,7 +11,7 @@ use half::f16;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
-    mesh::OmmSlices,
+    mesh::{MorphDelta, OmmSlices},
     omm::{Micromap, MicromapBuild},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
@@ -164,14 +164,35 @@ pub struct BLAS {
     pub geometry_to_triangle: Buffer<u32>,
     /// Skinning influences, parallel to `vertex_buffer` (skinned meshes only).
     pub skin_buffer: Option<Buffer<SkinVertex>>,
+    /// Morph targets, vertex-major (meshes that carry them).
+    pub morph: Option<MorphBuffers>,
     /// The opacity micromap the structure references (alpha-cutout meshes with a bake).
     pub micromap: Option<Micromap>,
+}
+
+/// A mesh's morph targets as the deform kernel gathers them: vertex `v` owns
+/// `entries[ranges[v]..ranges[v + 1]]`, each naming its target in `index`.
+pub struct MorphBuffers {
+    pub ranges: Buffer<u32>,
+    pub entries: Buffer<MorphDelta>,
+    pub target_count: u32,
+}
+
+/// [`MorphBuffers`] on the host, before upload.
+pub struct MorphHost {
+    pub ranges: Buffer<u32>,
+    pub entries: Buffer<MorphDelta>,
+    pub target_count: u32,
 }
 
 impl BLAS {
     pub fn destroy(&self, render_device: &RenderDevice) {
         if let Some(skin) = &self.skin_buffer {
             render_device.destroyer.destroy_buffer(skin.handle);
+        }
+        if let Some(morph) = &self.morph {
+            render_device.destroyer.destroy_buffer(morph.ranges.handle);
+            render_device.destroyer.destroy_buffer(morph.entries.handle);
         }
         if let Some(micromap) = &self.micromap {
             micromap.destroy(render_device);
@@ -232,6 +253,8 @@ pub struct BlasBuildInput {
     pub geometries: Vec<GeometryDescr>,
     /// Skinning influences, one per vertex, for meshes that carry joint attributes.
     pub skin_host: Option<Buffer<SkinVertex>>,
+    /// Morph targets, vertex-major, for meshes that carry them.
+    pub morph_host: Option<MorphHost>,
     /// A baked opacity micromap to attach (single-geometry meshes; omm.rs).
     pub omm: Option<Arc<OmmSlices>>,
 }
@@ -257,6 +280,7 @@ pub fn build_blas_from_buffers(
             index_buffer_host,
             geometries: geometries.to_vec(),
             skin_host: None,
+            morph_host: None,
             omm: None,
         }],
     )
@@ -297,6 +321,7 @@ pub fn build_blas_batch_device(
             geom_to_index: input.geometry_to_index,
             geom_to_triangle: input.geometry_to_triangle,
             skin: None,
+            morph: None,
             omm: None,
             geometries: input.geometries,
             vertex_count: input.vertex_count,
@@ -348,6 +373,7 @@ struct BlasStaging {
     geom_to_index: Buffer<u32>,
     geom_to_triangle: Buffer<u32>,
     skin: Option<Buffer<SkinVertex>>,
+    morph: Option<MorphBuffers>,
     /// Boxed and never moved: the geometry's `pNext` points into it.
     omm: Option<Box<MicromapBuild>>,
     geometries: Vec<GeometryDescr>,
@@ -440,6 +466,7 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             index_buffer_host,
             geometries,
             skin_host,
+            morph_host,
             omm,
         } = input;
         let mut triangle_host: Buffer<Triangle> = render_device.create_host_buffer(
@@ -491,6 +518,29 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             ));
             host_buffers.push(host.handle);
             dev
+        });
+        let morph = morph_host.map(|host| {
+            let ranges: Buffer<u32> =
+                render_device.create_device_buffer(host.ranges.nr_elements, storage);
+            let entries: Buffer<MorphDelta> =
+                render_device.create_device_buffer(host.entries.nr_elements, storage);
+            uploads.push((
+                host.ranges.handle,
+                ranges.handle,
+                host.ranges.nr_elements * 4,
+            ));
+            uploads.push((
+                host.entries.handle,
+                entries.handle,
+                host.entries.nr_elements * std::mem::size_of::<MorphDelta>() as u64,
+            ));
+            host_buffers.push(host.ranges.handle);
+            host_buffers.push(host.entries.handle);
+            MorphBuffers {
+                ranges,
+                entries,
+                target_count: host.target_count,
+            }
         });
 
         uploads.push((
@@ -547,6 +597,7 @@ pub fn build_blas_batch(render_device: &RenderDevice, inputs: Vec<BlasBuildInput
             geom_to_index: geom_to_index_dev,
             geom_to_triangle: geom_to_triangle_dev,
             skin,
+            morph,
             omm,
             geometries,
             vertex_count,
@@ -926,6 +977,7 @@ fn build_chunk(
             geometry_to_index: s.geom_to_index,
             geometry_to_triangle: s.geom_to_triangle,
             skin_buffer: s.skin,
+            morph: s.morph,
             micromap: s.omm.map(|build| build.finish(render_device)),
         })
         .collect()

@@ -21,6 +21,11 @@
 //! rebuilt every frame a skinned instance deformed). Previous-frame deformed positions stay
 //! in the other half of the vertex ping-pong for the closest-hit's motion vectors.
 //!
+//! Morph targets ride the joint deform: before skinning, `skin_vertices` adds each of the vertex's
+//! target offsets (the mesh BLAS's vertex-major `MorphBuffers`) scaled by the instance's weight,
+//! read from bevy's [`MorphWeights`] / [`MeshMorphWeights`] on the skinned entity. Only skinned
+//! meshes morph for now.
+//!
 //! [`WindSway`] rides the same machinery with a different kernel: `wind_vertices` shears each
 //! vertex downwind by its sway weight (the skin stream's first joint weight, 0 at the anchored
 //! base, 1 at the tip; the first joint index is a per-plant phase id) under the global [`Wind`].
@@ -41,7 +46,10 @@ use bevy::{
         observer::On,
     },
     math::DMat4,
-    mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+    mesh::{
+        morph::{MeshMorphWeights, MorphWeights},
+        skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+    },
     prelude::*,
 };
 use bytemuck::{Pod, Zeroable};
@@ -288,6 +296,12 @@ struct SkinParams {
     base: u32,
     joint_count: u32,
     mesh_node: u32,
+    /// Vertex-major morph targets and this frame's weights; `morph_count` 0 = none.
+    morph_ranges: u64,
+    morph_entries: u64,
+    morph_weights: u64,
+    morph_count: u32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -348,6 +362,12 @@ struct SkinnedGpu {
     joint_nodes: Flip<Buffer<u32>>,
     joint_count: u32,
     inverse_bind: u64,
+    /// The mesh's morph targets (ranges, entries addresses) and the weights the deform reads,
+    /// one host-visible copy per frame in flight. `morph_count` 0: the mesh carries none.
+    morph_ranges: u64,
+    morph_entries: u64,
+    morph_weights: Flip<Buffer<f32>>,
+    morph_count: u32,
     /// The mesh's opacity micromap (handle, per-triangle index address, usage counts):
     /// attached to every build and refit, as the mesh BLAS attaches it.
     micromap: Option<(vk::MicromapEXT, u64, Vec<vk::MicromapUsageEXT>)>,
@@ -373,6 +393,11 @@ impl SkinnedGpu {
             self.scratch.handle,
         ] {
             rd.destroyer.destroy_buffer(b);
+        }
+        if self.morph_count > 0 {
+            for b in self.morph_weights.copies() {
+                rd.destroyer.destroy_buffer(b.handle);
+            }
         }
     }
 
@@ -423,6 +448,9 @@ struct SkinnedInstance {
     /// Transform-table node per joint (`NO_NODE` while a joint has no slot yet).
     joint_nodes: Vec<u32>,
     joints_dirty: bool,
+    /// Morph weights from the entity, in target order (empty = rest shape).
+    morph_weights: Vec<f32>,
+    morph_dirty: bool,
     gpu: Option<SkinnedGpu>,
 }
 
@@ -523,6 +551,15 @@ impl Skins {
                     .copy_from_slice(&inst.joint_nodes);
                 inst.joints_dirty = false;
             }
+            if gpu.morph_count > 0 && inst.morph_dirty {
+                let mut weights = vec![0.0f32; gpu.morph_count as usize];
+                for (w, v) in weights.iter_mut().zip(&inst.morph_weights) {
+                    *w = *v;
+                }
+                rd.map_buffer(gpu.morph_weights.write())
+                    .copy_from_slice(&weights);
+                inst.morph_dirty = false;
+            }
         }
 
         // Deform.
@@ -547,6 +584,15 @@ impl Skins {
                         base: 0,
                         joint_count: gpu.joint_count,
                         mesh_node: inst.source.node,
+                        morph_ranges: gpu.morph_ranges,
+                        morph_entries: gpu.morph_entries,
+                        morph_weights: if gpu.morph_count > 0 {
+                            gpu.morph_weights.current().address
+                        } else {
+                            0
+                        },
+                        morph_count: gpu.morph_count,
+                        pad: 0,
                     };
                     record_dispatch(
                         rd,
@@ -851,6 +897,8 @@ impl Skins {
                         source,
                         joint_nodes: Vec::new(),
                         joints_dirty: true,
+                        morph_weights: Vec::new(),
+                        morph_dirty: true,
                         gpu: None,
                     },
                 );
@@ -901,6 +949,39 @@ fn extract_wind(
                 node: node.0,
             },
         );
+    }
+}
+
+/// Morph weights of every skinned entity, each frame: from `MeshMorphWeights` (its values, or the
+/// `MorphWeights` of the entity it references) or a `MorphWeights` of its own.
+fn extract_morph_weights(
+    mut skins: ResMut<Skins>,
+    skinned: Query<
+        (
+            &GpuInstance,
+            Option<&MeshMorphWeights>,
+            Option<&MorphWeights>,
+        ),
+        With<SkinnedMesh>,
+    >,
+    weights: Query<&MorphWeights>,
+) {
+    for (instance, mesh_weights, own) in &skinned {
+        let Some(inst) = skins.instances.get_mut(&instance.0) else {
+            continue;
+        };
+        let current: &[f32] = match mesh_weights {
+            Some(MeshMorphWeights::Value { weights }) => weights,
+            Some(MeshMorphWeights::Reference(entity)) => {
+                weights.get(*entity).map_or(&[][..], |w| w.weights())
+            }
+            None => own.map_or(&[][..], |w| w.weights()),
+        };
+        if inst.morph_weights != current {
+            inst.morph_weights.clear();
+            inst.morph_weights.extend_from_slice(current);
+            inst.morph_dirty = true;
+        }
     }
 }
 
@@ -1038,6 +1119,28 @@ pub fn prepare_skins(
                 .micromap
                 .as_ref()
                 .map(|m| (m.handle, m.index_address(), m.index_usage().to_vec()));
+            let (morph_ranges, morph_entries, morph_count) = blas
+                .morph
+                .as_ref()
+                .filter(|_| matches!(inst.source.kind, SkinKind::Joints { .. }))
+                .map_or((0, 0, 0), |m| {
+                    (m.ranges.address, m.entries.address, m.target_count)
+                });
+            let mut morph_weights = Flip::default();
+            if morph_count > 0 {
+                // One `write()` per copy: it flips before it returns, so a second call in the
+                // same iteration would leave a copy unallocated (address 0 to the kernel).
+                for _ in 0..2 {
+                    let copy = morph_weights.write();
+                    *copy = render_device.create_host_buffer::<f32>(
+                        morph_count as u64,
+                        vk::BufferUsageFlags::STORAGE_BUFFER,
+                    );
+                    render_device
+                        .map_buffer(copy)
+                        .copy_from_slice(&vec![0.0f32; morph_count as usize]);
+                }
+            }
 
             let mut gpu = SkinnedGpu {
                 mesh_vertex_buffer: blas.vertex_buffer.handle,
@@ -1053,6 +1156,10 @@ pub fn prepare_skins(
                 joint_nodes,
                 joint_count,
                 inverse_bind,
+                morph_ranges,
+                morph_entries,
+                morph_weights,
+                morph_count,
                 micromap,
                 blas: AccelerationStructure::default(),
                 scratch: Buffer::default(),
@@ -1092,6 +1199,7 @@ pub fn prepare_skins(
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             );
             inst.joints_dirty = true;
+            inst.morph_dirty = true;
             inst.gpu = Some(gpu);
         }
         // Point the TLAS slot at the deformed BLAS once it has been built (the first build
@@ -1158,7 +1266,13 @@ impl Plugin for SkinningPlugin {
         app.add_systems(
             Last,
             (
-                (upload_bindposes, extract_skins, extract_wind).in_set(RenderSet::Extract),
+                (
+                    upload_bindposes,
+                    extract_skins,
+                    extract_morph_weights.after(extract_skins),
+                    extract_wind,
+                )
+                    .in_set(RenderSet::Extract),
                 prepare_skins
                     .in_set(RenderSet::Prepare)
                     .after(poll_for_asset::<AuroraMesh>)

@@ -3,7 +3,8 @@
 // A skinned instance owns a deformed copy of its mesh's vertex stream and a per-instance
 // BLAS that is refit from it every frame. Two kernels per instance:
 //
-//   skin_vertices   one thread per vertex: blends the 4 influencing joints' skin matrices
+//   skin_vertices   one thread per vertex: adds the vertex's weighted morph-target offsets to
+//                   the rest position, then blends the 4 influencing joints' skin matrices
 //                   (joint world from the GPU transform table * inverse bind pose), moves the
 //                   rest-pose position / normal, then pre-multiplies the inverse of the
 //                   instance's own world so the output is MESH-LOCAL -- the TLAS places the
@@ -31,6 +32,13 @@ struct SkinVertex {
     uint2 joints;
     uint2 pad;
     float4 weights;
+};
+
+// One morph-target offset of a vertex, vertex-major: `index` is the target (`MorphDelta` in
+// aurora_mesh, 16 bytes).
+struct MorphDelta {
+    uint index;
+    float px, py, pz;
 };
 
 // A node's world affine: three rows of a row-major 3x4 (`NodeEnvironment` in gpu_transform.rs).
@@ -120,6 +128,11 @@ struct SkinParams {
     uint base;
     uint joint_count;
     uint mesh_node;       // The instance's own node: its world is divided out.
+    uint* morph_ranges;   // Per vertex + 1: its span of `morph_entries`.
+    MorphDelta* morph_entries;
+    float* morph_weights; // Per target, this frame.
+    uint morph_count;     // 0 = the mesh has no morph targets.
+    uint pad;
 };
 [[vk::push_constant]] SkinParams skin_params;
 
@@ -131,8 +144,18 @@ void skin_vertices(uint3 gid: SV_DispatchThreadID) {
         return;
     }
     let rest = skin_params.rest[i];
-    let rest_pos = float3(rest.px, rest.py, rest.pz);
+    var rest_pos = float3(rest.px, rest.py, rest.pz);
     let rest_nrm = float3(rest.nx, rest.ny, rest.nz);
+    if (skin_params.morph_count > 0) {
+        let end = skin_params.morph_ranges[i + 1];
+        for (uint e = skin_params.morph_ranges[i]; e < end; e++) {
+            let d = skin_params.morph_entries[e];
+            let w = skin_params.morph_weights[d.index];
+            if (w != 0.0) {
+                rest_pos += w * float3(d.px, d.py, d.pz);
+            }
+        }
+    }
     let influence = skin_params.skin[i];
     let joints = uint4(
         influence.joints.x & 0xffff,

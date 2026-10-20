@@ -7,8 +7,9 @@
 //! The format (magic `AURAMESH`, version 1) is a fixed header followed by an lz4 frame of
 //! length-prefixed POD slices: vertex positions / octahedral normals / tangents / uvs,
 //! cluster-local indices, the cluster tables and LOD DAG, the opacity-micromap slices, then the
-//! skin slices. The clusters respect NVIDIA's cluster acceleration structure limits when baked by
-//! [`AuroraMesh::clustered`]; the renderer today traces the finest LOD as one ordinary BLAS.
+//! skin slices, then (version 2) the morph-target slices. The clusters respect NVIDIA's cluster
+//! acceleration structure limits when baked by [`AuroraMesh::clustered`]; the renderer today
+//! traces the finest LOD as one ordinary BLAS. Version 1 files read as meshes without morphs.
 //!
 //! Bevy's [`Mesh`] is an import format here, not something the tracer sees: an importer bakes it
 //! with [`AuroraMesh::clustered`]. A mesh built at runtime is made from its streams with
@@ -32,7 +33,9 @@ use thiserror::Error;
 
 /// ASCII `"AURAMESH"` interpreted little-endian.
 const AURORA_MESH_MAGIC: u64 = u64::from_le_bytes(*b"AURAMESH");
-pub const AURORA_MESH_VERSION: u64 = 1;
+pub const AURORA_MESH_VERSION: u64 = 2;
+/// The last version without morph targets, still read.
+const AURORA_MESH_VERSION_NO_MORPHS: u64 = 1;
 
 /// NV cluster limits [`AuroraMesh::clustered`] respects.
 const MAX_CLUSTER_TRIANGLES: usize = 128;
@@ -97,6 +100,24 @@ pub struct OmmDesc {
     pub format: u16,
 }
 
+/// One vertex's position offset under one morph target. In a mesh's target-major list
+/// (`AuroraMesh::morph_deltas`) `index` is the vertex; the renderer's vertex-major copy reuses it
+/// for the target.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug, Default, PartialEq)]
+pub struct MorphDelta {
+    pub index: u32,
+    pub position: [f32; 3],
+}
+
+/// Morph targets for [`AuroraMesh::clustered_with_morphs`]: per target a name and one position
+/// offset per source vertex.
+#[derive(Clone, Debug, Default)]
+pub struct MorphTargets {
+    pub names: Vec<String>,
+    pub positions: Vec<Vec<Vec3>>,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
 pub struct OmmUsage {
@@ -139,6 +160,13 @@ pub struct AuroraMesh {
     pub vertex_joint_weights: Arc<[Vec4]>,
     pub cluster_bloat_aabbs: Arc<[ClusterBloatAabb]>,
     pub inverse_bind_count: u32,
+    /// Morph targets, target-major and sparse: target `t` owns
+    /// `morph_deltas[morph_offsets[t]..morph_offsets[t + 1]]`, indexed by vertex.
+    pub morph_deltas: Arc<[MorphDelta]>,
+    /// `target count + 1` entries; empty for a mesh without morph targets.
+    pub morph_offsets: Arc<[u32]>,
+    /// Target names, each terminated by `\0`, in target order.
+    pub morph_names: Arc<[u8]>,
 }
 
 /// The mesh of a ray-traced entity. A material is required alongside; an entity spawned
@@ -189,7 +217,11 @@ fn read_header(reader: &mut dyn Read) -> Result<Header, std::io::Error> {
     })
 }
 
-fn read_body<R: Read>(header: Header, reader: R) -> Result<AuroraMesh, AuroraMeshError> {
+fn read_body<R: Read>(
+    header: Header,
+    version: u64,
+    reader: R,
+) -> Result<AuroraMesh, AuroraMeshError> {
     let mut reader = FrameDecoder::new(reader);
     let reader: &mut dyn Read = &mut reader;
 
@@ -213,6 +245,15 @@ fn read_body<R: Read>(header: Header, reader: R) -> Result<AuroraMesh, AuroraMes
     let cluster_bloat_aabbs = read_slice(reader)?;
     let inverse_bind_count: Arc<[u32]> = read_slice(reader)?;
     let inverse_bind_count = inverse_bind_count.first().copied().unwrap_or(0);
+    let (morph_deltas, morph_offsets, morph_names) = if version > AURORA_MESH_VERSION_NO_MORPHS {
+        (
+            read_slice(reader)?,
+            read_slice(reader)?,
+            read_slice(reader)?,
+        )
+    } else {
+        Default::default()
+    };
 
     Ok(AuroraMesh {
         vertex_positions,
@@ -239,6 +280,9 @@ fn read_body<R: Read>(header: Header, reader: R) -> Result<AuroraMesh, AuroraMes
         vertex_joint_weights,
         cluster_bloat_aabbs,
         inverse_bind_count,
+        morph_deltas,
+        morph_offsets,
+        morph_names,
     })
 }
 
@@ -247,11 +291,11 @@ pub fn read_aurora_mesh<R: Read>(mut reader: R) -> Result<AuroraMesh, AuroraMesh
         return Err(AuroraMeshError::WrongFileType);
     }
     let version = read_u64(&mut reader)?;
-    if version != AURORA_MESH_VERSION {
+    if !(AURORA_MESH_VERSION_NO_MORPHS..=AURORA_MESH_VERSION).contains(&version) {
         return Err(AuroraMeshError::WrongVersion { found: version });
     }
     let header = read_header(&mut reader)?;
-    read_body(header, reader)
+    read_body(header, version, reader)
 }
 
 pub fn write_aurora_mesh<W: Write>(
@@ -286,6 +330,9 @@ pub fn write_aurora_mesh<W: Write>(
     write_slice(&asset.vertex_joint_weights, &mut encoder)?;
     write_slice(&asset.cluster_bloat_aabbs, &mut encoder)?;
     write_slice(&[asset.inverse_bind_count], &mut encoder)?;
+    write_slice(&asset.morph_deltas, &mut encoder)?;
+    write_slice(&asset.morph_offsets, &mut encoder)?;
+    write_slice(&asset.morph_names, &mut encoder)?;
     encoder.finish()?;
     Ok(())
 }
@@ -372,7 +419,19 @@ pub struct FlatMesh {
     pub tangents: Vec<Vec4>,
     /// Joint indices and weights, when the mesh carries a skin covering every vertex.
     pub skin: Option<(Vec<[u16; 4]>, Vec<Vec4>)>,
+    /// Morph targets in this triangle list's vertex order, when the mesh carries any.
+    pub morphs: Option<FlatMorphs>,
     pub indices: Vec<u32>,
+}
+
+/// [`AuroraMesh`]'s morph targets re-indexed to a [`FlatMesh`]: target-major, `index` is the
+/// flattened vertex.
+#[derive(Clone, Debug, Default)]
+pub struct FlatMorphs {
+    pub target_count: u32,
+    pub deltas: Vec<MorphDelta>,
+    /// `target_count + 1` entries into `deltas`.
+    pub offsets: Vec<u32>,
 }
 
 /// A mesh's baked opacity micromap, in the triangle order [`AuroraMesh::flatten`] emits: the
@@ -408,6 +467,19 @@ impl AuroraMesh {
         !self.omm_array_data.is_empty() && !self.omm_descs.is_empty()
     }
 
+    pub fn morph_target_count(&self) -> usize {
+        self.morph_offsets.len().saturating_sub(1)
+    }
+
+    /// Morph target names, in target (weight) order.
+    pub fn morph_target_names(&self) -> Vec<String> {
+        self.morph_names
+            .split(|&b| b == 0)
+            .take(self.morph_target_count())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect()
+    }
+
     pub fn has_skin(&self) -> bool {
         self.vertex_joint_indices.len() == self.vertex_positions.len()
             && self.vertex_joint_weights.len() == self.vertex_positions.len()
@@ -425,10 +497,22 @@ impl AuroraMesh {
         let mut flat = FlatMesh::default();
         let mut joints = Vec::new();
         let mut weights = Vec::new();
+        // Stored vertex -> flattened vertex, for re-indexing the morph targets.
+        let morph_count = self.morph_target_count();
+        let mut flat_of = if morph_count > 0 {
+            vec![u32::MAX; n]
+        } else {
+            Vec::new()
+        };
         for cluster in self.finest_clusters() {
             let base = flat.positions.len() as u32;
             let v0 = cluster.vertex_offset as usize;
             let v1 = v0 + cluster.vertex_count as usize;
+            if morph_count > 0 {
+                for (k, v) in (v0..v1).enumerate() {
+                    flat_of[v] = base + k as u32;
+                }
+            }
             flat.positions
                 .extend_from_slice(&self.vertex_positions[v0..v1]);
             if has_normals {
@@ -466,6 +550,27 @@ impl AuroraMesh {
         }
         if has_skin {
             flat.skin = Some((joints, weights));
+        }
+        if morph_count > 0 {
+            let mut morphs = FlatMorphs {
+                target_count: morph_count as u32,
+                deltas: Vec::new(),
+                offsets: vec![0],
+            };
+            for t in 0..morph_count {
+                let range = self.morph_offsets[t] as usize..self.morph_offsets[t + 1] as usize;
+                for d in &self.morph_deltas[range] {
+                    let flat_vertex = flat_of.get(d.index as usize).copied().unwrap_or(u32::MAX);
+                    if flat_vertex != u32::MAX {
+                        morphs.deltas.push(MorphDelta {
+                            index: flat_vertex,
+                            position: d.position,
+                        });
+                    }
+                }
+                morphs.offsets.push(morphs.deltas.len() as u32);
+            }
+            flat.morphs = Some(morphs);
         }
         flat
     }
@@ -824,7 +929,20 @@ impl AuroraMesh {
     /// 128 triangles and 256 vertices per cluster, one root group, no BVH nodes). What an
     /// importer writes to disk.
     pub fn clustered(mesh: &Mesh) -> Result<Self, AuroraMeshError> {
+        Self::clustered_with_morphs(mesh, None)
+    }
+
+    /// [`Self::clustered`] carrying morph targets: `morphs.positions[t]` holds one offset per
+    /// `mesh` vertex. Offsets below a micrometre are dropped, so the file stays sparse.
+    pub fn clustered_with_morphs(
+        mesh: &Mesh,
+        morphs: Option<&MorphTargets>,
+    ) -> Result<Self, AuroraMeshError> {
         let s = SourceStreams::read(mesh)?;
+        let morphs = morphs.filter(|m| {
+            !m.positions.is_empty() && m.positions.iter().all(|t| t.len() == s.positions.len())
+        });
+        let mut out_source: Vec<u32> = Vec::new();
 
         let mut out_positions = Vec::new();
         let mut out_normals = Vec::new();
@@ -861,6 +979,7 @@ impl AuroraMesh {
                             out_joints.push(j[c]);
                             out_weights.push(w[c]);
                         }
+                        out_source.push(c as u32);
                         next
                     });
                     out_indices.push(idx);
@@ -883,6 +1002,29 @@ impl AuroraMesh {
 
         let aabb = aabb_of(&s.positions);
         let cluster_to_group = vec![0u32; clusters.len()];
+        let (mut morph_deltas, mut morph_offsets, mut morph_names) =
+            (Vec::new(), Vec::new(), Vec::new());
+        if let Some(m) = morphs {
+            morph_offsets.push(0u32);
+            for (t, target) in m.positions.iter().enumerate() {
+                for (stored, &source) in out_source.iter().enumerate() {
+                    let d = target[source as usize];
+                    if d.length_squared() > 1e-12 {
+                        morph_deltas.push(MorphDelta {
+                            index: stored as u32,
+                            position: d.to_array(),
+                        });
+                    }
+                }
+                morph_offsets.push(morph_deltas.len() as u32);
+                let name = m
+                    .names
+                    .get(t)
+                    .map_or_else(|| format!("target{t}"), Clone::clone);
+                morph_names.extend_from_slice(name.as_bytes());
+                morph_names.push(0);
+            }
+        }
         Ok(Self {
             vertex_positions: out_positions.into(),
             vertex_normals: out_normals.into(),
@@ -897,6 +1039,9 @@ impl AuroraMesh {
             aabb,
             root_node_id: u32::MAX,
             lod_levels: 1,
+            morph_deltas: morph_deltas.into(),
+            morph_offsets: morph_offsets.into(),
+            morph_names: morph_names.into(),
             ..Default::default()
         })
     }
@@ -1013,6 +1158,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn morphs_survive_clustering_and_flatten() {
+        let (mesh, positions, indices) = strip(1000);
+        let morphs = MorphTargets {
+            names: vec!["up".into(), "every_third".into()],
+            positions: vec![
+                (0..positions.len()).map(|i| Vec3::Y * i as f32).collect(),
+                (0..positions.len())
+                    .map(|i| if i % 3 == 0 { Vec3::X } else { Vec3::ZERO })
+                    .collect(),
+            ],
+        };
+        let data = AuroraMesh::clustered_with_morphs(&mesh, Some(&morphs)).unwrap();
+        let mut bytes = Vec::new();
+        write_aurora_mesh(&data, &mut bytes).unwrap();
+        let back = read_aurora_mesh(bytes.as_slice()).unwrap();
+        assert_eq!(back.morph_target_names(), vec!["up", "every_third"]);
+
+        let flat = back.flatten();
+        let m = flat.morphs.expect("morphs flatten");
+        assert_eq!(m.target_count, 2);
+        // Flattened vertex -> source vertex, through the triangle corners.
+        let mut source = vec![u32::MAX; flat.positions.len()];
+        for (t, tri) in flat.indices.chunks(3).enumerate() {
+            for k in 0..3 {
+                source[tri[k] as usize] = indices[t * 3 + k];
+            }
+        }
+        for t in 0..2 {
+            let deltas = &m.deltas[m.offsets[t] as usize..m.offsets[t + 1] as usize];
+            for d in deltas {
+                let want = morphs.positions[t][source[d.index as usize] as usize];
+                assert_eq!(d.position, want.to_array());
+            }
+        }
+        // Zero offsets are not stored: vertex 0 never moves under "up".
+        let up = &m.deltas[m.offsets[0] as usize..m.offsets[1] as usize];
+        assert!(up.iter().all(|d| source[d.index as usize] != 0));
+    }
+
+    #[test]
+    fn version_one_reads_without_morphs() {
+        let (mesh, _, _) = strip(100);
+        let data = AuroraMesh::clustered(&mesh).unwrap();
+        let mut bytes = Vec::new();
+        write_aurora_mesh(&data, &mut bytes).unwrap();
+        // Rewrite as version 1: same header, body without the three morph slices.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&bytes[..8]);
+        v1.extend_from_slice(&1u64.to_le_bytes());
+        let header_len = size_of::<MeshAabb>() + 16;
+        v1.extend_from_slice(&bytes[16..16 + header_len]);
+        let mut body = Vec::new();
+        FrameDecoder::new(&bytes[16 + header_len..])
+            .read_to_end(&mut body)
+            .unwrap();
+        body.truncate(body.len() - 3 * 8);
+        let mut enc = FrameEncoder::new(&mut v1);
+        enc.write_all(&body).unwrap();
+        enc.finish().unwrap();
+        let back = read_aurora_mesh(v1.as_slice()).unwrap();
+        assert_eq!(back.morph_target_count(), 0);
+        assert_eq!(back.clusters.len(), data.clusters.len());
     }
 
     /// Terrain addresses vertices by grid index, so a runtime conversion keeps them in place.
