@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Physics on GPU Transforms</title>
+<style>
+:root {
+  --bg: #fbfaf7; --fg: #1d1d1b; --muted: #6b6a66; --line: #e2dfd8; --card: #ffffff;
+  --accent: #2f6f8f; --rec: #2e7d4f; --warn: #a3561d; --code: #f2efe9;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --fg: #e9e7e2; --muted: #9b998f; --line: #2e2d2a; --card: #1e1e1c;
+    --accent: #7fb6d1; --rec: #7cc79a; --warn: #e0a06a; --code: #262522;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161615; --fg: #e9e7e2; --muted: #9b998f; --line: #2e2d2a; --card: #1e1e1c;
+  --accent: #7fb6d1; --rec: #7cc79a; --warn: #e0a06a; --code: #262522;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 920px; margin: 0 auto; padding: 32px 16px 80px; }
+h1 { font-size: 1.7rem; margin: 0 0 4px; }
+h2 { font-size: 1.25rem; margin: 40px 0 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+h3 { font-size: 1.05rem; margin: 24px 0 6px; }
+p, li { max-width: 72ch; }
+.sub { color: var(--muted); margin: 0 0 24px; }
+code, pre { font: 0.88em/1.45 ui-monospace, "SF Mono", Menlo, monospace; background: var(--code);
+  border-radius: 4px; }
+code { padding: 1px 4px; }
+pre { padding: 12px 14px; overflow-x: auto; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 18px; margin: 14px 0; }
+.card h3 { margin-top: 0; }
+.tag { display: inline-block; font-size: 0.75rem; font-weight: 600; letter-spacing: .02em;
+  padding: 1px 7px; border-radius: 10px; border: 1px solid currentColor; margin-right: 6px; }
+.rec { color: var(--rec); }
+.warn { color: var(--warn); }
+.alt { color: var(--muted); }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.93rem; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.wrap { overflow-x: auto; }
+.num { font-variant-numeric: tabular-nums; }
+nav ol { padding-left: 20px; }
+nav a, a { color: var(--accent); }
+.flow { font: 0.88em/1.6 ui-monospace, Menlo, monospace; background: var(--code); padding: 12px 14px;
+  border-radius: 6px; white-space: pre; overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+<h1>Physics on GPU Transforms</h1>
+<p class="sub">avian rides aurora's GPU transform hierarchy: one owner per pose, work proportional to what
+moved, a static world free. Plan for the aurora + avian fork change (2026-10-20).</p>
+
+<div class="card">
+<strong>Why.</strong> The whole Eastern Kingdoms (687 tiles, ~150k static colliders) runs a 139 ms CPU frame,
+113 ms of it avian: <code>propagate_collider_transforms</code> (10.6 ms) and the fork's
+<code>transform_to_position</code> (4.7 ms) walk every collider's hierarchy on every fixed step, six steps a
+frame (the catch-up spiral). Nothing in that world moves. aurora already propagates every
+<code>Transform</code> on the GPU and knows exactly what changed; avian redoes it on the CPU, and its own
+bodies' poses make a full round trip back to it.
+</div>
+
+<nav><strong>Contents</strong>
+<ol>
+<li><a href="#decisions">Decisions to review</a> (D1-D7)</li>
+<li><a href="#types">New types and interfaces</a></li>
+<li><a href="#user">What changes for code using physics</a></li>
+<li><a href="#expect">Expected results</a></li>
+<li><a href="#phases">Phases</a></li>
+<li><a href="#mech">Mechanical work</a></li>
+</ol></nav>
+
+<h2 id="decisions">1. Decisions to review</h2>
+
+<div class="card">
+<h3>D1. Who owns a pose</h3>
+<p>Every collider or body pose has exactly one source, and only that source does work for it.</p>
+<div class="wrap"><table>
+<tr><th>Owner</th><th>Who</th><th>How avian learns the pose</th><th>Cost</th></tr>
+<tr><td><b>avian</b></td><td>Dynamic bodies; kinematic bodies driven by velocity</td>
+<td>It wrote it. Never read back.</td><td>per awake body</td></tr>
+<tr><td><b>gameplay</b></td><td>Non-static bodies moved by writing <code>Transform</code> in the fixed step: the KCC
+(bevy_ahoy writes <code>Transform</code>), teleports</td>
+<td>Same step: a <code>Changed&lt;Transform&gt;</code> check over <em>non-static bodies only</em> (an
+archetype filter, so the scan is over a few hundred entities, never the world)</td><td>per non-static body</td></tr>
+<tr><td><b>hierarchy</b></td><td>Colliders that moved because an ancestor moved: a door under a swinging frame,
+a tile dragged in jackdaw</td><td>The change list (D2), next frame</td><td>per moved collider</td></tr>
+<tr><td><b>nobody</b></td><td>Statics: nearly the whole map</td><td>Composed once when added (an observer)</td>
+<td><b>zero</b> after spawn</td></tr>
+</table></div>
+<p>Ownership is derived, never authored: no component to remember. Static = <code>RigidBody::Static</code> or a
+collider with no body; avian-owned = <code>Dynamic</code>, or <code>Kinematic</code> with no
+<code>Transform</code> write that step.</p>
+</div>
+
+<div class="card">
+<h3>D2. Where the "what moved" list comes from</h3>
+<p><span class="tag rec">recommended</span><b>(b) CPU seeds from aurora's extract.</b> aurora's
+<code>extract_transforms</code> already finds every entity whose <code>Transform</code> or parent changed this
+frame (the seeds it uploads), once per frame. It publishes them as a list. avian expands each seed down
+<em>only</em> through children that carry its own <code>AncestorMarker&lt;ColliderMarker&gt;</code> /
+<code>ColliderMarker</code>, recomposing those colliders in f64. That stops at <code>PhysicsEnvironment</code>s
+and at bodies avian owns.</p>
+<ul>
+<li>Precise: f64 compose, environment-relative, as now.</li>
+<li>Environment-aware: a moving environment (a planet, a ship) changes no <code>Position</code> inside it, so its
+seed is skipped. A GPU world-pose list would flood with its whole subtree every frame.</li>
+<li>Works with no render device (headless server, tests).</li>
+<li>Bones and meshes never enter it: the descent only follows collider markers.</li>
+</ul>
+<p><span class="tag alt">alternative</span><b>(a) The GPU readback set.</b> The slots <code>propagate</code>
+rewrote are already copied back. That's free to publish, but they are world-space f32 poses: precision is lost, it
+includes every animated bone, and it floods under moving environments. A GPU-side compaction (a "physics node" flag and
+a second list that stops at environment nodes) fixes the last two, not precision.</p>
+<p>Either way the readback stays as it is: it is what feeds <code>GlobalTransform</code>.</p>
+</div>
+
+<div class="card">
+<h3>D3. Where the bridge lives</h3>
+<p><span class="tag rec">recommended</span><b>The avian fork gets a generic "external transforms" mode;
+aurora implements it</b> (a new <code>src/physics_pose.rs</code>). aurora already adds avian's
+<code>PhysicsPlugins</code> in <code>AuroraDefaultPlugins</code> and makes baked collision into avian colliders,
+so no new crate. avian's side has no aurora types in it, so it stays rebasable on upstream and could be proposed
+there.</p>
+<p><span class="tag alt">alternative</span>A separate <code>aurora_avian</code> crate. Only worth it if aurora ever
+wants a physics-free build.</p>
+</div>
+
+<div class="card">
+<h3>D4. <code>Transform</code> on avian-owned bodies</h3>
+<p><span class="tag rec">recommended first</span><b>Keep mirroring it</b>, but only for bodies avian moved this
+step (its own write list, not a <code>Changed&lt;Position&gt;</code> scan). All gameplay code that reads a
+body's <code>Transform</code> keeps working: the camera follows the rig's <code>Transform</code>, as do NPC and
+story code. The GPU upload stays aurora's ordinary extract path. Interpolation is unchanged: it eases the mirror.</p>
+<p><span class="tag warn">end state, P4</span><b>avian writes the world pose straight into the body's GPU
+node</b> through a frame override: the node composes against its environment's node rather than its
+<code>ChildOf</code> parent, with its local = <code>Position</code>/<code>Rotation</code>. That removes the
+inverse chain walk (<code>position_to_transform</code>'s <code>frame_chain</code>) and the one-frame-stale parent it
+converts against. <code>Transform</code> becomes optional for such bodies (read <code>GlobalTransform</code> or
+<code>Position</code>). Worth it once a scene has many dynamic bodies under deep hierarchies; measured on the
+stress scene before committing to it.</p>
+</div>
+
+<div class="card">
+<h3>D5. Lag, as gameplay sees it</h3>
+<ul>
+<li><b>Gameplay moves</b> (the KCC, teleports via <code>Transform</code> or <code>Position</code>): physics sees
+them the same step, as today.</li>
+<li><b>Hierarchy moves</b> (an ancestor moved in <code>Update</code>, or in the editor): physics sees them the next
+fixed step, exactly as today (<code>Update</code> runs after the fixed loop).</li>
+<li><b><code>GlobalTransform</code></b>: unchanged (last frame's GPU readback).</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>D6. The fixed-step spiral</h3>
+<p>With physics nearly free, six catch-up steps stop being a spiral. Still cap them: <code>Time&lt;Virtual&gt;</code>
+max delta at 3 fixed steps' worth (a slow frame slows the simulation instead of snowballing).
+<span class="tag rec">recommended</span>in zero's app setup, not aurora's (it's a game policy).</p>
+</div>
+
+<div class="card">
+<h3>D7. Upstream CPU mode stays</h3>
+<p><code>TransformSync::Cpu</code> stays avian's default and its current behaviour, tests included. aurora switches
+its worlds to <code>External</code>. That keeps the fork's diff to one mode, not a rewrite of avian's sync.</p>
+</div>
+
+<h2 id="types">2. New types and interfaces</h2>
+
+<h3>avian fork (<code>physics_transform</code>)</h3>
+<pre>/// Who keeps Position / Rotation / ColliderTransform in step with the hierarchy.
+pub enum TransformSync {
+    /// Walk the hierarchy every step (upstream's behaviour; the default).
+    Cpu,
+    /// Driven by the host: newly added colliders and bodies compose once (an observer),
+    /// non-static bodies are checked for Transform writes each step, and everything else
+    /// recomposes only when listed in `HierarchyMoves`.
+    External,
+}
+// New field: PhysicsTransformConfig { sync: TransformSync, .. }
+
+/// Entities whose own Transform or parent changed since the last physics step: the host
+/// fills it, avian drains it at the first step after (seeds, not descendants).
+#[derive(Resource, Default)]
+pub struct HierarchyMoves(pub Vec&lt;Entity&gt;);
+
+/// Bodies whose Position / Rotation avian wrote this step (the solver's awake set plus
+/// teleports): what the host mirrors and uploads. Cleared at the start of each step.
+#[derive(Resource, Default)]
+pub struct PhysicsMoves(pub Vec&lt;Entity&gt;);</pre>
+
+<h3>aurora (<code>gpu_transform.rs</code>, new <code>physics_pose.rs</code>)</h3>
+<pre>/// Entities extract saw a local or parent change for this frame (the seeds it uploaded).
+/// Fed into avian's HierarchyMoves by physics_pose.rs.
+#[derive(Resource, Default)]
+pub struct TransformSeeds(pub Vec&lt;Entity&gt;);
+
+// P4 only: a node composes against `frame`'s node instead of its ChildOf parent, its local
+// being the pose in that frame. physics_pose.rs sets it to the body's PhysicsEnvironment
+// for avian-owned bodies and writes Position / Rotation as the local.
+#[derive(Component)]
+pub struct PoseFrame(pub Entity);</pre>
+<p>On the GPU (P4): one more column, the <em>frame slot</em> (<code>NO_NODE</code> = use the parent). The
+propagate kernel's ancestor walk starts from the frame slot when set. Children still list under their
+<code>ChildOf</code> parent, so frontier expansion is unchanged.</p>
+
+<h2 id="user">3. What changes for code using physics</h2>
+<div class="wrap"><table>
+<tr><th>Thing</th><th>Today</th><th>After</th></tr>
+<tr><td>Spawning bodies and colliders</td><td>as usual</td><td>unchanged</td></tr>
+<tr><td>Teleport by <code>Transform</code></td><td>works (next step)</td><td>works (same step) for non-static bodies;
+a static moved by <code>Transform</code> is a hierarchy move (next step)</td></tr>
+<tr><td>Teleport by <code>Position</code></td><td>works</td><td>works</td></tr>
+<tr><td>Reading a body's <code>Transform</code></td><td>mirrored</td><td>mirrored (D4); optional after P4</td></tr>
+<tr><td>Moving a static collider by moving its parent (editor, a construct room)</td><td>next step</td><td>next step,
+recomposing that subtree's colliders only</td></tr>
+<tr><td><code>PhysicsTransformConfig</code></td><td>untouched by zero</td><td>aurora sets
+<code>sync: External</code>; <code>propagate_before_physics</code> off (bevy's dirty marking / propagation no
+longer run in the fixed step)</td></tr>
+<tr><td>Interpolation (<code>TransformInterpolation</code>)</td><td>eases <code>Transform</code></td><td>unchanged
+until P4; then eases the frame-override local</td></tr>
+</table></div>
+
+<h2 id="expect">4. Expected results</h2>
+<div class="wrap"><table class="num">
+<tr><th>Scene</th><th>Now</th><th>Target</th><th>How measured</th></tr>
+<tr><td>Eastern Kingdoms, standing still</td><td>139 ms CPU (113 ms physics, 6 steps)</td>
+<td>~25 ms CPU; physics &lt; 1 ms, 1-2 steps <em>(estimate: the remaining 26 ms is everything else)</em></td>
+<td>Tracy, <code>examples/eastern_kingdoms</code> (asset span filtered)</td></tr>
+<tr><td>Northshire</td><td>(baseline at P0)</td><td>no worse; player, NPCs and doors behave the same</td>
+<td>Tracy + walking the abbey</td></tr>
+<tr><td>Stress: N dynamic spheres falling into Northshire</td><td>(baseline at P0)</td>
+<td>cost scales with awake spheres only; P4 compared against P2</td><td>Tracy on the new example</td></tr>
+</table></div>
+
+<h2 id="phases">5. Phases</h2>
+<ol>
+<li><b>P0 Baseline.</b> Tracy for Northshire and the full map (the full map is done: 139 ms). A stress example (aurora
+<code>examples/physics_stress.rs</code>, no flags, a feathers panel for the sphere count) dropping N spheres onto a
+baked scene. It's also the start of the pool test (spheres in water).</li>
+<li><b>P1 External mode, statics free.</b> avian: <code>TransformSync::External</code>, an observer to compose on add,
+draining <code>HierarchyMoves</code> through collider markers. aurora: <code>TransformSeeds</code> from extract, and
+<code>physics_pose.rs</code> wiring it, setting <code>External</code> and
+<code>propagate_before_physics = false</code>. <i>Done when</i>: the full map's physics is under 1 ms while still,
+and Northshire behaves the same.</li>
+<li><b>P2 Moved bodies.</b> The non-static <code>Changed&lt;Transform&gt;</code> step check (gameplay owner);
+<code>PhysicsMoves</code> from the solver's writeback; <code>position_to_transform</code> over that list instead of a
+scan. The fixed-step cap (D6) lands in zero.</li>
+<li><b>P3 Cleanup.</b> Delete the fork's every-step compose path under <code>External</code>; one compose function
+shared by the add observer, hierarchy moves and the Cpu mode; tests for each owner.</li>
+<li><b>P4 Frame override</b> (D4 end state). A GPU frame-slot column, <code>PoseFrame</code>, avian-owned bodies
+written as environment-relative locals, the mirror optional, interpolation easing the local. Kept only if the stress
+scene shows it.</li>
+</ol>
+
+<h2 id="mech">6. Mechanical work</h2>
+<h3>avian fork</h3>
+<ul>
+<li><code>PhysicsTransformConfig.sync</code>; the <code>External</code> branch's systems run instead of
+<code>transform_to_position</code> and <code>propagate_collider_transforms</code>, chained in the same sets
+(<code>PhysicsTransformSystems::{Propagate, TransformToPosition}</code>).</li>
+<li>An add observer (<code>On&lt;Add, Position&gt;</code> plus the <code>ColliderOf</code> insert hook avian already
+has): compose the entity's environment-relative pose (<code>compose_to_physics_world</code>) and its
+<code>ColliderTransform</code> relative to its body.</li>
+<li>Drain <code>HierarchyMoves</code> once per frame (first step after it fills): per seed, depth-first through
+children matching <code>ShouldPropagate</code>, stopping at <code>PhysicsEnvironment</code> and at non-static bodies;
+recompose <code>Position</code>/<code>Rotation</code> (rootless colliders) or <code>ColliderTransform</code> (child
+colliders), with the existing tolerance compare.</li>
+<li>Non-static check: <code>Query&lt;.., (Changed&lt;Transform&gt;, Without&lt;Static&gt;-equivalent)&gt;</code> using
+the <code>is_changed_after_tick</code> idiom already there, so avian's own mirror writes don't count.</li>
+<li><code>PhysicsMoves</code> filled at the solver's writeback (<code>Position</code> integration for awake bodies) and
+by teleport handling; <code>position_to_transform</code> iterates it.</li>
+<li>Tests in <code>physics_transform/tests.rs</code>: a static under a moved parent; a moving environment changes
+nothing; KCC-style <code>Transform</code> writes the same step; a body's mirror round-trip; add-time composition under
+a deep chain.</li>
+</ul>
+<h3>aurora</h3>
+<ul>
+<li><code>extract_transforms</code> pushes each seed entity into <code>TransformSeeds</code> (it already visits
+exactly those); cleared each frame.</li>
+<li><code>physics_pose.rs</code>: insert <code>PhysicsTransformConfig { sync: External, propagate_before_physics:
+false, .. }</code> in the plugin group; a <code>First</code> system moving <code>TransformSeeds</code> into
+<code>HierarchyMoves</code>; registered in <code>AuroraDefaultPlugins</code> beside <code>PhysicsPlugins</code>.</li>
+<li>P4: <code>PoseFrame</code> column (scatter, the propagate kernel's starting slot in
+<code>transform.slang</code>), and the writer for avian-owned bodies.</li>
+</ul>
+<h3>zero</h3>
+<ul>
+<li>The <code>Time&lt;Virtual&gt;</code> max-delta cap in <code>build_app</code>.</li>
+<li>Re-run the Tracy captures (P0's recipe: <code>--features remote,trace</code>,
+<code>RUST_LOG=…,bevy_asset::server=warn</code>, <code>tracy-capture -s 110</code>).</li>
+</ul>
+<h3>Risks</h3>
+<ul>
+<li>A collider whose ancestor chain has a gap with no collider marker would be missed by the descent. avian
+inserts the markers on every ancestor of a collider, so the descent follows exactly avian's own invariant. A test
+covers reparenting.</li>
+<li>Something that moves a static's ancestor inside the fixed step (not <code>Update</code>) is seen a step late.
+Nothing does this today; it's logged if found.</li>
+<li>Rebasing the fork: the change sits behind one enum branch and new systems, without rewriting upstream's.</li>
+</ul>
+</main>
+</body>
+</html>

@@ -14,7 +14,10 @@
 //!
 //! avian propagates the whole hierarchy on the CPU before every physics step by default
 //! (`PhysicsTransformConfig::propagate_before_physics`): every skeleton bone, ~1.6 ms of worker
-//! time a frame in Northshire. Off here; physics reads the read-back `GlobalTransform`.
+//! time a frame in Northshire. Off here. It also recomposes every body and collider from its
+//! ancestors each step (115 ms a frame over the whole Eastern Kingdoms' static colliders); with
+//! `hierarchy_moves` it checks only non-static bodies each step and recomposes statics and
+//! colliders under what the GPU extract saw move (`gpu_transform.rs`).
 
 use avian3d::physics_transform::PhysicsTransformConfig;
 use bevy::{
@@ -65,6 +68,7 @@ impl Plugin for TransformPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(PhysicsTransformConfig {
             propagate_before_physics: false,
+            hierarchy_moves: true,
             ..default()
         })
         .add_plugins(ValidateParentHasComponentPlugin::<GlobalTransform>::default())

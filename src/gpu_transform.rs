@@ -18,10 +18,14 @@
 //! back (`readback`) in a small submit of its own, ahead of the rest of the frame, and the next
 //! frame's `First` writes those rows into `GlobalTransform` -- so `Update` sees last frame's
 //! world poses, as in stock bevy, without the CPU walking the hierarchy (`transform.rs`).
+//!
+//! The entities whose local or parent changed are also avian's `HierarchyMoves`: physics
+//! recomposes only the collider subtrees under them (`PhysicsTransformConfig::hierarchy_moves`).
 
 use std::mem::offset_of;
 
 use ash::vk;
+use avian3d::physics_transform::HierarchyMoves;
 use bevy::{
     ecs::{
         hierarchy::{ChildOf, Children},
@@ -913,6 +917,7 @@ fn extract_transforms(
     slots: Res<GpuNodeSlots>,
     changed: Query<
         (
+            Entity,
             Ref<Transform>,
             Option<Ref<ChildOf>>,
             Ref<GpuNode>,
@@ -927,11 +932,12 @@ fn extract_transforms(
     has_children: Query<(), With<Children>>,
     has_child_of: Query<(), With<ChildOf>>,
     with_transform: Query<(&Transform, &GpuNode)>,
+    mut moves: ResMut<HierarchyMoves>,
 ) {
     let table = &mut *table;
     table.node_count = slots.count();
 
-    for (transform, child_of, node, children) in changed.iter() {
+    for (entity, transform, child_of, node, children) in changed.iter() {
         let first = node.is_added();
         let slot = node.0;
         let parent_changed = child_of.as_ref().is_some_and(Ref::is_changed);
@@ -940,10 +946,12 @@ fn extract_transforms(
         // accumulation every frame).
         if first || parent_changed {
             table.push_local(slot, NodeLocal::from_transform(&transform));
+            moves.0.push(entity);
         } else if transform.is_changed() {
             let local = NodeLocal::from_transform(&transform);
             if table.locals.get(slot as usize) != Some(&local) {
                 table.push_local(slot, local);
+                moves.0.push(entity);
             }
         }
         if first || parent_changed {
@@ -982,9 +990,19 @@ fn extract_transforms(
         if let Ok((transform, node)) = with_transform.get(entity) {
             table.push_parent(node.0, ROOT_PARENT);
             table.push_local(node.0, NodeLocal::from_transform(transform));
+            moves.0.push(entity);
         }
     }
+    // Physics drains the list each step; while it doesn't step (paused, no fixed loop), the
+    // same animated entities would repeat every frame.
+    if moves.0.len() > MOVES_DEDUP_AT {
+        moves.0.sort_unstable();
+        moves.0.dedup();
+    }
 }
+
+/// [`HierarchyMoves`] length past which extract dedups it.
+const MOVES_DEDUP_AT: usize = 1 << 18;
 
 fn cleanup(world: &mut World) {
     world.resource_scope(|world, mut table: Mut<GpuTransforms>| {
