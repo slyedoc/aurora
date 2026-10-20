@@ -6,6 +6,7 @@ use bevy::{ecs::lifecycle::Remove, prelude::*};
 use bevy_aurora::{
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
+    render_texture::DataImages,
 };
 use wgpu_types::TextureFormat;
 
@@ -324,17 +325,24 @@ pub struct PaintLayer {
     pub file: Handle<crate::sculpt::LayerPagesFile>,
 }
 
-/// A splatmap layer's texels on the GPU.
+/// A splatmap layer's texels on the GPU: a coarse copy, always held (what LOD rings read),
+/// and the full texels while the layer is near the finest window ([`stream_splatmaps`]).
 #[derive(Component)]
 pub struct SplatmapSource {
+    fine: Option<SplatTexels>,
+    coarse: SplatTexels,
+    images: (AssetId<Image>, AssetId<Image>),
+}
+
+/// One copy of a splatmap's ids and weights.
+pub struct SplatTexels {
     ids: Buffer<u32>,
     weights: Buffer<u32>,
     pub width: u32,
     pub height: u32,
-    images: (AssetId<Image>, AssetId<Image>),
 }
 
-impl SplatmapSource {
+impl SplatTexels {
     pub fn ids_address(&self) -> u64 {
         self.ids.address
     }
@@ -351,6 +359,55 @@ impl SplatmapSource {
             }
         }
     }
+}
+
+impl SplatmapSource {
+    /// The texels a level evaluates from: the finest level the full ones when held (the
+    /// coarse until they are), a ring the coarse (a ring's texel is at least as large).
+    pub fn texels(&self, finest: bool) -> &SplatTexels {
+        match &self.fine {
+            Some(fine) if finest => fine,
+            _ => &self.coarse,
+        }
+    }
+
+    fn destroy(&mut self, rd: &RenderDevice) {
+        self.coarse.destroy(rd);
+        if let Some(mut fine) = self.fine.take() {
+            fine.destroy(rd);
+        }
+    }
+}
+
+/// The coarse copy keeps every `COARSE_STEP`th texel each way: the first LOD ring's texel. Ids
+/// are picked, never averaged (a palette id has no mean).
+const COARSE_STEP: u32 = 2;
+/// Full texels load for layers within this many pages of the finest window, and go once a
+/// layer is `FINE_RELEASE_PAGES` away.
+const FINE_MARGIN_PAGES: f32 = 1.0;
+const FINE_RELEASE_PAGES: f32 = 3.0;
+
+fn coarse_words(words: &[u32], width: u32, height: u32) -> (Vec<u32>, u32, u32) {
+    let (cw, ch) = (width.div_ceil(COARSE_STEP), height.div_ceil(COARSE_STEP));
+    let mut out = Vec::with_capacity((cw * ch) as usize);
+    for y in 0..ch {
+        let sy = (y * COARSE_STEP + COARSE_STEP / 2).min(height - 1);
+        for x in 0..cw {
+            let sx = (x * COARSE_STEP + COARSE_STEP / 2).min(width - 1);
+            out.push(words[(sy * width + sx) as usize]);
+        }
+    }
+    (out, cw, ch)
+}
+
+fn fine_texels(rd: &RenderDevice, ids: &Image, weights: &Image) -> Option<SplatTexels> {
+    let (id_words, weight_words) = (r32_words(ids)?, r32_words(weights)?);
+    Some(SplatTexels {
+        ids: words_buffer(rd, id_words),
+        weights: words_buffer(rd, weight_words),
+        width: ids.width(),
+        height: ids.height(),
+    })
 }
 
 /// The landscape-local rectangle a material layer last covered.
@@ -414,11 +471,18 @@ pub fn upload_splatmaps(
         else {
             continue;
         };
+        let (w, h) = (id_image.width(), id_image.height());
+        let (coarse_ids, cw, ch) = coarse_words(id_words, w, h);
+        let (coarse_weights, _, _) = coarse_words(weight_words, w, h);
+        // The full texels come with `stream_splatmaps`, near the finest window.
         let fresh = SplatmapSource {
-            ids: words_buffer(&rd, id_words),
-            weights: words_buffer(&rd, weight_words),
-            width: id_image.width(),
-            height: id_image.height(),
+            fine: None,
+            coarse: SplatTexels {
+                ids: words_buffer(&rd, &coarse_ids),
+                weights: words_buffer(&rd, &coarse_weights),
+                width: cw,
+                height: ch,
+            },
             images: ids,
         };
         match source {
@@ -428,6 +492,74 @@ pub fn upload_splatmaps(
             }
             None => {
                 commands.entity(entity).insert(fresh);
+            }
+        }
+    }
+}
+
+/// A height or splatmap layer's images are data, read into buffers here: aurora never uploads
+/// them as textures (a continent's splatmaps were 7 GB of unsampled mip chains).
+pub fn layer_images_are_data(
+    insert: On<Insert<(HeightmapLayer, SplatmapLayer)>>,
+    layers: Query<(Option<&HeightmapLayer>, Option<&SplatmapLayer>)>,
+    data: Option<ResMut<DataImages>>,
+) {
+    let (Some(mut data), Ok((heightmap, splatmap))) = (data, layers.get(insert.entity)) else {
+        return;
+    };
+    if let Some(heightmap) = heightmap {
+        data.0.insert(heightmap.image.id());
+    }
+    if let Some(splatmap) = splatmap {
+        data.0.insert(splatmap.ids.id());
+        data.0.insert(splatmap.weights.id());
+    }
+}
+
+/// Full splatmap texels near the finest window: loaded for the layers within
+/// `FINE_MARGIN_PAGES` of its pages (every layer, when the landscape doesn't stream), dropped
+/// past `FINE_RELEASE_PAGES`. Rings read the coarse copy, so a streaming continent holds its
+/// full texels only around the viewer. Loading one re-evaluates the pages under it (a change
+/// of the source); dropping one does not (no page the finest level holds lies under it).
+pub fn stream_splatmaps(
+    rd: Res<RenderDevice>,
+    images: Res<Assets<Image>>,
+    landscapes: Query<&Landscape, Without<crate::ring::LandscapeRing>>,
+    mut layers: Query<(
+        &ChildOf,
+        &SplatmapLayer,
+        &MaterialFootprint,
+        &mut SplatmapSource,
+    )>,
+) {
+    for (child_of, layer, footprint, mut source) in &mut layers {
+        let Ok(landscape) = landscapes.get(child_of.parent()) else {
+            continue;
+        };
+        let page = landscape.page_size();
+        let window = Rect::from_corners(
+            landscape.pages_min.as_vec2() * page,
+            landscape.pages_max.as_vec2() * page,
+        );
+        let near = |margin: f32| {
+            landscape.stream_radius == 0
+                || !footprint
+                    .0
+                    .intersect(window.inflate(margin * page))
+                    .is_empty()
+        };
+        if source.fine.is_none() && near(FINE_MARGIN_PAGES) {
+            let (Some(ids), Some(weights)) = (images.get(&layer.ids), images.get(&layer.weights))
+            else {
+                continue;
+            };
+            if let Some(fine) = fine_texels(&rd, ids, weights) {
+                source.fine = Some(fine);
+            }
+        } else if source.fine.is_some() && !near(FINE_RELEASE_PAGES) {
+            let source = source.bypass_change_detection();
+            if let Some(mut fine) = source.fine.take() {
+                fine.destroy(&rd);
             }
         }
     }

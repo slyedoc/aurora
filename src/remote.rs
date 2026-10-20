@@ -13,6 +13,10 @@
 //!   accumulated with the world held still (no denoiser, nits), to `dir/reference.pfm` and a PNG
 //!   preview. A job.
 //! - `aurora.timing` `{frames?}`: each GPU profiler scope's mean over `frames` frames. A job.
+//! - `aurora.memory` `{top?}`: GPU memory by who allocated it (`memory.rs`): the allocator's
+//!   capacity and live bytes, the `top` (20) source files and `file:line` sites holding the
+//!   most, the device's heaps (this process's usage and budget, the driver's own included), and
+//!   the blocks by how full they are, with the emptiest blocks' remaining tenants.
 //! - `aurora.job` `{id}`: a job's state, and its result once it is done.
 //! - `aurora.exit`: quits through `AppExit` (the renderer's ordered teardown, unlike a signal).
 //!
@@ -76,7 +80,8 @@ impl Plugin for AuroraRemotePlugin {
         .add_remote_method("aurora.timing", timing_method)
         .add_remote_method("aurora.job", job_method)
         .add_remote_method("aurora.exit", exit_method)
-        .add_remote_method("aurora.view", view_method);
+        .add_remote_method("aurora.view", view_method)
+        .add_remote_method("aurora.memory", memory_method);
     }
 }
 
@@ -439,6 +444,58 @@ fn view_method(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
         .position(|v| *v == current)
         .unwrap_or(0);
     Ok(json!({ "view": names[index], "views": names }))
+}
+
+fn memory_method(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let top = params
+        .as_ref()
+        .and_then(|p| p.get("top"))
+        .and_then(Value::as_u64)
+        .unwrap_or(20) as usize;
+    let rd = world
+        .get_resource::<RenderDevice>()
+        .ok_or_else(|| BrpError::internal("no render device"))?;
+    let report = crate::memory::report(rd);
+    let mib = |bytes: u64| (bytes as f64 / (1024.0 * 1024.0) * 10.0).round() / 10.0;
+    let uses = |list: &[crate::memory::MemoryUse]| {
+        list.iter()
+            .take(top)
+            .map(|u| json!({ "name": u.name, "mib": mib(u.bytes), "count": u.count }))
+            .collect::<Vec<_>>()
+    };
+    let heaps: Vec<Value> = report
+        .heaps
+        .iter()
+        .map(|h| {
+            json!({
+                "device_local": h.device_local,
+                "size_mib": mib(h.size),
+                "usage_mib": h.usage.map(mib),
+                "budget_mib": h.budget.map(mib),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "capacity_mib": mib(report.capacity),
+        "allocated_mib": mib(report.allocated),
+        "blocks": report.blocks,
+        "allocations": report.allocations,
+        "files": uses(&report.files),
+        "sites": uses(&report.sites),
+        "heaps": heaps,
+        "occupancy": report.occupancy.iter().map(|o| json!({
+            "under": o.under,
+            "blocks": o.blocks,
+            "capacity_mib": mib(o.capacity),
+            "used_mib": mib(o.used),
+        })).collect::<Vec<_>>(),
+        "sparse_blocks": report.sparse_blocks.iter().map(|b| json!({
+            "size_mib": mib(b.size),
+            "used_mib": mib(b.used),
+            "allocations": b.allocations,
+            "sites": uses(&b.sites),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 fn exit_method(In(_): In<Option<Value>>, world: &mut World) -> BrpResult {

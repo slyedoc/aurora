@@ -3,7 +3,10 @@ use ash::vk::TaggedStructure as _;
 use bevy::{
     app::Plugin,
     asset::AssetApp,
+    ecs::system::lifetimeless::SRes,
     image::{CompressedImageFormats, HdrTextureLoader, ImageLoader},
+    platform::collections::HashSet,
+    prelude::*,
 };
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 
@@ -11,7 +14,8 @@ use crate::{
     render_buffer::BufferProvider,
     render_device::RenderDevice,
     vk_init,
-    vulkan_asset::{VulkanAsset, VulkanAssetExt},
+    ray_render_plugin::RenderSet,
+    vulkan_asset::{DroppedAssets, VulkanAsset, VulkanAssetExt, VulkanAssets},
 };
 
 pub struct RenderTexturePlugin;
@@ -22,6 +26,33 @@ impl Plugin for RenderTexturePlugin {
         app.register_asset_loader(ImageLoader::new(CompressedImageFormats::BC));
         app.init_asset_loader::<HdrTextureLoader>();
         app.init_vulkan_asset::<bevy::prelude::Image>();
+        app.init_resource::<DataImages>()
+            .add_systems(Last, drop_data_images.in_set(RenderSet::Extract));
+    }
+}
+
+/// Images their owners read on the CPU (a terrain's splatmaps and heightmaps): never uploaded
+/// as textures. An image listed after its upload is freed.
+#[derive(Resource, Default)]
+pub struct DataImages(pub HashSet<AssetId<Image>>);
+
+fn drop_data_images(
+    data: Res<DataImages>,
+    render_device: Option<Res<RenderDevice>>,
+    mut textures: ResMut<VulkanAssets<Image>>,
+    mut dropped: ResMut<DroppedAssets>,
+) {
+    let Some(render_device) = render_device else {
+        return;
+    };
+    if !data.is_changed() {
+        return;
+    }
+    for id in &data.0 {
+        if let Some(texture) = textures.take_loaded(*id) {
+            Image::destroy_asset(&render_device, &texture);
+            dropped.0.push(id.untyped());
+        }
     }
 }
 
@@ -171,8 +202,19 @@ pub fn record_mip_chain(
 
 impl VulkanAsset for bevy::prelude::Image {
     type ExtractedAsset = bevy::prelude::Image;
-    type ExtractParam = ();
+    type ExtractParam = SRes<DataImages>;
     type PreparedAsset = RenderTexture;
+
+    fn extract_asset_with_id(
+        &self,
+        id: AssetId<Self>,
+        param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
+    ) -> Option<Self::ExtractedAsset> {
+        if param.0.contains(&id) {
+            return None;
+        }
+        self.extract_asset(param)
+    }
 
     fn extract_asset(
         &self,
@@ -333,6 +375,7 @@ fn generates_mips(format: vk::Format) -> bool {
 }
 
 /// A single-level image, mipped on upload when [`generates_mips`].
+#[track_caller]
 pub fn load_texture_from_bytes(
     device: &RenderDevice,
     format: vk::Format,
@@ -358,6 +401,7 @@ pub fn load_texture_from_bytes(
 /// generated when [`generates_mips`]: a ray-tracing stage has no derivatives, so without
 /// one a minified texture lands on a different texel every jittered frame.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn load_texture_levels(
     device: &RenderDevice,
     format: vk::Format,
@@ -425,7 +469,7 @@ pub fn load_texture_levels(
 
         let allocation = state
             .allocate(&AllocationCreateDesc {
-                name: "render_texture",
+                name: &crate::memory::caller_name(),
                 requirements: requirements.memory_requirements,
                 linear: false,
                 location: gpu_allocator::MemoryLocation::GpuOnly,
@@ -576,6 +620,7 @@ pub fn padd_pixel_bytes_rgba_unorm(
 
 /// Creates an empty GPU texture (no byte upload) and transitions it to `desired_layout`:
 /// render targets like the UI surface panels, written by the GPU and sampled bindlessly.
+#[track_caller]
 pub fn create_blank_texture(
     device: &RenderDevice,
     format: vk::Format,
@@ -598,6 +643,7 @@ pub fn create_blank_texture(
 
 /// [`create_blank_texture`] with `mip_levels` levels (the view spans them all): a GPU-written
 /// texture whose chain [`record_mip_chain`] refills.
+#[track_caller]
 pub fn create_blank_texture_mipped(
     device: &RenderDevice,
     format: vk::Format,
@@ -621,6 +667,7 @@ pub fn create_blank_texture_mipped(
 
 /// A 3D image of `depth` slices, viewed as 3D (a `Sampler3D` reads it through the bindless
 /// heap, raygen.slang `volumes`).
+#[track_caller]
 pub fn create_blank_volume(
     device: &RenderDevice,
     format: vk::Format,
@@ -642,6 +689,7 @@ pub fn create_blank_volume(
     )
 }
 
+#[track_caller]
 fn create_blank(
     device: &RenderDevice,
     format: vk::Format,
@@ -679,7 +727,7 @@ fn create_blank(
         let mut state = device.allocator_state.lock().unwrap();
         let allocation = state
             .allocate(&AllocationCreateDesc {
-                name: "blank_texture",
+                name: &crate::memory::caller_name(),
                 requirements: requirements.memory_requirements,
                 linear: false,
                 location: gpu_allocator::MemoryLocation::GpuOnly,

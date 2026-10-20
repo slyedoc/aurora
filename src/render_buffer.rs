@@ -71,10 +71,13 @@ impl<'a, T> std::ops::IndexMut<usize> for BufferView<T> {
 }
 
 pub trait BufferProvider {
+    #[track_caller]
     fn create_host_buffer<T>(&self, size: u64, usage: vk::BufferUsageFlags) -> Buffer<T>;
 
+    #[track_caller]
     fn create_device_buffer<T>(&self, size: u64, usage: vk::BufferUsageFlags) -> Buffer<T>;
 
+    #[track_caller]
     fn create_buffer<T>(
         &self,
         size: u64,
@@ -93,6 +96,7 @@ pub trait BufferProvider {
 }
 
 impl BufferProvider for RenderDevice {
+    #[track_caller]
     fn create_host_buffer<T>(&self, size: u64, usage: vk::BufferUsageFlags) -> Buffer<T> {
         self.create_buffer(
             size,
@@ -101,6 +105,7 @@ impl BufferProvider for RenderDevice {
         )
     }
 
+    #[track_caller]
     fn create_device_buffer<T>(&self, size: u64, usage: vk::BufferUsageFlags) -> Buffer<T> {
         self.create_buffer(
             size,
@@ -109,6 +114,7 @@ impl BufferProvider for RenderDevice {
         )
     }
 
+    #[track_caller]
     fn create_buffer<T>(
         &self,
         nr_elements: u64,
@@ -156,7 +162,7 @@ impl BufferProvider for RenderDevice {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let allocation = state
                 .allocate(&AllocationCreateDesc {
-                    name: "Buffer Allocation",
+                    name: &crate::memory::caller_name(),
                     // At least 64-byte aligned: cooperative vector matrices are converted from
                     // and to device addresses on that alignment (nrc.rs record_convert).
                     requirements: vk::MemoryRequirements {

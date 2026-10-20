@@ -384,6 +384,8 @@ pub struct InstanceOverride {
 
 /// Refits between full TLAS builds.
 const REFIT_FRAMES: u32 = 60;
+/// Rows the instance table grows in multiples of.
+const TABLE_STEP: u32 = 64 * 1024;
 
 #[derive(Resource)]
 pub struct TLAS {
@@ -613,7 +615,11 @@ impl TLAS {
     }
 
     fn grow(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
-        self.capacity = self.count.max(1024).next_power_of_two();
+        // A quarter's headroom, not the next power of two: at millions of rows a doubling holds
+        // as much again in four 64-byte arrays, unused.
+        self.capacity = (self.count + self.count / 4)
+            .max(1024)
+            .next_multiple_of(TABLE_STEP);
         self.generation = self.generation.wrapping_add(1);
         log::debug!("GPU instance table: {} slots", self.capacity);
         rd.destroyer.destroy_buffer(self.instances_buf.handle);

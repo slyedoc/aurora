@@ -675,6 +675,7 @@ fn material_passes(
     pool: GpuPagePool,
     order: &[Entity],
     layers: &MaterialLayers,
+    finest: bool,
 ) -> Option<Vec<MatPass>> {
     let mut passes = Vec::new();
     for &entity in order {
@@ -692,7 +693,7 @@ fn material_passes(
             ..default()
         };
         if let Some(splatmap) = splatmap {
-            let source = source?;
+            let source = source?.texels(finest);
             let (m, o) = placement(transform, splatmap.size);
             passes.push(MatPass {
                 entry: "apply_splatmap",
@@ -821,7 +822,8 @@ pub fn evaluate_pages(
         let Some(passes) = height_passes(landscape, &order, &height_layers, &sculpts) else {
             continue;
         };
-        let Some(mat_passes) = material_passes(pages.pool(), &material_order, &material_layers)
+        let Some(mat_passes) =
+            material_passes(pages.pool(), &material_order, &material_layers, ring.is_none())
         else {
             continue;
         };

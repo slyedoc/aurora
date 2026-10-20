@@ -17,11 +17,17 @@ use ash::{
 };
 use bevy::prelude::*;
 use crossbeam::channel::Sender;
-use gpu_allocator::{AllocationError, MemoryLocation, vulkan::*};
+use gpu_allocator::{AllocationError, AllocationSizes, MemoryLocation, vulkan::*};
 use raw_window_handle::DisplayHandle;
 
 use crate::render_texture::RenderTexture;
 use crate::xr::XrContext;
+
+/// The allocator's memory block size, device and host. gpu-allocator's 256 MB default left
+/// most of a streamed world's blocks a tenth full: landscape tiles and their BLASes are made and
+/// dropped as the LOD moves, and a few survivors pinned each block. Smaller blocks empty (and go
+/// back to the driver) far more often; anything larger than a block gets one of its own.
+const MEMBLOCK_SIZE: u64 = 32 * 1024 * 1024;
 
 pub struct AllocatorState {
     allocator: Arc<Mutex<Allocator>>,
@@ -36,6 +42,11 @@ impl AllocatorState {
     ) -> Result<Allocation, AllocationError> {
         let mut allocator = self.allocator.lock().unwrap();
         allocator.allocate(desc)
+    }
+
+    /// Every live allocation and memory block (`memory.rs`).
+    pub fn generate_report(&self) -> gpu_allocator::AllocatorReport {
+        self.allocator.lock().unwrap().generate_report()
     }
 
     pub fn register_image_allocation(&mut self, image: vk::Image, allocation: Allocation) {
@@ -365,7 +376,7 @@ impl RenderDevice {
                         physical_device,
                         debug_settings: Default::default(),
                         buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
-                        allocation_sizes: Default::default(),
+                        allocation_sizes: AllocationSizes::new(MEMBLOCK_SIZE, MEMBLOCK_SIZE),
                     })
                     .unwrap(),
                 )),
@@ -446,6 +457,7 @@ impl RenderDevice {
         }
     }
 
+    #[track_caller]
     pub fn create_render_target(&self, image_info: &vk::ImageCreateInfo) -> vk::Image {
         let image = unsafe { self.device.create_image(image_info, None).unwrap() };
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
@@ -453,7 +465,7 @@ impl RenderDevice {
         let mut state = self.allocator_state.lock().unwrap();
         let allocation = state
             .allocate(&AllocationCreateDesc {
-                name: "Image",
+                name: &crate::memory::caller_name(),
                 requirements,
                 location: MemoryLocation::GpuOnly,
                 linear: false,

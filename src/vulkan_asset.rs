@@ -115,6 +115,17 @@ pub enum VulkanAssetLoadingState<A: VulkanAsset> {
 pub struct VulkanAssets<A: VulkanAsset>(HashMap<AssetId<A>, VulkanAssetLoadingState<A>>);
 
 impl<A: VulkanAsset> VulkanAssets<A> {
+    /// Takes a prepared asset out (its owner frees it); one still building is left alone.
+    pub fn take_loaded(&mut self, id: AssetId<A>) -> Option<A::PreparedAsset> {
+        if !matches!(self.0.get(&id), Some(VulkanAssetLoadingState::Loaded(_))) {
+            return None;
+        }
+        match self.0.remove(&id) {
+            Some(VulkanAssetLoadingState::Loaded(prepared)) => Some(prepared),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, handle: &Handle<A>) -> Option<&A::PreparedAsset> {
         self.get_by_id(handle.id())
     }

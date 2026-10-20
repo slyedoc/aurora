@@ -289,6 +289,7 @@ pub struct LandscapePlugin;
 
 impl Plugin for LandscapePlugin {
     fn build(&self, app: &mut App) {
+        app.add_observer(layer::layer_images_are_data);
         let server = app.world().resource::<AssetServer>();
         let eval = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/eval.slang")),
@@ -328,7 +329,7 @@ impl Plugin for LandscapePlugin {
         ));
         let scatter = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/scatter.slang")),
-            &["scatter"],
+            &["scatter_count", "scatter_scan", "scatter_write"],
         ));
         let interaction = server.add(ComputeModule::new(
             server.load(aurora_asset("shaders/landscape/interaction.slang")),
@@ -401,6 +402,7 @@ impl Plugin for LandscapePlugin {
                         layer::upload_heightmaps,
                         generator::upload_genomes,
                         layer::upload_splatmaps,
+                        layer::stream_splatmaps,
                         layer::track_layers,
                         layer::track_materials,
                         ring::track_ring_layers,

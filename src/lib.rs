@@ -36,6 +36,7 @@ pub mod gpu_profiler;
 pub mod gpu_transform;
 pub mod latency;
 pub mod lights;
+pub mod memory;
 pub mod material;
 pub mod mesh;
 pub mod nrc;
