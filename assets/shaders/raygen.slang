@@ -168,6 +168,7 @@ static const uint MATERIAL_WORDS = 28u;
 static const uint MATERIAL_ROW_WORD = 21u;
 static const uint MATERIAL_FLAGS_WORD = 25u;
 static const uint MATERIAL_WATER_FLAG = 1u;
+static const uint MATERIAL_TRANSMISSION_WORD = 13u;
 
 // A visibility test by ray query (inline: no shader call, nothing held across it spilled -- the
 // shift's TraceRay visibility was ~85 % of gi_spatial), and the nearest water surface passed, as
@@ -188,6 +189,11 @@ ShadowPayload shadowInline(uint mask, float3 origin, float3 direction, float tma
         // The analytic sphere (hit offset 0, sphere.slang): unit diameter in object space.
         if (q.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE
             && q.CandidateInstanceContributionToHitGroupIndex() == 0u) {
+            // A clear sphere lets the shadow through (sphere.slang `intersection`).
+            let record = ((uint*)pc.materials) + q.CandidateInstanceID() * MATERIAL_WORDS;
+            if (asfloat(record[MATERIAL_TRANSMISSION_WORD]) > 0.5) {
+                continue;
+            }
             let o = q.CandidateObjectRayOrigin();
             let d = q.CandidateObjectRayDirection();
             let b = dot(o, d);
@@ -349,13 +355,12 @@ bool sampleFogScatter(EnvironmentGpu* env, float3 o, float3 d, float t_max, out 
 }
 
 
-// Henyey-Greenstein phase function, per steradian.
-float fogPhase(EnvironmentGpu* env, float cos_theta) {
+// Henyey-Greenstein phase function, per steradian, as the environment's fog scatters.
+float fogPhase(EnvironmentGpu* env, float3 x, float cos_theta) {
     return fogPhaseG(env.fog_scatter, cos_theta);
 }
 
-
-float3 sampleFogScatterDirection(EnvironmentGpu* env, float3 incoming) {
+float3 sampleFogScatterDirection(EnvironmentGpu* env, float3 x, float3 incoming) {
     // Henyey-Greenstein phase function sampling
     // g is the asymmetry parameter (-1 <= g <= 1)
     // g > 0 means forward scattering
@@ -431,11 +436,11 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
             continue;
         }
         let step_t = exp(-sigma * dt);
-        var Ls = fogSunLight(env, ray_mask, tmax, x, d);
+        var Ls = fogSunLight(env, ray_mask, tmax, x, d, env.fog_scatter);
         if (i == sky_step) {
             // Phase-sampled, so the phase over its pdf is 1; one step in n carries it. Its own
             // payload: one held across the march's sun rays doubled the caller's stack.
-            let w = sampleFogScatterDirection(env, d);
+            let w = sampleFogScatterDirection(env, x, d);
             HitPayload payload = {};
             payload.t = -1.0;
             payload.miss_flags = ray_env << 1;
@@ -453,7 +458,7 @@ void fogMarch(EnvironmentGpu* env, uint ray_env, uint ray_mask, float tmax, floa
 
 // The suns' light at fog point `x`, as the fog scatters it along `d`. The HDR sky's sun is
 // two discs (core, halo) on one direction: one shadow ray serves every disc that shares it.
-float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, float3 d) {
+float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, float3 d, float g) {
     var Ls = float3(0.0);
     var visible = false;
     var l = float3(0.0);
@@ -475,7 +480,7 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
             radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
         }
         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-        Ls += radiance * sun_t * solid_angle * fogPhase(env, dot(d, l));
+        Ls += radiance * sun_t * solid_angle * fogPhaseG(g, dot(d, l));
     }
     return Ls;
 }
@@ -724,13 +729,14 @@ void fog_grid() {
     let cell = float3(id);
     let grid = float3(size);
     let r = float3(randf(), randf(), randf());
-    let x = fogGridPoint((cell.xy + r.xy) / grid.xy, (cell.z + r.z) / grid.z, dist);
+    let x = fogAboveGround(pc.uniforms,
+                           fogGridPoint((cell.xy + r.xy) / grid.xy, (cell.z + r.z) / grid.z, dist));
     let cam = mat4MulVecAt(&pc.uniforms.fog_grid_inverse_view[0], float4(0.0, 0.0, 0.0, 1.0)).xyz;
     let centre = fogGridPoint((cell.xy + 0.5) / grid.xy, (cell.z + 0.5) / grid.z, dist);
     let d = normalize(centre - cam);
 
-    var L = fogSunLight(env, ray_mask, tmax, x, d);
-    let w = sampleFogScatterDirection(env, d);
+    var L = fogSunLight(env, ray_mask, tmax, x, d, env.fog_scatter);
+    let w = sampleFogScatterDirection(env, x, d);
     payload.t = -1.0;
     payload.miss_flags = ray_env << 1;
     trace(FLAGS_SHADOW, ray_mask, x, 0.0, w, tmax, payload);
@@ -2306,11 +2312,11 @@ void main() {
                             sun_radiance *= atmoSunTransmittanceAt(origin);
                         }
                         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                        acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle
+                        acc += mask * fogPhase(env, origin, dot(direction, l)) * sun_radiance * solid_angle
                             * traceLight(ray_mask, origin, l, tmax, water);
                     }
                 }
-                direction = sampleFogScatterDirection(env, direction);
+                direction = sampleFogScatterDirection(env, origin, direction);
                 prev_pdf = 0.0;
                 mis_pdf = 0.0;
                 path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH | PATH_PT_CHAIN);

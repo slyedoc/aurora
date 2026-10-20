@@ -42,10 +42,53 @@ public float3 fogVolumeLocal(FogVolumeGpu v, float4 p) {
     return float3(dot(v.row0, p), dot(v.row1, p), dot(v.row2, p));
 }
 
+// The terrain height under world `xz` from a Ground volume's height buffer (bilinear), or a
+// sentinel far below where it has none.
+float fogGroundHeight(FogVolumeGpu v, float2 xz) {
+    let n = v.ground_size;
+    let g = (xz - float2(v.ground_x, v.ground_z)) / v.ground_texel;
+    let i = floor(g);
+    if (v.heights == nullptr || any(i < float2(0.0)) || any(i >= float2(float(n - 1u)))) {
+        return -1.0e30;
+    }
+    let f = g - i;
+    let at = uint(i.y) * n + uint(i.x);
+    let h00 = v.heights[at];
+    let h10 = v.heights[at + 1u];
+    let h01 = v.heights[at + n];
+    let h11 = v.heights[at + n + 1u];
+    let h = lerp(lerp(h00, h10, f.x), lerp(h01, h11, f.x), f.y);
+    return isfinite(h) ? h : -1.0e30;
+}
+
+// Mist: full on the ground, thinning out over `thickness` above it, fading toward the box's sides
+// (over `edge`), carved by noise that drifts with the wind and climbs at `rise`.
+float fogGroundDensity(FogVolumeGpu v, float3 x, float3 p, float time) {
+    let r = length(p.xz);
+    if (r >= 1.0 || abs(p.y) >= 1.0) {
+        return 0.0;
+    }
+    let h = x.y - fogGroundHeight(v, x.xz);
+    if (h < -1.0 || h > v.thickness) {
+        return 0.0;
+    }
+    var d = v.density * (1.0 - smoothstep(0.2 * v.thickness, v.thickness, h));
+    d *= v.edge > 0.0 ? smoothstep(1.0, 1.0 - v.edge, r) : 1.0;
+    if (v.noise_strength > 0.0) {
+        let q = (x - float3(v.wind_x, v.wind_y + v.rise, v.wind_z) * time) / v.noise_scale;
+        let n = 0.65 * fogValueNoise(q) + 0.35 * fogValueNoise(q * 2.03 + 17.0);
+        d *= lerp(1.0, smoothstep(0.3, 0.7, n), v.noise_strength);
+    }
+    return d;
+}
+
 // A volume's density at a world point: full inside, fading over `edge` toward the surface,
 // carved by drifting noise. Never above `density` (the majorant relies on it).
 public float fogVolumeDensity(FogVolumeGpu v, float3 x, float time) {
     let p = fogVolumeLocal(v, float4(x, 1.0));
+    if (v.shape == 2u) {
+        return fogGroundDensity(v, x, p, time);
+    }
     let r = v.shape == 0u ? max(abs(p.x), max(abs(p.y), abs(p.z))) : length(p);
     if (r >= 1.0) {
         return 0.0;
@@ -71,6 +114,19 @@ public bool fogVolumeSpan(FogVolumeGpu v, float3 o, float3 d, float t_max, out f
     t0 = max(max(n.x, n.y), max(n.z, 0.0));
     t1 = min(min(f.x, f.y), min(f.z, t_max));
     return t1 > t0;
+}
+
+// A fog grid cell's lighting sample lifted out of the ground under any Ground volume: a cell
+// is coarser than a mist layer is deep, and a sample left underground lights the cell black.
+public float3 fogAboveGround(UniformData* u, float3 x) {
+    var p = x;
+    for (uint i = 0u; i < u.fog_volume_count; i++) {
+        let v = u.fog_volumes[i];
+        if (v.shape == 2u) {
+            p.y = max(p.y, fogGroundHeight(v, p.xz) + 0.1);
+        }
+    }
+    return p;
 }
 
 // All the fog at a point: the environment's (`base`) and every volume's.

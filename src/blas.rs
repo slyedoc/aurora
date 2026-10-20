@@ -1079,5 +1079,6 @@ mod tests {
         assert_eq!(size_of::<super::RTXMaterial>(), 28 * 4);
         assert_eq!(offset_of!(super::RTXMaterial, surface_param_index), 21 * 4);
         assert_eq!(offset_of!(super::RTXMaterial, flags), 25 * 4);
+        assert_eq!(offset_of!(super::RTXMaterial, specular_transmission_factor), 13 * 4);
     }
 }

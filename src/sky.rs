@@ -374,6 +374,7 @@ fn gather_skies(
         Option<&Fog>,
         Option<&SkyBrightness>,
         Option<&SkyAir>,
+        Option<&crate::weather::Weather>,
     )>,
     suns: Query<(
         &DirectionalLight,
@@ -391,10 +392,10 @@ fn gather_skies(
     let mut atmosphere = None;
     let mut exposures = [None; 8];
     for bit in 0..8u8 {
-        let (sky, gradient, exposure, fog, brightness, air) = worlds
+        let (sky, gradient, exposure, fog, brightness, air, weather) = worlds
             .environment(bit)
             .and_then(|world| skies.get(world).ok())
-            .unwrap_or((None, None, None, None, None, None));
+            .unwrap_or((None, None, None, None, None, None, None));
         exposures[bit as usize] = exposure.map(|e| e.ev100);
         let mut sky = sky.cloned().unwrap_or_default();
         if matches!(sky, Sky::Atmosphere) {
@@ -411,6 +412,15 @@ fn gather_skies(
         entry.sky = sky;
         entry.gradient = gradient.cloned().unwrap_or_default();
         entry.fog = fog.copied().unwrap_or_else(Fog::off);
+        // Mist scatters more evenly than haze (a thick layer's light has scattered many times
+        // over): its g pulls the fog's toward it as it thickens. One g for the whole fog: a
+        // density-weighted g per point would walk the volumes at every phase evaluation.
+        if let Some(weather) = weather
+            && weather.mist > 0.0
+        {
+            let k = weather.mist / (weather.mist + 0.05);
+            entry.fog.scatter += (weather.mist_anisotropy - entry.fog.scatter) * k;
+        }
         entry.sky_brightness = brightness.copied().unwrap_or_default().0;
         match air {
             Some(air) => entry.air.clone_from(air),

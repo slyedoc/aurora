@@ -27,6 +27,9 @@ pub enum FogShape {
     #[default]
     Box,
     Ellipsoid,
+    /// A layer on the ground across the box (`thickness` deep over the terrain, which
+    /// [`GroundHeights`] samples around the camera), fading out toward the box's sides: mist.
+    Ground,
 }
 
 /// A pocket of fog, added to the environment's.
@@ -52,6 +55,12 @@ pub struct FogVolume {
     pub noise_strength: f32,
     /// The wisps drift with this (metres per second).
     pub wind: Vec3,
+    /// `Ground`: how deep the layer lies over the terrain (metres).
+    #[reflect(@0.1..=50.0_f32)]
+    pub thickness: f32,
+    /// `Ground`: how fast its wisps climb (metres per second).
+    #[reflect(@0.0..=5.0_f32)]
+    pub rise: f32,
 }
 
 impl Default for FogVolume {
@@ -64,6 +73,8 @@ impl Default for FogVolume {
             noise_scale: 12.0,
             noise_strength: 0.0,
             wind: Vec3::new(0.6, 0.0, 0.3),
+            thickness: 3.0,
+            rise: 0.3,
         }
     }
 }
@@ -80,6 +91,23 @@ pub struct GpuFogVolume {
     noise_strength: f32,
     wind: [f32; 3],
     shape: u32,
+    /// `Ground`: the height buffer (0: none yet, no mist) and its mapping.
+    heights: u64,
+    ground_origin: [f32; 2],
+    ground_texel: f32,
+    ground_size: u32,
+    thickness: f32,
+    rise: f32,
+}
+
+/// Terrain heights around the camera for [`FogShape::Ground`] volumes: `size` x `size` texels of
+/// `texel` metres, texel (0, 0)'s centre at `origin` (xz). The weather plugin keeps it.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GroundHeights {
+    pub address: u64,
+    pub origin: Vec2,
+    pub texel: f32,
+    pub size: u32,
 }
 
 /// The uploaded volume table; the frame uniform carries its address + count.
@@ -111,8 +139,10 @@ pub const MAX_FOG_VOLUMES: usize = 64;
 fn upload_fog_volumes(
     render_device: Res<RenderDevice>,
     volumes: Query<(&FogVolume, &GlobalTransform, &InheritedVisibility)>,
+    ground: Option<Res<GroundHeights>>,
     mut table: ResMut<FogVolumeTable>,
 ) {
+    let ground = ground.map(|g| *g).unwrap_or_default();
     let mut entries: Vec<GpuFogVolume> = Vec::new();
     for (volume, global, visible) in &volumes {
         if !visible.get() || volume.density <= 0.0 || entries.len() == MAX_FOG_VOLUMES {
@@ -136,7 +166,14 @@ fn upload_fog_volumes(
             shape: match volume.shape {
                 FogShape::Box => 0,
                 FogShape::Ellipsoid => 1,
+                FogShape::Ground => 2,
             },
+            heights: ground.address,
+            ground_origin: ground.origin.to_array(),
+            ground_texel: ground.texel,
+            ground_size: ground.size,
+            thickness: volume.thickness.max(0.1),
+            rise: volume.rise,
         });
     }
     if entries == table.last && (table.buffer.is_some() || entries.is_empty()) {
@@ -171,5 +208,15 @@ impl Plugin for FogVolumePlugin {
         app.register_type::<FogVolume>()
             .init_resource::<FogVolumeTable>()
             .add_systems(Last, upload_fog_volumes.in_set(RenderSet::Prepare));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `FogVolumeGpu` in rt_types.slang: its pointer lands 8-aligned at 80, 112 bytes in all.
+    #[test]
+    fn gpu_fog_volume_matches_the_shader() {
+        assert_eq!(core::mem::offset_of!(super::GpuFogVolume, heights), 80);
+        assert_eq!(size_of::<super::GpuFogVolume>(), 112);
     }
 }

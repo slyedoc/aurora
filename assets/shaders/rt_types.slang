@@ -58,6 +58,14 @@ public struct FogVolumeGpu {
     public float noise_strength;
     public float wind_x, wind_y, wind_z;
     public uint shape;
+    // Ground (shape 2): the terrain heights around the camera (src/fog_volume.rs
+    // `GroundHeights`; 0: none) and the layer's depth and climb.
+    public float* heights;
+    public float ground_x, ground_z;
+    public float ground_texel;
+    public uint ground_size;
+    public float thickness;
+    public float rise;
 };
 
 public struct EnvironmentGpu {

@@ -24,6 +24,12 @@ float2 gemsIntersections(float3 orig, float3 dir, float3 center, float radius) {
 
 [shader("intersection")]
 void intersection() {
+    // Shadow rays pass clear spheres (rain, glass marbles), as they pass glass triangles
+    // (any_hit.slang `ignoredHit`).
+    if ((RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0
+        && pc.materials[InstanceID()].specular_transmission_factor > 0.5) {
+        return;
+    }
     let orig = ObjectRayOrigin();
     let dir = ObjectRayDirection();
     let t = gemsIntersections(orig, dir, float3(0.0), 0.5);

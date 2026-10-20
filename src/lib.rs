@@ -36,8 +36,8 @@ pub mod gpu_profiler;
 pub mod gpu_transform;
 pub mod latency;
 pub mod lights;
-pub mod memory;
 pub mod material;
+pub mod memory;
 pub mod mesh;
 pub mod nrc;
 pub mod nsight;
@@ -80,6 +80,7 @@ pub mod vk_utils;
 pub mod vulkan_asset;
 pub mod water;
 pub mod water_waves;
+pub mod weather;
 pub mod xr;
 
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -119,6 +120,7 @@ pub mod prelude {
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt, VideoExt, VideoRecorder},
         water::{WaterKind, WaterMaterial, WaterMaterial3d, WaterSurface},
+        weather::Weather,
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }
@@ -158,6 +160,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::portal::PortalPlugin);
         group = group.add(crate::fog_volume::FogVolumePlugin);
         group = group.add(crate::water::WaterVolumePlugin);
+        group = group.add(crate::weather::WeatherPlugin);
         // `--headless [WxH]`: no window; the frames run on and the camera renders into a
         // WxH image (util/headless.rs, default 1280x720), which screenshots read back.
         let headless = crate::util::headless::headless_size();
