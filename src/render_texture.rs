@@ -11,10 +11,10 @@ use bevy::{
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 
 use crate::{
+    ray_render_plugin::RenderSet,
     render_buffer::BufferProvider,
     render_device::RenderDevice,
     vk_init,
-    ray_render_plugin::RenderSet,
     vulkan_asset::{DroppedAssets, VulkanAsset, VulkanAssetExt, VulkanAssets},
 };
 

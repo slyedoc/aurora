@@ -1368,12 +1368,19 @@ fn render_frame(
                     | vk::AccessFlags2::SHADER_WRITE
                     | vk::AccessFlags2::UNIFORM_READ,
             );
-            // Last frame's instance rows kept for motion vectors, then the queued per-frame
-            // dispatches (landscape scatter writes instance rows), ahead of the TLAS build.
+            // The instance table grown to every slot handed out, last frame's rows kept for
+            // motion vectors, then the queued per-frame dispatches (landscape scatter, weather
+            // write instance rows), ahead of the TLAS build.
             let section = info_span!("record_frame_commands").entered();
             let scope = prof.begin(&render_device, scene_cmd, "frame commands");
+            tlas.prepare_storage(&render_device, scene_cmd);
             tlas.snapshot_prev(&render_device, scene_cmd);
-            frame_commands.record(&render_device, &modules, scene_cmd);
+            frame_commands.record(
+                &render_device,
+                &modules,
+                scene_cmd,
+                &crate::compute::FrameContext::new(tlas),
+            );
             prof.end(&render_device, scene_cmd, scope);
             drop(section);
             crate::gpu_transform::world_barrier(&render_device, scene_cmd);
@@ -1416,6 +1423,12 @@ fn render_frame(
             );
             prof.end(&render_device, scene_cmd, scope);
             drop(section);
+            frame_commands.record_after_tlas(
+                &render_device,
+                &modules,
+                scene_cmd,
+                &crate::compute::FrameContext::new(tlas),
+            );
             if pick {
                 let _submit = info_span!("submit_pick").entered();
                 picker.submit(&render_device, scene_cmd, &modules, tlas, &compute_wait);

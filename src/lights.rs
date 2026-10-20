@@ -760,7 +760,11 @@ fn track_analytic_lights(
     points: Query<(Entity, &PointLight)>,
     spots: Query<(Entity, &SpotLight)>,
     rects: Query<(Entity, &RectLight)>,
-    spheres: Query<(Entity, &GpuInstance, &AuroraMaterial3d), With<Sphere>>,
+    // A block's spheres (particles) move on the GPU; their head has no transform to light from.
+    spheres: Query<
+        (Entity, &GpuInstance, &AuroraMaterial3d),
+        (With<Sphere>, Without<crate::tlas_builder::InstanceBlock>),
+    >,
     materials: Res<Assets<AuroraMaterial>>,
     nodes: Query<(&Transform, Option<&ChildOf>)>,
     worlds: Query<(

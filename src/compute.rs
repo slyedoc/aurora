@@ -20,6 +20,7 @@ use crate::{
     descriptor_heap::{Mapping, stage_mapping},
     render_device::RenderDevice,
     shader::Shader,
+    tlas_builder::{InstanceBlockSlots, TLAS},
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
 };
 
@@ -350,44 +351,152 @@ fn propagate_modified(
     }
 }
 
-/// Work recorded into the frame's own command buffer, at its start: a system with a small
-/// per-frame dispatch queues it here instead of a blocking `run_transfer_commands`, which
-/// stalls the CPU on the GPU every frame. Captured data must be by value (it runs in `Last`).
-pub type FrameCommand =
-    Box<dyn FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer) + Send + Sync>;
+/// Work recorded into the frame's own command buffer: a system with a small per-frame dispatch
+/// queues it here instead of a blocking `run_transfer_commands`, which stalls the CPU on the GPU
+/// every frame. Captured data must be by value (it runs in `Last`); whatever lives in the TLAS's
+/// storage (instance rows, the acceleration structure) comes from the [`FrameContext`], resolved
+/// as the command records, never captured.
+pub type FrameCommand = Box<
+    dyn for<'a> FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer, &FrameContext<'a>)
+        + Send
+        + Sync,
+>;
 
-/// This frame's [`FrameCommand`]s, drained by the renderer (followed by one barrier to
-/// everything after).
-#[derive(Resource, Default)]
-pub struct FrameCommands(Vec<FrameCommand>);
+/// What a [`FrameCommand`] may touch of the TLAS, as it records: its instance table already
+/// holds every slot handed out (`TLAS::prepare_storage` runs first).
+pub struct FrameContext<'a> {
+    tlas: &'a TLAS,
+}
 
-impl FrameCommands {
-    pub fn push(
-        &mut self,
-        f: impl FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer) + Send + Sync + 'static,
-    ) {
-        self.0.push(Box::new(f));
+impl<'a> FrameContext<'a> {
+    pub(crate) fn new(tlas: &'a TLAS) -> Self {
+        Self { tlas }
     }
 
-    /// Records every queued command into `cmd_buffer`, then makes their writes visible to
-    /// the rest of the frame.
+    /// The rows a kernel writes for `block` (instance_rows.slang), or `None` while its mesh and
+    /// material are still resolving (its rows' static half is not in place yet).
+    pub fn block_rows(&self, block: InstanceBlockSlots) -> Option<BlockRows> {
+        self.tlas.block_rows(block)
+    }
+
+    /// The TLAS as last built before this command runs (the frame commands: last frame's;
+    /// after the build: this frame's), with its material records; `None` before the first build.
+    pub fn tlas(&self) -> Option<TlasRef> {
+        let tlas = self.tlas.acceleration_structure.address;
+        (tlas != 0).then(|| TlasRef {
+            tlas,
+            materials: self.tlas.material_address(),
+        })
+    }
+}
+
+/// An [`InstanceBlock`](crate::tlas_builder::InstanceBlock)'s rows of this frame's and last
+/// frame's instance arrays, and how many (instance_rows.slang `BlockRows`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlockRows {
+    pub rows: u64,
+    pub prev: u64,
+    pub count: u32,
+    pub pad: u32,
+}
+
+/// A TLAS to trace inline ray queries against, and its material records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TlasRef {
+    pub tlas: u64,
+    pub materials: u64,
+}
+
+/// This frame's [`FrameCommand`]s: those recorded at its start, ahead of the TLAS build (they
+/// may write instance rows), and those recorded right after it (they trace this frame's TLAS).
+#[derive(Resource, Default)]
+pub struct FrameCommands {
+    before_build: Vec<FrameCommand>,
+    after_build: Vec<FrameCommand>,
+}
+
+impl FrameCommands {
+    /// Queues `f` ahead of this frame's TLAS build.
+    pub fn push(
+        &mut self,
+        f: impl for<'a> FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer, &FrameContext<'a>)
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.before_build.push(Box::new(f));
+    }
+
+    /// Queues `f` right after this frame's TLAS build (dropped on a frame without one).
+    pub fn push_after_tlas(
+        &mut self,
+        f: impl for<'a> FnOnce(&RenderDevice, &ComputeModules, vk::CommandBuffer, &FrameContext<'a>)
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.after_build.push(Box::new(f));
+    }
+
+    /// Records the commands queued ahead of the build into `cmd_buffer`, then makes their writes
+    /// visible to the rest of the frame.
     pub fn record(
         &mut self,
         render_device: &RenderDevice,
         modules: &ComputeModules,
         cmd_buffer: vk::CommandBuffer,
+        ctx: &FrameContext,
     ) {
-        if self.0.is_empty() {
+        if self.before_build.is_empty() {
             return;
         }
-        for command in self.0.drain(..) {
-            command(render_device, modules, cmd_buffer);
+        for command in self.before_build.drain(..) {
+            command(render_device, modules, cmd_buffer, ctx);
         }
         memory_barrier(
             render_device,
             cmd_buffer,
             vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
+    }
+
+    /// Records the commands queued after the build into `cmd_buffer`, between barriers from the
+    /// build and to everything after.
+    pub fn record_after_tlas(
+        &mut self,
+        render_device: &RenderDevice,
+        modules: &ComputeModules,
+        cmd_buffer: vk::CommandBuffer,
+        ctx: &FrameContext,
+    ) {
+        if self.after_build.is_empty() {
+            return;
+        }
+        if ctx.tlas().is_none() {
+            self.after_build.clear();
+            return;
+        }
+        memory_barrier(
+            render_device,
+            cmd_buffer,
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
+        );
+        for command in self.after_build.drain(..) {
+            command(render_device, modules, cmd_buffer, ctx);
+        }
+        memory_barrier(
+            render_device,
+            cmd_buffer,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
             vk::PipelineStageFlags2::ALL_COMMANDS,
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
         );
@@ -405,5 +514,36 @@ impl Plugin for ComputePlugin {
         app.init_resource::<FrameCommands>();
         app.init_vulkan_asset::<ComputeModule>();
         app.add_systems(Update, propagate_modified);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// instance_rows.slang reads `BlockRows` by device address: two pointers, the count, a pad.
+    #[test]
+    fn block_rows_match_the_shader() {
+        use core::mem::{offset_of, size_of};
+        let source = include_str!("../assets/shaders/instance_rows.slang");
+        let body = source
+            .split_once("public struct BlockRows {")
+            .expect("instance_rows.slang declares BlockRows")
+            .1;
+        let fields: Vec<&str> = body[..body.find('}').unwrap()]
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("public "))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "public Instance* rows;",
+                "public Instance* prev;",
+                "public uint count;",
+                "public uint pad;"
+            ]
+        );
+        assert_eq!(offset_of!(super::BlockRows, prev), 8);
+        assert_eq!(offset_of!(super::BlockRows, count), 16);
+        assert_eq!(size_of::<super::BlockRows>(), 24);
     }
 }

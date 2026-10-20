@@ -244,7 +244,7 @@ pub fn sync_shading(
         let rows_buffer = class.rows.handle;
         let row_offset = shading.row as u64 * size_of::<LandscapeRow>() as u64;
         let palette_bytes = bytemuck::cast_slice::<PaletteGpu, u8>(&gpu_palette).to_vec();
-        frame_commands.push(move |rd, _, cmd| unsafe {
+        frame_commands.push(move |rd, _, cmd, _| unsafe {
             if !palette_bytes.is_empty() {
                 rd.device
                     .cmd_update_buffer(cmd, palette_buffer, 0, &palette_bytes);

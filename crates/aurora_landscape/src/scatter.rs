@@ -16,7 +16,8 @@ use ash::vk;
 use bevy::{ecs::lifecycle::Remove, prelude::*};
 use bevy_aurora::{
     compute::{
-        ComputeModules, FrameCommands, compute_to_compute_barrier, memory_barrier, record_dispatch,
+        BlockRows, ComputeModules, FrameCommands, compute_to_compute_barrier, memory_barrier,
+        record_dispatch,
     },
     mesh::AuroraMesh,
     render_buffer::{Buffer, BufferProvider},
@@ -114,13 +115,11 @@ impl ScatterSpecies {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ScatterPush {
-    instances: u64,
     materials: u64,
     tables: u64,
     /// The interaction field (interaction.rs), 0 while nothing disturbs it.
     field: u64,
     pool: GpuPagePool,
-    first: u32,
     width: u32,
     cell0_x: i32,
     cell0_z: i32,
@@ -136,6 +135,7 @@ struct ScatterPush {
     wave: f32,
     inner_radius: f32,
     fade: f32,
+    pad: u32,
 }
 
 /// `SpeciesTables` in scatter.slang: the keep factor per palette id, and the wind poses.
@@ -149,7 +149,8 @@ struct SpeciesTables {
     prev_wave: f32,
     prev_valid: u32,
     _pad: u32,
-    prev_instances: u64,
+    /// The species' block (instance_rows.slang), filled as the step records.
+    rows: BlockRows,
     clump: f32,
     clump_size: f32,
     edge_scale: f32,
@@ -230,7 +231,10 @@ impl ScatterState {
 /// (a quarter's headroom), shrunk once they fall under a quarter of it.
 fn block_rows(kept: u32, now: u32, cells: u32) -> u32 {
     let floor = INITIAL_ROWS.min(cells);
-    let target = (kept + kept / 4).max(floor).next_multiple_of(ROW_STEP).min(cells);
+    let target = (kept + kept / 4)
+        .max(floor)
+        .next_multiple_of(ROW_STEP)
+        .min(cells);
     if kept > now || (kept < now / 4 && now > floor) {
         target
     } else {
@@ -272,7 +276,9 @@ pub fn size_blocks(
             }
             Some(_) => {}
             None => {
-                commands.entity(entity).insert(ScatterState::new(&rd, cells));
+                commands
+                    .entity(entity)
+                    .insert(ScatterState::new(&rd, cells));
             }
         }
     }
@@ -312,14 +318,13 @@ pub fn scatter_species(
     let generation = tlas.generation();
     // A disturbed field re-grows every frame, so plants spring back as it decays.
     let field = field.address(time.elapsed_secs_f64());
-    let mut jobs: Vec<(vk::Buffer, SpeciesTables, ScatterPush)> = Vec::new();
+    let mut jobs: Vec<(vk::Buffer, SpeciesTables, ScatterPush, InstanceBlockSlots)> = Vec::new();
     // Plants appear or vanish (the window moved, the pages or the species changed): the TLAS
     // rebuilds. Wind and the interaction field only bend them (rows moved, poses swapped): a
     // refit.
     let mut structural = false;
-    let wave_now = |spec: &ScatterSpecies| {
-        (time.elapsed_secs_f64() * spec.wind_speed as f64).fract() as f32
-    };
+    let wave_now =
+        |spec: &ScatterSpecies| (time.elapsed_secs_f64() * spec.wind_speed as f64).fract() as f32;
     for (entity, spec, child_of, block, slots, mut state) in &mut species {
         let Some((landscape, pages, transform)) = std::iter::once(child_of.parent())
             .chain(parents.iter_ancestors(child_of.parent()))
@@ -331,7 +336,7 @@ pub fn scatter_species(
         if landscape.sphere.is_some() {
             continue;
         }
-        if !pages.is_complete() || !tlas.block_ready(*slots) {
+        if !pages.is_complete() || !tlas.block_resolved(*slots) {
             continue;
         }
         let width = spec.width();
@@ -377,7 +382,6 @@ pub fn scatter_species(
             tables.prev_wave = prev;
             tables.prev_valid = 1;
         }
-        tables.prev_instances = tlas.prev_instances_address();
         tables.capacity = block.capacity;
         tables.keep = state.keep.address;
         tables.groups = state.groups.address;
@@ -385,12 +389,10 @@ pub fn scatter_species(
         state.last = Some((cell0, generation));
         state.last_wave = Some(wave);
         let push = ScatterPush {
-            instances: tlas.instances_address(),
             materials: pages.materials_address(),
             tables: state.tables.address,
             field,
             pool: pages.pool(),
-            first: slots.first,
             width,
             cell0_x: cell0.x,
             cell0_z: cell0.y,
@@ -407,18 +409,28 @@ pub fn scatter_species(
             wave,
             inner_radius: spec.inner_radius,
             fade: spec.fade,
+            pad: 0,
         };
-        jobs.push((state.tables.handle, tables, push));
+        jobs.push((state.tables.handle, tables, push, *slots));
     }
     if jobs.is_empty() {
         return;
     }
     // Recorded into the frame's command buffer, ahead of the TLAS build that reads the rows.
     let kernel = kernels.scatter.clone();
-    frame.push(move |rd, modules, cmd| {
+    frame.push(move |rd, modules, cmd, ctx| {
         let Some(module) = modules.get(&kernel) else {
             return;
         };
+        // Each block's rows as the instance arrays stand now (a block resolved when the step was
+        // planned stays so; one that is not is left for a later frame).
+        let jobs: Vec<(vk::Buffer, SpeciesTables, ScatterPush)> = jobs
+            .into_iter()
+            .filter_map(|(buffer, mut tables, push, slots)| {
+                tables.rows = ctx.block_rows(slots)?;
+                Some((buffer, tables, push))
+            })
+            .collect();
         for (buffer, tables, _) in &jobs {
             unsafe {
                 rd.device
@@ -435,7 +447,15 @@ pub fn scatter_species(
         );
         // Count every species' kept spots, scan them into rows, then write the plants.
         for (_, _, job) in &jobs {
-            record_dispatch(rd, cmd, module, "scatter_count", job, job.width * job.width, None);
+            record_dispatch(
+                rd,
+                cmd,
+                module,
+                "scatter_count",
+                job,
+                job.width * job.width,
+                None,
+            );
         }
         compute_to_compute_barrier(rd, cmd);
         for (_, _, job) in &jobs {
@@ -443,7 +463,15 @@ pub fn scatter_species(
         }
         compute_to_compute_barrier(rd, cmd);
         for (_, _, job) in &jobs {
-            record_dispatch(rd, cmd, module, "scatter_write", job, job.width * job.width, None);
+            record_dispatch(
+                rd,
+                cmd,
+                module,
+                "scatter_write",
+                job,
+                job.width * job.width,
+                None,
+            );
         }
     });
     if structural {

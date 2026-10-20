@@ -339,7 +339,7 @@ fn prepare_water_waves(
         let texels = [set.texels[0].handle, set.texels[1].handle];
         let images = [set.textures[0].image, set.textures[1].image];
         let module = waves.module.clone();
-        commands.push(move |rd, modules, cmd| {
+        commands.push(move |rd, modules, cmd, _| {
             let Some(module) = modules.get(&module) else {
                 return;
             };

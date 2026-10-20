@@ -184,7 +184,7 @@ pub fn update_field(
     // the GPU every frame.
     let pushers = field.pushers.handle;
     let kernel = kernels.interaction.clone();
-    frame.push(move |rd, modules, cmd| {
+    frame.push(move |rd, modules, cmd, _| {
         let Some(module) = modules.get(&kernel) else {
             return;
         };

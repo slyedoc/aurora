@@ -13,16 +13,7 @@
 import pages;
 import materials;
 import interaction;
-
-// VkAccelerationStructureInstanceKHR (instances.slang).
-struct Instance {
-    float4 t0;
-    float4 t1;
-    float4 t2;
-    uint custom_and_mask;
-    uint sbt_and_flags;
-    uint64_t blas;
-};
+import instance_rows;
 
 // `BlockPose` in aurora's tlas_builder.rs.
 struct Pose {
@@ -41,7 +32,8 @@ struct SpeciesTables {
     float prev_wave;
     uint prev_valid;
     uint pad;
-    Instance* prev_instances;
+    // The species' instance block (instance_rows.slang): its rows, this frame's and last.
+    BlockRows rows;
     // ScatterSpecies::clump, clump_size, edge_scale.
     float clump;
     float clump_size;
@@ -56,15 +48,13 @@ struct SpeciesTables {
     uint* total_out;
 };
 
-// `ScatterPush` in scatter.rs (the whole 128-byte block).
+// `ScatterPush` in scatter.rs.
 struct ScatterPush {
-    Instance* instances;
     uint2* materials;
     SpeciesTables* tables;
     // The interaction field, or null while nothing disturbs it.
     FieldTexel* field;
     PagePool pool;
-    uint first;
     uint width;
     int cell0_x;
     int cell0_z;
@@ -83,6 +73,7 @@ struct ScatterPush {
     // Ring the species grows in around the viewer, each edge dithered over `fade` metres.
     float inner_radius;
     float fade;
+    uint pad;
 };
 [[vk::push_constant]] ScatterPush push;
 
@@ -229,10 +220,8 @@ void place(Spot sp, inout uint h, uint row) {
         lean *= 1.5 / lean_len;
     }
     let tall = scale / sqrt(1.0 + dot(lean, lean));
-    var r = Instance();
-    r.t0 = float4(c, lean.x * tall, sn, at.x);
-    r.t1 = float4(0.0, tall, 0.0, at.y);
-    r.t2 = float4(-sn, lean.y * tall, c, at.z);
+    Transform r = { float4(c, lean.x * tall, sn, at.x), float4(0.0, tall, 0.0, at.y),
+                    float4(-sn, lean.y * tall, c, at.z) };
     var prev = r;
 
     let pose_count = push.seed_poses >> 24;
@@ -253,25 +242,14 @@ void place(Spot sp, inout uint h, uint row) {
         prev.t0.y += c * prev_g;
         prev.t2.y -= sn * prev_g;
         let pose = tables.poses[k];
-        push.instances[row].blas = pose.blas;
-        push.instances[row].sbt_and_flags = pose.sbt_and_flags;
+        writePose(tables.rows, row, pose.blas, pose.sbt_and_flags);
     }
-    push.instances[row].t0 = r.t0;
-    push.instances[row].t1 = r.t1;
-    push.instances[row].t2 = r.t2;
-    tables.prev_instances[row].t0 = prev.t0;
-    tables.prev_instances[row].t1 = prev.t1;
-    tables.prev_instances[row].t2 = prev.t2;
+    writeRow(tables.rows, row, r, prev);
 }
 
 // An inactive row: no transform (traces nothing), this frame and last.
 void clear_row(uint row) {
-    push.instances[row].t0 = float4(0.0);
-    push.instances[row].t1 = float4(0.0);
-    push.instances[row].t2 = float4(0.0);
-    push.tables.prev_instances[row].t0 = float4(0.0);
-    push.tables.prev_instances[row].t1 = float4(0.0);
-    push.tables.prev_instances[row].t2 = float4(0.0);
+    writeRow(push.tables.rows, row, noTransform(), noTransform());
 }
 
 groupshared uint keep_mask[2];
@@ -348,7 +326,7 @@ void scatter_write(uint3 gid: SV_DispatchThreadID, uint3 lid: SV_GroupThreadID,
     let group_count = (push.width * push.width + 63u) / 64u;
     let total = tables.groups[group_count];
     if (i < tables.capacity && i >= total) {
-        clear_row(push.first + i);
+        clear_row(i);
     }
     if (i >= push.width * push.width) {
         return;
@@ -368,5 +346,5 @@ void scatter_write(uint3 gid: SV_DispatchThreadID, uint3 lid: SV_GroupThreadID,
     }
     var h = 0u;
     let sp = spot(i, h);
-    place(sp, h, push.first + row);
+    place(sp, h, row);
 }

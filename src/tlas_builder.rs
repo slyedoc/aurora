@@ -32,7 +32,8 @@ use crate::{
     assets::aurora_asset,
     blas::{AccelerationStructure, RTXMaterial},
     compute::{
-        CompiledComputeModule, ComputeModule, ComputeModules, memory_barrier, record_dispatch,
+        BlockRows, CompiledComputeModule, ComputeModule, ComputeModules, memory_barrier,
+        record_dispatch,
     },
     gpu_transform::{GpuNode, GpuTransforms, NO_NODE, ensure_staging, upload_slice},
     material::{AuroraMaterial, AuroraMaterial3d},
@@ -172,7 +173,7 @@ fn assign_gpu_instances(
     blocks: Query<
         (Entity, &InstanceBlock),
         (
-            Or<(With<AuroraMesh3d>, With<ProceduralMesh3d>)>,
+            Or<(With<AuroraMesh3d>, With<ProceduralMesh3d>, With<Sphere>)>,
             With<Transform>,
             Without<GpuInstance>,
         ),
@@ -498,16 +499,36 @@ impl TLAS {
         self.generation
     }
 
-    /// The instance array holds the block's slots and their static half (mesh, material,
-    /// poses) is resolved: a kernel may write its rows.
-    pub fn block_ready(&self, block: InstanceBlockSlots) -> bool {
-        self.capacity >= block.first + block.count
-            && self
-                .mirror
-                .get((block.first + block.count - 1) as usize)
-                .is_some_and(|r| r.blas != 0)
+    /// The block's static half (mesh, material, poses) is resolved: its rows are worth writing.
+    pub fn block_resolved(&self, block: InstanceBlockSlots) -> bool {
+        self.mirror
+            .get((block.first + block.count - 1) as usize)
+            .is_some_and(|r| r.blas != 0)
             && !self.pending.contains(&block.first)
             && self.block_poses.contains_key(&block.first)
+    }
+
+    /// The rows a kernel writes for `block`: resolved, and inside the instance arrays as they
+    /// stand (after [`Self::prepare_storage`], every slot handed out is).
+    pub(crate) fn block_rows(&self, block: InstanceBlockSlots) -> Option<BlockRows> {
+        (block.count > 0
+            && self.capacity >= block.first + block.count
+            && self.block_resolved(block))
+        .then(|| BlockRows {
+            rows: self.instances_buf.address + block.first as u64 * 64,
+            prev: self.prev_instances_buf.address + block.first as u64 * 64,
+            count: block.count,
+            pad: 0,
+        })
+    }
+
+    /// Grows the instance table to every slot handed out. First in the frame's commands, ahead
+    /// of anything that writes rows (`snapshot_prev`, the frame commands), so no writer sees a
+    /// table shorter than its slots.
+    pub fn prepare_storage(&mut self, rd: &RenderDevice, cmd: vk::CommandBuffer) {
+        if self.count > self.capacity {
+            self.grow(rd, cmd);
+        }
     }
 
     /// The block's pose meshes, resolved, in [`InstanceBlock::poses`] order.
@@ -753,12 +774,7 @@ impl TLAS {
             return;
         }
 
-        let mut transfers = false;
-        if self.count > self.capacity {
-            self.grow(rd, cmd);
-            transfers = true;
-        }
-        transfers |= self.materials.upload(rd, cmd);
+        let transfers = self.materials.upload(rd, cmd);
         // Rows the frame's queued kernels wrote (the landscape scatter) land before the
         // gather and the build.
         memory_barrier(

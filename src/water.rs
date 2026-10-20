@@ -150,7 +150,13 @@ pub enum WaterKind {
 }
 
 impl WaterKind {
-    pub const ALL: [Self; 5] = [Self::Lake, Self::River, Self::Ocean, Self::Pond, Self::Swamp];
+    pub const ALL: [Self; 5] = [
+        Self::Lake,
+        Self::River,
+        Self::Ocean,
+        Self::Pond,
+        Self::Swamp,
+    ];
 
     pub fn material(self) -> WaterMaterial {
         match self {

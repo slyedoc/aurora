@@ -364,7 +364,7 @@ fn prepare_sky_gen(
         let radiance_buffer = slot.radiance.handle;
         let image = slot.texture.unwrap().image;
         let module = module.clone();
-        commands.push(move |rd, modules, cmd| {
+        commands.push(move |rd, modules, cmd, _| {
             let Some(module) = modules.get(&module) else {
                 return;
             };
@@ -513,7 +513,7 @@ fn filter_hdr(
         ..default()
     };
     let radiance = slot.radiance.handle;
-    commands.push(move |rd, modules, cmd| {
+    commands.push(move |rd, modules, cmd, _| {
         for t in &scratch {
             rd.destroyer.destroy_image_view(t.image_view);
             rd.destroyer.destroy_image(t.image);

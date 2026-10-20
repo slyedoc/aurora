@@ -822,9 +822,12 @@ pub fn evaluate_pages(
         let Some(passes) = height_passes(landscape, &order, &height_layers, &sculpts) else {
             continue;
         };
-        let Some(mat_passes) =
-            material_passes(pages.pool(), &material_order, &material_layers, ring.is_none())
-        else {
+        let Some(mat_passes) = material_passes(
+            pages.pool(),
+            &material_order,
+            &material_layers,
+            ring.is_none(),
+        ) else {
             continue;
         };
 
