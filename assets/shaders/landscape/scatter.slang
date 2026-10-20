@@ -244,5 +244,20 @@ void scatter(uint3 gid: SV_DispatchThreadID) {
         let pose = push.tables.poses[k];
         push.instances[slot].blas = pose.blas;
         push.instances[slot].sbt_and_flags = pose.sbt_and_flags;
+        // Motion vectors see only the transform: a pose swap changes the geometry under it
+        // while the shear drops back a step, so last frame's row would report the plant
+        // springing back. Re-express last frame's lean against this frame's pose (one pose step
+        // ~ wind_shear, the approximation the sway itself makes) and the motion is the true step.
+        let prev = push.tables.prev_instances + slot;
+        if (prev.blas != pose.blas && any(prev.t1 != float4(0.0))) {
+            for (uint j = 0u; j < pose_count; j++) {
+                if (push.tables.poses[j].blas == prev.blas) {
+                    let dg = (float(j) - float(k)) * push.tables.wind_shear;
+                    prev.t0.y += c * dg;
+                    prev.t2.y -= sn * dg;
+                    break;
+                }
+            }
+        }
     }
 }
