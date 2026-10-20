@@ -27,7 +27,7 @@ use crate::{
     render_device::RenderDevice,
     render_texture::{RenderTexture, create_blank_texture_mipped, record_mip_chain},
     vk_init,
-    water_volume::{WaterMaterial, WaterMaterial3d, WaterVolume},
+    water::{WaterMaterial, WaterMaterial3d, WaterSurface},
 };
 
 /// Texels along a cascade's side (water_fft.slang `N`).
@@ -277,7 +277,7 @@ fn prepare_water_waves(
     rd: Res<RenderDevice>,
     time: Res<Time>,
     reference: Res<ReferenceState>,
-    volumes: Query<(&WaterMaterial3d, &InheritedVisibility), With<WaterVolume>>,
+    volumes: Query<(&WaterMaterial3d, &InheritedVisibility), With<WaterSurface>>,
     materials: Res<Assets<WaterMaterial>>,
     mut waves: ResMut<WaterWaves>,
     mut commands: ResMut<FrameCommands>,
@@ -445,7 +445,7 @@ impl Plugin for WaterWavesPlugin {
             Last,
             prepare_water_waves
                 .in_set(RenderSet::Prepare)
-                .before(crate::water_volume::upload_water_volumes),
+                .before(crate::water::upload_water_media),
         )
         .add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }

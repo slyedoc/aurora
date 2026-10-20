@@ -38,8 +38,12 @@ public struct Material {
     public float diffuse_transmission;
     public float clearcoat;
     public float clearcoat_roughness;
-    public uint pad;
+    // blas.rs `material_flags`.
+    public uint flags;
+    public float uv_scroll_x, uv_scroll_y;
 };
+
+public static const uint MATERIAL_WATER = 1u;
 
 // `Triangle` in blas.rs (32 bytes).
 public struct Triangle {
@@ -53,6 +57,7 @@ public struct Triangle {
 // ray_render_plugin.rs.
 static const uint UNIFORM_LOD_BIAS_FLOAT = 94;
 static const uint UNIFORM_EMISSIVE_BOOST_FLOAT = 103;
+static const uint UNIFORM_CLOCK_FLOAT = 113;
 
 // `PushConstants` in rt_types.slang, up to the last field a hit shader reads.
 public struct PushConstants {
@@ -246,7 +251,8 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
 
     let tri = record.triangle_data[record.triangles[GeometryIndex()].v + PrimitiveIndex()];
     hit.uv = unpackUv(tri.uv0) * hit.bary.x + unpackUv(tri.uv1) * hit.bary.y
-        + unpackUv(tri.uv2) * hit.bary.z;
+        + unpackUv(tri.uv2) * hit.bary.z
+        + float2(hit.material.uv_scroll_x, hit.material.uv_scroll_y) * pc.uniforms[UNIFORM_CLOCK_FLOAT];
     hit.object_normal = unpackNormal(tri.n0) * hit.bary.x + unpackNormal(tri.n1) * hit.bary.y
         + unpackNormal(tri.n2) * hit.bary.z;
     hit.tangent = unpackNormal(tri.tangent);

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Water Medium Tracking</title>
+<style>
+:root {
+  --bg: #fbfaf7; --fg: #1d1d1b; --muted: #6b6a66; --line: #e2dfd8; --card: #ffffff;
+  --accent: #2f6f8f; --rec: #2e7d4f; --warn: #a3561d; --code: #f2efe9;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --fg: #e9e7e2; --muted: #9b998f; --line: #2e2d2a; --card: #1e1e1c;
+    --accent: #7fb6d1; --rec: #7cc79a; --warn: #e0a06a; --code: #262522;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161615; --fg: #e9e7e2; --muted: #9b998f; --line: #2e2d2a; --card: #1e1e1c;
+  --accent: #7fb6d1; --rec: #7cc79a; --warn: #e0a06a; --code: #262522;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 920px; margin: 0 auto; padding: 32px 16px 80px; }
+h1 { font-size: 1.7rem; margin: 0 0 4px; }
+h2 { font-size: 1.25rem; margin: 40px 0 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+h3 { font-size: 1.05rem; margin: 22px 0 6px; }
+p, li { max-width: 74ch; }
+.sub { color: var(--muted); margin: 0 0 24px; }
+code, pre { font: 0.88em/1.45 ui-monospace, "SF Mono", Menlo, monospace; background: var(--code); border-radius: 4px; }
+code { padding: 1px 4px; }
+pre { padding: 12px 14px; overflow-x: auto; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin: 14px 0; }
+.card h3 { margin-top: 0; }
+.tag { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 1px 7px; border-radius: 10px;
+  border: 1px solid currentColor; margin-right: 6px; }
+.rec { color: var(--rec); } .warn { color: var(--warn); } .alt { color: var(--muted); }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.93rem; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.wrap { overflow-x: auto; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>Water Medium Tracking</h1>
+<p class="sub">Every lake gets depth and colour: the water's medium is tracked along paths by its
+surface crossings in the main TLAS, not looked up in a capped table of boxes. Plus WoW's water
+types. A "lighter B": the camera is assumed above water. Plan, 2026-10-20.</p>
+
+<div class="card">
+<strong>Why.</strong> Today a water's medium is a <code>WaterVolume</code> box, and every water lookup
+(shadow rays, path segments, ReSTIR reconnections, the surface hit) loops over a table of boxes.
+That table is capped at the 64 nearest the camera (<code>MAX_WATER_VOLUMES</code>), so on the full
+WoW map (5,815 boxes) most lakes have no medium and render as clear glass. The surfaces are already in
+the main TLAS, and a path already hits them going in and out: track "in water" on the path, the way
+offline path tracers track media (PBRT medium interfaces, Cycles' volume stack), one level deep.
+</div>
+
+<h2>1. Decisions to review</h2>
+
+<div class="card">
+<h3>D1. Scope: lighter B</h3>
+<ul>
+<li><b>Kept:</b> per-path in-water state; absorption and the murk's scattering on in-water segments;
+underwater shadow/NEE (the sun reaching a lake bed); ReSTIR GI/PT segments through one helper;
+a leak guard.</li>
+<li><b>Dropped for now:</b> starting underwater (no camera probe: a path starts out of water); nested
+media (water in glass); <code>WaterVolume</code> boxes entirely.</li>
+<li><b>Later, small and separate:</b> a per-frame camera-underwater probe (one ray up against water
+surfaces, Cycles' "volume stack init") turns diving on.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>D2. Where a water's material lives: on the surface</h3>
+<p><code>WaterSurface</code> requires <code>WaterMaterial3d</code> (moved from <code>WaterVolume</code>).
+Its row in a GPU water-material table rides the existing per-material surface-class row
+(<code>SurfaceGroupData::set_row</code>, read in shaders as the material record's
+<code>surface_param_index</code>): the water class's row <em>is</em> the medium index. The shadow
+any-hit also needs to know a hit is water: a flag bit in the material record (see M3).</p>
+</div>
+
+<div class="card">
+<h3>D3. WoW water types: a <code>WaterKind</code> preset component</h3>
+<p><code>WaterKind { Lake, River, Ocean, Pond, Swamp }</code> on a surface (reflected, an enum
+jackdaw edits) inserts the matching shared preset <code>WaterMaterial3d</code> (aurora keeps one
+asset per kind, so a kind shares one FFT wave job). Presets: <code>CLEAR_LAKE</code>,
+<code>RIVER</code> (new: clear-green, shorter waves), <code>OCEAN</code> (new: deeper blue-green, long
+waves), <code>MURKY_POND</code>, <code>SWAMP</code>.</p>
+<div class="wrap"><table>
+<tr><th>MH2O <code>liquidType</code></th><th>Imported as</th></tr>
+<tr><td>2 (ocean)</td><td><code>WaterKind::Ocean</code> surface</td></tr>
+<tr><td>5, 301 and any other non-magma</td><td><code>WaterKind::Lake</code>; cells that slope
+(corner heights differ) <code>WaterKind::River</code></td></tr>
+<tr><td>7 (magma)</td><td>an opaque, emissive lava surface (an <code>AuroraMaterial</code>: dark red base,
+orange emissive, rough), no <code>WaterSurface</code>, no medium</td></tr>
+</table></div>
+</div>
+
+<div class="card">
+<h3>D4. One crossing per straight segment</h3>
+<p>A shadow ray or reconnection segment is assumed to cross the water surface at most once: its any-hit
+keeps the <em>nearest</em> water crossing. Paths crossing twice in one straight segment (in and out
+again through a wave) are rare and get the first crossing only.</p>
+</div>
+
+<div class="card">
+<h3>D5. Refraction stays approximated for shadows</h3>
+<p>As now: a shadow ray passes the surface straight, takes the Fresnel transmittance and the underwater
+length along the refracted direction for the same depth. No caustics from shadow rays (offline engines
+do the same).</p>
+</div>
+
+<h2>2. Types and interfaces</h2>
+<pre>// aurora src/water_volume.rs (rename the module to water.rs if you like; keep the plugin name)
+#[derive(Component, Reflect, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[reflect(Component, Default)]
+#[require(WaterSurface)]
+pub enum WaterKind { #[default] Lake, River, Ocean, Pond, Swamp }
+
+#[derive(Component, Reflect, Clone, Copy, Debug, Default)]
+#[reflect(Component, Default)]
+#[require(WaterMaterial3d)]
+pub struct WaterSurface;          // was a bare marker; now carries the medium via WaterMaterial3d
+
+// WaterMaterial gains: pub const RIVER, pub const OCEAN
+// Resource WaterPresets: one Handle&lt;WaterMaterial&gt; per WaterKind (Assets::add at finish()).
+// A WaterKind added/changed -> insert WaterMaterial3d(presets[kind]).
+// WaterVolume, GpuWaterVolume's transform rows, WaterVolumeTable's per-volume rows: removed.
+
+// GPU: a water-material table (one row per WaterMaterial in use), replacing the volume table:
+struct GpuWaterMedium { absorption: [f32;3], ior: f32, scattering: [f32;3], anisotropy: f32,
+                        wave_direction: [f32;2], wavelength: f32, steepness: f32, wave_speed: f32,
+                        wave_tex: [u32;2], wave_tile: f32 }   // = GpuWaterVolume less `rows`</pre>
+<p>The uniform keeps two fields under new names: <code>water_volumes</code> -> the medium table's
+address, <code>water_volume_count</code> -> its row count (same offsets: the layout tests in
+<code>ray_render_plugin.rs</code> pin them, and <code>water_surface.slang</code> reads them as float
+indices 98 and 187).</p>
+
+<h2>3. What changes in the shaders</h2>
+<div class="wrap"><table>
+<tr><th>Today (box table)</th><th>After</th></tr>
+<tr><td><code>water_surface.slang</code> finds its volume by position (loop over boxes) for waves and
+medium</td><td>reads its medium row from <code>surface_param_index</code>; same waves code</td></tr>
+<tr><td>path loop: <code>waterSegment(u, o, d, t)</code> over box spans (raygen ~2090)</td><td>path
+state <code>water</code> (0 = none, else row+1). Refracting <em>down</em> through a water surface sets
+it, <em>up</em> clears it. While set, the segment's free flight runs in that one medium over [0, t]
+(the existing collision/survival maths, one span)</td></tr>
+<tr><td>shadow/NEE: <code>waterLightTransmittance(u, x, l, t)</code> (raygen 242, 430, 668, 2229)</td>
+<td><code>waterAlong(state, crossing, l, t)</code>: the shadow trace's any-hit returns the nearest water
+crossing (t, row, facing); in water at the start: medium up to the crossing, then Fresnel; out of
+water and the ray enters: Fresnel, then medium to t</td></tr>
+<tr><td>primary pass <code>waterSurvivalWeight</code> (raygen 1103)</td><td>same, over the camera
+segment's in-water part (state from the path)</td></tr>
+<tr><td>ReSTIR PT replay / reconnection <code>waterTransmittance</code> (raygen 1288, 1355, 1406)</td>
+<td>replay re-traces its prefix, so it tracks the state itself; a reconnection segment uses
+<code>waterAlong</code> with the start vertex's state and its visibility ray's crossing</td></tr>
+</table></div>
+
+<h2>4. Steps (each builds and runs on its own)</h2>
+<ol>
+<li><b>M1 Material on the surface.</b> <code>WaterSurface</code> requires <code>WaterMaterial3d</code>;
+<code>WaterKind</code>, <code>WaterPresets</code>, <code>RIVER</code>/<code>OCEAN</code> consts; the medium
+table (one row per material in use) replaces the volume table; the water class's
+<code>SurfaceGroupData::set_row</code> per surface material gives each surface its row.
+<code>water_surface.slang</code> reads its row instead of searching boxes. <i>Check:</i> the pond
+example's surface looks as before (waves, Fresnel), still with its old box for the medium.</li>
+<li><b>M2 Path state.</b> The in-water state in the path loop (set on refraction down through a
+water-class hit, cleared on refraction up); in-water segments take absorption + free-flight scattering
+from that row; the leak guard (in water, hitting a water surface from above: resync to that surface).
+<code>waterSegment</code> becomes a one-medium function. <i>Check:</i> the pond's depth tiles.</li>
+<li><b>M3 Shadow crossings.</b> <code>ShadowPayload</code> grows <code>water_t</code> and
+<code>water_row</code> (+ facing); the material record gets a water flag bit, set for water-class
+materials; <code>shadow_any_hit</code> keeps the nearest water hit before ignoring it (transmissive
+surfaces already pass). <code>waterAlong</code> replaces <code>waterLightTransmittance</code> at every
+call site. <i>Check:</i> the sunlit lake bed in the pond, against a reference.</li>
+<li><b>M4 ReSTIR.</b> PT replay tracks state from its re-traced hits; reconnection and GI segments use
+<code>waterAlong</code>. <i>Check:</i> ReSTIR GI on vs off, unbiased under water and from the bank.</li>
+<li><b>M5 Boxes out, WoW in.</b> Remove <code>WaterVolume</code> and its code; the pond example keeps
+just its surface (<code>WaterKind::Lake</code> or the inspector's material). aurora_files' WoW
+importer: drop <code>water_boxes</code> and <code>terrain_cell_floor</code>; emit one surface per
+liquid kind per tile (ocean / lake / river cells), each with its <code>WaterKind</code>; magma as the
+lava surface. Rebake the full map (<code>wow_import --all ... --out-dir zero/assets/wow_ek</code>) and,
+if wanted, Northshire.</li>
+</ol>
+
+<h2>5. Verification</h2>
+<ul>
+<li><b>Pond (aurora <code>examples/water.rs</code>):</b> the tiles at 0.25, 0.5, 1, 1.5, 2, 3 m within
+5% of Beer-Lambert, as W1 measured (<code>docs/plans/water.md</code>); a reference capture
+(<code>--capture</code>/<code>refcmp.py</code>, or the zero MCP <code>capture</code> tool).</li>
+<li><b>Bias:</b> ReSTIR GI on vs off under water and from the bank (refcmp on the two runs), as W2 did.</li>
+<li><b>WoW:</b> lakes beyond the old 64-box radius now tinted (the Loch Modan view from
+<code>examples/eastern_kingdoms</code>); an ocean shore; a magma pool in the Burning Steppes glowing.</li>
+<li><b>Cost:</b> <code>aurora.timing</code> before/after on the full map (the box loop is gone; the
+shadow payload grew).</li>
+</ul>
+
+<h2>6. Working notes</h2>
+<ul>
+<li>Keep <code>docs/plans/water-medium-notes.md</code>: decisions while building, <b>Deviations</b> (pick
+the conservative option, log it, keep going), results.</li>
+<li>Test with the zero MCP server or a headless run (<code>--features remote --headless 1280x720
+--timeout N</code>) driven over BRP on port 15702. <b>Check the port first:</b> if the user's own game is
+running (<code>ps</code> shows <code>examples/eastern_kingdoms</code> or <code>release/zero</code>
+without <code>--headless</code>), it owns the port; don't send it commands, and never kill it.</li>
+<li>Build binaries with <code>--features remote</code>: a plain build replaces the same file without it.</li>
+<li>Commit only when asked.</li>
+</ul>
+</main>
+</body>
+</html>

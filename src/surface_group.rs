@@ -53,6 +53,15 @@ pub struct SurfaceGroup {
     pub any_hit: Option<Handle<Shader>>,
 }
 
+/// An instance's own row in its class's parameter array (over its material's,
+/// [`SurfaceGroupData::row`]) and bits OR'd into its material record's flags
+/// ([`material_flags`](crate::blas::material_flags)).
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SurfaceRow {
+    pub row: u32,
+    pub flags: u32,
+}
+
 /// The registered surface groups, in class order.
 #[derive(Resource, Default)]
 pub struct SurfaceGroupRegistry {

@@ -1,14 +1,11 @@
-// A water volume's table row and its surface's waves, shared by the raygen (rt_types, water.slang)
+// A water medium's table row and its surface's waves, shared by the raygen (rt_types, water.slang)
 // and the water surface's closest-hit (water_surface.slang), which has no `rt_types`.
 module water_types;
 
-// One water volume (src/water_volume.rs `GpuWaterVolume`): world to unit-local rows, the medium
-// (absorption and scattering per metre, Henyey-Greenstein g), the surface's index of refraction
-// and its waves (direction of travel, longest wavelength in metres, steepness k A, speed scale).
-public struct WaterVolumeGpu {
-    public float4 row0;
-    public float4 row1;
-    public float4 row2;
+// One water material (src/water.rs `GpuWaterMedium`): the medium (absorption and scattering per
+// metre, Henyey-Greenstein g), the surface's index of refraction and its waves (direction of
+// travel, longest wavelength in metres, steepness k A, speed scale).
+public struct WaterMediumGpu {
     public float absorption_r, absorption_g, absorption_b;
     public float ior;
     public float scattering_r, scattering_g, scattering_b;
@@ -27,20 +24,16 @@ public static const float WATER_CASCADE_RATIO = 6.7;
 // Texels along a cascade's side (water_waves.rs `WAVE_N`).
 public static const uint WATER_WAVE_N = 256u;
 
-public float3 waterLocal(WaterVolumeGpu v, float4 p) {
-    return float3(dot(v.row0, p), dot(v.row1, p), dot(v.row2, p));
-}
-
 static const uint WATER_WAVES = 12u;
 static const float WATER_G = 9.81;
 
 // The surface's slope (dh/dx, dh/dz) at world `xz` and `time`: WATER_WAVES sines, each 0.73x
 // the last's wavelength, their directions fanned about the wind by a fixed golden-angle spread,
 // each moving at deep water's speed for its wavelength (omega^2 = g k) and as steep as the
-// volume's steepness. A wave shorter than `footprint` (the ray cone's width there) cannot be
+// water's steepness. A wave shorter than `footprint` (the ray cone's width there) cannot be
 // resolved by one sample: it fades out of the slope into `slope_var`, the slope variance the
 // surface's roughness takes instead (LEAN mapping's idea: unresolved bumps are microfacets).
-public float2 waterWaveSlope(WaterVolumeGpu v, float2 xz, float time, float footprint,
+public float2 waterWaveSlope(WaterMediumGpu v, float2 xz, float time, float footprint,
                              out float slope_var) {
     slope_var = 0.0;
     var slope = float2(0.0);

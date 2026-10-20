@@ -27,7 +27,7 @@ use bevy_aurora::{
     sky::Sky,
     sphere::Sphere,
     util::ScreenshotExt,
-    water_volume::{WaterMaterial, WaterMaterial3d, WaterSurface, WaterVolume},
+    water::{WaterMaterial, WaterMaterial3d, WaterSurface},
 };
 
 /// The bank's edge (where the slope starts, just above the water) and the slope's foot.
@@ -217,8 +217,8 @@ fn setup(
         Transform::from_xyz(4.0, 0.0, 4.0).with_scale(Vec3::splat(1.2)),
     ));
 
-    // The water: a plane, seen from both sides, is the surface (Fresnel and refraction); the
-    // volume under it, down to the bottom, is the medium, a shared material.
+    // The water: a plane, seen from both sides, is the surface (Fresnel and refraction); below it
+    // is its material's medium, down to whatever the path meets next.
     let water = WaterMaterial::CLEAR_LAKE;
     let ior = water.ior;
     let water = water_materials.add(water);
@@ -244,17 +244,8 @@ fn setup(
             ..default()
         })),
         WaterSurface,
-        Transform::from_xyz(0.0, 0.0, (SHORE_Z + FAR_Z) * 0.5),
-    ));
-    let bottom = -DEPTH - 0.4;
-    commands.spawn((
-        ChildOf(environment),
-        Name::new("Water Volume"),
-        WaterVolume {
-            half_extents: Vec3::new(HALF_W, -bottom * 0.5, (FAR_Z - SHORE_Z) * 0.5),
-        },
         WaterMaterial3d(water.clone()),
-        Transform::from_xyz(0.0, bottom * 0.5, (SHORE_Z + FAR_Z) * 0.5),
+        Transform::from_xyz(0.0, 0.0, (SHORE_Z + FAR_Z) * 0.5),
     ));
 
     // The water's inspector, on the left (the dev panel, F3, keeps the right).

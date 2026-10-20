@@ -1,41 +1,32 @@
-// Water volumes (src/water_volume.rs): a homogeneous medium in each box, crossed analytically
-// (no medium tracking). Volumes are upright: local +y is the surface's normal.
+// Water media (src/water.rs): each water surface's material names a homogeneous medium below it.
+// A path tracks which water it is in (a water id: medium row + 1, 0 none) by its crossings of the
+// surfaces (raygen.slang); one medium at a time (no nesting), entered from above only.
 module water;
 
 import rt_types;
 
-// Where a ray crosses a volume's box, clipped to [0, t_max], and whether it enters (`top_in`) or
-// leaves (`top_out`) through the surface. False when it misses the box.
-bool waterSpan(WaterVolumeGpu v, float3 o, float3 d, float t_max, out float t0, out float t1,
-               out bool top_in, out bool top_out) {
-    let lo = waterLocal(v, float4(o, 1.0));
-    let ld = waterLocal(v, float4(d, 0.0));
-    let inv = 1.0 / select(abs(ld) < 1.0e-12, float3(1.0e-12), ld);
-    let a = (float3(-1.0) - lo) * inv;
-    let b = (float3(1.0) - lo) * inv;
-    let n = min(a, b);
-    let f = max(a, b);
-    let enter = max(n.x, max(n.y, n.z));
-    let leave = min(f.x, min(f.y, f.z));
-    t0 = max(enter, 0.0);
-    t1 = min(leave, t_max);
-    top_in = ld.y < 0.0 && enter >= 0.0 && n.y >= max(n.x, n.z);
-    top_out = ld.y > 0.0 && leave <= t_max && f.y <= min(f.x, f.z);
-    return t1 > t0;
+// The water id's medium, or false for none (or a row past the table).
+bool waterMedium(UniformData* u, uint water, out WaterMediumGpu v) {
+    if (water == 0u || water > u.water_medium_count) {
+        v = {};
+        return false;
+    }
+    v = u.water_media[water - 1u];
+    return true;
 }
 
-float3 waterScattering(WaterVolumeGpu v) {
+float3 waterScattering(WaterMediumGpu v) {
     return float3(v.scattering_r, v.scattering_g, v.scattering_b);
 }
 
 // Extinction per metre: absorption plus scattering.
-float3 waterExtinction(WaterVolumeGpu v) {
+float3 waterExtinction(WaterMediumGpu v) {
     return float3(v.absorption_r, v.absorption_g, v.absorption_b) + waterScattering(v);
 }
 
 // The density collisions are drawn from: the channels' mean extinction where the water scatters,
 // none where it only absorbs (a collision there would carry nothing).
-float waterMajorant(WaterVolumeGpu v) {
+float waterMajorant(WaterMediumGpu v) {
     let s = waterScattering(v);
     if (max(s.r, max(s.g, s.b)) <= 0.0) {
         return 0.0;
@@ -58,46 +49,53 @@ float waterFresnel(float cos_i, float ior) {
     return 0.5 * (rs * rs + rp * rp);
 }
 
-// A traced segment from `o` along `d` for `t_max`, never scattering (ReSTIR PT's replay and
-// reconnection): the path's own rays refract at the surface mesh themselves, so the length
-// inside is the straight one.
-public float3 waterTransmittance(UniformData* u, float3 o, float3 d, float t_max) {
-    var tau = float3(0.0);
-    let len = length(d);
-    for (uint i = 0u; i < u.water_volume_count; i++) {
-        let v = u.water_volumes[i];
-        float t0, t1;
-        bool top_in, top_out;
-        if (waterSpan(v, o, d, t_max, t0, t1, top_in, top_out)) {
-            tau += waterExtinction(v) * ((t1 - t0) * len);
-        }
+// The water a traced segment ran through: the hit's, when it ended on a water surface from below
+// (whatever the path thought: a leak's resync), none when it ended on one from above, else the
+// path's own `state`. `hit_water` is the hit's water id, `rising` whether the ray met it from
+// below.
+public uint waterOfSegment(uint state, uint hit_water, bool rising) {
+    if (hit_water != 0u) {
+        return rising ? hit_water : 0u;
     }
-    return exp(-tau);
+    return state;
 }
 
-// A shadow ray toward a light from `o` along unit `l` for `t_max`. It passes the surface mesh
-// straight, but the light it stands for was bent there: a ray that crosses the surface takes
-// the Fresnel transmittance and, inside, the length along the refracted direction for the same
-// depth (a flat surface; the refracted path's offset is not traced).
-public float3 waterLightTransmittance(UniformData* u, float3 o, float3 l, float t_max) {
-    var T = float3(1.0);
-    for (uint i = 0u; i < u.water_volume_count; i++) {
-        let v = u.water_volumes[i];
-        float t0, t1;
-        bool top_in, top_out;
-        if (!waterSpan(v, o, l, t_max, t0, t1, top_in, top_out)) {
-            continue;
-        }
-        var len = t1 - t0;
-        if (top_in || top_out) {
-            let cos_air = abs(l.y);
-            let cos_water = sqrt(max(1.0 - (1.0 - cos_air * cos_air) / (v.ior * v.ior), 1.0e-6));
-            len = cos_air * len / cos_water;
-            T *= 1.0 - waterFresnel(cos_air, v.ior);
-        }
-        T *= exp(-waterExtinction(v) * len);
+// The water after a scatter at a vertex: through a water surface, its water when the new
+// direction goes below it, none above; anywhere else the water the path is in.
+public uint waterAfterScatter(uint state, uint vertex_water, bool below) {
+    if (vertex_water != 0u) {
+        return below ? vertex_water : 0u;
     }
-    return T;
+    return state;
+}
+
+// A straight segment from a point in water `state` along unit `d` for `t_max` that was not traced
+// to its end through the surfaces (shadow rays, ReSTIR reconnections): its ray reports the
+// nearest water surface it passed (`cross` at `cross_t`, 0 none). Passing it rising, the start
+// was in that water up to it; falling, the end is in it from there; passing none, the segment is
+// in `state`'s water all along. `bent`: the light the segment stands for was bent at the surface
+// (a shadow ray toward a light), so it takes the surface's Fresnel transmittance and, inside, the
+// length along the refracted direction for the same depth (a flat surface; the refracted path's
+// offset is not traced); else the straight length.
+public float3 waterAlong(UniformData* u, uint state, uint cross, float cross_t, float3 d,
+                         float t_max, bool bent) {
+    WaterMediumGpu v;
+    if (cross != 0u && waterMedium(u, cross, v)) {
+        let rising = d.y > 0.0;
+        var len = rising ? cross_t : max(t_max - cross_t, 0.0);
+        var T = float3(1.0);
+        if (bent) {
+            let cos_air = abs(d.y);
+            let cos_water = sqrt(max(1.0 - (1.0 - cos_air * cos_air) / (v.ior * v.ior), 1.0e-6));
+            len *= cos_air / cos_water;
+            T = float3(1.0 - waterFresnel(cos_air, v.ior));
+        }
+        return T * exp(-waterExtinction(v) * len);
+    }
+    if (waterMedium(u, state, v)) {
+        return exp(-waterExtinction(v) * t_max);
+    }
+    return float3(1.0);
 }
 
 // What a segment met in the water: a collision (`scatter`, at `t`, in a medium of phase
@@ -111,85 +109,56 @@ public struct WaterEvent {
     public float g;
 };
 
-// Free flight from `o` along `d` for `t_max` through every volume it crosses, in order. One
-// density for all three channels (each volume's mean extinction): the collision is drawn against
-// it, and the weight carries the channels' difference (spectral tracking in a homogeneous
-// medium, exact: T / P(no collision) through, sigma_s T / p(t) at a collision). Volumes must not
-// overlap.
-public WaterEvent waterSegment(UniformData* u, float3 o, float3 d, float t_max, float xi) {
+// Free flight through water `water` along a unit direction for `t_max`. One density for all three
+// channels (the mean extinction): the collision is drawn against it, and the weight carries the
+// channels' difference (spectral tracking in a homogeneous medium, exact: T / P(no collision)
+// through, sigma_s T / p(t) at a collision).
+public WaterEvent waterSegment(UniformData* u, uint water, float t_max, float xi) {
     WaterEvent e;
     e.scatter = false;
     e.t = t_max;
     e.weight = float3(1.0);
     e.survive = 1.0;
     e.g = 0.0;
-    let count = u.water_volume_count;
-    if (count == 0u) {
+    WaterMediumGpu v;
+    if (!waterMedium(u, water, v)) {
         return e;
     }
-    let len = length(d);
+    let sigma_t = waterExtinction(v);
+    let sigma_bar = waterMajorant(v);
     // The optical depth (in the drawn density) a collision needs.
-    var depth = -log(max(xi, 1.0e-12));
-    var tau = float3(0.0);
-    var tau_bar = 0.0;
-    var after = -1.0;
-    for (uint step = 0u; step < count; step++) {
-        // The next span along the ray.
-        var best = 0xFFFFFFFFu;
-        var b0 = 0.0;
-        var b1 = 0.0;
-        for (uint i = 0u; i < count; i++) {
-            float t0, t1;
-            bool top_in, top_out;
-            if (waterSpan(u.water_volumes[i], o, d, t_max, t0, t1, top_in, top_out) && t0 > after
-                && (best == 0xFFFFFFFFu || t0 < b0)) {
-                best = i;
-                b0 = t0;
-                b1 = t1;
-            }
-        }
-        if (best == 0xFFFFFFFFu) {
-            break;
-        }
-        after = b0;
-        let v = u.water_volumes[best];
-        let sigma_t = waterExtinction(v);
-        let sigma_bar = waterMajorant(v);
-        let span = (b1 - b0) * len;
-        if (sigma_bar > 0.0 && depth < sigma_bar * span) {
-            let s = depth / sigma_bar;
-            tau += sigma_t * s;
-            tau_bar += sigma_bar * s;
-            e.scatter = true;
-            e.t = b0 + s / len;
-            e.weight = exp(-(tau - tau_bar)) * waterScattering(v) / sigma_bar;
-            e.survive = 0.0;
-            e.g = v.anisotropy;
-            return e;
-        }
-        depth -= sigma_bar * span;
-        tau += sigma_t * span;
-        tau_bar += sigma_bar * span;
+    let depth = -log(max(xi, 1.0e-12));
+    if (sigma_bar > 0.0 && depth < sigma_bar * t_max) {
+        let s = depth / sigma_bar;
+        e.scatter = true;
+        e.t = s;
+        e.weight = exp(-(sigma_t - sigma_bar) * s) * waterScattering(v) / sigma_bar;
+        e.survive = 0.0;
+        e.g = v.anisotropy;
+        return e;
     }
-    e.weight = exp(-(tau - tau_bar));
-    e.survive = exp(-tau_bar);
+    e.weight = exp(-(sigma_t - sigma_bar) * t_max);
+    e.survive = exp(-sigma_bar * t_max);
     return e;
 }
 
-// The weight a segment that did not collide carries (T over the chance of no collision): the
-// primary pass's camera segment, as `main` weighs it.
-public float3 waterSurvivalWeight(UniformData* u, float3 o, float3 d, float t_max) {
-    var tau = float3(0.0);
-    let len = length(d);
-    for (uint i = 0u; i < u.water_volume_count; i++) {
-        let v = u.water_volumes[i];
-        float t0, t1;
-        bool top_in, top_out;
-        if (waterSpan(v, o, d, t_max, t0, t1, top_in, top_out)) {
-            tau += (waterExtinction(v) - waterMajorant(v)) * ((t1 - t0) * len);
-        }
+// The weight a segment in water `water` that did not collide carries (T over the chance of no
+// collision): the primary pass's camera segment, as `main` weighs it.
+public float3 waterSurvivalWeight(UniformData* u, uint water, float t_max) {
+    WaterMediumGpu v;
+    if (!waterMedium(u, water, v)) {
+        return float3(1.0);
     }
-    return exp(-tau);
+    return exp(-(waterExtinction(v) - waterMajorant(v)) * t_max);
+}
+
+// A traced segment that never scatters (ReSTIR PT's replay): its transmittance in `water`.
+public float3 waterTransmittance(UniformData* u, uint water, float t_max) {
+    WaterMediumGpu v;
+    if (!waterMedium(u, water, v)) {
+        return float3(1.0);
+    }
+    return exp(-waterExtinction(v) * t_max);
 }
 
 // Henyey-Greenstein, per steradian; `cos_theta` between the light's travel and the scattered

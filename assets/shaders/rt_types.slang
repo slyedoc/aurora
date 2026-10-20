@@ -172,8 +172,8 @@ public struct UniformData {
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
     public float restir_m_clamp;
-    // Water volumes (src/water_volume.rs): the table (count: water_volume_count).
-    public WaterVolumeGpu* water_volumes;
+    // Water media (src/water.rs): a row per water material (count: water_medium_count).
+    public WaterMediumGpu* water_media;
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -210,7 +210,7 @@ public struct UniformData {
     public float fog_grid_view_proj[16];
     public float fog_grid_prev_view_proj[16];
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
-    public uint water_volume_count;
+    public uint water_medium_count;
     // Bindless 3D images (raygen.slang `volumes`): the grid's columns summed front to back
     // (`fog_integrate`: per cell, the in-scatter and transmittance from the grid's eye to the
     // cell's far side, behind a first slice of nothing) and the grid blurred once across x and
@@ -637,7 +637,9 @@ public RestirSurface restirSurfacePack(float3 position, uint frame, float3 prev_
     s.depth = depth;
     s.albedo_metallic = packUnorm8(a.r) | (packUnorm8(a.g) << 8) | (packUnorm8(a.b) << 16)
         | (packUnorm8(metallic) << 24);
-    s.material = (lobes & 0xFFFFFFu) | (packUnorm8(roughness) << 24);
+    // Without a clear coat its roughness byte is free: restirSetWater keeps the water there.
+    let coat = ((lobes >> 8) & 0xFFu) != 0u;
+    s.material = (lobes & (coat ? 0xFFFFFFu : 0xFFFFu)) | (packUnorm8(roughness) << 24);
     s.throughput_rg = packHalf2(throughput.rg);
     s.throughput_b_mask = (f32tof16(throughput.b) & 0xFFFFu) | ((ray_mask & 0xFFu) << 16);
     s.normal_oct = packHalf2(float32x3_to_oct(n));
@@ -655,6 +657,17 @@ public float3 restirAlbedo(RestirSurface s) {
 
 public float restirMetallic(RestirSurface s) {
     return float(s.albedo_metallic >> 24) / 255.0;
+}
+
+// The water the surface lies in (a water id: medium row + 1, 0 none). Lost under a clear coat.
+public uint restirWater(RestirSurface s) {
+    return ((s.material >> 8) & 0xFFu) == 0u ? (s.material >> 16) & 0xFFu : 0u;
+}
+
+public void restirSetWater(inout RestirSurface s, uint water) {
+    if (((s.material >> 8) & 0xFFu) == 0u) {
+        s.material |= (water & 0xFFu) << 16;
+    }
 }
 
 public float restirRoughness(RestirSurface s) {

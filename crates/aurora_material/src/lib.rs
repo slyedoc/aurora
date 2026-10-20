@@ -98,6 +98,8 @@ pub struct AuroraMaterial {
     pub attenuation_color: Color,
     pub attenuation_distance: f32,
     pub alpha_mode: AlphaMode,
+    /// UV units per second every texture slides by (lava, a conveyor), on the shader clock.
+    pub uv_scroll: Vec2,
 
     // --- Authoring surface -------------------------------------------------------------
     // Carried so a `StandardMaterial` round-trips through this type without losing what an
@@ -160,6 +162,7 @@ impl Default for AuroraMaterial {
             attenuation_color: Color::WHITE,
             attenuation_distance: f32::INFINITY,
             alpha_mode: AlphaMode::Opaque,
+            uv_scroll: Vec2::ZERO,
             reflectance: 0.5,
             occlusion_texture: None,
             double_sided: false,

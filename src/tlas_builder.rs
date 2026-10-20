@@ -249,6 +249,8 @@ struct InstanceSource {
     /// Which hit group shades this instance; see [`crate::surface_group`]. Part of the
     /// instance's hit-record key, so changing it moves the instance to another record.
     class: u32,
+    /// The instance's own surface row ([`crate::surface_group::SurfaceRow`]).
+    row: Option<crate::surface_group::SurfaceRow>,
 }
 
 /// Material records for all instances, packed into one device buffer; an instance's
@@ -1096,6 +1098,7 @@ type ChangedInstances = Or<(
     Changed<bevy::camera::visibility::RenderLayers>,
     Changed<crate::environment::InEnvironment>,
     Changed<InstanceBlock>,
+    Changed<crate::surface_group::SurfaceRow>,
 )>;
 
 /// [`RenderLayers`](bevy::camera::visibility::RenderLayers) folded into the 8-bit TLAS
@@ -1134,6 +1137,7 @@ fn extract_instances(
             Option<&crate::environment::InEnvironment>,
             Option<&crate::surface_group::SurfaceClass>,
             Option<(&InstanceBlock, &InstanceBlockSlots)>,
+            Option<&crate::surface_group::SurfaceRow>,
         ),
         ChangedInstances,
     >,
@@ -1158,6 +1162,7 @@ fn extract_instances(
         world,
         class,
         block,
+        row,
     ) in changed.iter()
     {
         let node = match block {
@@ -1195,6 +1200,7 @@ fn extract_instances(
                     0x00
                 },
                 class: class.copied().unwrap_or_default().0,
+                row: row.copied(),
             }),
         );
     }
@@ -1338,6 +1344,10 @@ pub fn prepare_instances(
             Some(m) => {
                 let (mut resolved, all_textures) = m.resolve_checked(&render_device, &textures);
                 resolved.surface_param_index = surface_data.row(source.material);
+                if let Some(row) = source.row {
+                    resolved.surface_param_index = row.row;
+                    resolved.flags |= row.flags;
+                }
                 complete &= all_textures;
                 vec![resolved]
             }
@@ -1355,7 +1365,11 @@ pub fn prepare_instances(
             // with gl_RayFlagsOpaqueEXT, so they hit glass regardless).
             | if material_slice
                 .iter()
-                .all(|m| m.alpha_cutoff <= 0.0 && m.specular_transmission_factor <= 0.0)
+                .all(|m| {
+                    m.alpha_cutoff <= 0.0
+                        && m.specular_transmission_factor <= 0.0
+                        && m.flags & crate::blas::material_flags::WATER == 0
+                })
             {
                 INSTANCE_FORCE_OPAQUE
             } else {

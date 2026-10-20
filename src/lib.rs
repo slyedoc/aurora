@@ -78,7 +78,7 @@ pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;
-pub mod water_volume;
+pub mod water;
 pub mod water_waves;
 pub mod xr;
 
@@ -118,7 +118,7 @@ pub mod prelude {
         sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyAir, SkyBrightness},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt, VideoExt, VideoRecorder},
-        water_volume::WaterVolume,
+        water::{WaterKind, WaterMaterial, WaterMaterial3d, WaterSurface},
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }
@@ -157,7 +157,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(bevy::world_serialization::WorldSerializationPlugin);
         group = group.add(crate::portal::PortalPlugin);
         group = group.add(crate::fog_volume::FogVolumePlugin);
-        group = group.add(crate::water_volume::WaterVolumePlugin);
+        group = group.add(crate::water::WaterVolumePlugin);
         // `--headless [WxH]`: no window; the frames run on and the camera renders into a
         // WxH image (util/headless.rs, default 1280x720), which screenshots read back.
         let headless = crate::util::headless::headless_size();

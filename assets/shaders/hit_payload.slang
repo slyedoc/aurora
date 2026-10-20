@@ -30,11 +30,19 @@ public struct HitPayload {
     public uint lobes;
 };
 
-// Shadow rays: whether the ray reached the sky (the shadow miss shader sets it). One word, so
+// Shadow rays: whether the ray reached the sky (the shadow miss shader sets it), and the nearest
+// water surface it passed (its water id, medium row + 1, 0 none; at `water_t`). A few words, so
 // a visibility test carries none of the shading payload.
 public struct ShadowPayload {
     public uint visible;
+    public uint water;
+    public float water_t;
 };
+
+// The water id a hit payload carries (water_surface.slang: medium row + 1; 0 not water).
+public uint hitPayloadWater(HitPayload p) {
+    return p.lobes >> 24;
+}
 
 public uint packLobes(float transmission, float clearcoat, float clearcoat_roughness) {
     return uint(saturate(transmission) * 255.0 + 0.5)

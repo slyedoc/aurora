@@ -38,6 +38,17 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
 // payload, which a shader declared with the shading payload must never be run with.
 [shader("anyhit")]
 void shadow_any_hit(inout ShadowPayload payload, BuiltInTriangleIntersectionAttributes attribs) {
+    // A water surface passes the ray; the nearest one it crossed is kept (water.slang
+    // waterAlong).
+    let material = pc.materials[InstanceID() + GeometryIndex()];
+    if ((material.flags & MATERIAL_WATER) != 0u) {
+        let t = RayTCurrent();
+        if (payload.water == 0u || t < payload.water_t) {
+            payload.water = min(material.surface_param_index + 1u, 255u);
+            payload.water_t = t;
+        }
+        IgnoreHit();
+    }
     if (ignoredHit(true, attribs)) {
         IgnoreHit();
     }

@@ -113,7 +113,17 @@ pub struct RTXMaterial {
     pub diffuse_transmission: f32,
     pub clearcoat: f32,
     pub clearcoat_roughness: f32,
-    pub pad: u32,
+    /// [`material_flags`] bits.
+    pub flags: u32,
+    /// UV units per second (`AuroraMaterial::uv_scroll`).
+    pub uv_scroll: [f32; 2],
+}
+
+/// Bits of [`RTXMaterial::flags`].
+pub mod material_flags {
+    /// A water surface: shadow rays take its crossing (water.slang), `surface_param_index` is
+    /// its medium's row.
+    pub const WATER: u32 = 1;
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:
@@ -149,7 +159,8 @@ impl Default for RTXMaterial {
             diffuse_transmission: 0.0,
             clearcoat: 0.0,
             clearcoat_roughness: 0.5,
-            pad: 0,
+            flags: 0,
+            uv_scroll: [0.0; 2],
         }
     }
 }
@@ -1056,5 +1067,17 @@ pub fn allocate_acceleration_structure(
         handle: acceleration_structure,
         buffer,
         address,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// raygen.slang reads a record's surface row and flags by word (`MATERIAL_*_WORD`).
+    #[test]
+    fn material_record_words_match_the_raygen() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<super::RTXMaterial>(), 28 * 4);
+        assert_eq!(offset_of!(super::RTXMaterial, surface_param_index), 21 * 4);
+        assert_eq!(offset_of!(super::RTXMaterial, flags), 25 * 4);
     }
 }

@@ -72,8 +72,8 @@ pub struct UniformData {
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
-    /// Water volume table (src/water_volume.rs): buffer address (0 = none).
-    water_volumes: u64,
+    /// Water medium table (src/water.rs): buffer address (0 = none).
+    water_media: u64,
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -111,8 +111,8 @@ pub struct UniformData {
     fog_grid_view_proj: [f32; 16],
     fog_grid_prev_view_proj: [f32; 16],
     fog_grid_size: [u32; 3],
-    /// Water volume entry count.
-    water_volume_count: u32,
+    /// Water medium table rows.
+    water_medium_count: u32,
     /// Bindless 3D images: the grid's columns summed front to back (in-scatter and
     /// transmittance per cell, behind a first slice of nothing) and the grid blurred once
     /// across x and y. A camera ray's lookups filter them in the texture unit.
@@ -493,7 +493,7 @@ fn render_frame(
         ResMut<AtmosphereState>,
         ResMut<crate::picking::Picker>,
         Res<crate::fog_volume::FogVolumeTable>,
-        Res<crate::water_volume::WaterVolumeTable>,
+        Res<crate::water::WaterMedia>,
         ResMut<crate::fog_grid::FogGridState>,
         ResMut<crate::compute::FrameCommands>,
     ),
@@ -565,7 +565,7 @@ fn render_frame(
         mut atmo,
         mut picker,
         fog_volumes,
-        water_volumes,
+        water_media,
         mut fog_grid,
         mut frame_commands,
     ) = gpu;
@@ -1044,7 +1044,7 @@ fn render_frame(
             gi_roughness: settings.restir_gi_roughness.clamp(0.0, 1.0),
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
-            water_volumes: water_volumes.address(),
+            water_media: water_media.address(),
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
@@ -1071,7 +1071,7 @@ fn render_frame(
             fog_grid_view_proj: grid.view_proj.to_cols_array(),
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
-            water_volume_count: water_volumes.count(),
+            water_medium_count: water_media.count(),
             fog_grid_sum_tex: grid.sum_tex,
             fog_grid_soft_tex: grid.soft_tex,
             fog_grid_soft: grid.soft,
@@ -3028,12 +3028,12 @@ mod tests {
         );
         // water_surface.slang.
         assert_eq!(
-            core::mem::offset_of!(super::UniformData, water_volumes),
+            core::mem::offset_of!(super::UniformData, water_media),
             98 * 4
         );
         assert_eq!(core::mem::offset_of!(super::UniformData, time), 113 * 4);
         assert_eq!(
-            core::mem::offset_of!(super::UniformData, water_volume_count),
+            core::mem::offset_of!(super::UniformData, water_medium_count),
             187 * 4
         );
     }
@@ -3048,7 +3048,7 @@ mod tests {
         assert_eq!(offset_of!(U, view), 144);
         assert_eq!(offset_of!(U, prev_view_proj), 272);
         assert_eq!(offset_of!(U, frame), 344);
-        assert_eq!(offset_of!(U, water_volumes), 392);
+        assert_eq!(offset_of!(U, water_media), 392);
         assert_eq!(offset_of!(U, portals), 400);
         assert_eq!(offset_of!(U, camera_mask), 416);
         assert_eq!(offset_of!(U, primary_hidden), 420);

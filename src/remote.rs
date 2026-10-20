@@ -1,6 +1,6 @@
 //! The running app over the Bevy Remote Protocol (`--features remote`): BRP's own methods (query
 //! entities, read and change any reflected component or resource: `RenderSettings`, a
-//! `WaterVolume`, a `Transform`) on <http://127.0.0.1:15702>, plus aurora's:
+//! `WaterMaterial`, a `Transform`) on <http://127.0.0.1:15702>, plus aurora's:
 //!
 //! - `aurora.camera` `{position, look_at}` or `{position, yaw, pitch}` (degrees) holds the main
 //!   camera there every frame, `{release: true}` lets it go; no params: its pose now.

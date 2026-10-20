@@ -132,31 +132,50 @@ void trace(uint flags, uint mask, float3 origin, float tmin, float3 direction, f
     TraceRay(topLevelAS, flags, mask, 0, 0, 0, ray, payload);
 }
 
-// A shadow ray: true when nothing opaque lies between (the shadow miss shader, miss index 1,
-// ran; hits use each record's shadow twin, sbt.rs). Its one-word payload keeps the shading payload out of every visibility test.
-bool traceVisible(uint mask, float3 origin, float tmin, float3 direction, float tmax) {
+// A shadow ray: visible when nothing opaque lies between (the shadow miss shader, miss index 1,
+// ran; hits use each record's shadow twin, sbt.rs), and the nearest water surface it passed. Its
+// few-word payload keeps the shading payload out of every visibility test.
+ShadowPayload traceShadow(uint mask, float3 origin, float tmin, float3 direction, float tmax) {
     RayDesc ray;
     ray.Origin = origin;
     ray.TMin = tmin;
     ray.Direction = direction;
     ray.TMax = tmax;
-    ShadowPayload shadow = { 0u };
+    ShadowPayload shadow = { 0u, 0u, 0.0 };
     // Hit record offset 1: every geometry's shadow twin (its any-hit takes this payload).
     TraceRay(topLevelAS, FLAGS_SHADOW, mask, 1, 0, 1, ray, shadow);
-    return shadow.visible != 0u;
+    return shadow;
 }
 
-// visibleInline's fallback, a real call (the shift is one too: see ptShift).
-[noinline]
-bool visibleTraced(uint mask, float3 origin, float3 direction, float tmax) {
-    return traceVisible(mask, origin, 0.0, direction, tmax);
+// A light's shadow ray from a point in water `water` (a water id, 0 none) along unit `direction`:
+// 0 when something opaque lies between, else the water's transmittance (water.slang waterAlong).
+float3 traceLight(uint mask, float3 origin, float3 direction, float tmax, uint water) {
+    let shadow = traceShadow(mask, origin, 0.0, direction, tmax);
+    if (shadow.visible == 0u) {
+        return float3(0.0);
+    }
+    return waterAlong(pc.uniforms, water, shadow.water, shadow.water_t, direction, tmax, true);
 }
+
+// shadowInline's fallback, a real call (the shift is one too: see ptShift).
+[noinline]
+ShadowPayload shadowTraced(uint mask, float3 origin, float3 direction, float tmax) {
+    return traceShadow(mask, origin, 0.0, direction, tmax);
+}
+
+// A material record's flags and surface row (blas.rs `RTXMaterial`: 28 words; pinned by a test).
+static const uint MATERIAL_WORDS = 28u;
+static const uint MATERIAL_ROW_WORD = 21u;
+static const uint MATERIAL_FLAGS_WORD = 25u;
+static const uint MATERIAL_WATER_FLAG = 1u;
 
 // A visibility test by ray query (inline: no shader call, nothing held across it spilled -- the
-// shift's TraceRay visibility was ~85 % of gi_spatial). Opaque triangles resolve here; a candidate
-// only a shader can decide (an alpha-tested or glass triangle's any-hit, a procedural primitive's
-// intersection) hands the ray to traceVisible.
-bool visibleInline(uint mask, float3 origin, float3 direction, float tmax) {
+// shift's TraceRay visibility was ~85 % of gi_spatial), and the nearest water surface passed, as
+// traceShadow. Opaque triangles and water surfaces resolve here; a candidate only a shader can
+// decide (an alpha-tested or glass triangle's any-hit, a procedural primitive's intersection)
+// hands the ray to traceShadow.
+ShadowPayload shadowInline(uint mask, float3 origin, float3 direction, float tmax) {
+    ShadowPayload shadow = { 0u, 0u, 0.0 };
     RayDesc ray;
     ray.Origin = origin;
     ray.TMin = 0.0;
@@ -184,14 +203,30 @@ bool visibleInline(uint mask, float3 origin, float3 direction, float tmax) {
                     q.CommitProceduralPrimitiveHit(t);
                 }
             }
+        } else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            let record = ((uint*)pc.materials)
+                + (q.CandidateInstanceID() + q.CandidateGeometryIndex()) * MATERIAL_WORDS;
+            if ((record[MATERIAL_FLAGS_WORD] & MATERIAL_WATER_FLAG) != 0u) {
+                let t = q.CandidateTriangleRayT();
+                if (shadow.water == 0u || t < shadow.water_t) {
+                    shadow.water = min(record[MATERIAL_ROW_WORD] + 1u, 255u);
+                    shadow.water_t = t;
+                }
+            } else {
+                shader_needed = true;
+            }
         } else {
             shader_needed = true;
         }
     }
     if (q.CommittedStatus() != COMMITTED_NOTHING) {
-        return false;
+        return shadow;
     }
-    return shader_needed ? visibleTraced(mask, origin, direction, tmax) : true;
+    if (shader_needed) {
+        return shadowTraced(mask, origin, direction, tmax);
+    }
+    shadow.visible = 1u;
+    return shadow;
 }
 
 // One shadow ray for several light strategies at a vertex: each proposes its finished,
@@ -222,24 +257,25 @@ struct ShadowPick {
         }
     }
 
-    // The kept proposal's shadow ray from `origin` off `normal`; its contribution over its pick
-    // probability when visible.
-    float3 resolve(uint mask, float3 origin, float3 normal) {
+    // The kept proposal's shadow ray from `origin` off `normal` (geometric); its contribution over
+    // its pick probability when visible. `water`: the water the path reached the vertex in;
+    // `vertex_water` the vertex's own when it is a water surface (the ray leaves into it below).
+    float3 resolve(uint mask, float3 origin, float3 normal, uint water, uint vertex_water) {
         if (wsum <= 0.0) {
             return float3(0.0);
         }
-        return resolveAt(mask, leaveSurface(origin, normal, direction));
+        let below = dot(direction, normal) * normal.y < 0.0;
+        return resolveAt(mask, leaveSurface(origin, normal, direction),
+                         waterAfterScatter(water, vertex_water, below));
     }
 
-    // The kept proposal's shadow ray from `start` (a point in a medium: no surface to leave).
-    float3 resolveAt(uint mask, float3 start) {
+    // The kept proposal's shadow ray from `start` in water `water` (a point in a medium: no
+    // surface to leave).
+    float3 resolveAt(uint mask, float3 start, uint water) {
         if (wsum <= 0.0) {
             return float3(0.0);
         }
-        if (!traceVisible(mask, start, 0.0, direction, tmax)) {
-            return float3(0.0);
-        }
-        return scaled * wsum * waterLightTransmittance(pc.uniforms, start, direction, tmax);
+        return scaled * wsum * traceLight(mask, start, direction, tmax, water);
     }
 };
 
@@ -426,8 +462,8 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
         let sun = env.suns[si];
         if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
             l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
-            visible = traceVisible(ray_mask, x, 0.0, l, tmax);
-            sun_t = visible ? waterLightTransmittance(pc.uniforms, x, l, tmax) : float3(0.0);
+            sun_t = traceLight(ray_mask, x, l, tmax, 0u);
+            visible = any(sun_t > float3(0.0));
         }
         if (!visible) {
             continue;
@@ -661,11 +697,8 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, ino
     if (wsum <= 0.0 || sel_phat <= 0.0) {
         return float3(0.0);
     }
-    if (!traceVisible(ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4))) {
-        return float3(0.0);
-    }
     return sel_val * (wsum / (float(M) * sel_phat))
-        * waterLightTransmittance(pc.uniforms, x, ldir, ldist);
+        * traceLight(ray_mask, x, ldir, ldist * (1.0 - 1.0e-4), 0u);
 }
 
 // One thread per cell lit this frame (one of every stride x stride block, fogGridPhase;
@@ -1100,7 +1133,8 @@ void primary() {
                             hit_point, pc.uniforms.frame, payload.prev_world_pos,
                             mat4MulVecAt(&pc.uniforms.view_proj[0], float4(hit_point, 1.0)).w, payload.color.rgb,
                             hitPayloadGetMetallic(payload), hitPayloadGetRoughness(payload), payload.lobes,
-                            mask * waterSurvivalWeight(pc.uniforms, ray.Origin, direction, t),
+                            mask * waterSurvivalWeight(pc.uniforms,
+                                waterOfSegment(0u, hitPayloadWater(payload), dot(direction, surface_normal) * surface_normal.y > 0.0), t),
                             ray_mask, world_normal, surface_normal, -direction));
                     }
                 }
@@ -1219,6 +1253,8 @@ struct PtVertex {
     float3 v;
     SurfaceMaterial mat;
     Lobes lob;
+    // A water surface's water id (0: not one).
+    uint water;
 };
 
 PtVertex ptPrimaryVertex(RestirSurface s) {
@@ -1229,7 +1265,13 @@ PtVertex ptPrimaryVertex(RestirSurface s) {
     p.v = oct_to_float32x3(unpackHalf2(s.view_oct));
     p.mat = surfaceMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
     p.lob = unpackLobes(s.material);
+    p.water = 0u;
     return p;
+}
+
+// The water a path leaving vertex `p` along `dir` is in, from the water it reached `p` in.
+uint ptWaterLeaving(PtVertex p, uint water, float3 dir) {
+    return waterAfterScatter(water, p.water, dot(dir, p.ng) * p.ng.y < 0.0);
 }
 
 // Random replay (Lin et al. 2022, RTXDI's hybrid shift): x_1 .. x_{k-1} rebuilt from primary
@@ -1244,6 +1286,8 @@ struct PtReplay {
     float3 T;
     // The bounce counters reaching `last` (from the primary vertex's chain on).
     uint bounces;
+    // The water the path reached `last` in.
+    uint water;
 };
 
 PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
@@ -1252,6 +1296,8 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
     res.ok = false;
     res.T = float3(1.0);
     res.last = p;
+    var water = restirWater(s);
+    res.water = water;
     // The budgets bind the replay as they bound the path: past one, `main` would have stopped.
     var bounces = unpackBounces(s.throughput_b_mask >> 24);
     if (!ptReplayable(0.0, p.lob)) {
@@ -1285,7 +1331,13 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         if (payload.t == 0.0 || any(payload.emission != float3(0.0)) || hitPayloadGetMasked(payload)) {
             return res;
         }
-        res.T *= waterTransmittance(pc.uniforms, start, dir, payload.t);
+        water = ptWaterLeaving(p, water, dir);
+        let hit_water = hitPayloadWater(payload);
+        if (hit_water != 0u) {
+            let ng = oct_to_float32x3(payload.surface_and_world_normal.xy);
+            water = waterOfSegment(water, hit_water, dot(dir, ng) * ng.y > 0.0);
+        }
+        res.T *= waterTransmittance(pc.uniforms, water, payload.t);
         let transmission = hitPayloadGetTransmission(payload);
         let lob = unpackLobes(payload.lobes);
         let roughness = hitPayloadGetRoughness(payload);
@@ -1297,6 +1349,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
             q.ng = -q.ng;
         }
         q.v = -dir;
+        q.water = hit_water;
         // Glass as `main` saw it: eta for the side the ray came from, the medium's absorption
         // along the segment inside.
         let inside = hitPayloadGetInside(payload);
@@ -1317,6 +1370,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
     }
     res.last = p;
     res.bounces = bounces;
+    res.water = water;
     res.ok = rough;
     return res;
 }
@@ -1345,14 +1399,32 @@ float3 ptReconnect(PtVertex p, float3 T, GiCandidate c, float3 x_s, float3 n_s, 
     return T * surfaceEval(p.v, p.n, w, p.mat, p.lob) * ptSampleRadiance(c, -w);
 }
 
+// The water along a reconnection from `from` (reached in `water`) to x_s: its visibility ray's
+// nearest water surface (`shadow`) decides where the water is (water.slang waterAlong; straight:
+// the path's own segment, not light bent at the surface).
+float3 ptReconnectWater(PtVertex from, uint water, float3 dir, float dist, ShadowPayload shadow) {
+    return waterAlong(pc.uniforms, ptWaterLeaving(from, water, dir), shadow.water, shadow.water_t,
+                      dir, dist, false);
+}
+
 // light_eval.slang ptOwnTarget with the water its reconnection crosses: k > 1 carries it in T
-// (the path's own weight), k = 1 re-evaluates the segment from the primary vertex as ptShift does.
+// (the path's own weight), k = 1 re-evaluates the segment from the primary vertex as ptShift does
+// (its ray only for the water it passes: the sample was found visible).
 float3 ptOwnTargetWater(RestirSurface s, GiCandidate c) {
     let C = ptOwnTarget(s, c);
-    if ((c.k & 15u) != 1u || !(luma(C) > 0.0)) {
+    if ((c.k & 15u) != 1u || !(luma(C) > 0.0) || pc.uniforms.water_medium_count == 0u) {
         return C;
     }
-    return C * waterTransmittance(pc.uniforms, s.position, c.x_s - s.position, 1.0);
+    let from = ptPrimaryVertex(s);
+    let to = offsetRay(c.x_s, oct_to_float32x3(unpackHalf2(c.n_s_oct)));
+    let start = leaveSurface(from.x, from.ng, to - from.x);
+    let dist = length(to - start);
+    if (!(dist > 1.0e-4 && dist < 1.0e7)) {
+        return C;
+    }
+    let dir = (to - start) / dist;
+    let shadow = shadowInline(restirRayMask(s), start, dir, dist * 0.999);
+    return C * ptReconnectWater(from, restirWater(s), dir, dist, shadow);
 }
 
 // A sample shifted to a primary vertex: its target vector there (visibility of the reconnection
@@ -1399,11 +1471,15 @@ PtShift ptShift(RestirSurface s, float thr, GiCandidate c) {
     let to = offsetRay(c.x_s, n_s);
     let start = leaveSurface(from.x, from.ng, to - from.x);
     let dist = length(to - start);
-    if (!(dist > 1.0e-4 && dist < 1.0e7)
-        || !visibleInline(restirRayMask(s), start, (to - start) / dist, dist * 0.999)) {
+    if (!(dist > 1.0e-4 && dist < 1.0e7)) {
         return r;
     }
-    r.f = f * waterTransmittance(pc.uniforms, start, (to - start) / dist, dist);
+    let dir = (to - start) / dist;
+    let shadow = shadowInline(restirRayMask(s), start, dir, dist * 0.999);
+    if (shadow.visible == 0u) {
+        return r;
+    }
+    r.f = f * ptReconnectWater(from, rp.water, dir, dist, shadow);
     r.J = geo / c.geo;
     r.from_x = from.x;
     r.from_ng = from.ng;
@@ -1975,6 +2051,9 @@ void main() {
         // Whether that vertex sampled the light table too (a water collision samples only the
         // suns and the sky: a lamp its continuation finds is all that lamp's light there).
         var mis_lights = true;
+        // The water the path is in (water.slang: a water id, 0 none): set refracting down through a
+        // water surface, cleared up through one. Paths start out of water.
+        var water = 0u;
         // What this ray sees and where it is: the camera's layer mask and environment until a
         // portal swaps them.
         var ray_mask = pc.uniforms.camera_mask;
@@ -2085,11 +2164,14 @@ void main() {
                 traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             }
             cone_width += cone_spread * payload.t;
-            // The water this segment crossed (water.slang): it may scatter in the murk before
-            // its hit (the sky's segment runs out of the box).
-            if (pc.uniforms.water_volume_count > 0u) {
-                let we = waterSegment(pc.uniforms, start, direction,
-                                      payload.t != 0.0 ? payload.t : tmax, randf());
+            // The water this segment ran through (water.slang): it may scatter in the murk before
+            // its hit.
+            if (payload.t != 0.0 && hitPayloadWater(payload) != 0u) {
+                let ng = oct_to_float32x3(payload.surface_and_world_normal.xy);
+                water = waterOfSegment(water, hitPayloadWater(payload), dot(direction, ng) * ng.y > 0.0);
+            }
+            if (water != 0u) {
+                let we = waterSegment(pc.uniforms, water, payload.t != 0.0 ? payload.t : tmax, randf());
                 mask *= we.weight;
                 if (we.scatter) {
                     origin = start + direction * we.t;
@@ -2123,7 +2205,7 @@ void main() {
                             wpick.propose(mask * L * ph / (pdf_env + ph), l, tmax);
                         }
                     }
-                    acc += wpick.resolveAt(ray_mask, origin);
+                    acc += wpick.resolveAt(ray_mask, origin, water);
                     let wdir = waterSamplePhase(we.g, direction, randf(), randf());
                     let wpdf = waterPhase(we.g, dot(direction, wdir));
                     prev_pdf = wpdf;
@@ -2223,11 +2305,9 @@ void main() {
                         if (ATMOSPHERE_ON && env.mode == 3u && si == 0u) {
                             sun_radiance *= atmoSunTransmittanceAt(origin);
                         }
-                        if (traceVisible(ray_mask, origin, 0.0, l, tmax)) {
-                            let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                            acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle
-                                * waterLightTransmittance(pc.uniforms, origin, l, tmax);
-                        }
+                        let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
+                        acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle
+                            * traceLight(ray_mask, origin, l, tmax, water);
                     }
                 }
                 direction = sampleFogScatterDirection(env, direction);
@@ -2352,6 +2432,7 @@ void main() {
                         world_normal, surface_normal, -direction);
                     // The chain's bounces, for replay's budgets.
                     rs.throughput_b_mask |= packBounces(bounces) << 24;
+                    restirSetWater(rs, water);
                     restirSurfaceStore(pc.restir_surfaces + prim_at, rs);
                 }
                 path = (path | PATH_GI_VERTEX | PATH_PT_SEARCH) & ~PATH_PT_CHAIN;
@@ -2605,7 +2686,7 @@ void main() {
                     }
                 }
             }
-            let nee = pick.resolve(ray_mask, origin, surface_normal);
+            let nee = pick.resolve(ray_mask, origin, surface_normal, water, hitPayloadWater(payload));
             acc += nee;
             if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_nee = nee;
@@ -2638,6 +2719,8 @@ void main() {
                 break;
             }
             direction = l;
+            water = waterAfterScatter(water, hitPayloadWater(payload),
+                                      dot(l, surface_normal) * surface_normal.y < 0.0);
             if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_cont_dir = direction;
             }

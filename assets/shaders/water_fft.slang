@@ -1,4 +1,4 @@
-// Water waves by FFT (src/water_volume.rs `WaterWaves`, Tessendorf 2001): per frame, a cascade's
+// Water waves by FFT (src/water_waves.rs `WaterWaves`, Tessendorf 2001): per frame, a cascade's
 // initial spectrum h0(k) (generated on the CPU when the waves change) moves on to the frame's time,
 // becomes its slope spectrum, and goes back to space through an inverse 2D FFT (rows, then
 // columns). Both slopes ride in one complex field (dh/dx real, dh/dz imaginary: each is a real
