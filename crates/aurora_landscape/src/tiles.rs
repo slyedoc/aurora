@@ -2,7 +2,9 @@
 //! `landscape/tile.slang`. Split only below ready tiles and retire only once the replacements
 //! are ready (zero's planet rules), so LOD swaps never open holes; edges against a coarser
 //! neighbour are stitched. A tile whose pages re-evaluate refills in place: the old mesh
-//! stays until the new one is built.
+//! stays until the new one is built. Pages follow the same rule across LOD levels: a ring's
+//! page gives way only once the finer pages over it are ready, and a page that slid out of
+//! its window lingers until the coarser level's page over it is.
 
 use bevy::{
     ecs::lifecycle::Remove,
@@ -40,7 +42,13 @@ pub struct LandscapeRoot {
 pub struct LandscapeRoots {
     pool: u64,
     roots: HashMap<IVec2, Entity>,
+    /// Pages that slid out of the window, kept (with the frames they have waited) until the
+    /// coarser level's page over them is ready.
+    lingering: HashMap<IVec2, (Entity, u32)>,
 }
+
+/// Frames a page that left its window may wait for its coarser cover before it goes anyway.
+const LINGER_FRAMES: u32 = 300;
 
 /// `TilePush` in landscape/tile.slang, after the `ProceduralHeader`.
 #[repr(C)]
@@ -104,69 +112,129 @@ pub(crate) fn viewer_position(
 }
 
 /// A landscape whose pages are complete gets one root per evaluated page of its window;
-/// roots leave with their page (a streaming window slid) or all at once (a new pool).
+/// roots leave with their page (a streaming window slid) or all at once (a new pool). A page
+/// covered by the level inside goes once that level's ground is up there; one that slid out of
+/// the window lingers until the next coarser level's ground is up over it.
+#[allow(clippy::type_complexity)]
 pub fn spawn_roots(
     mut commands: Commands,
     mut landscapes: Query<(
         Entity,
+        &Landscape,
         &LandscapePages,
         Option<&mut LandscapeRoots>,
         Option<&crate::ring::LandscapeRing>,
     )>,
+    trees: Query<&QuadTree, With<LandscapeRoot>>,
+    prepared: Res<VulkanAssets<ProceduralMesh>>,
+    meshes: Query<&ProceduralMesh3d>,
 ) {
-    // A ring's page inside its hole gives way only once the ground is up under all four of its
-    // pages at the level inside: rooted there, or (where that level has its own hole) covered
-    // in turn by the levels further in. Built finest first.
-    let rooted: HashMap<Entity, HashSet<IVec2>> = landscapes
-        .iter()
-        .filter_map(|(entity, _, roots, _)| {
-            roots.map(|r| (entity, r.roots.keys().copied().collect()))
+    // A root is up when every leaf of its tree has a built mesh.
+    let up = |root: Entity| {
+        trees.get(root).is_ok_and(|tree| {
+            tree.leaf_node_ids().iter().all(|leaf| {
+                tree.nodes[leaf.0 as usize]
+                    .patch_entity
+                    .is_some_and(|e| meshes.get(e).is_ok_and(|m| prepared.get(&m.0).is_some()))
+            })
         })
-        .collect();
+    };
+    // A ring's page inside its hole gives way only once the ground is up under all four of its
+    // pages at the level inside: rooted and built there, or (where that level has its own hole)
+    // covered in turn by the levels further in. It comes back only where that level has no pages
+    // at all: a finer page still splitting near the viewer must not bring the coarse one back
+    // for a frame (it would rebuild every time). Built finest first.
+    let page_sets = |built: bool| -> HashMap<Entity, HashSet<IVec2>> {
+        landscapes
+            .iter()
+            .filter_map(|(entity, _, _, roots, _)| {
+                roots.map(|r| {
+                    let pages = r
+                        .roots
+                        .iter()
+                        .filter(|(_, root)| !built || up(**root))
+                        .map(|(page, _)| *page)
+                        .collect();
+                    (entity, pages)
+                })
+            })
+            .collect()
+    };
+    let built = page_sets(true);
+    let planted = page_sets(false);
     let mut levels: Vec<(Entity, Entity, u8)> = landscapes
         .iter()
-        .map(|(entity, _, _, ring)| match ring {
+        .map(|(entity, _, _, _, ring)| match ring {
             Some(ring) => (entity, ring.of, ring.level),
             None => (entity, entity, 0),
         })
         .collect();
+    // Each level's own built pages, for the pages one level finer that left their window.
+    let own: HashMap<(Entity, u8), &HashSet<IVec2>> = levels
+        .iter()
+        .filter_map(|&(entity, parent, level)| Some(((parent, level), built.get(&entity)?)))
+        .collect();
+    let coarser_levels: HashSet<(Entity, u8)> = own.keys().copied().collect();
     levels.sort_by_key(|&(_, _, level)| level);
-    let mut ground: HashMap<(Entity, u8), HashSet<IVec2>> = HashMap::default();
-    for (entity, parent, level) in levels {
-        let mut pages = rooted.get(&entity).cloned().unwrap_or_default();
-        if level > 0
-            && let Some(inner) = ground.get(&(parent, level - 1))
-        {
-            let quads: HashSet<IVec2> = inner
-                .iter()
-                .map(|c| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)))
-                .collect();
-            pages.extend(quads.into_iter().filter(|q| {
-                [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
+    // Per level, the pages its ground stands on: its own, and those whose four quarters the
+    // level inside stands on.
+    let ground_of = |sets: &HashMap<Entity, HashSet<IVec2>>| {
+        let mut ground: HashMap<(Entity, u8), HashSet<IVec2>> = HashMap::default();
+        for &(entity, parent, level) in &levels {
+            let mut pages = sets.get(&entity).cloned().unwrap_or_default();
+            if level > 0
+                && let Some(inner) = ground.get(&(parent, level - 1))
+            {
+                let quads: HashSet<IVec2> = inner
                     .iter()
-                    .all(|d| inner.contains(&(*q * 2 + *d)))
-            }));
+                    .map(|c| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)))
+                    .collect();
+                pages.extend(quads.into_iter().filter(|q| {
+                    [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
+                        .iter()
+                        .all(|d| inner.contains(&(*q * 2 + *d)))
+                }));
+            }
+            ground.insert((parent, level), pages);
         }
-        ground.insert((parent, level), pages);
-    }
-    for (entity, pages, roots, ring) in &mut landscapes {
+        ground
+    };
+    let ground_built = ground_of(&built);
+    let ground_planted = ground_of(&planted);
+    for (entity, landscape, pages, roots, ring) in &mut landscapes {
         if !pages.is_complete() {
             continue;
         }
-        let inner = ring.and_then(|ring| Some((*ring, ground.get(&(ring.of, ring.level - 1))?)));
-        let covered = |page: IVec2| {
-            inner.is_some_and(|(ring, inner)| {
-                ring.in_hole(page)
-                    && [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
-                        .iter()
-                        .all(|d| inner.contains(&(page * 2 + *d)))
+        let (parent, level) = ring.map_or((entity, 0), |r| (r.of, r.level));
+        let coarser = (parent, level + 1);
+        // A coarser level exists over this one (a ring around it): leaving pages can wait for it.
+        let has_coarser =
+            coarser_levels.contains(&coarser) || (ring.is_none() && landscape.lod_rings > 0);
+        let covered_from_outside = |page: IVec2| {
+            own.get(&coarser).is_some_and(|ready| {
+                ready.contains(&IVec2::new(page.x.div_euclid(2), page.y.div_euclid(2)))
             })
         };
+        let covered_by = |ground: &HashMap<(Entity, u8), HashSet<IVec2>>, page: IVec2| {
+            ring.is_some_and(|ring| {
+                ring.in_hole(page)
+                    && ground.get(&(ring.of, ring.level - 1)).is_some_and(|inner| {
+                        [IVec2::ZERO, IVec2::X, IVec2::Y, IVec2::ONE]
+                            .iter()
+                            .all(|d| inner.contains(&(page * 2 + *d)))
+                    })
+            })
+        };
+        // Gives way once the level inside is built over it; comes back only where that level
+        // has no pages over it.
+        let covered = |page: IVec2| covered_by(&ground_built, page);
+        let planted_over = |page: IVec2| covered_by(&ground_planted, page);
         let pool = pages.pool().heights;
         let Some(mut roots) = roots else {
             commands.entity(entity).insert(LandscapeRoots {
                 pool,
                 roots: HashMap::default(),
+                lingering: HashMap::default(),
             });
             continue;
         };
@@ -175,20 +243,53 @@ pub fn spawn_roots(
             for (_, root) in roots.roots.drain() {
                 commands.entity(root).try_despawn();
             }
+            for (_, (root, _)) in roots.lingering.drain() {
+                commands.entity(root).try_despawn();
+            }
             roots.pool = pool;
+        }
+        // Lingering pages: back into the window (kept, refilled when their page re-evaluates),
+        // gone once the coarser ground is up over them, or after LINGER_FRAMES regardless.
+        let lingering: Vec<IVec2> = roots.lingering.keys().copied().collect();
+        for page in lingering {
+            let (root, waited) = roots.lingering[&page];
+            if pages.in_window(page) && !planted_over(page) {
+                roots.lingering.remove(&page);
+                roots.roots.insert(page, root);
+            } else if covered_from_outside(page) || waited >= LINGER_FRAMES {
+                roots.lingering.remove(&page);
+                commands.entity(root).try_despawn();
+            } else {
+                roots.lingering.insert(page, (root, waited + 1));
+            }
+        }
+        let left: Vec<IVec2> = roots
+            .roots
+            .keys()
+            .copied()
+            .filter(|p| !pages.in_window(*p))
+            .collect();
+        for page in left {
+            if let Some(root) = roots.roots.remove(&page) {
+                if has_coarser {
+                    roots.lingering.insert(page, (root, 0));
+                } else {
+                    commands.entity(root).try_despawn();
+                }
+            }
         }
         let gone: Vec<IVec2> = roots
             .roots
             .keys()
             .copied()
-            .filter(|p| !pages.in_window(*p) || covered(*p))
+            .filter(|p| covered(*p))
             .collect();
         let missing: Vec<IVec2> = pages
             .window()
             .filter(|p| {
                 // Inside the hole too while the level inside has no roots there: the coarse
                 // ground stands in until the finer one is up.
-                !roots.roots.contains_key(p) && !pages.dirty.contains(p) && !covered(*p)
+                !roots.roots.contains_key(p) && !pages.dirty.contains(p) && !planted_over(*p)
             })
             .collect();
         if gone.is_empty() && missing.is_empty() {
@@ -267,6 +368,10 @@ pub fn update_quadtrees(
         let Ok((landscape, pages, transform)) = landscapes.get(root.landscape) else {
             continue;
         };
+        // A page that left the window (lingering) keeps the tiles it has: its pages are gone.
+        if !pages.in_window(root.page) {
+            continue;
+        }
         let mut local = viewer - transform.translation();
         if landscape.sphere.is_none() {
             // Height above the ground, not above y = 0: read on the finest level, the one with
@@ -447,6 +552,9 @@ pub fn spawn_tiles(
         let Ok((landscape, pages, material, _)) = landscapes.get(root.landscape) else {
             continue;
         };
+        if !pages.in_window(root.page) {
+            continue;
+        }
         if item.respawn {
             tree.retire_leaf(item.leaf);
         }
