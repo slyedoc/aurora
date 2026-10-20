@@ -185,8 +185,8 @@ impl WaterVolumeTable {
     }
 }
 
-/// Most volumes a segment is tested against.
-pub const MAX_WATER_VOLUMES: usize = 16;
+/// Most volumes a segment is tested against: the ones nearest the camera.
+pub const MAX_WATER_VOLUMES: usize = 64;
 
 /// `RenderSet::Prepare`: rebuild + upload the table when a volume moved or changed.
 pub(crate) fn upload_water_volumes(
@@ -197,15 +197,33 @@ pub(crate) fn upload_water_volumes(
         &GlobalTransform,
         &InheritedVisibility,
     )>,
+    cameras: Query<(&GlobalTransform, &Camera), With<Camera3d>>,
     materials: Res<Assets<WaterMaterial>>,
     waves: Res<WaterWaves>,
     mut table: ResMut<WaterVolumeTable>,
 ) {
+    let eye = cameras
+        .iter()
+        .find(|(_, camera)| camera.is_active)
+        .map_or(Vec3::ZERO, |(t, _)| t.translation());
+    let mut nearest: Vec<_> = volumes
+        .iter()
+        .filter(|(.., visible)| visible.get())
+        .map(|entry| {
+            let (volume, _, global, _) = entry;
+            let local = global.affine().inverse().transform_point3(eye);
+            let outside = (local.abs() - volume.half_extents).max(Vec3::ZERO);
+            (global.affine().transform_vector3(outside).length_squared(), entry)
+        })
+        .collect();
+    if nearest.len() > MAX_WATER_VOLUMES {
+        nearest.select_nth_unstable_by(MAX_WATER_VOLUMES, |a, b| a.0.total_cmp(&b.0));
+        nearest.truncate(MAX_WATER_VOLUMES);
+    }
+    // A stable order, so a still camera re-uploads nothing.
+    nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut entries: Vec<GpuWaterVolume> = Vec::new();
-    for (volume, material_handle, global, visible) in &volumes {
-        if !visible.get() || entries.len() == MAX_WATER_VOLUMES {
-            continue;
-        }
+    for (_, (volume, material_handle, global, _)) in nearest {
         // A material still loading: no water there yet.
         let Some(material) = materials.get(&material_handle.0) else {
             continue;
