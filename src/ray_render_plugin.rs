@@ -72,7 +72,8 @@ pub struct UniformData {
     light_epoch: u32,
     /// Cap on temporal history, in candidate-samples.
     restir_m_clamp: f32,
-    pad_cache: [u32; 2],
+    /// Water volume table (src/water_volume.rs): buffer address (0 = none).
+    water_volumes: u64,
     /// Ray-portal pair table (src/portal.rs): buffer address + entry count (0 = none).
     portals: u64,
     portal_count: u32,
@@ -110,8 +111,8 @@ pub struct UniformData {
     fog_grid_view_proj: [f32; 16],
     fog_grid_prev_view_proj: [f32; 16],
     fog_grid_size: [u32; 3],
-    /// Free (one_shadow_ray_from).
-    pad_one_ray: u32,
+    /// Water volume entry count.
+    water_volume_count: u32,
     /// Bindless 3D images: the grid's columns summed front to back (in-scatter and
     /// transmittance per cell, behind a first slice of nothing) and the grid blurred once
     /// across x and y. A camera ray's lookups filter them in the texture unit.
@@ -492,6 +493,7 @@ fn render_frame(
         ResMut<AtmosphereState>,
         ResMut<crate::picking::Picker>,
         Res<crate::fog_volume::FogVolumeTable>,
+        Res<crate::water_volume::WaterVolumeTable>,
         ResMut<crate::fog_grid::FogGridState>,
         ResMut<crate::compute::FrameCommands>,
     ),
@@ -563,6 +565,7 @@ fn render_frame(
         mut atmo,
         mut picker,
         fog_volumes,
+        water_volumes,
         mut fog_grid,
         mut frame_commands,
     ) = gpu;
@@ -1041,7 +1044,7 @@ fn render_frame(
             gi_roughness: settings.restir_gi_roughness.clamp(0.0, 1.0),
             light_epoch: lights.epoch,
             restir_m_clamp: (settings.restir_candidates as f32 * settings.restir_history).max(1.0),
-            pad_cache: [0; 2],
+            water_volumes: water_volumes.address(),
             emissive_boost: settings.emissive_boost.max(0.0),
             portals: portal_table.address(),
             portal_count: portal_table.count(),
@@ -1068,7 +1071,7 @@ fn render_frame(
             fog_grid_view_proj: grid.view_proj.to_cols_array(),
             fog_grid_prev_view_proj: grid.prev_view_proj.to_cols_array(),
             fog_grid_size: grid.size.to_array(),
-            pad_one_ray: 0,
+            water_volume_count: water_volumes.count(),
             fog_grid_sum_tex: grid.sum_tex,
             fog_grid_soft_tex: grid.soft_tex,
             fog_grid_soft: grid.soft,
@@ -2204,13 +2207,60 @@ fn render_frame(
                     );
                 }
                 render_device.cmd_end_rendering(cmd_buffer);
-                vk_utils::transition_image_layout(
-                    &render_device,
-                    cmd_buffer,
-                    texture.image,
-                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                );
+                // A screenshot of this target (a windowless app's): copied out through a host
+                // buffer on its way back to shader reads.
+                let readback = (*kind == TargetKind::Display)
+                    .then(|| screenshots.take_image(asset))
+                    .flatten();
+                if let Some(path) = readback {
+                    vk_utils::transition_image_layout(
+                        &render_device,
+                        cmd_buffer,
+                        texture.image,
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    );
+                    let size = extent.width as u64 * extent.height as u64 * 4;
+                    let buffer: Buffer<u8> = render_device.create_buffer(
+                        size,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        gpu_allocator::MemoryLocation::GpuToCpu,
+                    );
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: extent.width,
+                            height: extent.height,
+                            depth: 1,
+                        });
+                    render_device.cmd_copy_image_to_buffer(
+                        cmd_buffer,
+                        texture.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buffer.handle,
+                        std::slice::from_ref(&region),
+                    );
+                    screenshots.in_flight(path, buffer, *extent, kind.format(), frame_count);
+                    vk_utils::transition_image_layout(
+                        &render_device,
+                        cmd_buffer,
+                        texture.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
+                } else {
+                    vk_utils::transition_image_layout(
+                        &render_device,
+                        cmd_buffer,
+                        texture.image,
+                        vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
+                }
             }
 
             // The window, when there is one: the flat render or the XR spectator (left eye,
@@ -2976,6 +3026,16 @@ mod tests {
             core::mem::offset_of!(super::UniformData, emissive_boost),
             103 * 4
         );
+        // water_surface.slang.
+        assert_eq!(
+            core::mem::offset_of!(super::UniformData, water_volumes),
+            98 * 4
+        );
+        assert_eq!(core::mem::offset_of!(super::UniformData, time), 113 * 4);
+        assert_eq!(
+            core::mem::offset_of!(super::UniformData, water_volume_count),
+            187 * 4
+        );
     }
 
     /// `rt_types.slang` mirrors `UniformData` with scalars only; its offsets are these.
@@ -2988,7 +3048,7 @@ mod tests {
         assert_eq!(offset_of!(U, view), 144);
         assert_eq!(offset_of!(U, prev_view_proj), 272);
         assert_eq!(offset_of!(U, frame), 344);
-        assert_eq!(offset_of!(U, pad_cache), 392);
+        assert_eq!(offset_of!(U, water_volumes), 392);
         assert_eq!(offset_of!(U, portals), 400);
         assert_eq!(offset_of!(U, camera_mask), 416);
         assert_eq!(offset_of!(U, primary_hidden), 420);

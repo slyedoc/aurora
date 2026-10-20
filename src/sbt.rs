@@ -101,11 +101,7 @@ unsafe fn write_hit_pair(
     record: SBTRegionHitTriangle,
 ) {
     let shadow = SBTRegionHitTriangle {
-        handle: if record.handle == pipeline.hit_handle {
-            pipeline.shadow_hit_handle
-        } else {
-            pipeline.shadow_empty_handle
-        },
+        handle: pipeline.shadow_hit_handle,
         ..record
     };
     unsafe {

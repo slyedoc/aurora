@@ -13,7 +13,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 /// HDR sky brightness: texel value x this = nits (a clear sky sits around 2000-8000).
@@ -28,7 +28,6 @@ fn main() {
         .add_plugins((AuroraDefaultPlugins, DevUIPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

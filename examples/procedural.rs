@@ -17,7 +17,7 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 use bytemuck::{Pod, Zeroable};
 
@@ -47,7 +47,6 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, spawn_when_ready)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

@@ -13,7 +13,6 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     picking::{RayCaster, RayHits},
     sphere::Sphere,
-    util::TimeoutAppExt,
 };
 
 fn main() {
@@ -21,7 +20,6 @@ fn main() {
         .add_plugins((AuroraDefaultPlugins, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_systems(Update, (aim_cursor_ray, log_click, check_probes))
-        .add_timeout_exit(None, 8.0)
         .run();
 }
 

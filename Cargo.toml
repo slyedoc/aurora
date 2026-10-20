@@ -23,6 +23,9 @@ dlss-dev = []
 xr = []
 # Tracy: bevy's spans plus a frame mark per present. `--features bevy_aurora/trace_tracy`.
 trace_tracy = ["bevy/trace_tracy", "dep:tracy-client"]
+# The running app over the Bevy Remote Protocol (src/remote.rs): BRP plus aurora's camera,
+# screenshot, capture and timing methods on 127.0.0.1:15702. `--features bevy_aurora/remote`.
+remote = ["bevy/bevy_remote", "dep:serde_json"]
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
@@ -118,6 +121,7 @@ log = "0.4.20"
 # src/xr.rs), so flat builds pay nothing at runtime.
 openxr = { version = "0.21", features = ["loaded"] }
 png = "0.17.14"
+serde_json = { version = "1", optional = true }
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 raw-window-handle = "0.6.2"

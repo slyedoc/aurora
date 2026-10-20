@@ -7,6 +7,7 @@ import bsdf;
 import atmosphere_rt;
 import light_eval;
 import fog;
+import water;
 import nrc_record;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
@@ -227,10 +228,18 @@ struct ShadowPick {
         if (wsum <= 0.0) {
             return float3(0.0);
         }
-        if (!traceVisible(mask, leaveSurface(origin, normal, direction), 0.0, direction, tmax)) {
+        return resolveAt(mask, leaveSurface(origin, normal, direction));
+    }
+
+    // The kept proposal's shadow ray from `start` (a point in a medium: no surface to leave).
+    float3 resolveAt(uint mask, float3 start) {
+        if (wsum <= 0.0) {
             return float3(0.0);
         }
-        return scaled * wsum;
+        if (!traceVisible(mask, start, 0.0, direction, tmax)) {
+            return float3(0.0);
+        }
+        return scaled * wsum * waterLightTransmittance(pc.uniforms, start, direction, tmax);
     }
 };
 
@@ -412,11 +421,13 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
     var Ls = float3(0.0);
     var visible = false;
     var l = float3(0.0);
+    var sun_t = float3(0.0);
     for (uint si = 0u; si < env.sun_count; si++) {
         let sun = env.suns[si];
         if (si == 0u || any(sun.direction.xyz != env.suns[si - 1u].direction.xyz)) {
             l = sampleCone(sun.direction.xyz, sun.direction.w, randf(), randf());
             visible = traceVisible(ray_mask, x, 0.0, l, tmax);
+            sun_t = visible ? waterLightTransmittance(pc.uniforms, x, l, tmax) : float3(0.0);
         }
         if (!visible) {
             continue;
@@ -428,7 +439,7 @@ float3 fogSunLight(EnvironmentGpu* env, uint ray_mask, float tmax, float3 x, flo
             radiance *= atmoSunTransmittanceAt(x) * cloudShadow(x);
         }
         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-        Ls += radiance * solid_angle * fogPhase(env, dot(d, l));
+        Ls += radiance * sun_t * solid_angle * fogPhase(env, dot(d, l));
     }
     return Ls;
 }
@@ -653,7 +664,8 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, ino
     if (!traceVisible(ray_mask, x, 0.0, ldir, ldist * (1.0 - 1.0e-4))) {
         return float3(0.0);
     }
-    return sel_val * (wsum / (float(M) * sel_phat));
+    return sel_val * (wsum / (float(M) * sel_phat))
+        * waterLightTransmittance(pc.uniforms, x, ldir, ldist);
 }
 
 // One thread per cell lit this frame (one of every stride x stride block, fogGridPhase;
@@ -845,14 +857,19 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         // NOTE: emissive is deliberately NOT folded into this guide. A render-res albedo
         // guide carrying emissive-texture text aliases under the DLSS jitter, and RR's
         // history churns it into mush whenever the camera rests (tried 2026-09-02).
-        guide_diffuse[px] = float4(albedo * (1.0 - g_metallic), 1.0);
+        // A surface that keeps its guides though it is glass (water) sends all of its light on
+        // specularly, reflected or refracted: no diffuse, the whole of it specular.
+        let here = hitPayloadGetGuidesHere(payload) && hitPayloadGetTransmission(payload) > 0.5;
+        guide_diffuse[px] = here ? float4(0.0, 0.0, 0.0, 1.0)
+                                 : float4(albedo * (1.0 - g_metallic), 1.0);
         let g_f0 = lerp(float3(0.04), albedo, g_metallic);
         let g_NoV = dot(world_normal, -direction);
-        let g_spec = envBRDFApprox2(g_f0, linear_roughness, g_NoV);
+        let g_spec = here ? float3(1.0) : envBRDFApprox2(g_f0, linear_roughness, g_NoV);
         guide_specular[px] = float4(g_spec, 1.0);
         meter_albedo = any(payload.emission != float3(0.0))
             ? -1.0
-            : dot(float3(0.2125, 0.7154, 0.0721), albedo * (1.0 - g_metallic) + g_spec);
+            : dot(float3(0.2125, 0.7154, 0.0721),
+                  (here ? float3(0.0) : albedo * (1.0 - g_metallic)) + g_spec);
         guide_depth[px] = float4(min(linear_depth, 1.0e7), 0.0, 0.0, 0.0);
         // Motion in UV units (y down), current minus previous; NGX scales by -(w,h).
         let cur_clip = mat4MulVecAt(&pc.uniforms.view_proj[0], float4(virtual_pos, 1.0));
@@ -1051,7 +1068,8 @@ void primary() {
         }
         let guide_defer = payload.t != 0.0
             && hitPayloadGetTransmission(payload) > 0.5
-            && hitPayloadGetRoughness(payload) < 0.1;
+            && hitPayloadGetRoughness(payload) < 0.1
+            && !hitPayloadGetGuidesHere(payload);
         let t = payload.t;
         let ends = any(payload.emission != float3(0.0)) || t == 0.0;
         let hit_point = origin + direction * t;
@@ -1082,7 +1100,8 @@ void primary() {
                             hit_point, pc.uniforms.frame, payload.prev_world_pos,
                             mat4MulVecAt(&pc.uniforms.view_proj[0], float4(hit_point, 1.0)).w, payload.color.rgb,
                             hitPayloadGetMetallic(payload), hitPayloadGetRoughness(payload), payload.lobes,
-                            mask, ray_mask, world_normal, surface_normal, -direction));
+                            mask * waterSurvivalWeight(pc.uniforms, ray.Origin, direction, t),
+                            ray_mask, world_normal, surface_normal, -direction));
                     }
                 }
             }
@@ -1261,10 +1280,12 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         HitPayload payload = {};
         payload.miss_flags = 0u;
         payload.cone = float2(0.0, 0.01);
-        trace(FLAGS_OPAQUE, ray_mask, leaveSurface(p.x, p.ng, dir), 0.0, dir, 1.0e7, payload);
+        let start = leaveSurface(p.x, p.ng, dir);
+        trace(FLAGS_OPAQUE, ray_mask, start, 0.0, dir, 1.0e7, payload);
         if (payload.t == 0.0 || any(payload.emission != float3(0.0)) || hitPayloadGetMasked(payload)) {
             return res;
         }
+        res.T *= waterTransmittance(pc.uniforms, start, dir, payload.t);
         let transmission = hitPayloadGetTransmission(payload);
         let lob = unpackLobes(payload.lobes);
         let roughness = hitPayloadGetRoughness(payload);
@@ -1324,6 +1345,16 @@ float3 ptReconnect(PtVertex p, float3 T, GiCandidate c, float3 x_s, float3 n_s, 
     return T * surfaceEval(p.v, p.n, w, p.mat, p.lob) * ptSampleRadiance(c, -w);
 }
 
+// light_eval.slang ptOwnTarget with the water its reconnection crosses: k > 1 carries it in T
+// (the path's own weight), k = 1 re-evaluates the segment from the primary vertex as ptShift does.
+float3 ptOwnTargetWater(RestirSurface s, GiCandidate c) {
+    let C = ptOwnTarget(s, c);
+    if ((c.k & 15u) != 1u || !(luma(C) > 0.0)) {
+        return C;
+    }
+    return C * waterTransmittance(pc.uniforms, s.position, c.x_s - s.position, 1.0);
+}
+
 // A sample shifted to a primary vertex: its target vector there (visibility of the reconnection
 // segment included: the target is the integrand, so the reuse is unbiased), the Jacobian, and the
 // replayed x_{k-1}'s position and geometric normal (the segment gi_shade tests).
@@ -1372,7 +1403,7 @@ PtShift ptShift(RestirSurface s, float thr, GiCandidate c) {
         || !visibleInline(restirRayMask(s), start, (to - start) / dist, dist * 0.999)) {
         return r;
     }
-    r.f = f;
+    r.f = f * waterTransmittance(pc.uniforms, start, (to - start) / dist, dist);
     r.J = geo / c.geo;
     r.from_x = from.x;
     r.from_ng = from.ng;
@@ -1466,7 +1497,7 @@ void gi_temporal() {
     let own_W = own.pdf;
     var own_pdf = own;
     own_pdf.pdf = (own_W > 0.0 && own.q > 0.0) ? 1.0 / (own_W * own.q) : 0.0;
-    let C_c = (own_W > 0.0 && own_W < 1.0e20) ? ptOwnTarget(s, own_pdf) : float3(0.0);
+    let C_c = (own_W > 0.0 && own_W < 1.0e20) ? ptOwnTargetWater(s, own_pdf) : float3(0.0);
     let pc_c = luma(C_c);
     let own_valid = pc_c > 0.0;
 
@@ -1601,7 +1632,7 @@ void gi_spatial() {
     } else if (own_W > 0.0 && own_W < 1.0e20) {
         var own_pdf = own;
         own_pdf.pdf = own.q > 0.0 ? 1.0 / (own_W * own.q) : 0.0;
-        C_c = ptOwnTarget(s, own_pdf);
+        C_c = ptOwnTargetWater(s, own_pdf);
     }
     if (!(own_W > 0.0 && own_W < 1.0e20)) {
         C_c = float3(0.0);
@@ -1934,6 +1965,16 @@ void main() {
         // Solid-angle pdf of the ray being traced, when it came from BRDF sampling (0 for the
         // camera ray and delta continuations): the MIS partner of light-table sampling.
         var prev_pdf = 0.0;
+        // The MIS partner a light hit weighs against: the last rough vertex's lobe pdf, its
+        // position and the direction it left by. Kept through smooth glass that shadow rays pass
+        // (next-event estimation saw the light straight through it, so the refracted path is the
+        // other half of the same estimate, not a second one); 0 otherwise after a delta bounce.
+        var mis_pdf = 0.0;
+        var mis_origin = float3(0.0);
+        var mis_dir = float3(0.0, 1.0, 0.0);
+        // Whether that vertex sampled the light table too (a water collision samples only the
+        // suns and the sky: a lamp its continuation finds is all that lamp's light there).
+        var mis_lights = true;
         // What this ray sees and where it is: the camera's layer mask and environment until a
         // portal swaps them.
         var ray_mask = pc.uniforms.camera_mask;
@@ -2044,6 +2085,62 @@ void main() {
                 traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
             }
             cone_width += cone_spread * payload.t;
+            // The water this segment crossed (water.slang): it may scatter in the murk before
+            // its hit (the sky's segment runs out of the box).
+            if (pc.uniforms.water_volume_count > 0u) {
+                let we = waterSegment(pc.uniforms, start, direction,
+                                      payload.t != 0.0 ? payload.t : tmax, randf());
+                mask *= we.weight;
+                if (we.scatter) {
+                    origin = start + direction * we.t;
+                    surf_n = float3(0.0);
+                    if ((path & PATH_CAMERA) != 0u) {
+                        nrc_a0 = we.t * we.t / (4.0 * PI);
+                    }
+                    let wenv = pc.uniforms.environments + ray_env;
+                    // The suns and the sky into the collision through the phase function, one
+                    // shadow ray between them; the sky's estimate shares credit with the
+                    // phase-sampled continuation that reaches it.
+                    ShadowPick wpick = {};
+                    for (uint si = 0u; si < wenv.sun_count; si++) {
+                        let sun = wenv.suns[si];
+                        let r1 = randf();
+                        let r2 = randf();
+                        let l = sampleCone(sun.direction.xyz, sun.direction.w, r1, r2);
+                        let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
+                        wpick.propose(mask * waterPhase(we.g, dot(direction, l)) * sun.radiance.rgb * solid_angle,
+                                      l, tmax);
+                    }
+                    if (skySampled(wenv)) {
+                        float3 l;
+                        float pdf_env;
+                        let u1 = randf();
+                        let u2 = randf();
+                        let u3 = randf();
+                        let L = skySample(wenv, u1, u2, u3, l, pdf_env);
+                        if (pdf_env > 0.0) {
+                            let ph = waterPhase(we.g, dot(direction, l));
+                            wpick.propose(mask * L * ph / (pdf_env + ph), l, tmax);
+                        }
+                    }
+                    acc += wpick.resolveAt(ray_mask, origin);
+                    let wdir = waterSamplePhase(we.g, direction, randf(), randf());
+                    let wpdf = waterPhase(we.g, dot(direction, wdir));
+                    prev_pdf = wpdf;
+                    mis_pdf = wpdf;
+                    mis_origin = origin;
+                    mis_dir = wdir;
+                    mis_lights = false;
+                    direction = wdir;
+                    path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH | PATH_PT_CHAIN | PATH_CAMERA);
+                    continue;
+                }
+                // Surviving the segment is part of the sample's density, like the roulette:
+                // replay weighs the segment by its transmittance alone.
+                if ((path & PATH_PT_SEARCH) != 0u) {
+                    pt_q *= we.survive;
+                }
+            }
 
             let surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
             // The shading normal (interpolated, normal-mapped) can face away from the ray at
@@ -2066,6 +2163,7 @@ void main() {
                     surf_n = float3(0.0);
                     direction = p_dir;
                     prev_pdf = 0.0;
+                    mis_pdf = 0.0;
                     path &= ~PATH_PT_SEARCH;
                     continue;
                 }
@@ -2127,12 +2225,14 @@ void main() {
                         }
                         if (traceVisible(ray_mask, origin, 0.0, l, tmax)) {
                             let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
-                            acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle;
+                            acc += mask * fogPhase(env, dot(direction, l)) * sun_radiance * solid_angle
+                                * waterLightTransmittance(pc.uniforms, origin, l, tmax);
                         }
                     }
                 }
                 direction = sampleFogScatterDirection(env, direction);
                 prev_pdf = 0.0;
+                mis_pdf = 0.0;
                 path &= ~(PATH_WANT_SUN | PATH_PT_SEARCH | PATH_PT_CHAIN);
                 continue;
             }
@@ -2141,16 +2241,19 @@ void main() {
             if (any(payload.emission != float3(0.0)) || payload.t == 0.0) {
                 var contribution = mask * payload.emission;
                 // MIS: a BRDF-sampled ray landing on a table light shares credit with the
-                // next-event estimate taken at the previous vertex (prev_pdf 0 = camera ray or
-                // delta continuation, which take the emission at full weight).
-                if (payload.t != 0.0 && prev_pdf > 0.0 && pc.uniforms.light_entries > 0u
+                // next-event estimate taken at the last rough vertex (mis_pdf 0 = camera ray or
+                // delta continuation, which take the emission at full weight). Its pdfs are the
+                // ones next-event estimation had from there: straight to the light point.
+                let hit_at = origin + direction * payload.t;
+                let mis_dist = length(hit_at - mis_origin);
+                let mis_to = mis_dist > 0.0 ? (hit_at - mis_origin) / mis_dist : direction;
+                if (payload.t != 0.0 && mis_pdf > 0.0 && mis_lights && pc.uniforms.light_entries > 0u
                     && payload.slot < pc.lights.slot_map_count && pc.lights.total_power > 0.0) {
                     let linst_idx = pc.lights.slot_to_linst[payload.slot];
                     if (linst_idx != 0xFFFFFFFFu && (linst_idx & LIGHT_SLOT_ANALYTIC) != 0u) {
-                        // A sphere emitter: `origin` is still the vertex the ray left.
-                        let pdf_light = sphereEmitterPdf(lightCtx(), linst_idx & ~LIGHT_SLOT_ANALYTIC, origin);
+                        let pdf_light = sphereEmitterPdf(lightCtx(), linst_idx & ~LIGHT_SLOT_ANALYTIC, mis_origin);
                         if (pdf_light > 0.0) {
-                            contribution *= prev_pdf / (prev_pdf + pdf_light);
+                            contribution *= mis_pdf / (mis_pdf + pdf_light);
                         }
                     } else if (linst_idx != 0xFFFFFFFFu) {
                         let li = pc.lights.linsts[linst_idx];
@@ -2158,18 +2261,19 @@ void main() {
                             let e = li.entry_base + payload.prim_tri;
                             let p_pick = lightsEntryPick(lightCtx(), e);
                             if (p_pick > 0.0) {
-                                let pdf_light = lightTrianglePdf(lightCtx(), li, payload.prim_tri, p_pick, payload.t, direction);
+                                let pdf_light = lightTrianglePdf(lightCtx(), li, payload.prim_tri, p_pick, mis_dist, mis_to);
                                 if (pdf_light > 0.0) {
-                                    contribution *= prev_pdf / (prev_pdf + pdf_light);
+                                    contribution *= mis_pdf / (mis_pdf + pdf_light);
                                 }
                             }
                         }
                     }
                 }
                 // MIS against the environment sampler: a BRDF-sampled ray that escapes to the HDR
-                // sky shares credit with the previous vertex's environment estimate.
-                if (payload.t == 0.0 && prev_pdf > 0.0 && skySampled(env)) {
-                    contribution *= prev_pdf / (prev_pdf + skyPdf(env, direction));
+                // sky shares credit with that vertex's environment estimate, along the direction
+                // it left by.
+                if (payload.t == 0.0 && mis_pdf > 0.0 && skySampled(env)) {
+                    contribution *= mis_pdf / (mis_pdf + skyPdf(env, mis_dir));
                 }
                 acc += contribution;
                 break;
@@ -2543,8 +2647,16 @@ void main() {
             if (bpdf > 0.0) {
                 path &= ~(PATH_WANT_SUN | PATH_PT_CHAIN);
             }
-            // The opaque lobes' pdf (0 for a delta or glass): the MIS partner of light sampling.
+            // The opaque lobes' pdf (0 for a delta or glass).
             prev_pdf = bpdf;
+            if (bpdf > 0.0) {
+                mis_pdf = bpdf;
+                mis_origin = origin;
+                mis_dir = l;
+                mis_lights = true;
+            } else if (!(through && transmission > 0.5)) {
+                mis_pdf = 0.0;
+            }
             mask *= weight;
             // The cone opens with the lobe: a mirror keeps it, a diffuse bounce spreads wide.
             if (through) {

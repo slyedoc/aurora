@@ -22,7 +22,7 @@ use bevy_aurora::{
     surface_group::{
         LayeredParams, SurfaceClass, SurfaceGroup, SurfaceGroupData, SurfaceGroupRegistry,
     },
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 /// Holds the buffer alive: dropping it would leave `SurfaceGroupData` pointing at freed
@@ -38,7 +38,6 @@ fn main() {
         .add_plugins((AuroraDefaultPlugins, FreeCameraPlugin))
         .add_systems(Startup, (register_layered, setup).chain())
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 14.0)
         .run();
 }
 

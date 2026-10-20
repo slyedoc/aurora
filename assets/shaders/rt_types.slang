@@ -7,6 +7,7 @@
 module rt_types;
 
 __exported import hit_payload;
+__exported import water_types;
 
 public static const float PI = 3.141592653589793;
 
@@ -171,8 +172,8 @@ public struct UniformData {
     public uint light_epoch;
     // Cap on temporal history, in candidate-samples.
     public float restir_m_clamp;
-    public uint pad_cache0;
-    public uint pad_cache1;
+    // Water volumes (src/water_volume.rs): the table (count: water_volume_count).
+    public WaterVolumeGpu* water_volumes;
     // Ray portals (src/portal.rs): pair table (x = instance slot, y = target slot, z = valid)
     // + entry count (0 = none).
     public uint4* portals;
@@ -209,7 +210,7 @@ public struct UniformData {
     public float fog_grid_view_proj[16];
     public float fog_grid_prev_view_proj[16];
     public uint fog_grid_size_x, fog_grid_size_y, fog_grid_size_z;
-    public uint pad_one_ray;
+    public uint water_volume_count;
     // Bindless 3D images (raygen.slang `volumes`): the grid's columns summed front to back
     // (`fog_integrate`: per cell, the in-scatter and transmittance from the grid's eye to the
     // cell's far side, behind a first slice of nothing) and the grid blurred once across x and
@@ -953,6 +954,10 @@ public bool hitPayloadGetInside(HitPayload p) {
 
 public bool hitPayloadGetMasked(HitPayload p) {
     return (p.r_m_t_i & 0x02) != 0;
+}
+
+public bool hitPayloadGetGuidesHere(HitPayload p) {
+    return (p.r_m_t_i & 0x04) != 0;
 }
 
 // Returns +/- 1

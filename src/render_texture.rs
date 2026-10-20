@@ -592,6 +592,30 @@ pub fn create_blank_texture(
         width,
         height,
         1,
+        1,
+    )
+}
+
+/// [`create_blank_texture`] with `mip_levels` levels (the view spans them all): a GPU-written
+/// texture whose chain [`record_mip_chain`] refills.
+pub fn create_blank_texture_mipped(
+    device: &RenderDevice,
+    format: vk::Format,
+    usage_flags: vk::ImageUsageFlags,
+    desired_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+) -> RenderTexture {
+    create_blank(
+        device,
+        format,
+        usage_flags,
+        desired_layout,
+        width,
+        height,
+        1,
+        mip_levels,
     )
 }
 
@@ -614,6 +638,7 @@ pub fn create_blank_volume(
         width,
         height,
         depth,
+        1,
     )
 }
 
@@ -625,8 +650,10 @@ fn create_blank(
     width: u32,
     height: u32,
     depth: u32,
+    mip_levels: u32,
 ) -> RenderTexture {
-    let mut image_info = vk_init::image_info(width, height, format, usage_flags);
+    let mut image_info =
+        vk_init::image_info(width, height, format, usage_flags).mip_levels(mip_levels);
     if depth > 1 {
         image_info = image_info
             .image_type(vk::ImageType::TYPE_3D)
@@ -677,6 +704,12 @@ fn create_blank(
     device.run_transfer_commands(|cmd_buffer| unsafe {
         let to_final =
             vk_init::layout_transition2(image_handle, vk::ImageLayout::UNDEFINED, desired_layout)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(mip_levels)
+                        .layer_count(1),
+                )
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -687,7 +720,12 @@ fn create_blank(
         );
     });
 
-    let mut view_info = vk_init::image_view_info(image_handle, format);
+    let mut view_info = vk_init::image_view_info(image_handle, format).subresource_range(
+        vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(mip_levels)
+            .layer_count(1),
+    );
     if depth > 1 {
         view_info = view_info.view_type(vk::ImageViewType::TYPE_3D);
     }
@@ -696,7 +734,7 @@ fn create_blank(
     RenderTexture {
         image: image_handle,
         image_view: view,
-        mip_levels: 1,
+        mip_levels,
         width,
         height,
     }

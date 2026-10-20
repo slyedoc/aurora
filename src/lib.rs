@@ -50,6 +50,8 @@ pub mod procedural_mesh;
 pub mod ray_render_plugin;
 pub mod raytracing_pipeline;
 pub mod reference;
+#[cfg(feature = "remote")]
+pub mod remote;
 pub mod render_buffer;
 pub mod render_device;
 pub mod render_env;
@@ -75,6 +77,8 @@ pub mod util;
 pub mod vk_init;
 pub mod vk_utils;
 pub mod vulkan_asset;
+pub mod water_volume;
+pub mod water_waves;
 pub mod xr;
 
 use bevy::{app::PluginGroupBuilder, prelude::*};
@@ -113,6 +117,7 @@ pub mod prelude {
         sky::{EnvironmentSkies, Fog, GradientSky, Sky, SkyAir, SkyBrightness},
         ui_panel::{InspectorPanel3d, UiPanel3d},
         util::{ScreenshotExt, TimeoutAppExt, VideoExt, VideoRecorder},
+        water_volume::WaterVolume,
         xr::{XrHand, XrHandState, XrInput, XrPose, XrState, XrTracked},
     };
 }
@@ -151,7 +156,13 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(bevy::world_serialization::WorldSerializationPlugin);
         group = group.add(crate::portal::PortalPlugin);
         group = group.add(crate::fog_volume::FogVolumePlugin);
-        group = group.add(bevy::winit::WinitPlugin::default());
+        group = group.add(crate::water_volume::WaterVolumePlugin);
+        // `--headless [WxH]`: no window; the frames run on and the camera renders into a
+        // WxH image (util/headless.rs, default 1280x720), which screenshots read back.
+        let headless = crate::util::headless::headless_size();
+        if headless.is_none() {
+            group = group.add(bevy::winit::WinitPlugin::default());
+        }
         group = group.add(bevy::audio::AudioPlugin::default());
 
         // Before RayRenderPlugin: under the `xr` feature the render device is created through
@@ -191,6 +202,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::auto_exposure::AutoExposurePlugin);
         group = group.add(crate::atmosphere::AtmospherePlugin);
         group = group.add(crate::sky_gen::SkyGenPlugin);
+        group = group.add(crate::water_waves::WaterWavesPlugin);
         group = group.add(crate::debug_view::DebugViewPlugin);
         group = group.add(crate::surface_group::SurfaceGroupPlugin);
         group = group.add(crate::render_shaders::RenderShadersPlugin);
@@ -208,6 +220,14 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::gizmo_render::GizmoRenderPlugin);
         group = group.add(crate::bsn::BsnPlugin);
         group = group.add(crate::animclip::AnimClipPlugin);
+        if let Some(size) = headless {
+            group = group.add(crate::util::Headless { size });
+        }
+        // `--features remote`: the running app answers BRP (src/remote.rs).
+        #[cfg(feature = "remote")]
+        {
+            group = group.add(crate::remote::AuroraRemotePlugin::default());
+        }
 
         group
     }

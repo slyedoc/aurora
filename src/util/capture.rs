@@ -476,7 +476,7 @@ fn read_output(app: &mut App) -> Option<(Vec<[f32; 3]>, u32, u32)> {
 }
 
 /// A portable float map: `PF`, the size, -1 (little-endian), then rows bottom first.
-fn write_pfm(path: &Path, pixels: &[[f32; 3]], width: u32, height: u32) {
+pub(crate) fn write_pfm(path: &Path, pixels: &[[f32; 3]], width: u32, height: u32) {
     let mut out = Vec::with_capacity(pixels.len() * 12 + 32);
     write!(out, "PF\n{width} {height}\n-1.0\n").unwrap();
     for y in (0..height as usize).rev() {

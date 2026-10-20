@@ -20,6 +20,9 @@ use crate::render_device::RenderDevice;
 #[derive(Resource, Default)]
 pub struct ScreenshotRequests {
     pending: Vec<PathBuf>,
+    /// Image-target captures: the next frame drawn into that camera target (a windowless app's
+    /// screenshot).
+    pending_images: Vec<(AssetId<Image>, PathBuf)>,
     /// Copies recorded into this frame, read back the next.
     in_flight: Vec<InFlight>,
     /// Filled by the PNG threads.
@@ -46,6 +49,16 @@ impl ScreenshotRequests {
     /// Captures the next presented frame to `path` (PNG).
     pub fn request(&mut self, path: impl Into<PathBuf>) {
         self.pending.push(path.into());
+    }
+
+    /// Captures the next frame drawn into the display image target `image` to `path` (PNG).
+    pub fn request_image(&mut self, image: AssetId<Image>, path: impl Into<PathBuf>) {
+        self.pending_images.push((image, path.into()));
+    }
+
+    pub(crate) fn take_image(&mut self, image: AssetId<Image>) -> Option<PathBuf> {
+        let at = self.pending_images.iter().position(|(i, _)| *i == image)?;
+        Some(self.pending_images.remove(at).1)
     }
 
     /// Every capture written since the last call.

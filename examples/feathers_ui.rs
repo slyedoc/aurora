@@ -26,7 +26,7 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     sphere::Sphere,
     ui_render::UiPolyline,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 #[derive(Resource, Default)]
@@ -79,7 +79,6 @@ fn main() {
     // Every other example has these; this one did not, so it had no F12 and ran forever under
     // the screenshot recipe.
     app.add_screenshot(KeyCode::F12);
-    app.add_timeout_exit(None, 30.0);
     app.run();
 }
 

@@ -23,7 +23,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     portal::{AuroraPortal, PortalTraveler},
     sky::Sky,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 const SKY_SCALE_NITS: f32 = 8000.0;
@@ -33,7 +33,6 @@ fn main() {
         .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

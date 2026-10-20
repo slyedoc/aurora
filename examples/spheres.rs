@@ -13,7 +13,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
     sphere::Sphere,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -36,10 +36,8 @@ fn main() {
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, debug_gizmos)
-        // F12 captures to target/tmp; AUTO_SCREENSHOT_MS + the CLAUDECODE auto-exit make
-        // headless agent runs self-verifying.
+        // F12 captures to target/tmp.
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

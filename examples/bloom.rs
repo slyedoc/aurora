@@ -15,7 +15,7 @@ use bevy_aurora::{
     render_settings::RenderSettings,
     sky::SkyBrightness,
     sphere::Sphere,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 /// A fixed exposure: auto exposure meters only the dark (emitters are left out of the meter)
@@ -28,7 +28,6 @@ fn main() {
         .add_systems(Startup, (setup, start_strength))
         .add_systems(Update, (controls, bounce))
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 10.0)
         .run();
 }
 

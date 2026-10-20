@@ -19,7 +19,7 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 /// Panel brightness in nits (cd/m^2): a bright ceiling light panel. The camera's auto
@@ -31,7 +31,6 @@ fn main() {
         .add_plugins((AuroraDefaultPlugins, DevUIPlugin, FreeCameraPlugin))
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

@@ -27,7 +27,7 @@ use bevy_aurora::{
     sky::{Fog, Sky},
     sphere::Sphere,
     util::{
-        ScreenshotExt, TimeoutAppExt,
+        ScreenshotExt,
         capture::{self, CaptureArgs},
     },
 };
@@ -69,8 +69,7 @@ fn main() {
             DevUIPlugin,
             FreeCameraPlugin,
         ))
-        .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0);
+        .add_screenshot(KeyCode::F12);
     }
     app.add_systems(Startup, (setup, apply_flags))
         .add_systems(Update, pin_exposure);

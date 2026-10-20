@@ -169,6 +169,12 @@ public void hitPayloadSetMasked(inout HitPayload p, bool m) {
     p.r_m_t_i = (p.r_m_t_i & ~0x02) | (m ? 0x02 : 0);
 }
 
+// The DLSS guides stop here, smooth glass or not (water: its waves flip the dominant lobe
+// between what lies under and what it reflects pixel by pixel, which the guides must not follow).
+public void hitPayloadSetGuidesHere(inout HitPayload p, bool g) {
+    p.r_m_t_i = (p.r_m_t_i & ~0x04) | (g ? 0x04 : 0);
+}
+
 float2 signNotZero(float2 v) {
     return float2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
 }

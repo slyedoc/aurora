@@ -40,7 +40,7 @@ use bevy_aurora::{
     sky::Sky,
     sphere::Sphere as RtSphere,
     ui_panel::{InspectorPanel3d, UiPanel3d, UiPanel3dRoot},
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 /// The offscreen UI target's resolution: 16:9, matching the quad's 2.4 x 1.35 world aspect
@@ -74,7 +74,6 @@ fn main() {
             }
         })
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

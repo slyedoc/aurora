@@ -21,7 +21,7 @@ use bevy_aurora::{
     mesh::{AuroraMesh, AuroraMesh3d},
     skinning::{Wind, WindSway},
     sky::Sky,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
@@ -38,7 +38,6 @@ fn main() {
         })
         .add_systems(Startup, setup)
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .run();
 }
 

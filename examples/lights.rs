@@ -16,7 +16,7 @@ use bevy_aurora::{
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     sky::Sky,
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 fn main() {
@@ -25,7 +25,6 @@ fn main() {
     app.add_plugins(DevUIPlugin);
     app.add_plugins(FreeCameraPlugin::default());
     app.add_screenshot(KeyCode::F12);
-    app.add_timeout_exit(None, 20.0);
     app.add_systems(Startup, setup);
     app.run();
 }

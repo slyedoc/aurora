@@ -135,10 +135,9 @@ pub struct CompiledRaytracingPipeline {
     pub miss_handle: RTGroupHandle,
     /// Miss index 1: shadow rays.
     pub shadow_miss_handle: RTGroupHandle,
-    /// Shadow twins of the hit groups (record offset 1): the opaque triangles' alpha test,
-    /// and no shaders at all for the surface classes.
+    /// Shadow twin of every triangle hit group (record offset 1): the alpha test and the
+    /// pass through transmissive surfaces, from the material record every class shares.
     pub shadow_hit_handle: RTGroupHandle,
-    pub shadow_empty_handle: RTGroupHandle,
     /// The built-in opaque triangle group: [`SurfaceClass::OPAQUE`], and
     /// `surface_handles[0]`.
     pub hit_handle: RTGroupHandle,
@@ -611,8 +610,9 @@ impl VulkanAsset for RaytracingPipeline {
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
-        // Shadow hit groups (record offset 1, sbt.rs): the opaque triangles' alpha test under the
-        // shadow payload, and an empty group for the classes, which have no any-hit.
+        // The shadow hit group (record offset 1, sbt.rs): the alpha test and the pass through
+        // transmissive surfaces under the shadow payload, for every class (a water surface
+        // without it shadowed everything under it).
         let shadow_hit_group = shader_group.len();
         let shadow_any_hit_stage = shader_stages.len() as u32;
         shader_stages.push(render_device.load_shader_entry(
@@ -626,15 +626,6 @@ impl VulkanAsset for RaytracingPipeline {
                 .general_shader(vk::SHADER_UNUSED_KHR)
                 .closest_hit_shader(vk::SHADER_UNUSED_KHR)
                 .any_hit_shader(shadow_any_hit_stage)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-        );
-        let shadow_empty_group = shader_group.len();
-        shader_group.push(
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
                 .intersection_shader(vk::SHADER_UNUSED_KHR),
         );
 
@@ -753,7 +744,6 @@ impl VulkanAsset for RaytracingPipeline {
         let gi_temporal_handle = handles[gi_temporal_group];
         let shadow_miss_handle = handles[shadow_miss_group];
         let shadow_hit_handle = handles[shadow_hit_group];
-        let shadow_empty_handle = handles[shadow_empty_group];
 
         let group_stack = |group: usize, shader: vk::ShaderGroupShaderKHR| unsafe {
             render_device
@@ -833,7 +823,6 @@ impl VulkanAsset for RaytracingPipeline {
             miss_handle,
             shadow_miss_handle,
             shadow_hit_handle,
-            shadow_empty_handle,
             hit_handle,
             sphere_hit_handle,
             surface_handles,

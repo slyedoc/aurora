@@ -6,7 +6,8 @@ public struct HitPayload {
     public float t;
     public float refract_index;
     // r = roughness, m = metallic, t = transmission, i = flags (bit 0 inside, bit 1 masked:
-    // the material has an alpha cutoff, so its texture alpha means coverage).
+    // the material has an alpha cutoff, so its texture alpha means coverage; bit 2 guides here:
+    // the DLSS guides stop at this surface even where it is smooth glass).
     public int r_m_t_i;
     public float4 color;
     public float3 emission;

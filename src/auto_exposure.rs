@@ -61,12 +61,12 @@ pub enum AuroraExposure {
     Environment,
 }
 
-/// Auto around a fixed daylight anchor: interiors, shade and night are lifted part of the way
-/// by what the camera sees, without anyone authoring them, and a room looks the same at any
-/// hour.
+/// The environment's fixed exposure: authored (its `EnvironmentExposure`, which a game sets by
+/// time of day), else its brightest sun's. Never metered from what the camera sees: a dark
+/// corner stays dark, as in a game.
 impl Default for AuroraExposure {
     fn default() -> Self {
-        Self::Auto(AutoExposureSettings::default())
+        Self::Environment
     }
 }
 

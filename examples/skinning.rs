@@ -21,7 +21,7 @@ use bevy_aurora::{
     dev_ui::DevUIPlugin,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
-    util::{ScreenshotExt, TimeoutAppExt},
+    util::ScreenshotExt,
 };
 
 const CLIPS: [&str; 3] = [
@@ -41,7 +41,6 @@ fn main() {
             FreeCameraPlugin::default(),
         ))
         .add_screenshot(KeyCode::F12)
-        .add_timeout_exit(None, 12.0)
         .add_systems(Startup, setup)
         .add_systems(Update, switch_clips)
         .run();
