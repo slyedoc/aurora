@@ -1,4 +1,4 @@
-//! A pond for water work (docs/plans/water.md): one water plane at y = 0 over a shore that
+//! A pond for water work: one water plane at y = 0 over a shore that
 //! slopes from the bank into 3 m of water, then a flat bottom out to a far bank. White tiles lie
 //! on the slope at known depths (0.25, 0.5, 1, 1.5, 2, 3 m) to read the absorption by; a
 //! striped pole stands through the surface (refraction's kink, the fade along it); an orange

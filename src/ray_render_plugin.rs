@@ -233,7 +233,7 @@ pub struct TeardownSchedule;
 /// submitted frame reads: per-frame host buffers come in parity pairs or `Flip`s, small data
 /// goes through update-buffer commands, rewrites of shared tables go through
 /// `run_transfer_commands_after_frames`, and results read back from the GPU are consumed only
-/// after the wait (docs/plans/frame-pipeline.html). `Fence` is kept, empty, for ordering.
+/// after the wait. `Fence` is kept, empty, for ordering.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderSet {
     Shutdown,
@@ -839,7 +839,7 @@ fn render_frame(
         view.cost = (buffer.handle, buffer.address);
     }
 
-    // The primary pass's hit records, at each view's trace size (docs/plans/primary-pass.html).
+    // The primary pass's hit records, at each view's trace size.
     for view in &mut views {
         let buffer = &mut frame.primary_hits[view.slot];
         let len = view.trace_extent.width as u64 * view.trace_extent.height as u64;
@@ -1199,7 +1199,7 @@ fn render_frame(
         // With rays to pick, the instance table and TLAS go into their own command buffer,
         // submitted ahead of the rest with the pick at its end (picking.rs).
         let pick = picker.active(&modules, &tlas);
-        // Async compute (docs/plans/async-compute.html): skins with their BLAS refits and the
+        // Async compute: skins with their BLAS refits and the
         // radiance cache resolve run on the compute queue beside the frame commands; the TLAS,
         // lights and everything after wait for them. A pick submits the TLAS ahead of the frame,
         // so with one everything stays on the graphics queue.
@@ -1723,7 +1723,7 @@ fn render_frame(
                         };
                         push_trace(trace_constants);
                         // The primary pass: sample 0's camera chain and its hit record, which the
-                        // trace resumes from (docs/plans/primary-pass.html).
+                        // trace resumes from.
                         if view.primary_hits != 0 {
                             let scope = prof.begin(&render_device, cmd.get(), "primary");
                             // Its own ray stack (the driver's default sizes every dispatch for the largest raygen).
@@ -2617,8 +2617,8 @@ fn render_frame(
             let queue = render_device.queue.lock().unwrap();
             drop(queue_lock);
             let traced = crate::nsight::begin_frame(*queue);
-            // The frame's submits on the graphics queue, with the async compute between them
-            // (docs/plans/async-compute.html): without a pick, the scene lane's first half beside
+            // The frame's submits on the graphics queue, with the async compute between them:
+            // without a pick, the scene lane's first half beside
             // skins and the radiance cache resolve; then the TLAS and lights; the light grids
             // (compute) beside the first view's fog grid and primary pass; the rest after them.
             // The last submit waits (directly or through an earlier one) on every compute submit,

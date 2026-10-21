@@ -1,4 +1,4 @@
-//! The neural radiance cache's gym (docs/plans/nrc.html, phase 1): the training kernels against a
+//! The neural radiance cache's gym: the training kernels against a
 //! CPU reference, then a fit of a synthetic radiance field. Windowless; skipped on a device
 //! without cooperative vectors.
 

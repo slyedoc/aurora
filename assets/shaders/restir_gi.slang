@@ -1,4 +1,4 @@
-// ReSTIR PT's compute pass (src/restir_gi.rs; docs/plans/restir-pt.html), after the path tracer
+// ReSTIR PT's compute pass (src/restir_gi.rs), after the path tracer
 // wrote this frame's samples (raygen.slang `main`): each completed in place as a reservoir of one
 // (W = 1 / pdf, its target here). Without spatial reuse that is also the final reservoir; with it,
 // raygen.slang `gi_spatial` resamples (its shift replays prefixes, so it traces), then `gi_shade`

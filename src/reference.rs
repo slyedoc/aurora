@@ -1,5 +1,5 @@
 //! The reference: the traced image accumulated to convergence with Ray Reconstruction out of the
-//! loop (docs/plans/reference-mode.html).
+//! loop.
 //!
 //! Per view, at trace resolution, an RGBA32F buffer: rgb the summed radiance in nits (each
 //! frame's noisy colour with the exposure divided back out), a the frame count. The raygen's

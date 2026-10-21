@@ -1,4 +1,4 @@
-//! ReSTIR PT (docs/plans/restir-pt.html): reservoir resampling of whole paths at sample 0's
+//! ReSTIR PT: reservoir resampling of whole paths at sample 0's
 //! primary vertex (Lin et al. 2022), grown out of ReSTIR GI (whose names the passes keep).
 //!
 //! The path tracer (raygen.slang `main`) writes, for each pixel whose primary vertex takes part

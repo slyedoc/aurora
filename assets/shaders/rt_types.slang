@@ -332,7 +332,7 @@ public RestirSurface restirSurfaceLoad(RestirSurface* p) {
     return s;
 }
 
-// Where the path tracer resumes sample 0 (docs/plans/primary-pass.html), written by the
+// Where the path tracer resumes sample 0, written by the
 // primary pass per traced pixel. 64 bytes.
 public struct PrimaryHit {
     // The last camera-chain segment (after pass-through and portals): its start and direction.
@@ -388,7 +388,7 @@ public float3 unpackRadiance(uint p) {
     return unpackRgb9e5(p) * PT_RADIANCE_SCALE;
 }
 
-// ReSTIR PT's sample (src/restir_gi.rs; docs/plans/restir-pt.html), written by the path tracer per
+// ReSTIR PT's sample (src/restir_gi.rs), written by the path tracer per
 // traced pixel whose primary vertex takes part and whose path found a reconnection vertex x_k: the
 // first vertex k >= 1 where x_{k-1} and x_k are both rough and far apart. What x_k sends back is
 // kept so its BSDF can be evaluated again for another incoming direction (a shifted x_{k-1}): its

@@ -171,7 +171,7 @@ pub fn log_executable_statistics(rd: &RenderDevice, label: &str, pipeline: vk::P
 }
 
 /// The queue families buffers and images are shared between (graphics, then the compute-only
-/// family when the device has one; async compute, docs/plans/async-compute.html). Set once, when
+/// family when the device has one; async compute). Set once, when
 /// the device is made.
 static SHARING_FAMILIES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 

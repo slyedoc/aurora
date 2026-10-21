@@ -1,6 +1,6 @@
 //! Neural radiance cache (Müller, Rousselle, Novák, Keller 2021): a small MLP that learns the
 //! scattered outgoing radiance at a surface point from the frame's own paths, so a path that has
-//! spread far can end in the network's answer. Plan and gates: docs/plans/nrc.html.
+//! spread far can end in the network's answer.
 //!
 //! [`NrcNetwork`] is the network and its training state (assets/shaders/nrc_kernels.slang): the
 //! position's multiresolution hash grid and three 64 x 64 layers whose f16 copies feed the tensor

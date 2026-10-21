@@ -985,7 +985,7 @@ void cameraFog(EnvironmentGpu* env, uint ray_env, uint ray_mask, float3 origin, 
     fog_t *= seg_t;
 }
 
-// The primary pass (docs/plans/primary-pass.html), one thread per traced pixel, ahead of ReSTIR
+// The primary pass, one thread per traced pixel, ahead of ReSTIR
 // and the path tracer: sample 0's camera ray through alpha cutouts and portals to its first
 // accepted surface, which it records (PrimaryHit) for the path tracer to resume from; on the
 // way the DLSS guides, the camera ray's fog and the exposure meter. Behind smooth glass the
@@ -1843,7 +1843,7 @@ void gi_spatial() {
     }
 }
 
-// The reference accumulation (reference.rs, docs/plans/reference-mode.html), one thread per traced
+// The reference accumulation (reference.rs), one thread per traced
 // pixel after the trace and gi_shade: this frame's noisy colour, the exposure divided back out (so
 // nits), added to the running sum. A reset clears the buffer before this runs.
 [shader("raygeneration")]
@@ -2029,7 +2029,7 @@ void main() {
     // Far range: the sim-scale sky domes sit kilometers out, a planet's horizon tens of km.
     let tmax = 1.0e6;
 
-    // The primary pass (docs/plans/primary-pass.html) walked sample 0's camera chain: its hit
+    // The primary pass walked sample 0's camera chain: its hit
     // record, the guides, the camera ray's fog, the meter's divisor and the focus pull. The
     // record is read where needed, never held: 16 words live across every trace would spill.
     let prim_at = launch_id.y * launch_size.x + launch_id.x;

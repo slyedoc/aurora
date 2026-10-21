@@ -1,4 +1,4 @@
-//! Reference captures (docs/plans/reference-mode.html): run an app windowless into a fixed-size
+//! Reference captures: run an app windowless into a fixed-size
 //! image target and write, as float PFMs, the reference (the traced image accumulated over N
 //! frames, Ray Reconstruction out of the loop), a few single noisy frames and RR's output for the
 //! same frames, all in nits, plus `capture.json`. Nothing outside the program can change the size

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure reference captures (bevy_aurora::util::capture, docs/plans/reference-mode.html).
+"""Measure reference captures (bevy_aurora::util::capture).
 
     scripts/refcmp.py DIR            one capture: the reference's convergence (its checkpoints), the noisy input's
                                      noise and clumping, RR's output against the reference

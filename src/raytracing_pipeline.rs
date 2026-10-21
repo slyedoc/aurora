@@ -120,7 +120,7 @@ pub struct CompiledRaytracingPipeline {
     pub raygen_handle: RTGroupHandle,
     /// The fog grid update's raygen (fog_grid.rs).
     pub fog_grid_handle: RTGroupHandle,
-    /// The primary pass's raygen (docs/plans/primary-pass.html).
+    /// The primary pass's raygen.
     pub primary_handle: RTGroupHandle,
     /// ReSTIR GI's shading raygen (restir_gi.rs).
     pub gi_shade_handle: RTGroupHandle,

@@ -75,7 +75,7 @@ pub struct RenderSettings {
     /// (0 = off).
     #[reflect(@0.0..=1.0_f32)]
     pub restir_boiling: f32,
-    /// ReSTIR PT (restir_gi.rs; docs/plans/restir-pt.html; the setting keeps ReSTIR GI's name,
+    /// ReSTIR PT (restir_gi.rs; the setting keeps ReSTIR GI's name,
     /// which it replaced): sample 0's path from its reconnection vertex on resampled across
     /// neighbouring pixels (and, with `restir_pt_history`, frames) by the hybrid shift, shaded by
     /// a pass of its own. Unbiased against the plain path tracer (sun room references).
@@ -108,7 +108,7 @@ pub struct RenderSettings {
     pub light_grid_samples: u32,
     /// Neural radiance cache (nrc.rs; off on a device without VK_NV_cooperative_vector): paths
     /// that have spread far end in a small network's answer, trained online from the frame's own
-    /// paths (docs/plans/nrc.html). A no-cache truth for comparisons turns it off.
+    /// paths. A no-cache truth for comparisons turns it off.
     pub nrc: bool,
     /// A path ends in the cache once its footprint has spread past this x the primary vertex's
     /// (larger: later, less bias, more tracing).
