@@ -192,6 +192,8 @@ fn build_panels(
                 base_color: Color::BLACK,
                 emissive: LinearRgba::WHITE * panel.nits,
                 emissive_texture: Some(target.clone()),
+                // A screen glows; it is not a lamp (its texture is mostly dark widgets).
+                glow_only: true,
                 ..default()
             })),
             UiSurfacePanel {

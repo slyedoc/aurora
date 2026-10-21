@@ -26,8 +26,8 @@ struct QuadPush {
     float display_exposure;
     // AuroraDebugView (src/debug_view.rs): 0 = the output, else a guide visualisation.
     uint debug_view;
-    // 1: a scene-radiance target (half float) -- physical radiance, no exposure or tonemap.
-    uint scene_radiance;
+    // OUTPUT_* (post_process_filter.rs `Output`): what the target holds and how it is encoded.
+    uint output;
     // 1: slot 8 holds the camera ray's fog (rgb light pre-exposed like the colour, a its
     // transmittance), composited here over Ray Reconstruction's output.
     uint fog;
@@ -127,6 +127,71 @@ Frame frameOf(VertexOut v) {
     return f;
 }
 
+// `Output` in post_process_filter.rs.
+static const uint OUTPUT_DISPLAY = 0u;
+static const uint OUTPUT_RADIANCE = 1u;
+static const uint OUTPUT_CANVAS = 2u;
+static const uint OUTPUT_SRGB10 = 3u;
+static const uint OUTPUT_SRGB8 = 4u;
+static const uint OUTPUT_PQ10 = 5u;
+static const uint OUTPUT_SCRGB = 6u;
+// SDR white in an HDR signal (ITU-R BT.2408 reference white).
+static const float PAPER_WHITE_NITS = 203.0;
+
+float3 srgbEncode(float3 c) {
+    let hi = 1.055 * pow(max(c, float3(0.0031308)), float3(1.0 / 2.4)) - 0.055;
+    return select(c <= 0.0031308, c * 12.92, hi);
+}
+
+float3 srgbDecode(float3 e) {
+    return select(e <= 0.04045, e / 12.92, pow((e + 0.055) / 1.055, float3(2.4)));
+}
+
+// SMPTE ST 2084, of luminance over 10 000 nits.
+float3 pqEncode(float3 y) {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let p = pow(clamp(y, float3(0.0), float3(1.0)), float3(m1));
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), float3(m2));
+}
+
+// Triangular noise in (-1, 1), fixed per pixel so it does not crawl: one code value of it
+// before quantization hides the steps a smooth dark gradient makes.
+float ditherNoise(float2 pixel) {
+    let h1 = frac(sin(dot(pixel, float2(12.9898, 78.233))) * 43758.5453);
+    let h2 = frac(sin(dot(pixel, float2(39.3468, 11.135))) * 24634.6345);
+    return h1 + h2 - 1.0;
+}
+
+// An 8-bit sRGB attachment encodes on store: dither in the encoded space, hand back linear.
+float3 ditherSrgb8(float3 linear, float2 pixel) {
+    let e = clamp(srgbEncode(linear) + ditherNoise(pixel) / 255.0, float3(0.0), float3(1.0));
+    return srgbDecode(e);
+}
+
+// The window canvas (linear, display-referred, white = 1) into the swapchain's encoding.
+float3 encodeCanvas(float3 c, uint output, float2 pixel) {
+    let n = ditherNoise(pixel);
+    switch (output) {
+    case OUTPUT_SRGB8:
+        return clamp(srgbEncode(c) + n / 255.0, float3(0.0), float3(1.0));
+    case OUTPUT_PQ10: {
+        let bt2020 = float3(dot(c, float3(0.6274, 0.3293, 0.0433)),
+                            dot(c, float3(0.0691, 0.9195, 0.0114)),
+                            dot(c, float3(0.0164, 0.0880, 0.8956)));
+        return clamp(pqEncode(bt2020 * (PAPER_WHITE_NITS / 10000.0)) + n / 1023.0, float3(0.0),
+                     float3(1.0));
+    }
+    case OUTPUT_SCRGB:
+        return c * (PAPER_WHITE_NITS / 80.0);
+    default:
+        return clamp(srgbEncode(c) + n / 1023.0, float3(0.0), float3(1.0));
+    }
+}
+
 // Scene luminance in NITS, false-coloured against the authoring reference bands in
 // aurora_files/lighting_units.md. One decade per band, with the boundary darkened so the
 // decades are countable rather than a smooth ramp you have to eyeball.
@@ -224,6 +289,13 @@ static const uint GI_STATE_OWN_PRIVATE = 2u;
 static const uint GI_STATE_OWN = 3u;
 static const uint GI_STATE_NEIGHBOUR = 4u;
 static const uint GI_STATE_OCCLUDED = 5u;
+// rt_types.slang's RESTIR_DBG_* (restir.slang and the raygen write them).
+static const uint RESTIR_DBG_DISSIMILAR = 4u;
+static const uint RESTIR_DBG_ACCEPTED = 6u;
+static const uint RESTIR_DBG_FROM_HISTORY = 16u;
+static const uint RESTIR_DBG_FROM_NEIGHBOUR = 32u;
+static const uint RESTIR_DBG_SHADED = 256u;
+static const uint RESTIR_DBG_OCCLUDED = 512u;
 
 float2 unpackHalf2(uint q) {
     return float2(f16tof32(q & 0xFFFFu), f16tof32(q >> 16));
@@ -380,6 +452,10 @@ float4 fragment(VertexOut v) : SV_Target0 {
     let uv = v.uv;
     let frame = frameOf(v);
     let view = push.debug_view;
+    if (push.output >= OUTPUT_SRGB10) {
+        let c = test[0].Load(int3(int2(v.position.xy), 0)).rgb;
+        return float4(encodeCanvas(c, push.output, v.position.xy), 1.0);
+    }
     // Luminance: the one view that must UNDO the exposure. The colour guide is what Ray
     // Reconstruction ingests, pre-exposed at `input_exposure`; dividing that
     // back out recovers the scene's physical radiance in nits, independent of the look and
@@ -442,6 +518,33 @@ float4 fragment(VertexOut v) : SV_Target0 {
             case GI_STATE_NEIGHBOUR: c = float3(0.1, 0.9, 0.1); break;
             case GI_STATE_OCCLUDED: c = float3(1.0, 0.1, 0.1); break;
             default: c = float3(0.25); break;
+        }
+        return float4(c, 1.0);
+    }
+    // ReSTIR DI: where its winner came from (debug_view.rs `Restir`), the GI views' layout.
+    if (view == 15u) {
+        if (push.cost == nullptr || any(uv < 0.0) || any(uv >= 1.0)) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        let size = uint2(push.lum_width, push.lum_height);
+        let r = min(uint2(uv * float2(size)), size - 1u);
+        let w = push.cost[3u + 2u * (r.y * size.x + r.x)];
+        let t = w & 15u;
+        float3 c;
+        if ((w & RESTIR_DBG_SHADED) == 0u) {
+            c = float3(0.0);
+        } else if ((w & RESTIR_DBG_OCCLUDED) != 0u) {
+            c = float3(1.0, 0.0, 0.0);
+        } else if ((w & RESTIR_DBG_FROM_NEIGHBOUR) != 0u) {
+            c = float3(1.0, 1.0, 0.0);
+        } else if ((w & RESTIR_DBG_FROM_HISTORY) != 0u) {
+            c = float3(0.0, 1.0, 0.0);
+        } else if (t == RESTIR_DBG_DISSIMILAR) {
+            c = float3(1.0, 0.0, 1.0);
+        } else if (t != RESTIR_DBG_ACCEPTED) {
+            c = float3(1.0);
+        } else {
+            c = float3(0.0, 0.0, 1.0);
         }
         return float4(c, 1.0);
     }
@@ -509,7 +612,7 @@ float4 fragment(VertexOut v) : SV_Target0 {
         // reference (its input, accumulated) has none either.
         push.capture[p.y * size.x + p.x] = float4(src / input, 1.0);
     }
-    if (push.scene_radiance != 0u) {
+    if (push.output == OUTPUT_RADIANCE) {
         return float4((src * through + veil) / input, 1.0);
     }
     let look = push.display_exposure > 0.0 ? push.display_exposure : push.ae.exposure;
@@ -526,5 +629,5 @@ float4 fragment(VertexOut v) : SV_Target0 {
     }
     var color = clamp(push.tonemap != 0u ? acesFilm(exposed) : exposed, float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT], frame.output);
-    return float4(color, 1.0);
+    return float4(push.output == OUTPUT_DISPLAY ? ditherSrgb8(color, v.position.xy) : color, 1.0);
 }

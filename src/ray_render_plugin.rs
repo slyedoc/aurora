@@ -10,7 +10,8 @@ use raw_window_handle::HasDisplayHandle;
 
 use ash::vk;
 
-use crate::color_target::TargetKind;
+use crate::color_target::{DISPLAY_FORMAT, TargetKind, WINDOW_CANVAS_FORMAT};
+use crate::post_process_filter::{ENCODE_TARGET, Output};
 use crate::descriptor_heap::DescriptorHeaps;
 
 use crate::sky::{EnvironmentGpu, EnvironmentSkies, Sky};
@@ -820,6 +821,7 @@ fn render_frame(
             AuroraDebugView::Cost,
             AuroraDebugView::Gi,
             AuroraDebugView::GiReuse,
+            AuroraDebugView::Restir,
         ]
         .iter()
         .any(|v| v.shader_index() == view.debug_view)
@@ -1107,6 +1109,8 @@ fn render_frame(
                     view,
                     swapchain.swapchain_extent,
                     swapchain.swapchain_format,
+                    swapchain.canvas,
+                    swapchain.encode,
                 ))
             }
             _ => None,
@@ -1122,7 +1126,7 @@ fn render_frame(
         let tlas_cmd = render_device.lanes[2].1[parity];
         let view_back_cmd = render_device.lanes[3].1[parity];
 
-        if let Some((image, view, _, _)) = presenting {
+        if let Some((image, view, ..)) = presenting {
             frame.swapchain_image = image;
             frame.swapchain_view = view;
         }
@@ -1487,6 +1491,13 @@ fn render_frame(
                             lights: light_header,
                             instances: tlas.instances,
                             light_entries,
+                            debug: if view.debug_view
+                                == crate::debug_view::AuroraDebugView::Restir.shader_index()
+                            {
+                                view.cost.1
+                            } else {
+                                0
+                            },
                             settings,
                         },
                     );
@@ -1593,7 +1604,9 @@ fn render_frame(
                         let gi_view = view.debug_view
                             == crate::debug_view::AuroraDebugView::Gi.shader_index()
                             || view.debug_view
-                                == crate::debug_view::AuroraDebugView::GiReuse.shader_index();
+                                == crate::debug_view::AuroraDebugView::GiReuse.shader_index()
+                            || view.debug_view
+                                == crate::debug_view::AuroraDebugView::Restir.shader_index();
                         render_device.device.cmd_fill_buffer(
                             cmd.get(),
                             view.cost.0,
@@ -1606,7 +1619,8 @@ fn render_frame(
                             cmd.get(),
                             vk::PipelineStageFlags2::ALL_TRANSFER,
                             vk::AccessFlags2::TRANSFER_WRITE,
-                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                                | vk::PipelineStageFlags2::COMPUTE_SHADER,
                             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                         );
                     }
@@ -2078,7 +2092,8 @@ fn render_frame(
                             &render_device,
                             cmd_buffer,
                             pipeline,
-                            TargetKind::Display,
+                            DISPLAY_FORMAT,
+                            Output::Display,
                             DescriptorHeaps::post_block(parity, eye),
                             source_view,
                             dlss_outputs[eye].1,
@@ -2088,7 +2103,7 @@ fn render_frame(
                                 auto_exposure: views[eye].ae.1,
                                 display_exposure: views[eye].exposure.display_exposure(),
                                 debug_view,
-                                scene_radiance: 0,
+                                output: 0,
                                 fog: 0,
                                 local_tonemap,
                                 bloom,
@@ -2120,6 +2135,10 @@ fn render_frame(
             // resolving the asset -- a UI node, a material, a hit shader -- expects it.
             // The pass runs even with nothing to composite: an untraceable scene still owes its
             // target a clear, which a window camera gets free from the window's own pass.
+            // A windowless app's display is its target: the UI goes there, as it would on a window.
+            let windowless = !views
+                .iter()
+                .any(|v| matches!(v.target, ViewTarget::Window { .. }));
             for view in views {
                 let ViewTarget::Image { asset } = view.target else {
                     continue;
@@ -2173,7 +2192,12 @@ fn render_frame(
                         &render_device,
                         cmd_buffer,
                         pipeline,
-                        *kind,
+                        kind.format(),
+                        if *kind == TargetKind::SceneRadiance {
+                            Output::Radiance
+                        } else {
+                            Output::Display
+                        },
                         DescriptorHeaps::post_block(parity, view.slot),
                         source_view,
                         dlss_outputs[view.slot].1,
@@ -2183,7 +2207,7 @@ fn render_frame(
                             auto_exposure: view.ae.1,
                             display_exposure: view.exposure.display_exposure(),
                             debug_view: view.debug_view,
-                            scene_radiance: 0,
+                            output: 0,
                             fog: 0,
                             local_tonemap,
                             bloom,
@@ -2209,6 +2233,7 @@ fn render_frame(
                         cmd_buffer,
                         view.view_proj,
                         *extent,
+                        DISPLAY_FORMAT,
                         dlss_outputs[view.slot]
                             .1
                             .filter(|_| composite.is_some())
@@ -2218,6 +2243,9 @@ fn render_frame(
                         view.camera_mask,
                         &mut gizmos,
                     );
+                    if windowless {
+                        crate::ui_render::draw_ui(&render_device, cmd_buffer, *extent, DISPLAY_FORMAT, parity, &mut ui);
+                    }
                 }
                 render_device.cmd_end_rendering(cmd_buffer);
                 // A screenshot of this target (a windowless app's): copied out through a host
@@ -2278,8 +2306,24 @@ fn render_frame(
 
             // The window, when there is one: the flat render or the XR spectator (left eye,
             // aspect-fit), the gizmos and the UI. A windowless frame stops at the image targets.
-            if let Some((swapchain_image, swapchain_view, window_size, window_format)) = presenting
+            if let Some((
+                swapchain_image,
+                swapchain_view,
+                window_size,
+                window_format,
+                canvas,
+                encode,
+            )) = presenting
             {
+                // Last frame's encode (and screenshot blit) read the canvas: behind them.
+                crate::compute::memory_barrier(
+                    &render_device,
+                    cmd_buffer,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                );
                 // The XR spectator: the left eye's finished image (TRANSFER_SRC after its layer
                 // blit) letterboxed into the window by a blit, not a third run of the post-process.
                 let spectator = match (xr.as_deref(), xr_frame.as_ref()) {
@@ -2293,15 +2337,15 @@ fn render_frame(
                         &render_device,
                         cmd_buffer,
                         xr_state,
-                        swapchain_image,
+                        canvas.image,
                         window_size,
                     );
                 } else {
                     vk_utils::transition_image_layout(
                         &render_device,
                         cmd_buffer,
-                        swapchain_image,
-                        vk::ImageLayout::UNDEFINED,
+                        canvas.image,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                         vk::ImageLayout::ATTACHMENT_OPTIMAL,
                     );
                 }
@@ -2309,7 +2353,7 @@ fn render_frame(
                 let render_area = vk::Rect2D::default().extent(window_size);
 
                 let attachment_info = vk::RenderingAttachmentInfo::default()
-                    .image_view(swapchain_view)
+                    .image_view(canvas.image_view)
                     .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                     .load_op(if spectator.is_some() {
                         vk::AttachmentLoadOp::LOAD
@@ -2409,7 +2453,8 @@ fn render_frame(
                             &render_device,
                             cmd_buffer,
                             pipeline,
-                            TargetKind::Display,
+                            WINDOW_CANVAS_FORMAT,
+                            Output::Canvas,
                             DescriptorHeaps::post_block(parity, target),
                             source_view,
                             dlss_outputs[view.slot].1,
@@ -2419,7 +2464,7 @@ fn render_frame(
                                 auto_exposure: view.ae.1,
                                 display_exposure: view.exposure.display_exposure(),
                                 debug_view: view.debug_view,
-                                scene_radiance: 0,
+                                output: 0,
                                 fog: 0,
                                 local_tonemap,
                                 bloom,
@@ -2469,6 +2514,7 @@ fn render_frame(
                         cmd_buffer,
                         view.view_proj,
                         window_size,
+                        WINDOW_CANVAS_FORMAT,
                         scene_depth,
                         parity,
                         view.slot,
@@ -2476,8 +2522,55 @@ fn render_frame(
                         &mut gizmos,
                     );
                 }
-                crate::ui_render::draw_ui(&render_device, cmd_buffer, window_size, parity, &mut ui);
+                crate::ui_render::draw_ui(
+                    &render_device,
+                    cmd_buffer,
+                    window_size,
+                    WINDOW_CANVAS_FORMAT,
+                    parity,
+                    &mut ui,
+                );
 
+                render_device.cmd_end_rendering(cmd_buffer);
+
+                // The canvas into the acquired image, in the swapchain's encoding.
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    canvas.image,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+                vk_utils::transition_image_layout(
+                    &render_device,
+                    cmd_buffer,
+                    swapchain_image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::ATTACHMENT_OPTIMAL,
+                );
+                let swapchain_attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(swapchain_view)
+                    .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                render_device.cmd_begin_rendering(
+                    cmd_buffer,
+                    &vk::RenderingInfo::default()
+                        .layer_count(1)
+                        .render_area(render_area)
+                        .color_attachments(std::slice::from_ref(&swapchain_attachment)),
+                );
+                if let Some(pipeline) = postprocess {
+                    record_encode(
+                        &render_device,
+                        cmd_buffer,
+                        pipeline,
+                        window_format,
+                        encode,
+                        DescriptorHeaps::post_block(parity, ENCODE_TARGET),
+                        canvas.image_view,
+                    );
+                }
                 render_device.cmd_end_rendering(cmd_buffer);
 
                 // A pending screenshot copies the finished frame (UI included) out through a
@@ -2853,23 +2946,60 @@ fn record_spectator(
     );
 }
 
+/// The window canvas into the swapchain image (rendering begun on it): one fullscreen draw
+/// that encodes it (quad.slang `encodeCanvas`).
+unsafe fn record_encode(
+    render_device: &RenderDevice,
+    cmd_buffer: vk::CommandBuffer,
+    pipeline: &crate::post_process_filter::CompiledPostProcessFilter,
+    format: vk::Format,
+    encode: Output,
+    block: u32,
+    canvas: vk::ImageView,
+) {
+    let Some(format_pipeline) = pipeline.pipelines.get(format) else {
+        return;
+    };
+    let heaps = render_device.heaps();
+    for i in 0..crate::descriptor_heap::POST_INPUTS {
+        heaps.write_post(block, i, canvas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+    unsafe {
+        render_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, format_pipeline);
+    }
+    heaps.bind(cmd_buffer);
+    heaps.push(
+        cmd_buffer,
+        &crate::post_process_filter::PostProcessPushData {
+            constants: crate::post_process_filter::PostProcessPushConstants {
+                output: encode as u32,
+                ..bytemuck::Zeroable::zeroed()
+            },
+            inputs: block,
+            pad: 0,
+        },
+    );
+    unsafe { render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0) };
+}
+
 unsafe fn record_post_draw(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
     pipeline: &crate::post_process_filter::CompiledPostProcessFilter,
-    kind: TargetKind,
+    format: vk::Format,
+    output: Output,
     block: u32,
     source_view: vk::ImageView,
     guides: Option<crate::dlss::GuideViews>,
     prep: Option<crate::post_prep::PrepTextures>,
     push_constants: &crate::post_process_filter::PostProcessPushConstants,
 ) {
-    let Some(format_pipeline) = pipeline.pipelines.get(kind.format()) else {
+    let Some(format_pipeline) = pipeline.pipelines.get(format) else {
         return;
     };
     let prep = prep.filter(|_| guides.is_some());
     let mut constants = crate::post_process_filter::PostProcessPushConstants {
-        scene_radiance: (kind == TargetKind::SceneRadiance) as u32,
+        output: output as u32,
         fog: guides.is_some() as u32,
         ..*push_constants
     };

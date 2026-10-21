@@ -12,7 +12,8 @@
 //!    merged with last frame's final reservoir at the reprojected pixel.
 //! 3. `restir_spatial` (compute): merges random neighbours' reservoirs, with a boiling filter.
 //! 4. The path tracer (raygen.slang `main`, `restirWinner`) at its primary vertex: the final
-//!    sample's exact contribution, one shadow ray.
+//!    sample's exact contribution, one shadow ray. A winner it finds occluded leaves W = 0 in its
+//!    reservoir (M kept) for the next frame's temporal pass.
 //!
 //! Buffers live at trace resolution per view (each eye its own) and exist only while ReSTIR is on;
 //! they are zero-filled on (re)creation, which also drops history on a resize.
@@ -73,6 +74,8 @@ struct RestirFrameGpu {
     /// [`RenderSettings::ab`].
     ab: u32,
     pad: u32,
+    /// `AuroraDebugView::Restir`'s buffer (after the matrix: it stays 16-byte aligned).
+    debug: u64,
 }
 
 /// `RestirPush` in restir.slang.
@@ -95,6 +98,8 @@ pub struct RestirInput<'a> {
     pub lights: u64,
     pub instances: u64,
     pub light_entries: u32,
+    /// `AuroraDebugView::Restir`'s buffer (0 unless shown).
+    pub debug: u64,
     pub settings: &'a RenderSettings,
 }
 
@@ -253,6 +258,7 @@ impl RestirState {
             light_entries: input.light_entries,
             ab: input.settings.ab,
             pad: 0,
+            debug: input.debug,
         };
         // Recorded, not written through a mapping: the previous frame may still read it.
         unsafe {

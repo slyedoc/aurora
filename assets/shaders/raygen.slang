@@ -254,6 +254,8 @@ struct ShadowPick {
     float3 scaled;
     float3 direction;
     float tmax;
+    // The kept proposal is the first one made.
+    bool first;
 
     [mutating]
     void propose(float3 c, float3 d, float t1) {
@@ -261,11 +263,13 @@ struct ShadowPick {
         if (!(wc > 0.0)) {
             return;
         }
+        let none = wsum <= 0.0;
         wsum += wc;
         if (randf() * wsum < wc) {
             scaled = c / wc;
             direction = d;
             tmax = t1;
+            first = none;
         }
     }
 
@@ -1622,17 +1626,23 @@ void gi_temporal() {
         // another pixel).
         if (hframe == f.frame - 1u && M_t > 0.0 && restirSimilar(s, ps.normal_oct, ps.depth)) {
             let hs_valid = hs.pdf > 0.0 && hs.pdf < 1.0e20 && hs.phat > 0.0;
-            // Ours at last frame's vertex, in our measure.
+            // Ours at last frame's vertex, in our measure. The shift traces this frame's scene: on a
+            // surface that moved (a skinned body) last frame's vertex can sit inside it now, the
+            // shift fails as occluded, m_c goes to 1 beside a full m_t and the light counts twice.
+            // There a failed shift says nothing about last frame, so the history is not reused.
+            let surface_moved = any(s.position != s.prev_position);
             var m_c = 1.0;
+            var history_usable = true;
             if (own_valid) {
                 let at_p = ptShift(ps, thr_p, own);
                 let ok = luma(at_p.f) > 0.0 && at_p.J > 1.0 / PT_MAX_JACOBIAN && at_p.J < PT_MAX_JACOBIAN;
+                history_usable = ok || !surface_moved;
                 let den = pc_c + (ok ? M_t * luma(at_p.f) * at_p.J : 0.0);
                 m_c = den > 0.0 ? pc_c / den : 1.0;
             }
             // Last frame's, here.
             var here = PtShift(float3(0.0), 0.0, s.position, float3(0.0, 1.0, 0.0));
-            if (hs_valid) {
+            if (hs_valid && history_usable) {
                 here = ptShift(s, thr, hs);
             }
             let p_here = luma(here.f);
@@ -2558,6 +2568,7 @@ void main() {
             // The strategies below share one shadow ray: each proposes its unshadowed
             // contribution, one is picked by brightness and scaled by 1 / its pick probability.
             ShadowPick pick = {};
+            var restir_shadow = false;
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
                 if (RESTIR_ON && resumed) {
                     // ReSTIR DI's winner for this vertex: its passes ran between the primary pass
@@ -2567,6 +2578,16 @@ void main() {
                     let c = restirWinnerUnshadowed(prim_at, origin, world_normal, surface_normal,
                                                    -direction, surf_mat, lob, ray_mask, wdir, wdist);
                     pick.propose(mask * c, wdir, wdist * (1.0 - 1.0e-4));
+                    restir_shadow = pick.wsum > 0.0;
+                    // AuroraDebugView::Restir: the winner's own shadow ray.
+                    if (pc.restir_frame != nullptr && pc.restir_frame.debug != nullptr
+                        && luma(c) > 0.0) {
+                        let dbg = pc.restir_frame.debug;
+                        let lit = traceLight(ray_mask, leaveSurface(origin, surface_normal, wdir),
+                                             wdir, wdist * (1.0 - 1.0e-4), 0u);
+                        dbg[3u + 2u * prim_at] |= RESTIR_DBG_SHADED
+                            | (any(lit > float3(0.0)) ? 0u : RESTIR_DBG_OCCLUDED);
+                    }
                 } else {
                     // Resampled importance sampling, no reuse: M candidates, each weighted by its
                     // MIS-weighted unshadowed contribution at THIS point over its source pdf; one
@@ -2699,6 +2720,12 @@ void main() {
                 }
             }
             let nee = pick.resolve(ray_mask, origin, surface_normal, water, hitPayloadWater(payload));
+            // The ReSTIR winner's own shadow ray found it occluded: last frame's reservoir for the
+            // temporal pass carries W = 0 (its M still counts), so a winner hidden behind its
+            // fixture or the surface's own geometry is not resampled again and again.
+            if (RESTIR_ON && restir_shadow && pick.first && all(nee == float3(0.0))) {
+                pc.reservoirs_cur[prim_at].W = 0.0;
+            }
             acc += nee;
             if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_nee = nee;

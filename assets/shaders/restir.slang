@@ -203,13 +203,19 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     r.uv_pk = sel_uv;
 
     // Temporal: last frame's final reservoir at the reprojected pixel, re-evaluated here.
+    var dbg = RESTIR_DBG_OFFSCREEN;
     let pp = restirReproject(&f.prev_view_proj[0], f.width, f.height, s.prev_position);
     if (all(pp >= int2(0)) && pp.x < int(f.width) && pp.y < int(f.height)) {
         let prev = f.prev[uint(pp.y) * f.width + uint(pp.x)];
+        let similar = restirSimilar(s, prev.normal_pk, prev.depth);
+        dbg = prev.frame + 1u != f.frame ? RESTIR_DBG_STALE
+            : prev.epoch != f.epoch      ? RESTIR_DBG_EPOCH
+            : prev.M <= 0.0              ? RESTIR_DBG_EMPTY
+            : !similar                   ? RESTIR_DBG_DISSIMILAR
+                                         : RESTIR_DBG_ACCEPTED;
         // An occluded winner (W zeroed by the shade pass) still counts its samples: dropping
         // its M would average only the lucky, visible ones (biased bright).
-        if (prev.frame + 1u == f.frame && prev.epoch == f.epoch && prev.M > 0.0
-            && restirSimilar(s, prev.normal_pk, prev.depth)) {
+        if (prev.frame + 1u == f.frame && prev.epoch == f.epoch && prev.M > 0.0 && similar) {
             let Mprev = min(prev.M, f.m_cap);
             var phat = 0.0;
             var dens = 0.0;
@@ -224,6 +230,7 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
                     r.uv_pk = prev.uv_pk;
                     r_phat = phat;
                     r_dens = dens;
+                    dbg = RESTIR_DBG_ACCEPTED | RESTIR_DBG_FROM_HISTORY;
                 }
             }
             r_M += Mprev;
@@ -239,6 +246,9 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
         r.density = 0.0;
     }
     f.temporal[idx] = r;
+    if (f.debug != nullptr) {
+        f.debug[3u + 2u * idx] = dbg;
+    }
 }
 
 static const uint MAX_SPATIAL = 16;
@@ -307,6 +317,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
     var nr = own;
     var qs = s;
     var pc_yi = 0.0;
+    var from_neighbour = false;
     [loop]
     for (uint n = 0u; n < 2u * k; n++) {
         let here = (n & 1u) == 1u;
@@ -352,6 +363,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
             r.uv_pk = nr.uv_pk;
             r_phat = pc_yi;
             r_dens = dens_here;
+            from_neighbour = true;
         }
     }
     if (own_valid && pc_yc > 0.0) {
@@ -362,6 +374,7 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
             r.uv_pk = own.uv_pk;
             r_phat = pc_yc;
             r_dens = own.density;
+            from_neighbour = false;
         }
     }
 
@@ -385,4 +398,8 @@ void restir_spatial(uint3 gid: SV_DispatchThreadID) {
         r.density = 0.0;
     }
     f.final_[idx] = r;
+    if (f.debug != nullptr && from_neighbour) {
+        let at = 3u + 2u * idx;
+        f.debug[at] = (f.debug[at] & ~RESTIR_DBG_FROM_HISTORY) | RESTIR_DBG_FROM_NEIGHBOUR;
+    }
 }

@@ -45,8 +45,8 @@ use crate::{
     environment::{InEnvironment, environment_mask},
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
+    color_target::{FormatPipelines, OVERLAY_FORMATS},
     render_device::RenderDevice,
-    swapchain::DISPLAY_FORMAT,
     tlas_builder::layers_mask,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
 };
@@ -114,7 +114,8 @@ pub struct GizmoPipeline {
 }
 
 pub struct CompiledGizmoPipeline {
-    pub pipeline: vk::Pipeline,
+    /// One per attachment format it draws into (`OVERLAY_FORMATS`).
+    pub pipelines: FormatPipelines,
     /// Written when no view traced: binding 0 needs a live image even though the fragment
     /// shader will not sample it.
     pub depth_placeholder: crate::render_texture::RenderTexture,
@@ -219,31 +220,32 @@ impl VulkanAsset for GizmoPipeline {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let mut pipeline_rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
-
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stages)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .push(&mut pipeline_rendering_info)
-            .push(&mut flags2);
-
-        let pipeline = unsafe {
-            render_device.create_graphics_pipelines(
-                render_device.pipeline_cache,
-                &[pipeline_info],
-                None,
-            )
-        }
-        .unwrap()[0];
+        let pipelines = FormatPipelines::build(&OVERLAY_FORMATS, |format| {
+            let formats = [format];
+            let mut pipeline_rendering_info =
+                vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+            let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+                .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&shader_stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend_state)
+                .dynamic_state(&dynamic_state)
+                .push(&mut pipeline_rendering_info)
+                .push(&mut flags2);
+            unsafe {
+                render_device.create_graphics_pipelines(
+                    render_device.pipeline_cache,
+                    &[pipeline_info],
+                    None,
+                )
+            }
+            .unwrap()[0]
+        });
 
         unsafe {
             render_device.destroy_shader_module(shader_stages[0].module, None);
@@ -252,15 +254,13 @@ impl VulkanAsset for GizmoPipeline {
 
         log::debug!("gizmo pipeline compiled");
         CompiledGizmoPipeline {
-            pipeline,
+            pipelines,
             depth_placeholder,
         }
     }
 
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
-        render_device
-            .destroyer
-            .destroy_pipeline(prepared_asset.pipeline);
+        prepared_asset.pipelines.destroy(render_device);
         render_device
             .destroyer
             .destroy_image_view(prepared_asset.depth_placeholder.image_view);
@@ -585,6 +585,7 @@ pub unsafe fn draw_gizmos(
     cmd_buffer: vk::CommandBuffer,
     view_proj: Mat4,
     extent: vk::Extent2D,
+    format: vk::Format,
     scene_depth: Option<vk::ImageView>,
     frame_slot: usize,
     view_slot: usize,
@@ -600,6 +601,9 @@ pub unsafe fn draw_gizmos(
         return;
     };
     let Some(pipeline) = params.pipelines.get(&config.pipeline) else {
+        return;
+    };
+    let Some(format_pipeline) = pipeline.pipelines.get(format) else {
         return;
     };
 
@@ -642,7 +646,7 @@ pub unsafe fn draw_gizmos(
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline,
+            format_pipeline,
         );
         heaps.bind(cmd_buffer);
         heaps.push(

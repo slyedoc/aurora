@@ -193,7 +193,19 @@ pub(crate) fn save_png(
         format,
         vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_SNORM
     );
+    // A 10-bit swapchain (sRGB-encoded): its top 8 bits per channel.
+    let packed10 = match format {
+        vk::Format::A2B10G10R10_UNORM_PACK32 => Some([0, 10, 20]),
+        vk::Format::A2R10G10B10_UNORM_PACK32 => Some([20, 10, 0]),
+        _ => None,
+    };
     for px in pixels.chunks_exact_mut(4) {
+        if let Some(shifts) = packed10 {
+            let w = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            for (c, shift) in shifts.into_iter().enumerate() {
+                px[c] = ((w >> shift & 1023) >> 2) as u8;
+            }
+        }
         if bgra {
             px.swap(0, 2);
         }

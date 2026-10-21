@@ -850,7 +850,21 @@ public struct RestirFrame {
     public uint light_entries;     // 0 = light NEE off
     public uint ab;                // RenderSettings::ab: 0 the old path under test, 1 the new
     public uint pad_ab;
+    // AuroraDebugView::Restir (null unless shown): the gi_debug layout, RESTIR_DBG_* at 3 + 2i.
+    public uint* debug;
 };
+
+// AuroraDebugView::Restir's word: the temporal outcome (low nibble), then flags.
+public static const uint RESTIR_DBG_OFFSCREEN = 1u;
+public static const uint RESTIR_DBG_STALE = 2u;
+public static const uint RESTIR_DBG_EPOCH = 3u;
+public static const uint RESTIR_DBG_DISSIMILAR = 4u;
+public static const uint RESTIR_DBG_EMPTY = 5u;
+public static const uint RESTIR_DBG_ACCEPTED = 6u;
+public static const uint RESTIR_DBG_FROM_HISTORY = 16u;
+public static const uint RESTIR_DBG_FROM_NEIGHBOUR = 32u;
+public static const uint RESTIR_DBG_SHADED = 256u;
+public static const uint RESTIR_DBG_OCCLUDED = 512u;
 
 // The light-grid cell holding `p`, or ~0 outside the grid.
 public uint gridCell(RestirFrame* f, float3 p) {

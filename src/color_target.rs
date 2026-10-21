@@ -15,6 +15,13 @@ pub use crate::swapchain::DISPLAY_FORMAT;
 /// Pre-tonemap scene radiance, for targets a world material shows as emission.
 pub const SCENE_RADIANCE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// The window's canvas: the composite, gizmos and UI draw here in linear light, then one pass
+/// encodes it into the swapchain (10-bit sRGB, or HDR10 / scRGB where the surface offers it).
+pub const WINDOW_CANVAS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Every attachment format a UI or gizmo pass draws into.
+pub const OVERLAY_FORMATS: [vk::Format; 2] = [DISPLAY_FORMAT, WINDOW_CANVAS_FORMAT];
+
 /// What a render target holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetKind {

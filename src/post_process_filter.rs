@@ -16,8 +16,8 @@ pub struct PostProcessPushConstants {
     pub display_exposure: f32,
     /// [`AuroraDebugView`](crate::debug_view::AuroraDebugView) as its shader index.
     pub debug_view: u32,
-    /// 1: write physical radiance (no exposure or tonemap) for a scene-radiance target.
-    pub scene_radiance: u32,
+    /// What the target holds and how it is encoded: [`Output`] as its shader value.
+    pub output: u32,
     /// 1: composite the camera ray's fog (slot 8) over the resolved image.
     pub fog: u32,
     /// `RenderSettings::local_tonemap`.
@@ -68,8 +68,37 @@ pub struct CompiledPostProcessFilter {
     pub pipelines: FormatPipelines,
 }
 
-/// Composite targets per frame parity: one per view slot, plus the XR spectator window.
-pub const POST_TARGETS: usize = crate::MAX_VIEWS + 1;
+/// Composite targets per frame parity: one per view slot, the XR spectator window, and the
+/// window canvas's encode into the swapchain.
+pub const POST_TARGETS: usize = crate::MAX_VIEWS + 2;
+/// The post block the window canvas's encode reads.
+pub const ENCODE_TARGET: usize = crate::MAX_VIEWS + 1;
+
+/// What a post draw writes (quad.slang `OUTPUT_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// Exposed, tonemapped colour into an 8-bit sRGB attachment (dithered).
+    Display = 0,
+    /// Physical radiance, no exposure or tonemap.
+    Radiance = 1,
+    /// Exposed, tonemapped colour into the float window canvas.
+    Canvas = 2,
+    /// The canvas into a 10-bit UNORM swapchain, sRGB-encoded in the shader.
+    Srgb10 = 3,
+    /// The canvas into an 8-bit UNORM swapchain, sRGB-encoded in the shader.
+    Srgb8 = 4,
+    /// The canvas into a 10-bit HDR10 swapchain (BT.2020, PQ, SDR white at 203 nits).
+    Pq10 = 5,
+    /// The canvas into a half-float scRGB swapchain (linear, 1 = 80 nits).
+    Scrgb = 6,
+}
+
+/// Every swapchain format the encode may write (swapchain.rs picks among them).
+pub const SWAPCHAIN_FORMATS: [vk::Format; 3] = [
+    vk::Format::A2B10G10R10_UNORM_PACK32,
+    vk::Format::A2R10G10B10_UNORM_PACK32,
+    vk::Format::B8G8R8A8_UNORM,
+];
 
 impl VulkanAsset for PostProcessFilter {
     type ExtractedAsset = (crate::shader::Shader, crate::shader::Shader);
@@ -156,7 +185,7 @@ impl VulkanAsset for PostProcessFilter {
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
         let pipelines =
-            FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT], |format| {
+            FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT, SWAPCHAIN_FORMATS[0], SWAPCHAIN_FORMATS[1], SWAPCHAIN_FORMATS[2]], |format| {
                 let formats = [format];
                 let mut pipeline_rendering_info =
                     vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);

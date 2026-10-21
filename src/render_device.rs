@@ -783,6 +783,16 @@ unsafe fn create_instance(
             }
             None => Vec::new(),
         };
+        // HDR colour spaces (scRGB, HDR10) are only offered by a surface with this enabled.
+        if display_handle.is_some()
+            && entry
+                .enumerate_instance_extension_properties(None)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::swapchain_colorspace::NAME))
+        {
+            instance_extensions.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
         // DLSS (NGX) asks for its own instance extensions; union them in.
         let ngx_instance_extensions = crate::dlss::instance_extensions();
         for ext in &ngx_instance_extensions {

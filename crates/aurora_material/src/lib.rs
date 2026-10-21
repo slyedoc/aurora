@@ -125,6 +125,11 @@ pub struct AuroraMaterial {
     pub flip_normal_map_y: bool,
     /// Emit `base_color` directly with no lighting.
     pub unlit: bool,
+    /// Its emission is seen (a ray that hits it takes it in full) but it is no light: it stays
+    /// out of the next-event light table, so it lights nothing by itself. For glowing marks on a
+    /// surface (chalk, a screen's text) whose emissive texture is mostly empty, where sampling
+    /// the whole quad as a light would mostly land on nothing.
+    pub glow_only: bool,
     /// Whether distance fog applies. Aurora has no fog pass -- atmosphere and participating
     /// media are the physical equivalents -- so this is round-trip only.
     pub fog_enabled: bool,
@@ -169,6 +174,7 @@ impl Default for AuroraMaterial {
             cull_mode: Some(Face::Back),
             flip_normal_map_y: false,
             unlit: false,
+            glow_only: false,
             fog_enabled: true,
             depth_bias: 0.0,
             parallax_depth_scale: 0.1,

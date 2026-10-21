@@ -65,8 +65,8 @@ use crate::{
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
+    color_target::{DISPLAY_FORMAT, FormatPipelines, OVERLAY_FORMATS},
     render_texture::{RenderTexture, create_blank_texture},
-    swapchain::DISPLAY_FORMAT,
     vk_utils,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssetLoadingState, VulkanAssets},
 };
@@ -199,7 +199,8 @@ pub struct UiPipeline {
 }
 
 pub struct CompiledUiPipeline {
-    pub pipeline: vk::Pipeline,
+    /// One per attachment format it draws into (`OVERLAY_FORMATS`).
+    pub pipelines: FormatPipelines,
 }
 
 impl VulkanAsset for UiPipeline {
@@ -284,31 +285,32 @@ impl VulkanAsset for UiPipeline {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let mut pipeline_rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[DISPLAY_FORMAT]);
-
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stages)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .push(&mut pipeline_rendering_info)
-            .push(&mut flags2);
-
-        let pipeline = unsafe {
-            render_device.create_graphics_pipelines(
-                render_device.pipeline_cache,
-                &[pipeline_info],
-                None,
-            )
-        }
-        .unwrap()[0];
+        let pipelines = FormatPipelines::build(&OVERLAY_FORMATS, |format| {
+            let formats = [format];
+            let mut pipeline_rendering_info =
+                vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+            let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+                .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&shader_stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend_state)
+                .dynamic_state(&dynamic_state)
+                .push(&mut pipeline_rendering_info)
+                .push(&mut flags2);
+            unsafe {
+                render_device.create_graphics_pipelines(
+                    render_device.pipeline_cache,
+                    &[pipeline_info],
+                    None,
+                )
+            }
+            .unwrap()[0]
+        });
 
         unsafe {
             render_device.destroy_shader_module(shader_stages[0].module, None);
@@ -316,13 +318,11 @@ impl VulkanAsset for UiPipeline {
         }
 
         log::debug!("UI pipeline compiled");
-        CompiledUiPipeline { pipeline }
+        CompiledUiPipeline { pipelines }
     }
 
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
-        render_device
-            .destroyer
-            .destroy_pipeline(prepared_asset.pipeline);
+        prepared_asset.pipelines.destroy(render_device);
     }
 }
 
@@ -1652,6 +1652,7 @@ pub unsafe fn draw_ui(
     render_device: &RenderDevice,
     cmd_buffer: vk::CommandBuffer,
     extent: vk::Extent2D,
+    format: vk::Format,
     frame_slot: usize,
     params: &mut UiDrawParams,
 ) {
@@ -1728,12 +1729,15 @@ pub unsafe fn draw_ui(
         vertex_buffer: buffer.address,
         screen_size: [screen.x, screen.y],
     };
+    let Some(format_pipeline) = pipeline.pipelines.get(format) else {
+        return;
+    };
 
     unsafe {
         render_device.cmd_bind_pipeline(
             cmd_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline.pipeline,
+            format_pipeline,
         );
         render_device.heaps().bind(cmd_buffer);
         render_device.heaps().push(cmd_buffer, &push_constants);
@@ -2129,7 +2133,11 @@ pub unsafe fn draw_ui_surfaces(
     let Some(config) = params.config.as_ref() else {
         return;
     };
-    let Some(pipeline) = params.pipelines.get(&config.pipeline) else {
+    let Some(surface_pipeline) = params
+        .pipelines
+        .get(&config.pipeline)
+        .and_then(|p| p.pipelines.get(DISPLAY_FORMAT))
+    else {
         return;
     };
 
@@ -2206,7 +2214,7 @@ pub unsafe fn draw_ui_surfaces(
                 render_device.cmd_bind_pipeline(
                     cmd_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.pipeline,
+                    surface_pipeline,
                 );
                 let push_constants = UiPushConstants {
                     vertex_buffer: buffer_address,

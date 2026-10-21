@@ -56,6 +56,11 @@ pub enum AuroraDebugView {
     /// Ray Reconstruction's output against the reference, in stops: blue darker, red brighter,
     /// white the same (where RR, not the tracer, is wrong).
     ReferenceDiff,
+    /// ReSTIR DI's winner per pixel: blue = this frame's candidate (history accepted), magenta =
+    /// fresh because the history failed `restirSimilar`, white = fresh because it was off-screen,
+    /// stale or from another light table, green = taken from history, yellow = a neighbour's,
+    /// red = its shadow ray is occluded, black = no winner.
+    Restir,
 }
 
 impl AuroraDebugView {
@@ -75,6 +80,7 @@ impl AuroraDebugView {
         Self::GiReuse,
         Self::Reference,
         Self::ReferenceDiff,
+        Self::Restir,
     ];
 
     /// The value quad.slang switches on.
@@ -83,7 +89,7 @@ impl AuroraDebugView {
     }
 
     /// `$AURORA_DEBUG_VIEW`
-    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost|gi|gi-reuse|reference|reference-diff`),
+    /// (`color|normals|roughness|diffuse|specular|depth|spec-hit|motion|luminance|cost|gi|gi-reuse|reference|reference-diff|restir`),
     /// else the normal render: lets a headless run capture a guide view.
     pub fn from_env() -> Self {
         match std::env::var("AURORA_DEBUG_VIEW").ok().as_deref() {
@@ -101,6 +107,7 @@ impl AuroraDebugView {
             Some("gi-reuse") => Self::GiReuse,
             Some("reference") => Self::Reference,
             Some("reference-diff") => Self::ReferenceDiff,
+            Some("restir") => Self::Restir,
             _ => Self::None,
         }
     }

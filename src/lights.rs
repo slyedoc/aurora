@@ -454,7 +454,8 @@ fn track_lights(
             return;
         };
         let e = asset.emissive;
-        let emissive = 0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0;
+        let emissive =
+            0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only;
         pending.remove(&slot);
         if emissive {
             if sources.insert(slot, source) != Some(source) {
@@ -497,7 +498,8 @@ fn track_lights(
                 continue;
             };
             let e = asset.emissive;
-            let emissive = 0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0;
+            let emissive =
+                0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only;
             lights.pending.remove(&slot);
             if emissive {
                 if lights.sources.insert(slot, source) != Some(source) {
@@ -710,10 +712,14 @@ fn luma(rgb: [f32; 3]) -> f32 {
 }
 
 /// Mean linear rgb x alpha of an 8-bit RGBA image (sRGB decoded when the image says so),
-/// sampled on a stride so a 4k texture costs a few thousand texels. `None` for formats the
-/// tracer does not upload as RGBA8 (they are treated as white) or an image without data.
+/// sampled on a stride so a 4k texture costs a few thousand texels. An image with no CPU pixels
+/// (a render target: a UI surface, a camera's output) is white: its mean can never be read, and
+/// waiting on it kept the light table rebuilding (a new epoch, and the reuse history thrown
+/// away) every frame.
 fn image_mean_emission(image: &Image) -> Option<[f32; 3]> {
-    let data = image.data.as_ref()?;
+    let Some(data) = image.data.as_ref() else {
+        return Some([1.0; 3]);
+    };
     let (w, h) = (
         image.texture_descriptor.size.width as usize,
         image.texture_descriptor.size.height as usize,

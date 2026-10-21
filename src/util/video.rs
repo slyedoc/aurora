@@ -199,6 +199,8 @@ impl Session {
             vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_SNORM => {
                 "rgba"
             }
+            vk::Format::A2B10G10R10_UNORM_PACK32 => "x2bgr10le",
+            vk::Format::A2R10G10B10_UNORM_PACK32 => "x2rgb10le",
             other => {
                 error!("video: cannot record a {other:?} swapchain");
                 return None;

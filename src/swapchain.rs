@@ -4,14 +4,40 @@ use bevy::prelude::*;
 use bevy::window::RawHandleWrapper;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+use crate::color_target::WINDOW_CANVAS_FORMAT;
+use crate::post_process_filter::Output;
 use crate::ray_render_plugin::RenderWindow;
 use crate::render_device::RenderDevice;
+use crate::render_texture::{RenderTexture, create_blank_texture};
 
-/// The format of everything drawn for a display: the window swapchain, the XR eye targets,
-/// and every graphics pipeline's colour attachment (post-process, UI, gizmos). sRGB, so the
-/// shaders write linear light and the hardware applies the transfer function on store and
-/// blends in linear space -- the same convention as bevy's swapchain view.
+/// The format of an 8-bit display target: the XR eye targets, UI surfaces and image targets.
+/// sRGB, so the shaders write linear light and the hardware applies the transfer function on
+/// store and blends in linear space. The window instead draws into a float canvas
+/// ([`WINDOW_CANVAS_FORMAT`]) that one pass encodes into the swapchain.
 pub const DISPLAY_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
+
+/// The swapchain's format and colour space, best first: HDR10, scRGB, 10-bit sRGB, 8-bit sRGB.
+fn pick_surface_format(formats: &[vk::SurfaceFormatKHR]) -> (vk::SurfaceFormatKHR, Output) {
+    use vk::{ColorSpaceKHR as C, Format as F};
+    let ten = [F::A2B10G10R10_UNORM_PACK32, F::A2R10G10B10_UNORM_PACK32];
+    let wanted: [(&[F], C, Output); 4] = [
+        (&ten, C::HDR10_ST2084_EXT, Output::Pq10),
+        (&[F::R16G16B16A16_SFLOAT], C::EXTENDED_SRGB_LINEAR_EXT, Output::Scrgb),
+        (&ten, C::SRGB_NONLINEAR, Output::Srgb10),
+        (&[F::B8G8R8A8_UNORM], C::SRGB_NONLINEAR, Output::Srgb8),
+    ];
+    for (fmts, space, output) in wanted {
+        for &format in fmts {
+            if let Some(f) = formats
+                .iter()
+                .find(|f| f.format == format && f.color_space == space)
+            {
+                return (*f, output);
+            }
+        }
+    }
+    panic!("surface offers none of aurora's swapchain formats; it has {formats:?}")
+}
 
 #[derive(Resource)]
 pub struct Swapchain {
@@ -22,6 +48,11 @@ pub struct Swapchain {
     pub swapchain_image_views: Vec<vk::ImageView>,
     pub swapchain_extent: vk::Extent2D,
     pub swapchain_format: vk::Format,
+    /// How the canvas is encoded into the swapchain (its format and colour space).
+    pub encode: Output,
+    /// The window's linear canvas, the swapchain's size: the frame, gizmos and UI draw here,
+    /// then the encode pass writes it into the acquired image.
+    pub canvas: RenderTexture,
     /// The window size the current swapchain was built for; a different `RenderWindow`
     /// triggers a rebuild in `aquire_next_image`.
     requested: (u32, u32),
@@ -85,6 +116,8 @@ impl Swapchain {
                 swapchain_image_views: Vec::new(),
                 swapchain_extent: vk::Extent2D::default(),
                 swapchain_format: vk::Format::UNDEFINED,
+                encode: Output::Srgb8,
+                canvas: RenderTexture::default(),
                 requested: (0, 0),
                 image_available_semaphores,
                 available: 0,
@@ -107,15 +140,9 @@ impl Swapchain {
                 .ext_surface
                 .get_physical_device_surface_formats(self.device.physical_device, self.surface)
                 .unwrap();
-
-            // Every graphics pipeline in this crate is created against DISPLAY_FORMAT, so
-            // the surface has to offer it (every desktop driver does).
-            let surface_format = formats
-                .iter()
-                .find(|f| f.format == DISPLAY_FORMAT)
-                .unwrap_or_else(|| {
-                    panic!("surface does not offer {DISPLAY_FORMAT:?}; it has {formats:?}")
-                });
+            debug!("surface formats: {formats:?}");
+            let (surface_format, encode) = pick_surface_format(&formats);
+            self.encode = encode;
 
             let surface_caps = self
                 .device
@@ -147,6 +174,22 @@ impl Swapchain {
             self.swapchain_extent = surface_resolution;
             self.swapchain_format = surface_format.format;
             self.requested = (window.width, window.height);
+            if self.canvas.image != vk::Image::null() {
+                self.device.destroyer.destroy_image_view(self.canvas.image_view);
+                self.device.destroyer.destroy_image(self.canvas.image);
+            }
+            self.canvas = create_blank_texture(
+                &self.device,
+                WINDOW_CANVAS_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    // The XR spectator is blitted in; screenshots blit it out.
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                surface_resolution.width,
+                surface_resolution.height,
+            );
 
             let pre_transform = if surface_caps
                 .supported_transforms
@@ -253,11 +296,12 @@ impl Swapchain {
                 })
                 .collect();
 
-            log::debug!(
-                "swapchain: created {}x{} {:?}",
+            log::info!(
+                "swapchain: {}x{} {:?} {:?} ({encode:?})",
                 surface_resolution.width,
                 surface_resolution.height,
-                surface_format.format
+                surface_format.format,
+                surface_format.color_space
             );
         }
     }
@@ -391,6 +435,10 @@ impl Drop for Swapchain {
 
             for &image_view in self.swapchain_image_views.iter() {
                 self.device.destroy_image_view(image_view, None);
+            }
+            if self.canvas.image != vk::Image::null() {
+                self.device.destroyer.destroy_image_view(self.canvas.image_view);
+                self.device.destroyer.destroy_image(self.canvas.image);
             }
             self.device
                 .ext_swapchain
