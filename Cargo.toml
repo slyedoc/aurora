@@ -61,7 +61,6 @@ bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-fe
     "wayland",
     "custom_cursor",
     "bevy_window",
-    "bevy_audio",
     # assets
     "bevy_asset",
     "file_watcher",
@@ -107,6 +106,9 @@ avian3d = { git = "https://github.com/avianphysics/avian", branch = "main", defa
 # Graph-driven skeletal animation on baked `.animclip`s (slyedoc fork, `aurora` branch:
 # render-free bevy, no glTF); its plugin is part of `AuroraDefaultPlugins`.
 bevy_animation_graph = { git = "https://github.com/slyedoc/bevy_animation_graph", branch = "aurora" }
+# Audio playback (Firewheel), in place of bevy_audio: every aurora app gets it, so a scene that
+# names a sound (a landscape's footsteps) loads anywhere.
+bevy_seedling = { git = "https://github.com/slyedoc/bevy_seedling", branch = "bevy-main" }
 aurora_material = { path = "crates/aurora_material" }
 # Pure type definitions (`TextureFormat` for `Image::convert`); the version bevy_image resolves to.
 wgpu-types = { version = "30", default-features = false }

@@ -48,6 +48,7 @@ pub mod portal;
 pub mod post_prep;
 pub mod post_process_filter;
 pub mod procedural_mesh;
+pub mod prop;
 pub mod ray_render_plugin;
 pub mod raytracing_pipeline;
 pub mod reference;
@@ -167,7 +168,9 @@ impl PluginGroup for AuroraDefaultPlugins {
         if headless.is_none() {
             group = group.add(bevy::winit::WinitPlugin::default());
         }
-        group = group.add(bevy::audio::AudioPlugin::default());
+        // Audio is seedling's (Firewheel), not bevy_audio: one output, and its samples are what
+        // scenes name for sound (aurora_landscape's footsteps).
+        group = group.add_group(bevy_seedling::SeedlingPlugins);
 
         // Before RayRenderPlugin: under the `xr` feature the render device is created through
         // the OpenXR runtime, which must be up first.
@@ -185,6 +188,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::mesh::AuroraMeshPlugin);
         group = group.add(crate::procedural_mesh::ProceduralMeshPlugin);
         group = group.add(crate::collision::CollisionPlugin);
+        group = group.add(crate::prop::PropPlugin);
         group = group.add(crate::gpu_transform::GpuTransformPlugin);
         // Physics and skeletal animation are part of the stack: every world is an avian
         // physics world (world.rs), and characters play bevy_animation_graph graphs.
