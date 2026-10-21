@@ -1384,7 +1384,10 @@ pub fn prepare_instances(
                 .all(|m| {
                     m.alpha_cutoff <= 0.0
                         && m.specular_transmission_factor <= 0.0
-                        && m.flags & crate::blas::material_flags::WATER == 0
+                        && m.flags
+                            & (crate::blas::material_flags::WATER
+                                | crate::blas::material_flags::NO_SHADOW)
+                            == 0
                 })
             {
                 INSTANCE_FORCE_OPAQUE

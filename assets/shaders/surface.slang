@@ -44,6 +44,7 @@ public struct Material {
 };
 
 public static const uint MATERIAL_WATER = 1u;
+public static const uint MATERIAL_NO_SHADOW = 2u;
 
 // `Triangle` in blas.rs (32 bytes).
 public struct Triangle {

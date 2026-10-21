@@ -11,7 +11,8 @@ bool ignoredHit(bool shadow, BuiltInTriangleIntersectionAttributes attribs) {
     // Shadow rays (NEE / ReSTIR) pass through transmissive surfaces -- clear glass barely
     // blocks light, and counting it as a full occluder painted black shadows under every wine
     // glass. Absorption/Fresnel are ignored (the standard shadow-ray approximation).
-    if (shadow && material.specular_transmission_factor > 0.5) {
+    if (shadow && (material.specular_transmission_factor > 0.5
+                   || (material.flags & MATERIAL_NO_SHADOW) != 0u)) {
         return true;
     }
     // Opaque geometry inside a mixed (non-force-opaque) instance: accept.

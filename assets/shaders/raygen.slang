@@ -168,6 +168,7 @@ static const uint MATERIAL_WORDS = 28u;
 static const uint MATERIAL_ROW_WORD = 21u;
 static const uint MATERIAL_FLAGS_WORD = 25u;
 static const uint MATERIAL_WATER_FLAG = 1u;
+static const uint MATERIAL_NO_SHADOW_FLAG = 2u;
 static const uint MATERIAL_TRANSMISSION_WORD = 13u;
 
 // A visibility test by ray query (inline: no shader call, nothing held across it spilled -- the
@@ -189,9 +190,11 @@ ShadowPayload shadowInline(uint mask, float3 origin, float3 direction, float tma
         // The analytic sphere (hit offset 0, sphere.slang): unit diameter in object space.
         if (q.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE
             && q.CandidateInstanceContributionToHitGroupIndex() == 0u) {
-            // A clear sphere lets the shadow through (sphere.slang `intersection`).
+            // A clear sphere, or one that casts none, lets the shadow through (sphere.slang
+            // `intersection`).
             let record = ((uint*)pc.materials) + q.CandidateInstanceID() * MATERIAL_WORDS;
-            if (asfloat(record[MATERIAL_TRANSMISSION_WORD]) > 0.5) {
+            if (asfloat(record[MATERIAL_TRANSMISSION_WORD]) > 0.5
+                || (record[MATERIAL_FLAGS_WORD] & MATERIAL_NO_SHADOW_FLAG) != 0u) {
                 continue;
             }
             let o = q.CandidateObjectRayOrigin();
@@ -212,6 +215,9 @@ ShadowPayload shadowInline(uint mask, float3 origin, float3 direction, float tma
         } else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             let record = ((uint*)pc.materials)
                 + (q.CandidateInstanceID() + q.CandidateGeometryIndex()) * MATERIAL_WORDS;
+            if ((record[MATERIAL_FLAGS_WORD] & MATERIAL_NO_SHADOW_FLAG) != 0u) {
+                continue;
+            }
             if ((record[MATERIAL_FLAGS_WORD] & MATERIAL_WATER_FLAG) != 0u) {
                 let t = q.CandidateTriangleRayT();
                 if (shadow.water == 0u || t < shadow.water_t) {

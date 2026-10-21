@@ -124,6 +124,8 @@ pub mod material_flags {
     /// A water surface: shadow rays take its crossing (water.slang), `surface_param_index` is
     /// its medium's row.
     pub const WATER: u32 = 1;
+    /// Casts no shadow (rain, splashes): shadow rays pass it whatever its material.
+    pub const NO_SHADOW: u32 = 2;
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:

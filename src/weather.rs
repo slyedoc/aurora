@@ -13,6 +13,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{
     assets::aurora_asset,
+    blas::material_flags,
     compute::{BlockRows, ComputeModule, FrameCommands, memory_barrier, record_dispatch},
     environment::{InEnvironment, environment_mask},
     fog_volume::{FogShape, FogVolume, GroundHeights},
@@ -22,6 +23,7 @@ use crate::{
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     sphere::Sphere,
+    surface_group::SurfaceRow,
     tlas_builder::{InstanceBlock, InstanceBlockSlots, TLAS},
 };
 
@@ -30,8 +32,14 @@ pub const GROUND_SIZE: u32 = 256;
 pub const GROUND_TEXEL: f32 = 1.0;
 /// A ground texel with nothing under it (weather_ground.slang `GROUND_NONE`).
 const GROUND_NONE: f32 = -1.0e30;
+/// The rain's parts cast no shadow (their rows' material records carry the flag).
+const NO_SHADOW: SurfaceRow = SurfaceRow {
+    row: 0,
+    flags: material_flags::NO_SHADOW,
+};
+
 /// Most rain streaks at once (`Weather::rain` 1).
-pub const RAIN_CAPACITY: u32 = 16384;
+pub const RAIN_CAPACITY: u32 = 65536;
 /// Instance rows per splash (weather_rain.slang `SPLASH_PARTS`).
 const SPLASH_PARTS: u32 = 3;
 /// A drop's record on the GPU (weather_rain.slang `Drop`), in words.
@@ -69,9 +77,12 @@ pub struct Weather {
     /// Rain, 0 none to 1 a downpour.
     #[reflect(@0.0..=1.0_f32)]
     pub rain: f32,
-    /// The box about the camera it falls through (metres, half across).
+    /// How far about the camera it falls (metres); denser near, sparser far.
     #[reflect(@Step(1.0))]
     pub rain_radius: f32,
+    /// The height of the column it starts in about the camera (metres; 0.6 above, 0.4 below).
+    #[reflect(@Step(1.0))]
+    pub rain_height: f32,
     /// Falling speed (metres per second).
     #[reflect(@Step(0.5))]
     pub rain_speed: f32,
@@ -80,6 +91,9 @@ pub struct Weather {
     pub rain_length: f32,
     #[reflect(@Step(0.001))]
     pub rain_width: f32,
+    /// The streaks' colour: they scatter the light around them (lamps, windows, the sky), so
+    /// this is how bright rain reads by day and by night.
+    pub rain_color: Color,
 }
 
 impl Weather {
@@ -93,10 +107,12 @@ impl Weather {
         mist_anisotropy: 0.2,
         wind: Vec3::new(0.8, 0.0, 0.3),
         rain: 0.0,
-        rain_radius: 18.0,
+        rain_radius: 100.0,
+        rain_height: 30.0,
         rain_speed: 9.0,
         rain_length: 0.45,
         rain_width: 0.008,
+        rain_color: Color::srgb(0.72, 0.75, 0.78),
     };
 
     /// A still morning: mist in the hollows, no rain.
@@ -148,6 +164,7 @@ struct WeatherKernels {
     ground: Handle<ComputeModule>,
     rain: Handle<ComputeModule>,
     rain_material: Handle<AuroraMaterial>,
+    ripple_material: Handle<AuroraMaterial>,
     /// A thin unit ring in its xz plane: a ripple's crest.
     ripple_mesh: Handle<AuroraMesh>,
 }
@@ -210,7 +227,9 @@ struct RainPush {
     length: f32,
     width: f32,
     mask: u32,
-    pad: u32,
+    /// The angle one output pixel spans: streaks, droplets and rings thicken with distance so
+    /// each covers about a pixel (thinner, they drop out of the image a few metres off).
+    pixel_angle: f32,
 }
 
 fn spawn_parts(
@@ -241,6 +260,7 @@ fn spawn_parts(
                 poses: Vec::new(),
             },
             AuroraMaterial3d(kernels.rain_material.clone()),
+            NO_SHADOW,
             Transform::default(),
         ))
         .id();
@@ -254,6 +274,7 @@ fn spawn_parts(
                 poses: Vec::new(),
             },
             AuroraMaterial3d(kernels.rain_material.clone()),
+            NO_SHADOW,
             Transform::default(),
         ))
         .id();
@@ -266,7 +287,8 @@ fn spawn_parts(
                 capacity: RAIN_CAPACITY,
                 poses: Vec::new(),
             },
-            AuroraMaterial3d(kernels.rain_material.clone()),
+            AuroraMaterial3d(kernels.ripple_material.clone()),
+            NO_SHADOW,
             Transform::default(),
         ))
         .id();
@@ -291,6 +313,24 @@ fn despawn_parts(remove: On<Remove<Weather>>, parts: Query<&WeatherParts>, mut c
 /// The mist volume follows the camera; the ground under it is sampled after the TLAS build and
 /// the rain stepped before it.
 #[allow(clippy::too_many_arguments)]
+/// The weather's rain colour onto the streaks' and splashes' material.
+fn tint_rain(
+    weathers: Query<&Weather, Changed<Weather>>,
+    kernels: Res<WeatherKernels>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
+) {
+    let Some(weather) = weathers.iter().next() else {
+        return;
+    };
+    if materials
+        .get(&kernels.rain_material)
+        .is_some_and(|m| m.base_color != weather.rain_color)
+        && let Some(mut m) = materials.get_mut(&kernels.rain_material)
+    {
+        m.base_color = weather.rain_color;
+    }
+}
+
 fn update_weather(
     weathers: Query<(&Weather, &WeatherParts, &GlobalTransform)>,
     mut volumes: Query<(&mut FogVolume, &mut Transform)>,
@@ -300,6 +340,7 @@ fn update_weather(
         &Camera,
         Option<&RenderLayers>,
         Option<&InEnvironment>,
+        Option<&Projection>,
     )>,
     kernels: Res<WeatherKernels>,
     rd: Res<RenderDevice>,
@@ -309,8 +350,15 @@ fn update_weather(
     mut tlas: ResMut<TLAS>,
     mut frame: ResMut<FrameCommands>,
 ) {
-    let Some((camera, _, layers, world)) = cameras.iter().find(|(_, c, ..)| c.is_active) else {
+    let Some((camera, active, layers, world, projection)) =
+        cameras.iter().find(|(_, c, ..)| c.is_active)
+    else {
         return;
+    };
+    // The angle one output pixel spans (0: no floor on the rain's widths).
+    let pixel_angle = match (projection, active.physical_viewport_size()) {
+        (Some(Projection::Perspective(p)), Some(size)) if size.y > 0 => p.fov / size.y as f32,
+        _ => 0.0,
     };
     let eye = camera.translation();
     let Some((weather, parts, env)) = weathers.iter().next() else {
@@ -438,13 +486,13 @@ fn update_weather(
         time: time.elapsed_secs_wrapped(),
         camera: eye.to_array(),
         radius: weather.rain_radius.max(1.0),
-        height: weather.rain_radius.max(1.0) * 1.5,
+        height: weather.rain_height.max(1.0),
         speed: weather.rain_speed,
         wind: weather.wind.xz().to_array(),
         length: weather.rain_length,
         width: weather.rain_width,
         mask: environment_mask(layers, world) as u32,
-        pad: 0,
+        pixel_angle,
     };
     let module = kernels.rain.clone();
     frame.push(move |rd, modules, cmd, ctx| {
@@ -518,7 +566,7 @@ impl Plugin for WeatherPlugin {
             .add_observer(despawn_parts)
             .add_systems(
                 PostUpdate,
-                update_weather.run_if(resource_exists::<RenderDevice>),
+                (tint_rain, update_weather.run_if(resource_exists::<RenderDevice>)),
             )
             .add_systems(TeardownSchedule, free_buffers.before(on_shutdown));
     }
@@ -533,25 +581,33 @@ impl Plugin for WeatherPlugin {
             asset_server.load(aurora_asset("shaders/weather_rain.slang")),
             &["rain_step"],
         ));
-        // Water: a thin streak of it catches the sky and the lights (and lets shadows through).
-        let rain_material = app
-            .world_mut()
-            .resource_mut::<Assets<AuroraMaterial>>()
-            .add(AuroraMaterial {
-                base_color: Color::srgb(0.9, 0.93, 1.0),
-                perceptual_roughness: 0.1,
-                specular_transmission: 0.9,
-                ior: 1.33,
-                ..default()
-            });
+        let mut materials = app.world_mut().resource_mut::<Assets<AuroraMaterial>>();
+        // A streak is a drop smeared over the exposure, scattering every lamp's light around it:
+        // a pale translucent scatterer, not a glass rod (which shows only what lies behind it,
+        // and vanishes against a dark wall).
+        let rain_material = materials.add(AuroraMaterial {
+            base_color: Weather::CLEAR.rain_color,
+            perceptual_roughness: 0.4,
+            diffuse_transmission: 0.6,
+            ..default()
+        });
+        // A ripple reads by the sky it mirrors: clear water.
+        let ripple_material = materials.add(AuroraMaterial {
+            base_color: Color::srgb(0.9, 0.93, 1.0),
+            perceptual_roughness: 0.1,
+            specular_transmission: 0.9,
+            ior: 1.33,
+            ..default()
+        });
         let ripple_mesh = app
             .world_mut()
             .resource_mut::<Assets<AuroraMesh>>()
-            .add(AuroraMesh::from_shape(Torus::new(0.88, 1.0)));
+            .add(AuroraMesh::from_shape(Torus::new(0.84, 1.0)));
         app.insert_resource(WeatherKernels {
             ground,
             rain,
             rain_material,
+            ripple_material,
             ripple_mesh,
         });
     }
