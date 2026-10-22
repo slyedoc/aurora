@@ -34,7 +34,9 @@ pub struct ErosionLayer {
     pub size: Vec2,
     /// Metres between simulation cells. Coarser than the texels: channels form at landform
     /// scale (and a texel-scale grid shows its four pipe directions as combed grooves).
+    #[reflect(@0.5..=8.0_f32)]
     pub resolution: f32,
+    #[reflect(@0.0..=2000.0_f32)]
     pub iterations: u32,
     /// Seconds per step.
     pub dt: f32,
@@ -47,10 +49,12 @@ pub struct ErosionLayer {
     pub erode: f32,
     pub deposit: f32,
     /// Degrees past which loose material slips.
+    #[reflect(@5.0..=80.0_f32)]
     pub talus: f32,
     /// Fraction of the excess slipping per step.
     pub thermal: f32,
     /// Metres over which the result fades out at the region's border.
+    #[reflect(@0.0..=128.0_f32)]
     pub edge: f32,
     /// Set to (re)bake; it clears itself.
     pub bake: bool,

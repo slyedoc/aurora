@@ -18,20 +18,30 @@ use crate::HeightLayer;
 #[reflect(Component, Default)]
 #[require(HeightLayer)]
 pub struct GeneratorLayer {
+    #[reflect(@0.0..=100.0_f32)]
     pub seed: f32,
+    #[reflect(@-500.0..=500.0_f32)]
     pub base_height: f32,
     pub hills_frequency: f32,
+    #[reflect(@0.0..=300.0_f32)]
     pub hills_amplitude: f32,
+    #[reflect(@1.0..=10.0_f32)]
     pub hills_octaves: u32,
     pub mountains_frequency: f32,
+    #[reflect(@0.0..=2000.0_f32)]
     pub mountains_amplitude: f32,
+    #[reflect(@1.0..=12.0_f32)]
     pub mountains_octaves: u32,
+    #[reflect(@0.0..=1.0_f32)]
     pub mountains_warp: f32,
     pub mountains_mask_frequency: f32,
     /// > 1 shrinks the mountain regions.
+    #[reflect(@0.25..=8.0_f32)]
     pub mountains_mask_power: f32,
     pub detail_frequency: f32,
+    #[reflect(@0.0..=10.0_f32)]
     pub detail_amplitude: f32,
+    #[reflect(@1.0..=8.0_f32)]
     pub detail_octaves: u32,
 }
 
@@ -52,6 +62,22 @@ impl Default for GeneratorLayer {
             detail_frequency: 1.0 / 40.0,
             detail_amplitude: 1.2,
             detail_octaves: 3,
+        }
+    }
+}
+
+impl GeneratorLayer {
+    /// A few metres of rolling ground and no mountains: laid over a place (blend `Add`) it
+    /// rolls the ground that is there instead of burying it.
+    pub fn rolling() -> Self {
+        Self {
+            base_height: 0.0,
+            hills_frequency: 1.0 / 120.0,
+            hills_amplitude: 4.0,
+            hills_octaves: 4,
+            mountains_amplitude: 0.0,
+            detail_amplitude: 0.3,
+            ..default()
         }
     }
 }

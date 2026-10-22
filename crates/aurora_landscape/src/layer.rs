@@ -32,6 +32,7 @@ pub enum HeightBlend {
 #[require(Transform)]
 pub struct HeightLayer {
     pub enabled: bool,
+    #[reflect(@0.0..=1.0_f32)]
     pub opacity: f32,
     pub blend: HeightBlend,
 }
@@ -266,6 +267,7 @@ pub fn track_layers(
 #[require(Transform)]
 pub struct MaterialLayer {
     pub enabled: bool,
+    #[reflect(@0.0..=1.0_f32)]
     pub opacity: f32,
 }
 
@@ -299,6 +301,7 @@ pub struct SplatmapLayer {
 pub struct MaterialRuleLayer {
     pub material: u8,
     pub slope: Vec2,
+    #[reflect(@0.0..=45.0_f32)]
     pub slope_fade: f32,
     pub height: Vec2,
     pub height_fade: f32,
@@ -637,5 +640,44 @@ pub fn on_source_removed(
 pub fn release_sources(mut sources: Query<&mut HeightmapSource>, rd: Res<RenderDevice>) {
     for mut source in &mut sources {
         source.destroy(&rd);
+    }
+}
+
+/// Each stack's layers in child order, as last evaluated.
+#[derive(Component, Default)]
+pub struct StackOrder {
+    heights: Vec<Entity>,
+    materials: Vec<Entity>,
+}
+
+/// A stack whose layers were reordered or removed re-evaluates everywhere.
+#[allow(clippy::type_complexity)]
+pub fn track_stack_order(
+    mut commands: Commands,
+    mut landscapes: Query<
+        (Entity, &Children, &mut LandscapePages, Option<&mut StackOrder>),
+        (With<Landscape>, Changed<Children>),
+    >,
+    heights: Query<(), With<HeightLayer>>,
+    materials: Query<(), With<MaterialLayer>>,
+) {
+    for (entity, children, mut pages, order) in &mut landscapes {
+        let h: Vec<Entity> = children.iter().filter(|c| heights.contains(*c)).collect();
+        let m: Vec<Entity> = children.iter().filter(|c| materials.contains(*c)).collect();
+        let Some(mut order) = order else {
+            commands.entity(entity).insert(StackOrder {
+                heights: h,
+                materials: m,
+            });
+            continue;
+        };
+        if order.heights != h {
+            pages.dirty_all();
+            order.heights = h;
+        }
+        if order.materials != m {
+            pages.dirty_all_materials();
+            order.materials = m;
+        }
     }
 }

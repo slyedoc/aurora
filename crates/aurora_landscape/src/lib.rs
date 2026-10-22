@@ -405,6 +405,7 @@ impl Plugin for LandscapePlugin {
                         layer::stream_splatmaps,
                         layer::track_layers,
                         layer::track_materials,
+                        layer::track_stack_order,
                         ring::track_ring_layers,
                         sculpt::load_page_files,
                         sculpt::apply_dabs,
