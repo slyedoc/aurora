@@ -112,7 +112,11 @@ public struct EnvironmentGpu {
 // Binder, "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing Gems ch. 6).
 // Within 1/32 of the origin, where ulps get too fine, a small absolute offset instead. Rays
 // that start this way trace with tmin 0.
-public float3 offsetRay(float3 p, float3 n) {
+// `extent`: the size of the numbers the hit was found from (HitPayload::extent; 0 = p's own).
+// `p` is camera-relative, but the hardware intersects in object space: an 8 km ground of two
+// triangles has 4 km vertices there, ~1e-4 m of error under a camera-relative p of 1 m, and its
+// shadow rays re-hit it in square bands around the camera.
+public float3 offsetRay(float3 p, float3 n, float extent) {
     static const float ORIGIN = 1.0 / 32.0;
     static const float FLOAT_SCALE = 1.0 / 65536.0;
     static const float INT_SCALE = 256.0;
@@ -128,13 +132,13 @@ public float3 offsetRay(float3 p, float3 n) {
     // The hit point's error scales with its LARGEST coordinate, not each one's own: ground at
     // y ~ 0 a hundred metres out got a y push of ~1e-6 m against ~1e-5 m of error, and its
     // shadow rays hit the ground they left (acne moire wherever |y| is small).
-    let largest = max(max(abs(p.x), abs(p.y)), abs(p.z));
+    let largest = max(max(max(abs(p.x), abs(p.y)), abs(p.z)), extent);
     return per_axis + n * (largest * (1.0 / 524288.0));
 }
 
 // `offsetRay` off the surface with normal `n`, to the side direction `d` leaves through.
-public float3 leaveSurface(float3 p, float3 n, float3 d) {
-    return offsetRay(p, dot(d, n) >= 0.0 ? n : -n);
+public float3 leaveSurface(float3 p, float3 n, float3 d, float extent) {
+    return offsetRay(p, dot(d, n) >= 0.0 ? n : -n, extent);
 }
 
 // The sampling grid of every importance table (src/sky_gen.rs SKY_W / SKY_H).

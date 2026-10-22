@@ -28,6 +28,10 @@ public struct HitPayload {
     public float2 cone;
     // Hit -> raygen: thin translucency, clear coat and its roughness, a byte each (0..255).
     public uint lobes;
+    // Hit -> raygen: the size (metres) of the numbers this hit point was computed from: its
+    // primitive's object-space extent in world units, or the ray's length. Its error is a few
+    // ulps of that, which a ray leaving it must clear (rt_types.slang offsetRay); 0 for a miss.
+    public float extent;
 };
 
 // Shadow rays: whether the ray reached the sky (the shadow miss shader sets it), and the nearest

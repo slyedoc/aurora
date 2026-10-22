@@ -273,15 +273,16 @@ struct ShadowPick {
         }
     }
 
-    // The kept proposal's shadow ray from `origin` off `normal` (geometric); its contribution over
-    // its pick probability when visible. `water`: the water the path reached the vertex in;
-    // `vertex_water` the vertex's own when it is a water surface (the ray leaves into it below).
-    float3 resolve(uint mask, float3 origin, float3 normal, uint water, uint vertex_water) {
+    // The kept proposal's shadow ray from `origin` off `normal` (geometric; `extent` the hit's,
+    // offsetRay); its contribution over its pick probability when visible. `water`: the water the
+    // path reached the vertex in; `vertex_water` the vertex's own when it is a water surface (the
+    // ray leaves into it below).
+    float3 resolve(uint mask, float3 origin, float3 normal, float extent, uint water, uint vertex_water) {
         if (wsum <= 0.0) {
             return float3(0.0);
         }
         let below = dot(direction, normal) * normal.y < 0.0;
-        return resolveAt(mask, leaveSurface(origin, normal, direction),
+        return resolveAt(mask, leaveSurface(origin, normal, direction, extent),
                          waterAfterScatter(water, vertex_water, below));
     }
 
@@ -961,7 +962,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
             HitPayload probe = {};
             probe.miss_flags = ray_env << 1;
             probe.cone = float2(cone_width, cone_spread);
-            traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror), tmin, mirror, tmax, probe);
+            traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror, payload.extent), tmin, mirror, tmax, probe);
             spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t, SPEC_HIT_FAR);
         }
         guide_spec_hit[px] = float4(spec_hit, 0.0, 0.0, 0.0);
@@ -1033,6 +1034,7 @@ void primary() {
     lensRay(lens, launch_id, launch_size, origin, direction);
     let mask = float3(1.0);
     var surf_n = float3(0.0);
+    var surf_extent = 0.0;
     var ray_env = pc.uniforms.environment;
     var ray_mask = viewMask(pc.uniforms.camera_mask, ray_env);
     var in_view = true;
@@ -1062,7 +1064,7 @@ void primary() {
         payload.cone = float2(cone_width, cone_spread);
         let trace_mask = recorded ? ray_mask : (ray_mask & ~pc.uniforms.primary_hidden);
         RayDesc ray;
-        ray.Origin = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
+        ray.Origin = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
         ray.Direction = direction;
         ray.TMin = tmin;
         ray.TMax = tmax;
@@ -1131,6 +1133,7 @@ void primary() {
             && hitPayloadGetRoughness(payload) < 0.1
             && !hitPayloadGetGuidesHere(payload);
         let t = payload.t;
+        let extent = payload.extent;
         let ends = any(payload.emission != float3(0.0)) || t == 0.0;
         let hit_point = origin + direction * t;
         let env = pc.uniforms.environments + ray_env;
@@ -1189,6 +1192,7 @@ void primary() {
         if (pass_through) {
             origin = hit_point;
             surf_n = surface_normal;
+            surf_extent = extent;
             continue;
         }
         if (guides_written || !guide_defer || ++glass > 4u) {
@@ -1212,6 +1216,7 @@ void primary() {
             : normalize(eta * direction + world_normal * (eta * costi - sqrt(max(k, 0.0))));
         origin = hit_point;
         surf_n = surface_normal;
+        surf_extent = extent;
     }
     rec.meter_albedo = meter_albedo;
     rec.primary_t = primary_t;
@@ -1282,6 +1287,8 @@ struct PtVertex {
     Lobes lob;
     // A water surface's water id (0: not one).
     uint water;
+    // HitPayload::extent (offsetRay).
+    float extent;
 };
 
 PtVertex ptPrimaryVertex(RestirSurface s) {
@@ -1293,6 +1300,8 @@ PtVertex ptPrimaryVertex(RestirSurface s) {
     p.mat = surfaceMaterial(restirAlbedo(s), restirMetallic(s), restirRoughness(s));
     p.lob = unpackLobes(s.material);
     p.water = 0u;
+    // Not in the surface record (64 bytes, full): its own position's ulps only.
+    p.extent = 0.0;
     return p;
 }
 
@@ -1353,7 +1362,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         HitPayload payload = {};
         payload.miss_flags = 0u;
         payload.cone = float2(0.0, 0.01);
-        let start = leaveSurface(p.x, p.ng, dir);
+        let start = leaveSurface(p.x, p.ng, dir, p.extent);
         trace(FLAGS_OPAQUE, ray_mask, start, 0.0, dir, 1.0e7, payload);
         if (payload.t == 0.0 || any(payload.emission != float3(0.0)) || hitPayloadGetMasked(payload)) {
             return res;
@@ -1377,6 +1386,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         }
         q.v = -dir;
         q.water = hit_water;
+        q.extent = payload.extent;
         // Glass as `main` saw it: eta for the side the ray came from, the medium's absorption
         // along the segment inside.
         let inside = hitPayloadGetInside(payload);
@@ -1443,8 +1453,8 @@ float3 ptOwnTargetWater(RestirSurface s, GiCandidate c) {
         return C;
     }
     let from = ptPrimaryVertex(s);
-    let to = offsetRay(c.x_s, oct_to_float32x3(unpackHalf2(c.n_s_oct)));
-    let start = leaveSurface(from.x, from.ng, to - from.x);
+    let to = offsetRay(c.x_s, oct_to_float32x3(unpackHalf2(c.n_s_oct)), 0.0);
+    let start = leaveSurface(from.x, from.ng, to - from.x, from.extent);
     let dist = length(to - start);
     if (!(dist > 1.0e-4 && dist < 1.0e7)) {
         return C;
@@ -1495,8 +1505,8 @@ PtShift ptShift(RestirSurface s, float thr, GiCandidate c) {
     if (!(luma(f) > 0.0) || !(c.geo > 0.0)) {
         return r;
     }
-    let to = offsetRay(c.x_s, n_s);
-    let start = leaveSurface(from.x, from.ng, to - from.x);
+    let to = offsetRay(c.x_s, n_s, 0.0);
+    let start = leaveSurface(from.x, from.ng, to - from.x, from.extent);
     let dist = length(to - start);
     if (!(dist > 1.0e-4 && dist < 1.0e7)) {
         return r;
@@ -2092,8 +2102,10 @@ void main() {
         var ray_env = pc.uniforms.environment;
         var ray_mask = viewMask(pc.uniforms.camera_mask, ray_env);
         // The normal of the surface `origin` sits on, for the next ray to leave it by; zero where
-        // the ray does not start on a surface (the camera, a fog scatter, a portal exit).
+        // the ray does not start on a surface (the camera, a fog scatter, a portal exit); and the
+        // hit's extent (HitPayload::extent), how far it must be left.
         var surf_n = float3(0.0);
+        var surf_extent = 0.0;
         // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
         // Neural radiance cache: the path's footprint (the sum of square roots of its spread so far
@@ -2187,7 +2199,7 @@ void main() {
             payload.miss_flags = (((path & PATH_WANT_SUN) != 0u) ? 1u : 0u) | (ray_env << 1);
             payload.cone = float2(cone_width, cone_spread);
             let trace_mask = ((path & PATH_CAMERA) != 0u) ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
-            let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction) : origin;
+            let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
             // The recorded hit is rebuilt, not traced: the primary pass already found it.
             let resumed = resume;
             if (resume) {
@@ -2395,6 +2407,7 @@ void main() {
             // Alpha-cutout pass-through: carry on along the same ray from the hit.
             origin = origin + direction * payload.t;
             surf_n = surface_normal;
+            surf_extent = payload.extent;
             if (pass_through) {
                 // Replay cannot draw the alpha coin again.
                 path &= ~PATH_PT_SEARCH;
@@ -2594,7 +2607,7 @@ void main() {
                     if (pc.restir_frame != nullptr && pc.restir_frame.debug != nullptr
                         && luma(c) > 0.0) {
                         let dbg = pc.restir_frame.debug;
-                        let lit = traceLight(ray_mask, leaveSurface(origin, surface_normal, wdir),
+                        let lit = traceLight(ray_mask, leaveSurface(origin, surface_normal, wdir, surf_extent),
                                              wdir, wdist * (1.0 - 1.0e-4), 0u);
                         dbg[3u + 2u * prim_at] |= RESTIR_DBG_SHADED
                             | (any(lit > float3(0.0)) ? 0u : RESTIR_DBG_OCCLUDED);
@@ -2730,7 +2743,7 @@ void main() {
                     }
                 }
             }
-            let nee = pick.resolve(ray_mask, origin, surface_normal, water, hitPayloadWater(payload));
+            let nee = pick.resolve(ray_mask, origin, surface_normal, surf_extent, water, hitPayloadWater(payload));
             // The ReSTIR winner's own shadow ray found it occluded: last frame's reservoir for the
             // temporal pass carries W = 0 (its M still counts), so a winner hidden behind its
             // fixture or the surface's own geometry is not resampled again and again.

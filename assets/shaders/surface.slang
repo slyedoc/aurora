@@ -207,6 +207,8 @@ public struct SurfaceHit {
     // The triangle's true face normal (world space), facing the ray: what a ray leaving the hit
     // offsets along (raygen offsetRay) -- vertex normals can lie in the face.
     public float3 face_normal;
+    // HitPayload::extent.
+    public float extent;
     // Ray-cone texture LOD before the per-texture texel-count term; feed `sampleLod`.
     public float lod_base;
     // The ray cone's footprint on the surface as an ellipse (the bias applied): its two axes in
@@ -239,6 +241,20 @@ public float3 objectToWorldNormal(float3 n) {
                   dot(n, float3(m[0][2], m[1][2], m[2][2])));
 }
 
+// HitPayload::extent: `object_extent` (the largest |coordinate| the hit was intersected from,
+// object space) in world units -- the hardware intersects in object space, so a vertex 4 km from
+// its mesh origin brings 4 km of rounding to a hit under the camera -- or the ray's length,
+// which the raygen's origin + t * direction rounds at.
+public float hitExtent(float3 object_extent) {
+    let m = ObjectToWorld3x4();
+    let c0 = float3(m[0][0], m[1][0], m[2][0]);
+    let c1 = float3(m[0][1], m[1][1], m[2][1]);
+    let c2 = float3(m[0][2], m[1][2], m[2][2]);
+    let scale2 = max(max(dot(c0, c0), dot(c1, c1)), dot(c2, c2));
+    let largest = max(max(object_extent.x, object_extent.y), object_extent.z);
+    return max(largest * sqrt(scale2), RayTCurrent() * length(WorldRayDirection()));
+}
+
 // The ray cone's width at the hit (raygen -> hit, payload.cone), never zero.
 public float coneWidth(HitPayload payload) {
     return max(payload.cone.x + payload.cone.y * RayTCurrent(), 1.0e-7);
@@ -264,8 +280,12 @@ public SurfaceHit surfaceHit(HitPayload payload, BuiltInTriangleIntersectionAttr
     }
     hit.surface_normal = normalize(objectToWorldNormal(hit.object_normal));
     // From the BLAS's own positions (position fetch): world-space edges.
-    let e1 = objectToWorldDir(HitTriangleVertexPosition(1) - HitTriangleVertexPosition(0));
-    let e2 = objectToWorldDir(HitTriangleVertexPosition(2) - HitTriangleVertexPosition(0));
+    let v0 = HitTriangleVertexPosition(0);
+    let v1 = HitTriangleVertexPosition(1);
+    let v2 = HitTriangleVertexPosition(2);
+    let e1 = objectToWorldDir(v1 - v0);
+    let e2 = objectToWorldDir(v2 - v0);
+    hit.extent = hitExtent(max(max(abs(v0), abs(v1)), abs(v2)));
     hit.face_normal = normalize(cross(e1, e2));
     if (dot(hit.face_normal, WorldRayDirection()) > 0.0) {
         hit.face_normal = -hit.face_normal;
@@ -358,6 +378,7 @@ public float3 prevWorldPos(float3 object_p) {
 // colour, emission and roughness.
 public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3 world_normal) {
     payload.t = RayTCurrent();
+    payload.extent = hit.extent;
     payload.surface_and_world_normal = packNormals(hit.face_normal, world_normal);
     payload.slot = instanceSlot();
     payload.prim_tri = record.triangles[GeometryIndex()].v + PrimitiveIndex();

@@ -60,6 +60,7 @@ void closesthit(inout HitPayload payload, SphereAttributes attribs) {
     }
 
     payload.t = RayTCurrent();
+    payload.extent = hitExtent(float3(0.5));
     payload.absorption = float3(0.0);
     payload.color = materialBaseColor(material);
     payload.emission = materialEmissive(material) * uniformEmissiveBoost();
