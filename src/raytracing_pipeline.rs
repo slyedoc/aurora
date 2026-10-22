@@ -680,17 +680,13 @@ impl VulkanAsset for RaytracingPipeline {
             .dynamic_state(&dynamic)
             .push(&mut flags2);
 
-        let pipeline = unsafe {
-            render_device
-                .ext_rtx_pipeline
-                .create_ray_tracing_pipelines(
-                    vk::DeferredOperationKHR::null(),
-                    render_device.pipeline_cache,
-                    std::slice::from_ref(&pipeline_info),
-                    None,
-                )
-                .unwrap()[0]
-        };
+        let pipeline = crate::pipeline_binary::create_pipeline(
+            render_device,
+            "raytracing",
+            &pipeline_info,
+            |info, cache| unsafe { create_on_every_core(render_device, info, cache) },
+        )
+        .unwrap();
 
         unsafe {
             for shader in shader_stages {
@@ -916,4 +912,52 @@ impl Plugin for RaytracingPipelinePlugin {
         app.init_vulkan_asset::<RaytracingPipeline>();
         app.add_systems(Update, (propagate_modified, rebuild_on_features));
     }
+}
+
+/// Compiles a ray-tracing pipeline as a deferred operation joined from a thread per core: the
+/// driver splits the work across them, where a plain create runs it on this thread alone.
+unsafe fn create_on_every_core(
+    rd: &crate::render_device::RenderDeviceData,
+    info: &vk::RayTracingPipelineCreateInfoKHR,
+    cache: vk::PipelineCache,
+) -> Result<vk::Pipeline, vk::Result> {
+    use ash::khr::deferred_host_operations;
+    let ops = deferred_host_operations::Device::load(&rd.instance, &rd.device);
+    let op = unsafe { ops.create_deferred_operation(None)? };
+    // Written once the operation completes; it outlives the joins below.
+    let mut pipeline = vk::Pipeline::null();
+    let started = unsafe {
+        (rd.ext_rtx_pipeline.fp().create_ray_tracing_pipelines_khr)(
+            rd.device.handle(),
+            op,
+            cache,
+            1,
+            info,
+            std::ptr::null(),
+            &mut pipeline,
+        )
+    };
+    if started == vk::Result::OPERATION_DEFERRED_KHR {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let threads = unsafe { ops.get_deferred_operation_max_concurrency(op) }
+            .clamp(1, cores as u32);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    match unsafe { ops.deferred_operation_join(op) } {
+                        // More work may come to this thread later.
+                        Err(vk::Result::THREAD_IDLE_KHR) => std::thread::yield_now(),
+                        _ => break,
+                    }
+                });
+            }
+        });
+    }
+    let result = match started {
+        vk::Result::OPERATION_DEFERRED_KHR => unsafe { ops.get_deferred_operation_result(op) },
+        vk::Result::OPERATION_NOT_DEFERRED_KHR => Ok(()),
+        other => other.result(),
+    };
+    unsafe { ops.destroy_deferred_operation(op, None) };
+    result.map(|()| pipeline)
 }

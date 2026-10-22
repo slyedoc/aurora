@@ -2321,11 +2321,28 @@ pub struct UiPointerHit {
 #[derive(Component, Default)]
 pub struct UiPointerTrack {
     id: Option<PointerId>,
+    /// The caster tracing this source's ray into the world (`pointer_picking`).
+    pub(crate) world: Option<Entity>,
     last: Option<Location>,
     /// Buttons as seen last frame (edge detection).
     prev: [bool; 3],
     /// Buttons pressed *on a panel* and not yet released.
     down: [bool; 3],
+}
+
+/// Where a world point shows in the first active 3D camera's view, as a pointer location.
+fn world_location(
+    point: Vec3,
+    cameras: &Query<(&Camera, Option<&RenderTarget>, &GlobalTransform), With<Camera3d>>,
+    window: Option<Entity>,
+) -> Option<Location> {
+    let (camera, target, transform) = cameras.iter().find(|(c, ..)| c.is_active)?;
+    Some(Location {
+        target: target.cloned().unwrap_or_default().normalize(window)?,
+        position: camera
+            .world_to_viewport(transform, point)
+            .unwrap_or(Vec2::ZERO),
+    })
 }
 
 /// The window mouse as a [`UiPointerSource`]: one is spawned by [`UiRenderPlugin`], and
@@ -2390,6 +2407,9 @@ fn drive_ui_pointers(
     frames: Query<(&Transform, Option<&ChildOf>)>,
     panels: Query<(Entity, &GlobalTransform, &UiSurfacePanel)>,
     targets: Res<UiSurfaceTargets>,
+    world_hits: Query<&crate::picking::RayHits>,
+    cameras: Query<(&Camera, Option<&RenderTarget>, &GlobalTransform), With<Camera3d>>,
+    primary: Query<Entity, With<PrimaryWindow>>,
     mut writer: MessageWriter<PointerInput>,
 ) {
     const BUTTONS: [PointerButton; 3] = [
@@ -2499,6 +2519,46 @@ fn drive_ui_pointers(
             }
             None => {
                 source.hit = None;
+                // Off every panel but on something the tracer draws: point at it like a mouse
+                // over the camera's view, so world picking sees moves, presses and releases.
+                let on_world = source
+                    .active
+                    .then(|| track.world.and_then(|e| world_hits.get(e).ok()))
+                    .flatten()
+                    .and_then(|hits| hits.first().copied())
+                    .and_then(|hit| world_location(hit.point, &cameras, primary.iter().next()));
+                if let Some(location) = on_world {
+                    let delta = match &track.last {
+                        Some(last) if last.target == location.target => {
+                            location.position - last.position
+                        }
+                        _ => Vec2::ZERO,
+                    };
+                    writer.write(PointerInput::new(
+                        id,
+                        location.clone(),
+                        PointerAction::Move { delta },
+                    ));
+                    for (i, button) in BUTTONS.into_iter().enumerate() {
+                        if buttons[i] && !prev[i] && !track.down[i] {
+                            track.down[i] = true;
+                            writer.write(PointerInput::new(
+                                id,
+                                location.clone(),
+                                PointerAction::Press(button),
+                            ));
+                        } else if !buttons[i] && track.down[i] {
+                            track.down[i] = false;
+                            writer.write(PointerInput::new(
+                                id,
+                                location.clone(),
+                                PointerAction::Release(button),
+                            ));
+                        }
+                    }
+                    track.last = Some(location);
+                    continue;
+                }
                 let Some(last) = track.last.take() else {
                     continue;
                 };

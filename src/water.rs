@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::{
     assets::aurora_asset,
     blas::{absorption_from_attenuation, material_flags},
-    ray_render_plugin::RenderSet,
+    ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     surface_group::{SurfaceClass, SurfaceGroup, SurfaceGroupRegistry, SurfaceRow},
@@ -341,6 +341,12 @@ pub(crate) fn upload_water_media(
 
 pub struct WaterVolumePlugin;
 
+fn cleanup_water_media(mut media: ResMut<WaterMedia>, rd: Res<RenderDevice>) {
+    if let Some(buffer) = media.buffer.take() {
+        rd.destroyer.destroy_buffer(buffer.handle);
+    }
+}
+
 impl Plugin for WaterVolumePlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<WaterMaterial>()
@@ -351,6 +357,7 @@ impl Plugin for WaterVolumePlugin {
             .init_resource::<WaterMedia>()
             .add_systems(PostUpdate, (apply_water_kind, assign_water_rows).chain())
             .add_systems(Last, upload_water_media.in_set(RenderSet::Prepare))
+            .add_systems(TeardownSchedule, cleanup_water_media.before(on_shutdown))
             .add_observer(tag_water_surface);
     }
 

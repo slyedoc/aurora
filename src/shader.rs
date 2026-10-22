@@ -169,6 +169,7 @@ fn compile_slang_cached(
     let cached = dir.join(format!("{}.spv", hasher.finalize().to_hex()));
     if let Ok(spirv) = std::fs::read(&cached) {
         log::debug!("slang cache hit: {source_path}");
+        crate::pipeline_binary::touch(&cached);
         return Ok(spirv);
     }
     let spirv = compile_slang(source_path)?;

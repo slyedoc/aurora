@@ -237,14 +237,13 @@ impl VulkanAsset for GizmoPipeline {
                 .dynamic_state(&dynamic_state)
                 .push(&mut pipeline_rendering_info)
                 .push(&mut flags2);
-            unsafe {
-                render_device.create_graphics_pipelines(
-                    render_device.pipeline_cache,
-                    &[pipeline_info],
-                    None,
-                )
-            }
-            .unwrap()[0]
+            crate::pipeline_binary::create_pipeline(render_device, &format!("gizmo {formats:?}"), &pipeline_info, |info, cache| unsafe {
+                render_device
+                    .create_graphics_pipelines(cache, std::slice::from_ref(info), None)
+                    .map(|p| p[0])
+                    .map_err(|(_, e)| e)
+            })
+            .unwrap()
         });
 
         unsafe {

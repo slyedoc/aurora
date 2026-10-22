@@ -95,6 +95,10 @@ impl Drop for AllocatorState {
 /// [`capture_statistics`] report each shader's registers, binary size and stack
 /// ([`log_executable_statistics`]). NVIDIA reports compute pipelines; ray tracing pipelines
 /// return no executables.
+/// Whether the device caches pipelines as binaries on disk (`pipeline_binary.rs`).
+pub static PIPELINE_BINARIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub static EXECUTABLE_STATISTICS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -215,6 +219,8 @@ pub struct RenderDeviceData {
     /// `VK_NV_low_latency2` (Reflex) with `VK_KHR_present_id`, on a windowed, non-XR NVIDIA
     /// device (latency.rs); `None` otherwise.
     pub ext_low_latency: Option<low_latency2::Device>,
+    /// Pipelines cached as driver binaries (`pipeline_binary.rs`), when the device can.
+    pub ext_pipeline_binary: Option<ash::khr::pipeline_binary::Device>,
     pub command_pool: vk::CommandPool,
     pub bindless_descriptor_map: Mutex<BindlessMap>,
     /// The resource and sampler descriptor heaps (descriptor_heap.rs), set right after the
@@ -365,7 +371,10 @@ impl RenderDevice {
                 let pool = create_command_pool(&device, queue_family_idx);
                 (pool, create_command_buffers(&device, pool))
             });
-            let pipeline_cache = create_pipeline_cache(&device);
+            let binaries = PIPELINE_BINARIES.load(std::sync::atomic::Ordering::Relaxed);
+            let ext_pipeline_binary =
+                binaries.then(|| ash::khr::pipeline_binary::Device::load(&instance, &device));
+            let pipeline_cache = create_pipeline_cache(&device, binaries);
             let ext_debug_utils = ash::ext::debug_utils::Device::load(&instance, &device);
 
             let allocator_state = Arc::new(Mutex::new(ManuallyDrop::new(AllocatorState {
@@ -414,6 +423,7 @@ impl RenderDevice {
                 ext_acc_struct,
                 ext_micromap,
                 ext_low_latency,
+                ext_pipeline_binary,
                 command_pool,
                 bindless_descriptor_map: Mutex::new(BindlessMap::default()),
                 heaps: std::sync::OnceLock::new(),
@@ -438,6 +448,9 @@ impl RenderDevice {
     /// Writes the pipeline cache to disk; called after a pipeline compiles, not at exit, so a
     /// crashing teardown still keeps it.
     pub fn save_pipeline_cache(&self) {
+        if self.ext_pipeline_binary.is_some() {
+            return;
+        }
         let Some(path) = pipeline_cache_path() else {
             return;
         };
@@ -1170,6 +1183,18 @@ unsafe fn create_logical_device(
             device_extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
         }
         EXECUTABLE_STATISTICS.store(executable_stats, std::sync::atomic::Ordering::Relaxed);
+        // Pipeline binaries (pipeline_binary.rs): the only disk cache descriptor-heap pipelines get.
+        let pipeline_binaries = has(ash::khr::pipeline_binary::NAME) && {
+            let mut query = vk::PhysicalDevicePipelineBinaryFeaturesKHR::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut query);
+            instance.get_physical_device_features2(physical_device, &mut features);
+            query.pipeline_binaries == vk::TRUE
+        };
+        if pipeline_binaries {
+            device_extensions.push(ash::khr::pipeline_binary::NAME.as_ptr());
+        }
+        PIPELINE_BINARIES.store(pipeline_binaries, std::sync::atomic::Ordering::Relaxed);
+        log::info!("vulkan: pipeline binaries: {pipeline_binaries}");
         // Cooperative vectors (nrc.rs). Slang lowers a CoopVec splat to a replicated composite;
         // the cache's hash grid gathers its gradients with float atomic adds (f32, and f16x2
         // where an entry sums a few rows: nrc_kernels.slang nrcGridBackward).
@@ -1308,6 +1333,13 @@ unsafe fn create_logical_device(
         let device_info = device_info.push(&mut features_heap);
         let device_info = if micromaps {
             device_info.push(&mut features_micromap)
+        } else {
+            device_info
+        };
+        let mut features_pipeline_binary =
+            vk::PhysicalDevicePipelineBinaryFeaturesKHR::default().pipeline_binaries(true);
+        let device_info = if pipeline_binaries {
+            device_info.push(&mut features_pipeline_binary)
         } else {
             device_info
         };
@@ -1604,9 +1636,25 @@ fn pipeline_cache_path() -> Option<std::path::PathBuf> {
 }
 
 /// The pipeline cache, seeded from the last run's; the driver checks the blob's header (vendor,
-/// device, driver UUID) and starts empty when it doesn't match.
-fn create_pipeline_cache(device: &ash::Device) -> vk::PipelineCache {
-    let data = pipeline_cache_path()
+/// device, driver UUID) and starts empty when it doesn't match. With pipeline binaries it is
+/// unused: empty, never saved, and the old blob is deleted.
+fn create_pipeline_cache(device: &ash::Device, binaries: bool) -> vk::PipelineCache {
+    if let Some(dir) = crate::shader::cache_dir() {
+        crate::pipeline_binary::prune(&dir);
+        if let Some(pipelines) = crate::pipeline_binary::dir() {
+            crate::pipeline_binary::prune(&pipelines);
+        }
+        crate::pipeline_binary::prune(&dir.join("slang"));
+    }
+    let path = pipeline_cache_path();
+    if binaries
+        && let Some(path) = &path
+        && std::fs::remove_file(path).is_ok()
+    {
+        log::info!("pipeline cache: {} replaced by pipeline binaries", path.display());
+    }
+    let data = path
+        .filter(|_| !binaries)
         .and_then(|path| std::fs::read(path).ok())
         .unwrap_or_default();
     let info = vk::PipelineCacheCreateInfo::default().initial_data(&data);

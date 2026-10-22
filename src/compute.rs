@@ -157,14 +157,21 @@ impl VulkanAsset for ComputeModule {
                 }
             })
             .collect();
-        let handles = unsafe {
-            render_device
-                .device
-                .create_compute_pipelines(render_device.pipeline_cache, &infos, None)
-                .unwrap_or_else(|(_, e)| {
-                    panic!("compute pipelines for {} failed: {e:?}", shader.path)
+        let handles: Vec<vk::Pipeline> = infos
+            .iter()
+            .zip(&entry_points)
+            .map(|(info, entry)| {
+                let label = format!("{}#{entry}", shader.path);
+                crate::pipeline_binary::create_pipeline(render_device, &label, info, |info, cache| unsafe {
+                    render_device
+                        .device
+                        .create_compute_pipelines(cache, std::slice::from_ref(info), None)
+                        .map(|p| p[0])
+                        .map_err(|(_, e)| e)
                 })
-        };
+                .unwrap_or_else(|e| panic!("compute pipelines for {} failed: {e:?}", shader.path))
+            })
+            .collect();
         log::debug!(
             "Compiled compute module {} ({} kernels)",
             shader.path,

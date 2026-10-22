@@ -638,10 +638,13 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
         direction = normalize(portalXformDir(t0, t1, t2, d));
         // Nudge past the exit surface so the continued ray doesn't immediately re-hit it.
         origin = portalXformPoint(t0, t1, t2, p) + direction * 1.0e-4;
-        // The ray now lives in whatever environment the exit does: adopt the exit INSTANCE's
-        // render-layer mask (instance row 3 packs custom_index | mask << 24) and its environment.
-        ray_mask = (asuint(pc.cur_instances[tb + 3u].x) >> 24) & 0xFFu;
-        ray_env = environmentOf(ray_mask, pc.uniforms.environment_bits);
+        // The ray now lives in whatever environment the exit does: the exit INSTANCE's
+        // environment bits (instance row 3 packs custom_index | mask << 24) replace the ray's,
+        // and its named layers (a first-person body) stay with it.
+        let env_bits = pc.uniforms.environment_bits | 1u;
+        let exit_mask = (asuint(pc.cur_instances[tb + 3u].x) >> 24) & 0xFFu;
+        ray_mask = (ray_mask & ~env_bits) | (exit_mask & env_bits);
+        ray_env = environmentOf(ray_mask, env_bits);
         return true;
     }
     return false;

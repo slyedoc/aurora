@@ -43,6 +43,7 @@ pub mod nrc;
 pub mod nsight;
 pub mod omm;
 pub mod picking;
+pub mod pipeline_binary;
 pub mod pointer_picking;
 pub mod portal;
 pub mod post_prep;

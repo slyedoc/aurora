@@ -7,6 +7,9 @@
 //! (picking.rs). `Pickable` is honoured: an entity that is not hoverable is skipped, and one
 //! that blocks lower stops the list.
 //!
+//! Every [`UiPointerSource`] but the window cursor (the mouse is already a `RayMap` pointer)
+//! traces its ray too: an XR laser off the panels hovers and clicks what it points at.
+//!
 //! Active only when bevy_picking's `PickingPlugin` is in the app.
 
 use bevy::{
@@ -17,6 +20,7 @@ use bevy::{
             HitData, PointerHits,
             ray::{RayId, RayMap},
         },
+        pointer::PointerId,
     },
     platform::collections::HashMap,
     prelude::*,
@@ -24,7 +28,8 @@ use bevy::{
 
 use crate::{
     environment::{InEnvironment, environment_mask},
-    picking::{RayCaster, RayHits},
+    picking::{RayCaster, RayHit, RayHits},
+    ui_render::{UiPointerSource, UiPointerTrack, WindowCursorPointer},
 };
 
 /// The caster tracing one pointer ray.
@@ -46,20 +51,94 @@ fn report_hits(
         let Ok(camera) = cameras.get(id.camera) else {
             continue;
         };
-        let mut picks = Vec::new();
-        for hit in hits.iter() {
-            let pickable = pickables.get(hit.entity).ok();
-            if pickable.is_none_or(|p| p.is_hoverable) {
-                picks.push((
-                    hit.entity,
-                    HitData::new(id.camera, hit.distance, Some(hit.point), Some(hit.normal)),
-                ));
-            }
-            if pickable.is_some_and(|p| p.should_block_lower) {
-                break;
+        let picks = picks(hits, id.camera, &pickables);
+        out.write(PointerHits::new(id.pointer, picks, camera.order as f32));
+    }
+}
+
+/// `hits` as picks seen from `camera`, honouring `Pickable`.
+fn picks(hits: &[RayHit], camera: Entity, pickables: &Query<&Pickable>) -> Vec<(Entity, HitData)> {
+    let mut picks = Vec::new();
+    for hit in hits {
+        let pickable = pickables.get(hit.entity).ok();
+        if pickable.is_none_or(|p| p.is_hoverable) {
+            picks.push((
+                hit.entity,
+                HitData::new(camera, hit.distance, Some(hit.point), Some(hit.normal)),
+            ));
+        }
+        if pickable.is_some_and(|p| p.should_block_lower) {
+            break;
+        }
+    }
+    picks
+}
+
+/// The caster tracing a [`UiPointerSource`]'s ray.
+#[derive(Component)]
+struct SourceRay;
+
+/// Each pointer source's ray, traced in its own world. Its hits drive the source's pointer
+/// off the panels (`drive_ui_pointers`).
+#[allow(clippy::type_complexity)]
+fn aim_source_rays(
+    mut commands: Commands,
+    mut sources: Query<
+        (
+            &Transform,
+            Option<&ChildOf>,
+            &UiPointerSource,
+            &mut UiPointerTrack,
+            Option<&InEnvironment>,
+        ),
+        Without<WindowCursorPointer>,
+    >,
+    frames: Query<(&Transform, Option<&ChildOf>)>,
+    mut casters: Query<&mut RayCaster, With<SourceRay>>,
+) {
+    for (local, parent, source, mut track, world) in &mut sources {
+        let pose =
+            crate::transform::pose_from_ancestors(local, parent.map(ChildOf::parent), &frames);
+        let Ok(dir) = Dir3::new(pose.transform_vector3(Vec3::NEG_Z)) else {
+            continue;
+        };
+        let mut ray = RayCaster::new(Ray3d::new(pose.translation.into(), dir));
+        ray.max_distance = source.max_distance;
+        ray.mask = environment_mask(None, world);
+        match track.world.and_then(|e| casters.get_mut(e).ok()) {
+            Some(mut caster) => *caster = ray,
+            None => {
+                track.world = Some(
+                    commands
+                        .spawn((Name::new("Pointer source ray"), SourceRay, ray))
+                        .id(),
+                );
             }
         }
-        out.write(PointerHits::new(id.pointer, picks, camera.order as f32));
+    }
+}
+
+/// What each source points at off the panels, as `PointerHits` (none while on one, so the
+/// world behind a panel is never hovered through it).
+fn report_source_hits(
+    sources: Query<(&UiPointerSource, &UiPointerTrack, &PointerId), Without<WindowCursorPointer>>,
+    hits: Query<&RayHits>,
+    cameras: Query<(Entity, &Camera), With<Camera3d>>,
+    pickables: Query<&Pickable>,
+    mut out: MessageWriter<PointerHits>,
+) {
+    let Some((camera, cam)) = cameras.iter().find(|(_, c)| c.is_active) else {
+        return;
+    };
+    for (source, track, id) in &sources {
+        let picks = match (source.active && source.hit.is_none(), track.world) {
+            (true, Some(caster)) => hits
+                .get(caster)
+                .map(|h| picks(h, camera, &pickables))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        out.write(PointerHits::new(*id, picks, cam.order as f32));
     }
 }
 
@@ -111,7 +190,7 @@ impl Plugin for PointerPickingPlugin {
         }
         app.init_resource::<PointerCasters>().add_systems(
             PreUpdate,
-            (report_hits, aim_pointer_rays)
+            (report_hits, report_source_hits, aim_pointer_rays, aim_source_rays)
                 .chain()
                 .in_set(PickingSystems::Backend),
         );

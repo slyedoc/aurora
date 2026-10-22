@@ -17,17 +17,24 @@
 //!
 //! [`PortalTraveler`] carries an entity (a camera, a player) through a portal it crosses: the
 //! same map the rays use moves it, and it joins the exit's world (a physics body by avian's
-//! `TransferToEnvironment`, anything else by re-parenting under the exit's world).
+//! `TransferToEnvironment`, anything else by re-parenting under the exit's world), turns its
+//! velocity with it, and triggers [`PortalCrossed`] on it. [`Portals`] finds crossings for
+//! anything else that must follow a segment through (a camera boom).
 
 use ash::vk;
-use avian3d::{environment::TransferToEnvironment, prelude::RigidBody};
-use bevy::{math::Affine3A, prelude::*, transform::TransformSystems};
+use avian3d::{
+    environment::TransferToEnvironment,
+    prelude::{AngularVelocity, LinearVelocity, RigidBody},
+};
+use bevy::{
+    ecs::system::SystemParam, math::Affine3A, prelude::*, transform::TransformSystems,
+};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
     environment::{InEnvironment, RenderEnvironments},
     mesh::{AuroraMesh, AuroraMesh3d},
-    ray_render_plugin::RenderSet,
+    ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
     tlas_builder::GpuInstance,
@@ -149,7 +156,78 @@ pub fn portal_map(portal: Affine3A, target: Affine3A) -> Affine3A {
     target * Affine3A::from_rotation_y(std::f32::consts::PI) * portal.inverse()
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// A crossing found by [`Portals::crossing`].
+#[derive(Clone, Copy, Debug)]
+pub struct Crossing {
+    pub portal: Entity,
+    pub target: Entity,
+    /// The exit's world: the environment owning its render bit.
+    pub world: Entity,
+    /// World space through the portal (see [`portal_map`]).
+    pub map: Affine3A,
+}
+
+/// Every portal, for finding where a segment passes through one.
+#[derive(SystemParam)]
+pub struct Portals<'w, 's> {
+    portals: Query<'w, 's, (Entity, &'static AuroraPortal, &'static GlobalTransform, Option<&'static AuroraMesh3d>)>,
+    frames: Query<'w, 's, &'static GlobalTransform>,
+    meshes: Res<'w, Assets<AuroraMesh>>,
+    in_world: Query<'w, 's, &'static InEnvironment>,
+    worlds: Res<'w, RenderEnvironments>,
+}
+
+impl Portals<'_, '_> {
+    /// The first portal the world-space segment `from` -> `to` enters front to back, within its
+    /// mesh's bounds, and whose exit is in an environment.
+    pub fn crossing(&self, from: Vec3, to: Vec3) -> Option<Crossing> {
+        self.portals.iter().find_map(|(portal, link, global, mesh)| {
+            let pose = global.affine();
+            let to_local = pose.inverse();
+            let (a, b) = (to_local.transform_point3(from), to_local.transform_point3(to));
+            if !(a.z > 0.0 && b.z <= 0.0) {
+                return None;
+            }
+            let hit = a.lerp(b, a.z / (a.z - b.z));
+            let half = mesh
+                .and_then(|m| self.meshes.get(&m.0))
+                .map_or(Vec2::splat(0.5), |m| {
+                    Vec2::new(m.aabb.half_extent[0], m.aabb.half_extent[1])
+                });
+            if hit.x.abs() > half.x || hit.y.abs() > half.y {
+                return None;
+            }
+            let target = self.frames.get(link.target).ok()?;
+            // An exit in no environment leads nowhere.
+            let Some(world) = self
+                .in_world
+                .get(link.target)
+                .ok()
+                .and_then(|w| self.worlds.environment(w.0))
+            else {
+                warn_once!("aurora: portal exit {} is in no environment", link.target);
+                return None;
+            };
+            Some(Crossing {
+                portal,
+                target: link.target,
+                world,
+                map: portal_map(pose, target.affine()),
+            })
+        })
+    }
+}
+
+/// Triggered on a [`PortalTraveler`] once it has been carried through a portal.
+#[derive(EntityEvent, Clone, Copy, Debug)]
+pub struct PortalCrossed {
+    pub entity: Entity,
+    pub portal: Entity,
+    /// World space through the portal: what turned it, and what to turn with it.
+    pub map: Affine3A,
+}
+
+#[allow(clippy::type_complexity)]
 fn travel(
     mut commands: Commands,
     mut travelers: Query<(
@@ -158,14 +236,13 @@ fn travel(
         &mut Transform,
         Option<&ChildOf>,
         Has<RigidBody>,
+        Option<&mut LinearVelocity>,
+        Option<&mut AngularVelocity>,
     )>,
-    portals: Query<(&AuroraPortal, &GlobalTransform, Option<&AuroraMesh3d>)>,
+    portals: Portals,
     frames: Query<&GlobalTransform, Without<PortalTraveler>>,
-    meshes: Res<Assets<AuroraMesh>>,
-    in_world: Query<&InEnvironment>,
-    worlds: Res<RenderEnvironments>,
 ) {
-    for (entity, mut traveler, mut transform, child_of, body) in &mut travelers {
+    for (entity, mut traveler, mut transform, child_of, body, linear, angular) in &mut travelers {
         // This frame's pose, ahead of propagation: the teleport lands in the same frame.
         let parent_affine = child_of
             .and_then(|c| frames.get(c.parent()).ok())
@@ -175,56 +252,46 @@ fn travel(
         let Some(last) = traveler.last.replace(now) else {
             continue;
         };
-        for (portal, portal_global, mesh) in &portals {
-            let portal_pose = portal_global.affine();
-            let to_local = portal_pose.inverse();
-            let (a, b) = (
-                to_local.transform_point3(last),
-                to_local.transform_point3(now),
-            );
-            if !(a.z > 0.0 && b.z <= 0.0) {
-                continue;
-            }
-            let hit = a.lerp(b, a.z / (a.z - b.z));
-            let half = mesh
-                .and_then(|m| meshes.get(&m.0))
-                .map_or(Vec2::splat(0.5), |m| {
-                    Vec2::new(m.aabb.half_extent[0], m.aabb.half_extent[1])
-                });
-            if hit.x.abs() > half.x || hit.y.abs() > half.y {
-                continue;
-            }
-            let Ok(target) = frames.get(portal.target) else {
-                continue;
-            };
-            // The exit's world: the owner of its render bit. An exit in no environment leads
-            // nowhere.
-            let Some(world) = in_world
-                .get(portal.target)
-                .ok()
-                .and_then(|w| worlds.environment(w.0))
-            else {
-                warn_once!("aurora: portal exit {} is in no environment", portal.target);
-                continue;
-            };
-            let moved = portal_map(portal_pose, target.affine()) * global;
-            let local = frames
-                .get(world)
-                .map_or(moved, |p| p.affine().inverse() * moved);
-            let (scale, rotation, translation) = local.to_scale_rotation_translation();
-            *transform = Transform {
-                translation,
-                rotation,
-                scale,
-            };
-            traveler.last = Some(moved.translation.into());
-            if body {
-                commands.trigger(TransferToEnvironment { entity, world });
-            } else {
-                commands.entity(entity).insert(ChildOf(world));
-            }
-            break;
+        let Some(crossing) = portals.crossing(last, now) else {
+            continue;
+        };
+        let moved = crossing.map * global;
+        let local = frames
+            .get(crossing.world)
+            .map_or(moved, |p| p.affine().inverse() * moved);
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        *transform = Transform {
+            translation,
+            rotation,
+            scale,
+        };
+        traveler.last = Some(moved.translation.into());
+        // Momentum turns with it.
+        if let Some(mut v) = linear {
+            v.0 = crossing.map.transform_vector3(v.0);
         }
+        if let Some(mut w) = angular {
+            w.0 = crossing.map.transform_vector3(w.0);
+        }
+        if body {
+            commands.trigger(TransferToEnvironment {
+                entity,
+                world: crossing.world,
+            });
+        } else {
+            commands.entity(entity).insert(ChildOf(crossing.world));
+        }
+        commands.trigger(PortalCrossed {
+            entity,
+            portal: crossing.portal,
+            map: crossing.map,
+        });
+    }
+}
+
+fn cleanup_portals(mut table: ResMut<PortalTable>, rd: Res<RenderDevice>) {
+    if let Some(buffer) = table.buffer.take() {
+        rd.destroyer.destroy_buffer(buffer.handle);
     }
 }
 
@@ -237,7 +304,8 @@ impl Plugin for PortalPlugin {
             .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
         app.init_resource::<PortalTable>();
         // The Prepare set already gates on the render device existing.
-        app.add_systems(Last, upload_portals.in_set(RenderSet::Prepare));
+        app.add_systems(Last, upload_portals.in_set(RenderSet::Prepare))
+            .add_systems(TeardownSchedule, cleanup_portals.before(on_shutdown));
     }
 }
 
