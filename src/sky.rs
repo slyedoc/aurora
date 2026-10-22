@@ -352,6 +352,13 @@ pub struct EnvironmentSkies {
 }
 
 impl EnvironmentSkies {
+    /// The radiance (nits) environment `bit`'s exposure shows as white: `1.2 * 2^EV100`. What
+    /// must read the same at any exposure (signs, pointer affordances) emits in multiples of it.
+    pub fn white_nits(&self, bit: u8) -> f32 {
+        let ev100 = self.environments.get(bit as usize).map_or(DEFAULT_EV100, |e| e.ev100);
+        1.2 * ev100.exp2()
+    }
+
     /// The environment a view of `mask` is in, ignoring its plain render layers. A view in none
     /// (it sees nothing anyway) reads entry 0.
     pub fn view_environment(&self, mask: u8) -> u8 {

@@ -23,7 +23,9 @@ use bevy::{
 };
 
 use crate::{
+    environment::InEnvironment,
     material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
+    sky::EnvironmentSkies,
     mesh::{AuroraMesh, AuroraMesh3d},
     ui_render::{UiSurfacePanel, ui_target_placeholder},
 };
@@ -44,8 +46,12 @@ pub struct UiPanel3d {
     pub px: UVec2,
     /// UI scale factor (logical px = physical px / scale).
     pub scale: f32,
-    /// Emission of lit pixels, in nits.
+    /// Emission of lit pixels, in nits; with `relative`, in multiples of the white of the
+    /// environment the panel is in.
     pub nits: f32,
+    /// `nits` follows the environment's exposure (1.0 reads as paper white anywhere, by day or
+    /// night): for signs and labels that must read wherever they stand.
+    pub relative: bool,
     /// Give the root the theme's window background (rounded). Off = transparent root; style
     /// it yourself.
     pub opaque: bool,
@@ -58,6 +64,7 @@ impl Default for UiPanel3d {
             px: UVec2::new(1024, 640),
             scale: 1.0,
             nits: 300.0,
+            relative: false,
             opaque: true,
         }
     }
@@ -129,7 +136,38 @@ pub struct UiPanelPlugin;
 
 impl Plugin for UiPanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (build_panels, build_inspector_panels).chain());
+        app.add_systems(
+            Update,
+            (build_panels, build_inspector_panels, follow_exposure).chain(),
+        );
+    }
+}
+
+/// Relative panels emit `nits` times their environment's white, updated as it changes.
+fn follow_exposure(
+    skies: Option<Res<EnvironmentSkies>>,
+    panels: Query<(&UiPanel3d, &AuroraMaterial3d, Option<&InEnvironment>), With<UiPanel3dRoot>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
+) {
+    let Some(skies) = skies else {
+        return;
+    };
+    for (panel, material, world) in &panels {
+        if !panel.relative {
+            continue;
+        }
+        let Some(world) = world else {
+            continue;
+        };
+        let want = panel.nits * skies.white_nits(world.0);
+        let Some(current) = materials.get(&material.0).map(|m| m.emissive.red) else {
+            continue;
+        };
+        if (current - want).abs() > want * 0.01
+            && let Some(mut material) = materials.get_mut(&material.0)
+        {
+            material.emissive = LinearRgba::WHITE * want;
+        }
     }
 }
 
