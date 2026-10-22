@@ -27,7 +27,7 @@ use bevy::{
 };
 
 use crate::{
-    environment::{InEnvironment, environment_mask},
+    environment::{AuroraPrimaryHidden, InEnvironment, environment_mask},
     picking::{RayCaster, RayHit, RayHits},
     ui_render::{UiPointerSource, UiPointerTrack, WindowCursorPointer},
 };
@@ -163,7 +163,11 @@ fn aim_pointer_rays(
     rays: Res<RayMap>,
     mut casters: ResMut<PointerCasters>,
     mut aimed: Query<&mut RayCaster, With<PointerRay>>,
-    cameras: Query<(Option<&RenderLayers>, Option<&InEnvironment>)>,
+    cameras: Query<(
+        Option<&RenderLayers>,
+        Option<&InEnvironment>,
+        Option<&AuroraPrimaryHidden>,
+    )>,
 ) {
     casters.0.retain(|id, entity| {
         let live = rays.map.contains_key(id);
@@ -173,8 +177,10 @@ fn aim_pointer_rays(
         live
     });
     for (&id, &ray) in rays.iter() {
-        let (layers, world) = cameras.get(id.camera).unwrap_or((None, None));
-        let mask = environment_mask(layers, world);
+        let (layers, world, hidden) = cameras.get(id.camera).unwrap_or((None, None, None));
+        // The mouse picks what the camera's rays see: not the layers they skip (a first-person
+        // body's own head).
+        let mask = environment_mask(layers, world) & !hidden.map_or(0, AuroraPrimaryHidden::mask);
         match casters.0.get(&id).and_then(|e| aimed.get_mut(*e).ok()) {
             Some(mut caster) => {
                 caster.ray = ray;
