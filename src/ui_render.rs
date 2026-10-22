@@ -2293,6 +2293,11 @@ pub struct UiPointerSource {
     /// The panel this ray landed on this frame, if any. World tools (the terrain brush) read
     /// this to yield to the UI.
     pub hit: Option<UiPointerHit>,
+    /// The nearest thing the tracer draws along the ray, off the panels (last frame's trace;
+    /// `pointer_picking`): where a laser visual ends.
+    pub world_hit: Option<crate::picking::RayHit>,
+    /// Scroll this frame, in lines (x right, y up): sent to the panel under the ray.
+    pub scroll: Vec2,
 }
 
 impl Default for UiPointerSource {
@@ -2302,6 +2307,8 @@ impl Default for UiPointerSource {
             buttons: [false; 3],
             max_distance: 50.0,
             hit: None,
+            world_hit: None,
+            scroll: Vec2::ZERO,
         }
     }
 }
@@ -2355,6 +2362,7 @@ fn aim_window_cursor_pointer(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     mut pointer: Single<(&mut Transform, &mut UiPointerSource), With<WindowCursorPointer>>,
 ) {
     let (tf, source) = &mut *pointer;
@@ -2363,6 +2371,11 @@ fn aim_window_cursor_pointer(
         mouse.pressed(MouseButton::Right),
         mouse.pressed(MouseButton::Middle),
     ];
+    source.scroll = match wheel.unit {
+        bevy::input::mouse::MouseScrollUnit::Line => wheel.delta,
+        // Pixels to lines at a browser's usual 40 px per notch.
+        bevy::input::mouse::MouseScrollUnit::Pixel => wheel.delta / 40.0,
+    };
     let ray = (|| {
         let window = windows.iter().next()?;
         let cursor = window.cursor_position()?;
@@ -2405,7 +2418,12 @@ fn drive_ui_pointers(
         &mut UiPointerTrack,
     )>,
     frames: Query<(&Transform, Option<&ChildOf>)>,
-    panels: Query<(Entity, &GlobalTransform, &UiSurfacePanel)>,
+    panels: Query<(
+        Entity,
+        &GlobalTransform,
+        &UiSurfacePanel,
+        Option<&InheritedVisibility>,
+    )>,
     targets: Res<UiSurfaceTargets>,
     world_hits: Query<&crate::picking::RayHits>,
     cameras: Query<(&Camera, Option<&RenderTarget>, &GlobalTransform), With<Camera3d>>,
@@ -2433,7 +2451,11 @@ fn drive_ui_pointers(
 
         let mut best: Option<(UiPointerHit, &UiSurfacePanel)> = None;
         if source.active {
-            for (panel_entity, panel_tf, panel) in &panels {
+            for (panel_entity, panel_tf, panel, visible) in &panels {
+                // A hidden panel is not there to point at.
+                if visible.is_some_and(|v| !v.get()) {
+                    continue;
+                }
                 let inv = panel_tf.affine().inverse();
                 let o = inv.transform_point3(origin);
                 let d = inv.transform_vector3(dir);
@@ -2498,6 +2520,18 @@ fn drive_ui_pointers(
                     location.clone(),
                     PointerAction::Move { delta },
                 ));
+                if source.scroll != Vec2::ZERO {
+                    writer.write(PointerInput::new(
+                        id,
+                        location.clone(),
+                        PointerAction::Scroll {
+                            unit: bevy::input::mouse::MouseScrollUnit::Line,
+                            x: source.scroll.x,
+                            y: source.scroll.y,
+                            phase: bevy::input::touch::TouchPhase::Moved,
+                        },
+                    ));
+                }
                 for (i, button) in BUTTONS.into_iter().enumerate() {
                     if buttons[i] && !prev[i] && !track.down[i] {
                         track.down[i] = true;

@@ -29,6 +29,14 @@ use crate::{
     vulkan_asset::VulkanAssets,
 };
 
+static TRACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A frame has been traced: the pipelines are built and the first image is on its way (a
+/// splash holds until then, or it would never be seen).
+pub fn has_traced() -> bool {
+    TRACED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Resource, Clone, Default)]
 pub struct RenderConfig {
     pub rtx_pipeline: Handle<RaytracingPipeline>,
@@ -1461,8 +1469,6 @@ fn render_frame(
             let cmd = std::cell::Cell::new(view_cmd);
             let mut grid_split = false;
             if let (Some(rtx_pipeline), true) = (rtx_pipeline, tlas.traceable) {
-                static TRACED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
                 if !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::info!("first frame traced");
                 }

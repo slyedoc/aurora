@@ -138,7 +138,13 @@ impl Plugin for UiPanelPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (build_panels, build_inspector_panels, follow_exposure).chain(),
+            (
+                resize_panels,
+                build_panels,
+                build_inspector_panels,
+                follow_exposure,
+            )
+                .chain(),
         );
     }
 }
@@ -194,9 +200,14 @@ fn build_panels(
             .id();
         let mut root = commands.spawn((
             Name::new("ui panel root"),
+            // The target's size, whatever the content wants (a long line would widen it).
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
+                min_width: Val::Px(0.0),
+                min_height: Val::Px(0.0),
+                max_width: Val::Percent(100.0),
+                max_height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
                 padding: UiRect::all(Val::Px(8.0)),
                 row_gap: Val::Px(6.0),
@@ -242,6 +253,66 @@ fn build_panels(
                 target,
             },
         ));
+    }
+}
+
+/// A built panel whose `size`, `px` or `scale` changed gets a new quad and a new target at
+/// the new resolution (surface targets are never resized in place); its UI tree is kept.
+fn resize_panels(
+    mut panels: Query<
+        (
+            &UiPanel3d,
+            &mut UiPanel3dRoot,
+            &mut UiSurfacePanel,
+            &AuroraMesh3d,
+            &AuroraMaterial3d,
+        ),
+        Changed<UiPanel3d>,
+    >,
+    mut cameras: Query<&mut RenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
+    mut materials: ResMut<Assets<AuroraMaterial>>,
+) {
+    for (panel, mut built, mut surface, mesh, material) in &mut panels {
+        let scale = panel.scale.max(0.1);
+        let px = images
+            .get(built.target.id())
+            .map(|image| UVec2::new(image.width(), image.height()));
+        if surface.size == panel.size && surface.scale == scale && px == Some(panel.px) {
+            continue;
+        }
+        if px != Some(panel.px) {
+            let target = images.add(ui_target_placeholder(panel.px));
+            if let Ok(mut render_target) = cameras.get_mut(built.camera) {
+                *render_target = RenderTarget::Image(ImageRenderTarget {
+                    handle: target.clone(),
+                    scale_factor: scale,
+                });
+            }
+            if let Some(mut material) = materials.get_mut(&material.0) {
+                material.emissive_texture = Some(target.clone());
+                if material.base_color_texture.is_some() {
+                    material.base_color_texture = Some(target.clone());
+                }
+            }
+            built.target = target.clone();
+            surface.target = target;
+        } else if surface.scale != scale
+            && let Ok(mut render_target) = cameras.get_mut(built.camera)
+        {
+            *render_target = RenderTarget::Image(ImageRenderTarget {
+                handle: built.target.clone(),
+                scale_factor: scale,
+            });
+        }
+        if surface.size != panel.size {
+            if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
+                *mesh = AuroraMesh::from_shape(Rectangle::new(panel.size.x, panel.size.y));
+            }
+        }
+        surface.size = panel.size;
+        surface.scale = scale;
     }
 }
 

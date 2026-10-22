@@ -121,7 +121,10 @@ fn aim_source_rays(
 /// What each source points at off the panels, as `PointerHits` (none while on one, so the
 /// world behind a panel is never hovered through it).
 fn report_source_hits(
-    sources: Query<(&UiPointerSource, &UiPointerTrack, &PointerId), Without<WindowCursorPointer>>,
+    mut sources: Query<
+        (&mut UiPointerSource, &UiPointerTrack, &PointerId),
+        Without<WindowCursorPointer>,
+    >,
     hits: Query<&RayHits>,
     cameras: Query<(Entity, &Camera), With<Camera3d>>,
     pickables: Query<&Pickable>,
@@ -130,7 +133,18 @@ fn report_source_hits(
     let Some((camera, cam)) = cameras.iter().find(|(_, c)| c.is_active) else {
         return;
     };
-    for (source, track, id) in &sources {
+    for (mut source, track, id) in &mut sources {
+        let world_hit = track
+            .world
+            .and_then(|caster| hits.get(caster).ok())
+            .and_then(|h| {
+                h.iter()
+                    .find(|hit| pickables.get(hit.entity).map_or(true, |p| p.is_hoverable))
+                    .copied()
+            });
+        if source.world_hit != world_hit {
+            source.world_hit = world_hit;
+        }
         let picks = match (source.active && source.hit.is_none(), track.world) {
             (true, Some(caster)) => hits
                 .get(caster)

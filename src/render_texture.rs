@@ -322,6 +322,9 @@ pub fn vk_format_for(format: wgpu_types::TextureFormat) -> Option<vk::Format> {
     Some(match format {
         F::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         F::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        // Web pages arrive BGRA (CEF's paint buffer): sampled as-is, no per-frame swizzle.
+        F::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        F::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
         F::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         F::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         F::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
@@ -341,7 +344,10 @@ pub fn vk_format_for(format: wgpu_types::TextureFormat) -> Option<vk::Format> {
 /// Texel block edge and bytes per block of an uploadable format.
 fn block_layout(format: vk::Format) -> (u32, usize) {
     match format {
-        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => (1, 4),
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB => (1, 4),
         vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => (1, 8),
         vk::Format::R32G32B32A32_SFLOAT => (1, 16),
         vk::Format::BC1_RGBA_UNORM_BLOCK
@@ -370,7 +376,10 @@ pub fn level_bytes(format: vk::Format, width: u32, height: u32, level: u32) -> u
 fn generates_mips(format: vk::Format) -> bool {
     matches!(
         format,
-        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
     )
 }
 

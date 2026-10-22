@@ -562,6 +562,11 @@ impl TLAS {
             && self.materials.data.len() as u32 <= self.materials.capacity
     }
 
+    /// Live instances; none means no structure is built and nothing is traced.
+    pub fn instance_count(&self) -> u32 {
+        self.count
+    }
+
     /// Device address of each packed TLAS row's slot (instances.slang `live_write`):
     /// `InstanceIndex()` is the packed row, this table its slot.
     pub fn instance_slots_address(&self) -> u64 {
@@ -787,6 +792,7 @@ impl TLAS {
         );
 
         if !self.records.is_empty() {
+            dedup_records(&mut self.records);
             let staging = self.staging.write();
             ensure_staging(rd, staging, self.records.len());
             rd.map_buffer(staging).copy_from_slice(&self.records);
@@ -1100,6 +1106,29 @@ impl TLAS {
             rd.destroyer.destroy_buffer(b);
         }
     }
+}
+
+/// One record per slot, the latest (a slot pushed again while the table waited, or re-pushed
+/// by a growth): the scatter's threads would race over the row and the stale one could win.
+fn dedup_records(records: &mut Vec<InstanceRecord>) {
+    if records.windows(2).all(|w| w[0].slot < w[1].slot) {
+        return;
+    }
+    // Stable: a slot's later pushes stay after its earlier ones.
+    records.sort_by_key(|r| r.slot);
+    let mut unique: Vec<InstanceRecord> = Vec::with_capacity(records.len());
+    for record in records.drain(..) {
+        match unique.last_mut() {
+            Some(last) if last.slot == record.slot => {
+                *last = InstanceRecord {
+                    fresh: last.fresh | record.fresh,
+                    ..record
+                };
+            }
+            _ => unique.push(record),
+        }
+    }
+    *records = unique;
 }
 
 // ---- extraction -----------------------------------------------------------------------------

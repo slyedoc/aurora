@@ -18,10 +18,16 @@
 //!   most, the device's heaps (this process's usage and budget, the driver's own included), and
 //!   the blocks by how full they are, with the emptiest blocks' remaining tenants.
 //! - `aurora.job` `{id}`: a job's state, and its result once it is done.
+//! - `aurora.ready`: whether frames are traced yet (and since when), the TLAS's instances, the
+//!   frames the profiler has read.
 //! - `aurora.exit`: quits through `AppExit` (the renderer's ordered teardown, unlike a signal).
 //!
+//! A windowless app idles at [`IDLE_FPS`] while no job is running.
+//!
 //! A job runs over frames; its method answers `{job: id}` at once and `aurora.job` is polled. A
-//! game adds methods of its own with [`RemoteAppExt::add_remote_method`].
+//! job fails when nothing has been traced for [`EMPTY_SECS`] with no instance in the TLAS (an
+//! empty scene draws nothing, not even its sky). A game adds methods of its own with
+//! [`RemoteAppExt::add_remote_method`].
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +46,7 @@ use crate::{
     gpu_profiler::GpuProfiler,
     reference::ReferenceState,
     render_device::RenderDevice,
+    tlas_builder::TLAS,
     util::{HeadlessTarget, ScreenshotRequests},
 };
 
@@ -50,6 +57,11 @@ const JOB_TIMEOUT: u32 = 60 * 600;
 /// Seconds after the first traced frame before a screenshot or capture is taken: the exposure
 /// adapts over about this long (a fresh start; later jobs are past it).
 const WARMUP_SECS: f64 = 2.0;
+/// Frames a second a windowless app runs at while no job wants frames (it would otherwise
+/// trace flat out, hundreds of frames a second, for nobody).
+const IDLE_FPS: f64 = 10.0;
+/// Seconds a job waits on an untraced, instance-free scene before it fails.
+const EMPTY_SECS: f64 = 10.0;
 
 pub struct AuroraRemotePlugin {
     pub port: u16,
@@ -72,13 +84,15 @@ impl Plugin for AuroraRemotePlugin {
         .init_resource::<RemotePose>()
         .init_resource::<RemoteJobs>()
         .init_resource::<FirstTrace>()
+        .init_resource::<KeepAwake>()
         .add_systems(PostUpdate, hold_pose)
-        .add_systems(Last, (note_first_trace, drive_jobs).chain())
+        .add_systems(Last, (note_first_trace, drive_jobs, idle).chain())
         .add_remote_method("aurora.camera", camera_method)
         .add_remote_method("aurora.screenshot", screenshot_method)
         .add_remote_method("aurora.capture", capture_method)
         .add_remote_method("aurora.timing", timing_method)
         .add_remote_method("aurora.job", job_method)
+        .add_remote_method("aurora.ready", ready_method)
         .add_remote_method("aurora.exit", exit_method)
         .add_remote_method("aurora.view", view_method)
         .add_remote_method("aurora.memory", memory_method);
@@ -269,6 +283,8 @@ enum JobState {
 struct Job {
     state: JobState,
     age: u32,
+    /// Since when (real seconds) the scene has had nothing traced and no instance.
+    empty_since: Option<f64>,
 }
 
 #[derive(Resource, Default)]
@@ -286,6 +302,7 @@ fn start_job(world: &mut World, kind: JobKind) -> BrpResult {
         Job {
             state: JobState::Running(kind),
             age: 0,
+            empty_since: None,
         },
     );
     Ok(json!({ "job": id }))
@@ -515,10 +532,77 @@ fn job_method(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
         .get(&id)
         .ok_or_else(|| invalid(format!("no job {id}")))?;
     Ok(match &job.state {
-        JobState::Running(_) => json!({ "state": "running", "frames": job.age }),
+        JobState::Running(_) => {
+            let mut out = ready(world);
+            out["state"] = json!("running");
+            out["job_frames"] = json!(job.age);
+            out
+        }
         JobState::Done(result) => json!({ "state": "done", "result": result }),
         JobState::Failed(error) => json!({ "state": "failed", "error": error }),
     })
+}
+
+/// A frame with a trace in it, the profiler's latest.
+fn tracing(world: &World) -> bool {
+    world
+        .resource::<GpuProfiler>()
+        .last_frame
+        .iter()
+        .any(|(name, _)| *name == "trace")
+}
+
+fn ready(world: &World) -> Value {
+    let now = world.resource::<Time<Real>>().elapsed_secs_f64();
+    let first = world.resource::<FirstTrace>().0;
+    json!({
+        "tracing": tracing(world),
+        "first_trace_secs_ago": first.map(|t| now - t),
+        "warmed_up": warmed_up(world),
+        "instances": world.get_resource::<TLAS>().map_or(0, |t| t.instance_count()),
+        "frames": world.resource::<GpuProfiler>().frames_read,
+    })
+}
+
+fn ready_method(In(_): In<Option<Value>>, world: &mut World) -> BrpResult {
+    Ok(ready(world))
+}
+
+/// Nothing traced and no instance to trace: an empty scene.
+fn empty(world: &World) -> bool {
+    !tracing(world)
+        && world
+            .get_resource::<TLAS>()
+            .is_none_or(|t| t.instance_count() == 0)
+}
+
+/// Set by the app while something needs full-rate frames with no job running (a web page
+/// loading or playing): a windowless app then skips its [`IDLE_FPS`] sleep. Cleared every frame.
+#[derive(Resource, Default)]
+pub struct KeepAwake(pub bool);
+
+/// A windowless app with no job running sleeps out the rest of an [`IDLE_FPS`] frame.
+fn idle(
+    jobs: Res<RemoteJobs>,
+    headless: Option<Res<HeadlessTarget>>,
+    mut awake: ResMut<KeepAwake>,
+    mut last: Local<Option<std::time::Instant>>,
+) {
+    let busy = std::mem::take(&mut awake.0)
+        || jobs
+            .jobs
+            .values()
+            .any(|job| matches!(job.state, JobState::Running(_)));
+    if headless.is_some()
+        && !busy
+        && let Some(previous) = *last
+    {
+        let frame = std::time::Duration::from_secs_f64(1.0 / IDLE_FPS);
+        if let Some(rest) = frame.checked_sub(previous.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    *last = Some(std::time::Instant::now());
 }
 
 /// Advances every running job by a frame.
@@ -535,9 +619,16 @@ fn drive_jobs(world: &mut World) {
             continue;
         };
         job.age += 1;
+        let now = world.resource::<Time<Real>>().elapsed_secs_f64();
+        job.empty_since = empty(world).then(|| job.empty_since.unwrap_or(now));
         if let JobState::Running(kind) = job.state {
             job.state = if job.age > JOB_TIMEOUT {
                 JobState::Failed("timed out".into())
+            } else if job.empty_since.is_some_and(|t| now - t > EMPTY_SECS) {
+                JobState::Failed(format!(
+                    "nothing to trace: no instance in the scene for {EMPTY_SECS} s (an empty \
+                     scene draws nothing, not even its sky)"
+                ))
             } else {
                 step(world, kind)
             };

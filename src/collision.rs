@@ -139,9 +139,10 @@ fn attach_colliders(
             }
         });
         if let Some(collider) = collider.clone() {
+            // try_: the placement may be despawned before this applies (its place unloaded).
             commands
                 .entity(entity)
-                .insert((collider, RigidBody::Static));
+                .try_insert((collider, RigidBody::Static));
             attached += 1;
         }
     }

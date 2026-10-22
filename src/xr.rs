@@ -141,6 +141,8 @@ pub struct XrState {
     running: bool,
     /// Session state FOCUSED: actions sync to real values.
     focused: bool,
+    /// The head was tracked at the last frame end (logged when it changes).
+    tracking: bool,
     /// The last `xrWaitFrame` predicted display time; poses are located at it.
     predicted_time: Option<xr::Time>,
     /// VIEW reference space, located in `space` for the head pose.
@@ -335,6 +337,9 @@ pub struct XrFrame {
     pub image: vk::Image,
     /// Per-eye pose + fov located at the predicted display time, in [`XrState::space`].
     pub views: Vec<xr::View>,
+    /// The runtime tracks the head's orientation this frame: without it the located poses are
+    /// zeros, which `xrEndFrame` rejects, so the frame ends with no layer.
+    tracked: bool,
 }
 
 impl XrFrame {
@@ -425,12 +430,25 @@ fn projection(fov: xr::Fovf, near: f32) -> Mat4 {
     )
 }
 
-pub struct XrPlugin;
+pub struct XrPlugin {
+    /// Bring the OpenXR runtime up (with the `xr` feature; without it, never). Defaults to the
+    /// feature, so an app that compiles XR in can still start flat (`.set(XrPlugin { enabled })`
+    /// from a command-line flag).
+    pub enabled: bool,
+}
+
+impl Default for XrPlugin {
+    fn default() -> Self {
+        Self {
+            enabled: cfg!(feature = "xr"),
+        }
+    }
+}
 
 impl Plugin for XrPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<XrInput>();
-        if !cfg!(feature = "xr") {
+        if !cfg!(feature = "xr") || !self.enabled {
             return;
         }
         match XrContext::new() {
@@ -459,7 +477,7 @@ impl Plugin for XrPlugin {
             )
             .add_systems(
                 PostUpdate,
-                (level_rig, follow_rig)
+                (recenter, level_rig, follow_rig)
                     .chain()
                     .before(TransformSystems::Propagate)
                     .run_if(resource_exists::<XrState>),
@@ -537,6 +555,35 @@ fn follow_rig(
             *tf = local;
         }
     }
+}
+
+/// On the rig camera: the first frame the head is tracked, the rig turns and shifts so the
+/// wearer's head lands on the rig's own pose (looking along its forward, at its position), then
+/// this is removed. For fixed views (a menu) where the wearer has no way to turn: LOCAL space's
+/// forward is wherever the headset faced when the runtime set it, not where they sit facing now.
+#[derive(Component, Default)]
+pub struct XrRecenter;
+
+fn recenter(
+    mut commands: Commands,
+    rig: Option<Single<(Entity, &mut Transform), (With<Camera3d>, With<XrRecenter>)>>,
+    tracked: Query<(&XrTracked, &XrPose)>,
+) {
+    let Some(rig) = rig else { return };
+    let Some(head) = tracked
+        .iter()
+        .find(|(kind, pose)| **kind == XrTracked::Head && pose.valid)
+        .map(|(_, pose)| pose.local)
+    else {
+        return;
+    };
+    let (entity, mut tf) = rig.into_inner();
+    let (rig_yaw, _, _) = tf.rotation.to_euler(EulerRot::YXZ);
+    let (head_yaw, _, _) = head.rotation.to_euler(EulerRot::YXZ);
+    let rotation = Quat::from_rotation_y(rig_yaw - head_yaw);
+    tf.translation -= rotation * head.translation;
+    tf.rotation = rotation;
+    commands.entity(entity).remove::<XrRecenter>();
 }
 
 /// Strips pitch and roll from the rig: the headset supplies those, and any tilt on the
@@ -771,6 +818,7 @@ impl XrState {
             blend_mode,
             running: false,
             focused: false,
+            tracking: true,
             predicted_time: None,
             view_space,
             actions,
@@ -887,7 +935,7 @@ impl XrState {
             self.swapchain.wait_image(xr::Duration::INFINITE).unwrap();
             index
         };
-        let (_, views) = self
+        let (flags, views) = self
             .session
             .locate_views(
                 xr::ViewConfigurationType::PRIMARY_STEREO,
@@ -895,11 +943,13 @@ impl XrState {
                 &self.space,
             )
             .unwrap();
+        let tracked = flags.contains(xr::ViewStateFlags::ORIENTATION_VALID);
         let views = if self.hold_head { held(views) } else { views };
         Some(XrFrame {
             frame_state,
             image: self.images[index as usize],
             views,
+            tracked,
         })
     }
 
@@ -1012,9 +1062,19 @@ impl XrState {
         let layer = xr::CompositionLayerProjection::new()
             .space(&self.space)
             .views(&projection_views);
-        if let Err(e) = self.frame_stream.end(time, self.blend_mode, &[&layer]) {
-            // The runtime hands back POSE_INVALID while the headset has no tracking yet
-            // (waking from dormancy, session not yet focused): drop the frame, not the game.
+        // No tracking (waking from dormancy, session not yet focused, headset off): the poses
+        // are zeros the runtime would reject, so show nothing this frame and say so once.
+        let tracked = frame.tracked || self.hold_head;
+        if tracked != self.tracking {
+            self.tracking = tracked;
+            match tracked {
+                true => log::info!("xr: head tracked"),
+                false => log::warn!("xr: no head tracking; frames end empty until it returns"),
+            }
+        }
+        let layers: &[&xr::CompositionLayerBase<xr::Vulkan>] =
+            if tracked { &[&layer] } else { &[] };
+        if let Err(e) = self.frame_stream.end(time, self.blend_mode, layers) {
             log::warn!("xr: frame end failed: {e:?} (frame dropped)");
         }
     }
