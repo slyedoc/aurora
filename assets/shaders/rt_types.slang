@@ -233,7 +233,9 @@ public struct UniformData {
     public uint fog_grid_stride;
     // RenderSettings::ab: 0 the old path under test, 1 the new (benches/northshire.rs --ab).
     public uint ab;
-    public uint pad_shared[2];
+    // Per environment bit (a byte each, low first): the render layers with something in it.
+    // A portal ray keeps only those of the exit's environment.
+    public uint layer_environments[2];
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment

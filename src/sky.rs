@@ -349,13 +349,20 @@ pub struct EnvironmentSkies {
     pub atmosphere: Option<u8>,
     /// Bits that are live environments; the rest of a mask are render layers.
     pub environment_bits: u8,
+    /// By render-layer bit: the environments its entities are in. A ray carries a layer only
+    /// in those, so a body on a layer of its own shows in its own environment and not at the
+    /// same coordinates in every other one.
+    pub layer_environments: [u8; 8],
 }
 
 impl EnvironmentSkies {
     /// The radiance (nits) environment `bit`'s exposure shows as white: `1.2 * 2^EV100`. What
     /// must read the same at any exposure (signs, pointer affordances) emits in multiples of it.
     pub fn white_nits(&self, bit: u8) -> f32 {
-        let ev100 = self.environments.get(bit as usize).map_or(DEFAULT_EV100, |e| e.ev100);
+        let ev100 = self
+            .environments
+            .get(bit as usize)
+            .map_or(DEFAULT_EV100, |e| e.ev100);
         1.2 * ev100.exp2()
     }
 
@@ -363,6 +370,26 @@ impl EnvironmentSkies {
     /// (it sees nothing anyway) reads entry 0.
     pub fn view_environment(&self, mask: u8) -> u8 {
         crate::environment::view_environment(mask & self.environment_bits)
+    }
+
+    /// The render layers of `mask` that have something in environment bit `environment`.
+    pub fn layers_in(&self, mask: u8, environment: u8) -> u8 {
+        let layers = mask & !self.environment_bits;
+        (0..8u8)
+            .filter(|&b| layers & (1 << b) != 0)
+            .filter(|&b| self.layer_environments[b as usize] & (1 << environment) != 0)
+            .fold(0, |m, b| m | (1 << b))
+    }
+
+    /// Per environment bit (a byte each, low first), the render layers with something in it:
+    /// what a ray keeps when a portal takes it there.
+    pub fn layers_by_environment(&self) -> [u32; 2] {
+        let mut out = [0u32; 2];
+        for env in 0..8u8 {
+            let layers = self.layers_in(0xFF, env) as u32;
+            out[env as usize / 4] |= layers << ((env % 4) * 8);
+        }
+        out
     }
 
     /// The sky of the environment a view of `mask` is in.
@@ -391,11 +418,20 @@ fn gather_skies(
         Option<&InEnvironment>,
         Option<&InheritedVisibility>,
     )>,
+    layered: Query<(&RenderLayers, &InEnvironment)>,
     mut out: ResMut<EnvironmentSkies>,
 ) {
     let Some(worlds) = worlds else {
         return;
     };
+    let environment_bits = worlds.environment_bits();
+    out.layer_environments = [0; 8];
+    for (layers, world) in &layered {
+        let named = crate::tlas_builder::layers_mask(Some(layers)) & !environment_bits;
+        for bit in (0..8u8).filter(|&b| named & (1 << b) != 0) {
+            out.layer_environments[bit as usize] |= 1 << world.0.min(7);
+        }
+    }
     let mut atmosphere = None;
     let mut exposures = [None; 8];
     for bit in 0..8u8 {

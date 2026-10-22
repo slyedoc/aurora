@@ -135,7 +135,9 @@ pub struct UniformData {
     fog_grid_stride: u32,
     /// [`RenderSettings::ab`].
     ab: u32,
-    pad_shared: [u32; 2],
+    /// Per environment bit (a byte each), the render layers with something in it: a portal ray
+    /// keeps only those ([`EnvironmentSkies::layers_by_environment`](crate::sky::EnvironmentSkies::layers_by_environment)).
+    layer_environments: [u32; 2],
 }
 
 #[repr(C)]
@@ -1090,7 +1092,7 @@ fn render_frame(
             fog_grid_soft: grid.soft,
             fog_grid_stride: grid.stride,
             ab: settings.ab,
-            pad_shared: [0; 2],
+            layer_environments: skies.layers_by_environment(),
         };
 
         uniform_uploads.push((view.slot, data));
@@ -3229,6 +3231,6 @@ mod tests {
         assert_eq!(offset_of!(U, fog_grid_sum_tex), 752);
         assert_eq!(offset_of!(U, fog_grid_soft), 760);
         assert_eq!(offset_of!(U, fog_grid_stride), 768);
-        assert_eq!(offset_of!(U, pad_shared), 776);
+        assert_eq!(offset_of!(U, layer_environments), 776);
     }
 }

@@ -610,6 +610,14 @@ float3 portalXformDir(float4 r0, float4 r1, float4 r2, float3 v) {
     return float3(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
 }
 
+// A ray's mask in environment `env`: `env_mask`'s environment bits, and of the camera's
+// render layers those with something in `env` (a first-person body stays in its own world).
+uint viewMask(uint env_mask, uint env) {
+    let env_bits = pc.uniforms.environment_bits | 1u;
+    let here = (pc.uniforms.layer_environments[env / 4u] >> ((env % 4u) * 8u)) & 0xFFu;
+    return (env_mask & env_bits) | (pc.uniforms.camera_mask & ~env_bits & here);
+}
+
 // If `hit_slot` is a portal surface, rewrite the ray to continue from the paired portal
 // (into portal-local, a half-turn about local Y, out through the target's frame) and
 // return true; else leave the ray untouched.
@@ -640,10 +648,10 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
         origin = portalXformPoint(t0, t1, t2, p) + direction * 1.0e-4;
         // The ray now lives in whatever environment the exit does: the exit INSTANCE's
         // environment bits (instance row 3 packs custom_index | mask << 24) replace the ray's,
-        // and its named layers (a first-person body) stay with it.
+        // and of its named layers (a first-person body) it keeps those with something there.
         let env_bits = pc.uniforms.environment_bits | 1u;
         let exit_mask = (asuint(pc.cur_instances[tb + 3u].x) >> 24) & 0xFFu;
-        ray_mask = (ray_mask & ~env_bits) | (exit_mask & env_bits);
+        ray_mask = viewMask(exit_mask, environmentOf(exit_mask, env_bits));
         ray_env = environmentOf(ray_mask, env_bits);
         return true;
     }
@@ -736,7 +744,7 @@ void fog_grid() {
     initRandom(uint2(pc.uniforms.fog_grid_cells, 1u), uint2(i, 0u), pc.uniforms.frame);
     let tmax = 1.0e6;
     let ray_env = pc.uniforms.environment;
-    let ray_mask = pc.uniforms.camera_mask;
+    let ray_mask = viewMask(pc.uniforms.camera_mask, ray_env);
     let env = pc.uniforms.environments + ray_env;
     let dist = env.fog_grid_distance;
     let cell = float3(id);
@@ -1025,8 +1033,8 @@ void primary() {
     lensRay(lens, launch_id, launch_size, origin, direction);
     let mask = float3(1.0);
     var surf_n = float3(0.0);
-    var ray_mask = pc.uniforms.camera_mask;
     var ray_env = pc.uniforms.environment;
+    var ray_mask = viewMask(pc.uniforms.camera_mask, ray_env);
     var in_view = true;
     var guides_written = false;
     var guide_dist = 0.0;
@@ -2081,8 +2089,8 @@ void main() {
         var water = 0u;
         // What this ray sees and where it is: the camera's layer mask and environment until a
         // portal swaps them.
-        var ray_mask = pc.uniforms.camera_mask;
         var ray_env = pc.uniforms.environment;
+        var ray_mask = viewMask(pc.uniforms.camera_mask, ray_env);
         // The normal of the surface `origin` sits on, for the next ray to leave it by; zero where
         // the ray does not start on a surface (the camera, a fog scatter, a portal exit).
         var surf_n = float3(0.0);
