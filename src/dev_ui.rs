@@ -72,17 +72,36 @@ impl Plugin for DevUIPlugin {
             app.add_plugins(FeathersInspectorPlugins);
         }
 
+        if !app.is_plugin_added::<DevReadoutsPlugin>() {
+            app.add_plugins(DevReadoutsPlugin);
+        }
         app.add_systems(Startup, spawn_panel);
-        app.add_systems(
-            Update,
-            (
-                toggle_panel,
-                update_probe,
-                update_frame_readout,
-                inspect_camera,
-            ),
-        );
+        app.add_systems(Update, (toggle_panel, inspect_camera));
     }
+}
+
+/// The panel's two readout lines (centre luminance + EV100, the GPU frame timeline), kept live
+/// wherever [`spawn_readouts`] put them; for an app with its own settings UI instead of F3.
+pub struct DevReadoutsPlugin;
+
+impl Plugin for DevReadoutsPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, (update_probe, update_frame_readout));
+    }
+}
+
+/// The probe and GPU lines under `parent`.
+pub fn spawn_readouts(commands: &mut Commands, parent: Entity) {
+    let line = |text: &str| {
+        (
+            Text::new(text),
+            TextFont::from_font_size(14.0),
+            TextColor(Color::srgb(0.8, 0.8, 0.8)),
+            ChildOf(parent),
+        )
+    };
+    commands.spawn((line("centre: -"), DevUIProbe));
+    commands.spawn((line("gpu: -"), DevUIFrame));
 }
 
 /// The first 3D camera's lens, exposure and DLSS mode join the panel once it exists.

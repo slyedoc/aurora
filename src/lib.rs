@@ -107,7 +107,7 @@ pub mod prelude {
         collision::{CollisionMesh, CollisionShape},
         compute::{ComputeModule, ComputeModules},
         debug_view::AuroraDebugView,
-        dev_ui::{DevUIPanel, DevUIPlugin},
+        dev_ui::{DevReadoutsPlugin, DevUIPanel, DevUIPlugin},
         dlss::{AuroraDlss, RrPreset},
         environment::{AuroraPrimaryHidden, InEnvironment, RenderEnvironments, RenderLayerApp},
         fog_volume::{FogShape, FogVolume},
