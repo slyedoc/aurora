@@ -232,11 +232,7 @@ struct RainPush {
     pixel_angle: f32,
 }
 
-fn spawn_parts(
-    add: On<Add<Weather>>,
-    kernels: Res<WeatherKernels>,
-    mut commands: Commands,
-) {
+fn spawn_parts(add: On<Add<Weather>>, kernels: Res<WeatherKernels>, mut commands: Commands) {
     let env = add.entity;
     let mist = commands
         .spawn((
@@ -370,7 +366,9 @@ fn update_weather(
     buffers.frame = buffers.frame.wrapping_add(1);
 
     if let Ok((mut volume, mut transform)) = volumes.get_mut(parts.mist) {
-        let radius = weather.mist_radius.clamp(1.0, GROUND_SIZE as f32 * GROUND_TEXEL * 0.47);
+        let radius = weather
+            .mist_radius
+            .clamp(1.0, GROUND_SIZE as f32 * GROUND_TEXEL * 0.47);
         let want = FogVolume {
             shape: FogShape::Ground,
             half_extents: Vec3::new(radius, 80.0, radius),
@@ -458,22 +456,18 @@ fn update_weather(
     let drops = buffers
         .drops
         .get_or_insert_with(|| {
-            let mut b = rd.create_host_buffer(
-                RAIN_CAPACITY as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-            );
+            let mut b =
+                rd.create_host_buffer(RAIN_CAPACITY as u64, vk::BufferUsageFlags::STORAGE_BUFFER);
             rd.map_buffer(&mut b).as_slice_mut().fill([0.0; DROP_WORDS]);
             b
         })
         .address;
-    let rows_buffer = buffers
-        .rain_rows
-        .get_or_insert_with(|| {
-            rd.create_device_buffer(
-                1,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-        });
+    let rows_buffer = buffers.rain_rows.get_or_insert_with(|| {
+        rd.create_device_buffer(
+            1,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+    });
     let (rows_handle, rows_address) = (rows_buffer.handle, rows_buffer.address);
     let push = RainPush {
         drops,
@@ -566,7 +560,10 @@ impl Plugin for WeatherPlugin {
             .add_observer(despawn_parts)
             .add_systems(
                 PostUpdate,
-                (tint_rain, update_weather.run_if(resource_exists::<RenderDevice>)),
+                (
+                    tint_rain,
+                    update_weather.run_if(resource_exists::<RenderDevice>),
+                ),
             )
             .add_systems(TeardownSchedule, free_buffers.before(on_shutdown));
     }

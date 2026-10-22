@@ -113,7 +113,7 @@ fn setup(
     ));
 
     // THE PANEL: one component. `UiPanel3d` mints the offscreen target, the routing camera
-    // (UI roots pointed at it lay out at the TEXTURE's resolution), the flipped-V quad with
+    // (UI roots pointed at it lay out at the TEXTURE's resolution), the quad with
     // the target as its emissive texture, and the `UiSurfacePanel` every pointer source
     // (window mouse, VR controller) operates. The surface stores straight-alpha sRGB with a
     // transparent background, so only lit UI pixels emit.
@@ -125,7 +125,6 @@ fn setup(
             size: Vec2::new(2.4, 1.35),
             px: TARGET_SIZE,
             nits: PANEL_NITS,
-            thickness: 0.06,
             // The root below styles itself.
             opaque: false,
             ..default()

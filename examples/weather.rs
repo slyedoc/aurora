@@ -48,7 +48,8 @@ fn main() {
 
 /// Rolling hills, a hollow at the middle.
 fn ground_y(x: f32, z: f32) -> f32 {
-    let hills = 3.0 * (x * 0.045).sin() * (z * 0.038).cos() + 1.2 * (x * 0.13 + 1.0).sin() * (z * 0.11).sin();
+    let hills = 3.0 * (x * 0.045).sin() * (z * 0.038).cos()
+        + 1.2 * (x * 0.13 + 1.0).sin() * (z * 0.11).sin();
     let hollow = -4.0 * (-(x * x + z * z) / (2.0 * 22.0 * 22.0)).exp();
     hills + hollow
 }

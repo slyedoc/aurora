@@ -11,8 +11,8 @@ use raw_window_handle::HasDisplayHandle;
 use ash::vk;
 
 use crate::color_target::{DISPLAY_FORMAT, TargetKind, WINDOW_CANVAS_FORMAT};
-use crate::post_process_filter::{ENCODE_TARGET, Output};
 use crate::descriptor_heap::DescriptorHeaps;
+use crate::post_process_filter::{ENCODE_TARGET, Output};
 
 use crate::sky::{EnvironmentGpu, EnvironmentSkies, Sky};
 use crate::{
@@ -63,8 +63,10 @@ pub struct UniformData {
     vignette: f32,
     /// Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     light_entries: u32,
+    /// Fade to black, after tonemapping (`AuroraLens::fade`).
+    fade: f32,
     /// Free (restir_candidates, light_candidates).
-    pad_candidates: [u32; 2],
+    pad_candidates: u32,
     /// Added to every ray-cone texture LOD: log2(render / output width) + the panel's bias.
     lod_bias: f32,
     /// ReSTIR GI's sharing threshold (`RenderSettings::restir_gi_roughness`).
@@ -1036,7 +1038,8 @@ fn render_frame(
             } else {
                 0
             },
-            pad_candidates: [0; 2],
+            fade: view.lens.fade,
+            pad_candidates: 0,
             // DLSS guide 3.5: textures are picked for the OUTPUT resolution, not the trace
             // resolution, so the upscaled image keeps its detail.
             lod_bias: (view.trace_extent.width.max(1) as f32
@@ -2244,7 +2247,14 @@ fn render_frame(
                         &mut gizmos,
                     );
                     if windowless {
-                        crate::ui_render::draw_ui(&render_device, cmd_buffer, *extent, DISPLAY_FORMAT, parity, &mut ui);
+                        crate::ui_render::draw_ui(
+                            &render_device,
+                            cmd_buffer,
+                            *extent,
+                            DISPLAY_FORMAT,
+                            parity,
+                            &mut ui,
+                        );
                     }
                 }
                 render_device.cmd_end_rendering(cmd_buffer);
@@ -2965,7 +2975,11 @@ unsafe fn record_encode(
         heaps.write_post(block, i, canvas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
     unsafe {
-        render_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, format_pipeline);
+        render_device.cmd_bind_pipeline(
+            cmd_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            format_pipeline,
+        );
     }
     heaps.bind(cmd_buffer);
     heaps.push(
@@ -3165,6 +3179,9 @@ mod tests {
     #[test]
     fn lod_bias_sits_where_the_slang_hit_shaders_read_it() {
         assert_eq!(core::mem::offset_of!(super::UniformData, lod_bias), 94 * 4);
+        // quad.slang.
+        assert_eq!(core::mem::offset_of!(super::UniformData, vignette), 90 * 4);
+        assert_eq!(core::mem::offset_of!(super::UniformData, fade), 92 * 4);
         assert_eq!(
             core::mem::offset_of!(super::UniformData, emissive_boost),
             103 * 4

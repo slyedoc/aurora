@@ -170,7 +170,9 @@ public struct UniformData {
     public float vignette;
     // Entries in the emissive-triangle light table (0 = no light NEE / MIS).
     public uint light_entries;
-    public uint pad_candidates[2];
+    // Fade to black, after tonemapping (AuroraLens::fade).
+    public float fade;
+    public uint pad_candidates;
     // Added to every ray-cone texture LOD: log2(render / output width) plus the panel's bias.
     public float lod_bias;
     // ReSTIR GI: the perceptual roughness from which a secondary hit's sample is shared with

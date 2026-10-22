@@ -14,6 +14,8 @@ struct AeData {
 
 // `UniformData`'s vignette, as a float index; pinned by a test in ray_render_plugin.rs.
 static const uint UNIFORM_VIGNETTE_FLOAT = 90;
+// `UniformData`'s fade (AuroraLens::fade), as a float index.
+static const uint UNIFORM_FADE_FLOAT = 92;
 // `UniformData`'s DLSS jitter (x, y; render pixels), as a float index.
 static const uint UNIFORM_JITTER_FLOAT = 84;
 
@@ -629,5 +631,6 @@ float4 fragment(VertexOut v) : SV_Target0 {
     }
     var color = clamp(push.tonemap != 0u ? acesFilm(exposed) : exposed, float3(0.0), float3(1.0));
     color = applyVignette(color, uv, push.uniforms[UNIFORM_VIGNETTE_FLOAT], frame.output);
+    color *= 1.0 - saturate(push.uniforms[UNIFORM_FADE_FLOAT]);
     return float4(push.output == OUTPUT_DISPLAY ? ditherSrgb8(color, v.position.xy) : color, 1.0);
 }

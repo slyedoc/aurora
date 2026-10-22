@@ -22,7 +22,11 @@ fn pick_surface_format(formats: &[vk::SurfaceFormatKHR]) -> (vk::SurfaceFormatKH
     let ten = [F::A2B10G10R10_UNORM_PACK32, F::A2R10G10B10_UNORM_PACK32];
     let wanted: [(&[F], C, Output); 4] = [
         (&ten, C::HDR10_ST2084_EXT, Output::Pq10),
-        (&[F::R16G16B16A16_SFLOAT], C::EXTENDED_SRGB_LINEAR_EXT, Output::Scrgb),
+        (
+            &[F::R16G16B16A16_SFLOAT],
+            C::EXTENDED_SRGB_LINEAR_EXT,
+            Output::Scrgb,
+        ),
         (&ten, C::SRGB_NONLINEAR, Output::Srgb10),
         (&[F::B8G8R8A8_UNORM], C::SRGB_NONLINEAR, Output::Srgb8),
     ];
@@ -175,7 +179,9 @@ impl Swapchain {
             self.swapchain_format = surface_format.format;
             self.requested = (window.width, window.height);
             if self.canvas.image != vk::Image::null() {
-                self.device.destroyer.destroy_image_view(self.canvas.image_view);
+                self.device
+                    .destroyer
+                    .destroy_image_view(self.canvas.image_view);
                 self.device.destroyer.destroy_image(self.canvas.image);
             }
             self.canvas = create_blank_texture(
@@ -437,7 +443,9 @@ impl Drop for Swapchain {
                 self.device.destroy_image_view(image_view, None);
             }
             if self.canvas.image != vk::Image::null() {
-                self.device.destroyer.destroy_image_view(self.canvas.image_view);
+                self.device
+                    .destroyer
+                    .destroy_image_view(self.canvas.image_view);
                 self.device.destroyer.destroy_image(self.canvas.image);
             }
             self.device

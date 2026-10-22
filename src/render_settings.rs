@@ -193,7 +193,7 @@ impl Default for RenderSettings {
     }
 }
 
-/// A camera's lens: depth of field and vignette. Without one, a pinhole with no vignette.
+/// A camera's lens: depth of field, vignette and fade. Without one, a pinhole with no vignette.
 #[derive(Component, Reflect, Clone, Copy, Debug, Default, PartialEq)]
 #[reflect(Component, Default)]
 pub struct AuroraLens {
@@ -203,6 +203,10 @@ pub struct AuroraLens {
     /// Post-process vignette strength (0 = off); aspect-corrected.
     #[reflect(@0.0..=1.0_f32)]
     pub vignette: f32,
+    /// Fade to black (0 = clear, 1 = black), after tonemapping: a state transition in a headset,
+    /// where a screen-space overlay never reaches the eyes.
+    #[reflect(@0.0..=1.0_f32)]
+    pub fade: f32,
 }
 
 pub struct RenderSettingsPlugin;

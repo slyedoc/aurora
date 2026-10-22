@@ -18,13 +18,12 @@ use bevy::{
     ecs::{lifecycle::HookContext, world::DeferredWorld},
     feathers::{theme::ThemeBackgroundColor, tokens},
     feathers_inspector::{BuildComponentInspector, BuildEntityInspector, BuildResourceInspector},
-    mesh::VertexAttributeValues,
     prelude::*,
     ui::UiTargetCamera,
 };
 
 use crate::{
-    material::{AuroraMaterial, AuroraMaterial3d},
+    material::{AlphaMode, AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
     ui_render::{UiSurfacePanel, ui_target_placeholder},
 };
@@ -47,8 +46,6 @@ pub struct UiPanel3d {
     pub scale: f32,
     /// Emission of lit pixels, in nits.
     pub nits: f32,
-    /// Quad thickness in meters (a slab, so it has edges to see from the side).
-    pub thickness: f32,
     /// Give the root the theme's window background (rounded). Off = transparent root; style
     /// it yourself.
     pub opaque: bool,
@@ -61,7 +58,6 @@ impl Default for UiPanel3d {
             px: UVec2::new(1024, 640),
             scale: 1.0,
             nits: 300.0,
-            thickness: 0.01,
             opaque: true,
         }
     }
@@ -147,13 +143,14 @@ fn build_panels(
 ) {
     for (entity, panel) in &panels {
         let target = images.add(ui_target_placeholder(panel.px));
+        let scale = panel.scale.max(0.1);
         let camera = commands
             .spawn((
                 Name::new("ui panel surface"),
                 Camera::default(),
                 RenderTarget::Image(ImageRenderTarget {
                     handle: target.clone(),
-                    scale_factor: panel.scale.max(0.1),
+                    scale_factor: scale,
                 }),
             ))
             .id();
@@ -176,16 +173,9 @@ fn build_panels(
         }
         let root = root.id();
 
-        // The UI target follows image convention (v = 0 at the TOP); bevy's `Cuboid` maps
-        // its +Z face with v = 0 at the bottom — flip V or the panel reads upside down.
-        let mut mesh = Mesh::from(Cuboid::new(panel.size.x, panel.size.y, panel.thickness));
-        if let Some(VertexAttributeValues::Float32x2(uvs)) =
-            mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0)
-        {
-            for uv in uvs.iter_mut() {
-                uv[1] = 1.0 - uv[1];
-            }
-        }
+        // One face, facing +Z; `Rectangle` already puts v = 0 at the top, the UI target's
+        // image convention.
+        let mesh = Mesh::from(Rectangle::new(panel.size.x, panel.size.y));
         commands.entity(entity).insert((
             AuroraMesh3d(meshes.add(AuroraMesh::from_mesh(&mesh).expect("cuboid has positions"))),
             AuroraMaterial3d(materials.add(AuroraMaterial {
@@ -194,11 +184,19 @@ fn build_panels(
                 emissive_texture: Some(target.clone()),
                 // A screen glows; it is not a lamp (its texture is mostly dark widgets).
                 glow_only: true,
+                // Without a background the quad is cut out wherever the UI drew nothing: rays
+                // pass through to the world behind, and only the widgets float.
+                base_color_texture: (!panel.opaque).then(|| target.clone()),
+                alpha_mode: match panel.opaque {
+                    true => AlphaMode::Opaque,
+                    false => AlphaMode::Mask(0.05),
+                },
                 ..default()
             })),
             UiSurfacePanel {
                 target: target.clone(),
                 size: panel.size,
+                scale,
             },
             UiPanel3dRoot {
                 root,

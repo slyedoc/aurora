@@ -184,8 +184,15 @@ impl VulkanAsset for PostProcessFilter {
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
 
-        let pipelines =
-            FormatPipelines::build(&[DISPLAY_FORMAT, SCENE_RADIANCE_FORMAT, SWAPCHAIN_FORMATS[0], SWAPCHAIN_FORMATS[1], SWAPCHAIN_FORMATS[2]], |format| {
+        let pipelines = FormatPipelines::build(
+            &[
+                DISPLAY_FORMAT,
+                SCENE_RADIANCE_FORMAT,
+                SWAPCHAIN_FORMATS[0],
+                SWAPCHAIN_FORMATS[1],
+                SWAPCHAIN_FORMATS[2],
+            ],
+            |format| {
                 let formats = [format];
                 let mut pipeline_rendering_info =
                     vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
@@ -210,7 +217,8 @@ impl VulkanAsset for PostProcessFilter {
                     )
                 }
                 .unwrap()[0]
-            });
+            },
+        );
 
         unsafe {
             render_device.destroy_shader_module(shader_stages[0].module, None);

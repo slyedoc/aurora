@@ -62,10 +62,10 @@ use bevy::platform::collections::HashMap;
 
 use crate::{
     assets::aurora_asset,
+    color_target::{DISPLAY_FORMAT, FormatPipelines, OVERLAY_FORMATS},
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
     render_device::RenderDevice,
-    color_target::{DISPLAY_FORMAT, FormatPipelines, OVERLAY_FORMATS},
     render_texture::{RenderTexture, create_blank_texture},
     vk_utils,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssetLoadingState, VulkanAssets},
@@ -2250,7 +2250,7 @@ pub unsafe fn draw_ui_surfaces(
 
 /// Declares that this entity displays a UI surface on its local XY plane: the texture spans
 /// `size` meters centered on the origin (+X right, +Y up, plane z = 0, viewed from +Z), with
-/// the image's v = 0 row at the TOP — the same convention as the flipped-V panel quad. With
+/// the image's v = 0 row at the TOP — the same convention as the panel quad. With
 /// this component on the panel mesh, every [`UiPointerSource`] ray that crosses it drives the
 /// panel's widgets: hover, click and drag like window UI.
 #[derive(Component, Clone)]
@@ -2260,6 +2260,9 @@ pub struct UiSurfacePanel {
     pub target: Handle<Image>,
     /// World size of the displayed face in meters.
     pub size: Vec2,
+    /// The UI scale factor its camera renders at (its `ImageRenderTarget::scale_factor`):
+    /// pointers report logical pixels against that same target, as the window cursor does.
+    pub scale: f32,
 }
 
 /// `PreUpdate`, after `InputSystems`, before picking: `Aim` is where owners write their
@@ -2455,12 +2458,13 @@ fn drive_ui_pointers(
                     continue;
                 };
                 source.hit = Some(hit);
-                let position = hit.uv * Vec2::new(extent.width as f32, extent.height as f32);
+                let position =
+                    hit.uv * Vec2::new(extent.width as f32, extent.height as f32) / panel.scale;
                 let location = Location {
                     target: bevy::camera::NormalizedRenderTarget::Image(
                         bevy::camera::ImageRenderTarget {
                             handle: panel.target.clone(),
-                            scale_factor: 1.0,
+                            scale_factor: panel.scale,
                         },
                     ),
                     position,

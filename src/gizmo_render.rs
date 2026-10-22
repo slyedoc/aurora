@@ -42,10 +42,10 @@ use bevy::{
 
 use crate::{
     assets::aurora_asset,
+    color_target::{FormatPipelines, OVERLAY_FORMATS},
     environment::{InEnvironment, environment_mask},
     ray_render_plugin::{RenderSet, TeardownSchedule},
     render_buffer::{Buffer, BufferProvider},
-    color_target::{FormatPipelines, OVERLAY_FORMATS},
     render_device::RenderDevice,
     tlas_builder::layers_mask,
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
