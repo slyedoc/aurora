@@ -26,9 +26,7 @@ use avian3d::{
     environment::TransferToEnvironment,
     prelude::{AngularVelocity, LinearVelocity, RigidBody},
 };
-use bevy::{
-    ecs::system::SystemParam, math::Affine3A, prelude::*, transform::TransformSystems,
-};
+use bevy::{ecs::system::SystemParam, math::Affine3A, prelude::*, transform::TransformSystems};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
@@ -170,7 +168,16 @@ pub struct Crossing {
 /// Every portal, for finding where a segment passes through one.
 #[derive(SystemParam)]
 pub struct Portals<'w, 's> {
-    portals: Query<'w, 's, (Entity, &'static AuroraPortal, &'static GlobalTransform, Option<&'static AuroraMesh3d>)>,
+    portals: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static AuroraPortal,
+            &'static GlobalTransform,
+            Option<&'static AuroraMesh3d>,
+        ),
+    >,
     frames: Query<'w, 's, &'static GlobalTransform>,
     meshes: Res<'w, Assets<AuroraMesh>>,
     in_world: Query<'w, 's, &'static InEnvironment>,
@@ -178,43 +185,58 @@ pub struct Portals<'w, 's> {
 }
 
 impl Portals<'_, '_> {
-    /// The first portal the world-space segment `from` -> `to` enters front to back, within its
-    /// mesh's bounds, and whose exit is in an environment.
-    pub fn crossing(&self, from: Vec3, to: Vec3) -> Option<Crossing> {
-        self.portals.iter().find_map(|(portal, link, global, mesh)| {
-            let pose = global.affine();
-            let to_local = pose.inverse();
-            let (a, b) = (to_local.transform_point3(from), to_local.transform_point3(to));
-            if !(a.z > 0.0 && b.z <= 0.0) {
-                return None;
-            }
-            let hit = a.lerp(b, a.z / (a.z - b.z));
-            let half = mesh
-                .and_then(|m| self.meshes.get(&m.0))
-                .map_or(Vec2::splat(0.5), |m| {
-                    Vec2::new(m.aabb.half_extent[0], m.aabb.half_extent[1])
-                });
-            if hit.x.abs() > half.x || hit.y.abs() > half.y {
-                return None;
-            }
-            let target = self.frames.get(link.target).ok()?;
-            // An exit in no environment leads nowhere.
-            let Some(world) = self
-                .in_world
-                .get(link.target)
-                .ok()
-                .and_then(|w| self.worlds.environment(w.0))
-            else {
-                warn_once!("aurora: portal exit {} is in no environment", link.target);
-                return None;
-            };
-            Some(Crossing {
-                portal,
-                target: link.target,
-                world,
-                map: portal_map(pose, target.affine()),
+    /// The environment `entity` is in.
+    pub fn environment_of(&self, entity: Entity) -> Option<Entity> {
+        self.worlds.environment(self.in_world.get(entity).ok()?.0)
+    }
+
+    /// The first portal in environment `world` the world-space segment `from` -> `to` enters
+    /// front to back, within its mesh's bounds, and whose exit is in an environment. Portals in
+    /// other environments are not there for it, wherever they stand.
+    pub fn crossing(&self, world: Entity, from: Vec3, to: Vec3) -> Option<Crossing> {
+        let bit = self.worlds.bit(world)?;
+        self.portals
+            .iter()
+            .find_map(|(portal, link, global, mesh)| {
+                if self.in_world.get(portal).ok().map(|w| w.0) != Some(bit) {
+                    return None;
+                }
+                let pose = global.affine();
+                let to_local = pose.inverse();
+                let (a, b) = (
+                    to_local.transform_point3(from),
+                    to_local.transform_point3(to),
+                );
+                if !(a.z > 0.0 && b.z <= 0.0) {
+                    return None;
+                }
+                let hit = a.lerp(b, a.z / (a.z - b.z));
+                let half = mesh
+                    .and_then(|m| self.meshes.get(&m.0))
+                    .map_or(Vec2::splat(0.5), |m| {
+                        Vec2::new(m.aabb.half_extent[0], m.aabb.half_extent[1])
+                    });
+                if hit.x.abs() > half.x || hit.y.abs() > half.y {
+                    return None;
+                }
+                let target = self.frames.get(link.target).ok()?;
+                // An exit in no environment leads nowhere.
+                let Some(world) = self
+                    .in_world
+                    .get(link.target)
+                    .ok()
+                    .and_then(|w| self.worlds.environment(w.0))
+                else {
+                    warn_once!("aurora: portal exit {} is in no environment", link.target);
+                    return None;
+                };
+                Some(Crossing {
+                    portal,
+                    target: link.target,
+                    world,
+                    map: portal_map(pose, target.affine()),
+                })
             })
-        })
     }
 }
 
@@ -252,7 +274,10 @@ fn travel(
         let Some(last) = traveler.last.replace(now) else {
             continue;
         };
-        let Some(crossing) = portals.crossing(last, now) else {
+        let Some(world) = portals.environment_of(entity) else {
+            continue;
+        };
+        let Some(crossing) = portals.crossing(world, last, now) else {
             continue;
         };
         let moved = crossing.map * global;
