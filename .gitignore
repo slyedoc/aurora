@@ -11,3 +11,6 @@
 crash-dumps/
 .cargo/local.toml
 __pycache__/
+
+# Untracked: cargo rewrites it on every build; the forks stay pushed instead.
+Cargo.lock
