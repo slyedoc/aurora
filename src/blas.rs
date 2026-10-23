@@ -126,6 +126,10 @@ pub mod material_flags {
     pub const WATER: u32 = 1;
     /// Casts no shadow (rain, splashes): shadow rays pass it whatever its material.
     pub const NO_SHADOW: u32 = 2;
+    /// Lit by nothing (`AuroraMaterial::unlit`): every point of it is an emitter, so a path
+    /// ends there, a dark texel showing (all but) nothing instead of a black gloss that catches
+    /// the sun.
+    pub const UNLIT: u32 = 4;
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:

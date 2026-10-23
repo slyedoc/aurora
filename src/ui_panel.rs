@@ -233,6 +233,8 @@ fn build_panels(
                 emissive_texture: Some(target.clone()),
                 // A screen glows; it is not a lamp (its texture is mostly dark widgets).
                 glow_only: true,
+                // Nor a mirror: its dark parts show dark, not the sun's gloss.
+                unlit: true,
                 // Without a background the quad is cut out wherever the UI drew nothing: rays
                 // pass through to the world behind, and only the widgets float.
                 base_color_texture: (!panel.opaque).then(|| target.clone()),

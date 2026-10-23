@@ -123,7 +123,10 @@ pub struct AuroraMaterial {
     /// flag in `RTXMaterial` and a sign flip in the hit shaders' normal decode -- a
     /// coordinated change to the GPU record (`RTXMaterial`) and `surface.slang`'s `Material`.
     pub flip_normal_map_y: bool,
-    /// Emit `base_color` directly with no lighting.
+    /// Lit by nothing (this one does reach the tracer: `material_flags::UNLIT`): the surface
+    /// shows its emission alone (a screen), and a path that reaches it ends there, so it
+    /// catches no reflection. Its base color then only cuts it out
+    /// (`alpha_mode`).
     pub unlit: bool,
     /// Its emission is seen (a ray that hits it takes it in full) but it is no light: it stays
     /// out of the next-event light table, so it lights nothing by itself. For glowing marks on a

@@ -137,10 +137,15 @@ pub fn prepare_camera_targets(
             }
             continue;
         }
+        // A display target can be screenshotted (a windowless app's): copied out of.
+        let readable = match kind {
+            TargetKind::Display => vk::ImageUsageFlags::TRANSFER_SRC,
+            TargetKind::SceneRadiance => vk::ImageUsageFlags::empty(),
+        };
         let texture = create_blank_texture(
             &render_device,
             kind.format(),
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | readable,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             size.x,
             size.y,

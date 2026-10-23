@@ -13,7 +13,7 @@ pub use aurora_material::{
 use bevy::prelude::*;
 
 use crate::{
-    blas::{RTXMaterial, absorption_from_attenuation},
+    blas::{RTXMaterial, absorption_from_attenuation, material_flags},
     render_device::RenderDevice,
     render_env::{DEFAULT_NORMAL_TEXTURE_IDX, WHITE_TEXTURE_IDX},
     vulkan_asset::{VulkanAsset, VulkanAssetExt, VulkanAssets},
@@ -62,7 +62,7 @@ impl RTXMaterial {
             diffuse_transmission: material.diffuse_transmission.clamp(0.0, 1.0),
             clearcoat: material.clearcoat.clamp(0.0, 1.0),
             clearcoat_roughness: material.clearcoat_perceptual_roughness.clamp(0.0, 1.0),
-            flags: 0,
+            flags: if material.unlit { material_flags::UNLIT } else { 0 },
             uv_scroll: material.uv_scroll.to_array(),
         }
     }
