@@ -1566,61 +1566,68 @@ fn spawn_destroy_thread(
     let ext_micromap = opacity_micromap::Device::load(&instance, &device);
     let (sender, receiver) = crossbeam::channel::unbounded();
     let thread = std::thread::spawn(move || {
+        // Runs a frame's destroys; what is still queued when the channel closes runs then (the
+        // device is idle and outlives this thread), so a destroy sent after the last tick is not lost.
+        let execute = |death_list: Vec<VkDestroyCmd>| {
+            for event in death_list {
+                log::trace!("Executing destroy {:?}", event);
+                match event {
+                    VkDestroyCmd::ImageView(view) => unsafe {
+                        device.destroy_image_view(view, None);
+                    },
+                    VkDestroyCmd::Image(image) => unsafe {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.free_image_allocation(image);
+                        device.destroy_image(image, None);
+                    },
+                    VkDestroyCmd::Buffer(buffer) => unsafe {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.free_buffer_allocation(buffer);
+                        device.destroy_buffer(buffer, None);
+                    },
+                    VkDestroyCmd::Swapchain(swapchain) => unsafe {
+                        ext_swapchain.destroy_swapchain(swapchain, None);
+                    },
+                    VkDestroyCmd::Pipeline(pipeline) => unsafe {
+                        device.destroy_pipeline(pipeline, None);
+                    },
+                    VkDestroyCmd::PipelineLayout(layout) => unsafe {
+                        device.destroy_pipeline_layout(layout, None);
+                    },
+                    VkDestroyCmd::AccelerationStructure(acceleration_structure) => unsafe {
+                        ext_acc_struct
+                            .destroy_acceleration_structure(acceleration_structure, None);
+                    },
+                    VkDestroyCmd::Micromap(micromap) => unsafe {
+                        (ext_micromap.fp().destroy_micromap_ext)(
+                            ext_micromap.device(),
+                            micromap,
+                            std::ptr::null(),
+                        );
+                    },
+                    VkDestroyCmd::Tick => panic!("Tick event in death list"),
+                }
+            }
+        };
         // Assuming 3 frames in flight
         let mut queue = VecDeque::from(vec![Vec::new(), Vec::new()]);
         while let Ok(cmd) = receiver.recv() {
             match cmd {
                 VkDestroyCmd::Tick => {
                     queue.push_front(Vec::new());
-                    let death_list = queue.pop_back().unwrap();
-                    for event in death_list {
-                        log::trace!("Executing destroy {:?}", event);
-                        match event {
-                            VkDestroyCmd::ImageView(view) => unsafe {
-                                device.destroy_image_view(view, None);
-                            },
-                            VkDestroyCmd::Image(image) => unsafe {
-                                let mut state = state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                state.free_image_allocation(image);
-                                device.destroy_image(image, None);
-                            },
-                            VkDestroyCmd::Buffer(buffer) => unsafe {
-                                let mut state = state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                state.free_buffer_allocation(buffer);
-                                device.destroy_buffer(buffer, None);
-                            },
-                            VkDestroyCmd::Swapchain(swapchain) => unsafe {
-                                ext_swapchain.destroy_swapchain(swapchain, None);
-                            },
-                            VkDestroyCmd::Pipeline(pipeline) => unsafe {
-                                device.destroy_pipeline(pipeline, None);
-                            },
-                            VkDestroyCmd::PipelineLayout(layout) => unsafe {
-                                device.destroy_pipeline_layout(layout, None);
-                            },
-                            VkDestroyCmd::AccelerationStructure(acceleration_structure) => unsafe {
-                                ext_acc_struct
-                                    .destroy_acceleration_structure(acceleration_structure, None);
-                            },
-                            VkDestroyCmd::Micromap(micromap) => unsafe {
-                                (ext_micromap.fp().destroy_micromap_ext)(
-                                    ext_micromap.device(),
-                                    micromap,
-                                    std::ptr::null(),
-                                );
-                            },
-                            VkDestroyCmd::Tick => panic!("Tick event in death list"),
-                        }
-                    }
+                    execute(queue.pop_back().unwrap());
                 }
                 destroy_event => {
                     queue[0].push(destroy_event);
                 }
             }
+        }
+        while let Some(death_list) = queue.pop_back() {
+            execute(death_list);
         }
         log::debug!("Destroy thread finished");
     });

@@ -288,9 +288,10 @@ impl Plugin for RayRenderPlugin {
         app.init_resource::<ScreenshotRequests>()
             .init_resource::<crate::util::video::VideoRecorder>();
 
-        let mut teardown = Schedule::new(TeardownSchedule);
-        teardown.add_systems(on_shutdown);
-        app.add_schedule(teardown);
+        // Plugins built earlier (portals, water, weather) already added their cleanups to it:
+        // init keeps them, where add_schedule replaced the schedule and dropped them.
+        app.init_schedule(TeardownSchedule)
+            .add_systems(TeardownSchedule, on_shutdown);
 
         app.configure_sets(
             Last,
