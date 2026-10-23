@@ -1133,6 +1133,8 @@ void primary() {
         let trace_mask = recorded ? ray_mask : (ray_mask & ~pc.uniforms.primary_hidden);
         RayDesc ray;
         ray.Origin = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
+        // Hits are measured from the pushed-off start: the next vertex is start + t * direction.
+        origin = ray.Origin;
         ray.Direction = direction;
         ray.TMin = tmin;
         ray.TMax = volumeTmax(vol, ray.Origin, direction, tmax);
@@ -1474,7 +1476,7 @@ PtReplay ptReplay(RestirSurface s, uint seed, uint k, float thr) {
         let lob = unpackLobes(payload.lobes);
         let roughness = hitPayloadGetRoughness(payload);
         PtVertex q;
-        q.x = p.x + dir * payload.t;
+        q.x = start + dir * payload.t;
         q.ng = oct_to_float32x3(payload.surface_and_world_normal.xy);
         q.n = bendTowardViewer(oct_to_float32x3(payload.surface_and_world_normal.zw), -dir);
         if (dot(q.ng, dir) > 0.0) {
@@ -2300,6 +2302,7 @@ void main() {
             payload.cone = float2(cone_width, cone_spread);
             let trace_mask = ((path & PATH_CAMERA) != 0u) ? (ray_mask & ~pc.uniforms.primary_hidden) : ray_mask;
             let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
+            origin = start;
             // The recorded hit is rebuilt, not traced: the primary pass already found it.
             let resumed = resume;
             let seg_max = volumeTmax(vol, start, direction, tmax);
