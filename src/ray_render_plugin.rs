@@ -1388,6 +1388,12 @@ fn render_frame(
             // The instance table grown to every slot handed out, last frame's rows kept for
             // motion vectors, then the queued per-frame dispatches (landscape scatter, weather
             // write instance rows), ahead of the TLAS build.
+            if frame_commands.has_uploads() {
+                let _section = info_span!("record_image_uploads").entered();
+                let scope = prof.begin(&render_device, scene_cmd, "image uploads");
+                frame_commands.record_uploads(&render_device, scene_cmd);
+                prof.end(&render_device, scene_cmd, scope);
+            }
             let section = info_span!("record_frame_commands").entered();
             let scope = prof.begin(&render_device, scene_cmd, "frame commands");
             tlas.prepare_storage(&render_device, scene_cmd);
@@ -1448,7 +1454,14 @@ fn render_frame(
             );
             if pick {
                 let _submit = info_span!("submit_pick").entered();
-                picker.submit(&render_device, scene_cmd, &modules, tlas, &compute_wait);
+                picker.submit(
+                    &render_device,
+                    scene_cmd,
+                    &modules,
+                    tlas,
+                    &portal_table,
+                    &compute_wait,
+                );
             }
             // The light table's weight/CDF kernels, whenever the light set changed (they read
             // the instance rows the gather above wrote).

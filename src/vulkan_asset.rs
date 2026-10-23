@@ -15,6 +15,7 @@ use bevy::{
 use crossbeam::channel::{Receiver, Sender};
 
 use crate::{
+    compute::FrameCommands,
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_device::RenderDevice,
 };
@@ -56,6 +57,19 @@ pub trait VulkanAsset: Asset + Clone + Send + Sync + 'static {
             .collect()
     }
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset);
+
+    /// Rewrites `prepared` from `self` without rebuilding it (same shape), queuing the copy into
+    /// this frame's commands; `false` falls back to a re-prepare.
+    fn update_in_place(
+        &self,
+        _id: AssetId<Self>,
+        _prepared: &Self::PreparedAsset,
+        _param: &mut SystemParamItem<Self::ExtractParam>,
+        _render_device: &RenderDevice,
+        _commands: &mut FrameCommands,
+    ) -> bool {
+        false
+    }
 }
 
 /// Upper bound on assets prepared per worker wake-up.
@@ -155,6 +169,32 @@ impl<A: VulkanAsset> Default for VulkanAssetDropped<A> {
     }
 }
 
+/// Builds sent to the worker and not yet back, per asset: an in-place update waits for none,
+/// or the older build would land over it.
+#[derive(Resource)]
+pub struct VulkanAssetInFlight<A: VulkanAsset>(HashMap<AssetId<A>, u32>);
+
+impl<A: VulkanAsset> Default for VulkanAssetInFlight<A> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<A: VulkanAsset> VulkanAssetInFlight<A> {
+    fn sent(&mut self, id: AssetId<A>) {
+        *self.0.entry(id).or_default() += 1;
+    }
+
+    fn landed(&mut self, id: AssetId<A>) {
+        if let Some(count) = self.0.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(&id);
+            }
+        }
+    }
+}
+
 /// Assets whose last handle dropped this frame (their GPU side is already on the destroyer);
 /// `prepare_instances` releases their SBT hit records.
 #[derive(Resource, Default)]
@@ -175,6 +215,8 @@ fn extract_vulkan_asset<A: VulkanAsset>(
     mut render_assets: ResMut<VulkanAssets<A>>,
     mut dropped: ResMut<VulkanAssetDropped<A>>,
     mut dropped_ids: ResMut<DroppedAssets>,
+    mut in_flight: ResMut<VulkanAssetInFlight<A>>,
+    mut frame_commands: Option<ResMut<FrameCommands>>,
     comms: Res<VulkanAssetComms<A>>,
     param: StaticSystemParam<A::ExtractParam>,
 ) {
@@ -197,6 +239,8 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                         if comms.send_work.send((*id, extracted)).is_err() {
                             log::error!("VulkanAsset build thread is gone; dropping {id:?}");
                             render_assets.0.remove(id);
+                        } else {
+                            in_flight.sent(*id);
                         }
                     }
                 } else {
@@ -213,9 +257,26 @@ fn extract_vulkan_asset<A: VulkanAsset>(
                     asset_server.get_path(*id)
                 );
                 if let Some(asset) = assets.get(*id) {
+                    // Same shape, nothing building: rewrite the existing GPU object in place.
+                    if !in_flight.0.contains_key(id)
+                        && let Some(commands) = frame_commands.as_deref_mut()
+                        && let Some(VulkanAssetLoadingState::Loaded(prepared)) =
+                            render_assets.0.get(id)
+                        && asset.update_in_place(
+                            *id,
+                            prepared,
+                            &mut param,
+                            &render_device,
+                            commands,
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(extracted) = asset.extract_asset_with_id(*id, &mut param) {
                         if comms.send_work.send((*id, extracted)).is_err() {
                             log::error!("VulkanAsset build thread is gone; {id:?} stays stale");
+                        } else {
+                            in_flight.sent(*id);
                         }
                     }
                 } else {
@@ -249,9 +310,11 @@ pub fn poll_for_asset<A: VulkanAsset>(
     mut assets: ResMut<VulkanAssets<A>>,
     mut dropped: ResMut<VulkanAssetDropped<A>>,
     mut replaced: ResMut<ReplacedAssets>,
+    mut in_flight: ResMut<VulkanAssetInFlight<A>>,
 ) {
     while let Ok((id, prep)) = comms.recv_result.try_recv() {
         log::debug!("VulkanAsset received prepared asset for id: {:?}", id);
+        in_flight.landed(id);
         if dropped.0.remove(&id) {
             log::debug!("VulkanAsset {id:?} dropped while building; destroying the result");
             A::destroy_asset(&render_device, &prep);
@@ -315,6 +378,7 @@ impl VulkanAssetExt for App {
     fn init_vulkan_asset<A: VulkanAsset>(&mut self) {
         self.init_resource::<VulkanAssets<A>>();
         self.init_resource::<VulkanAssetDropped<A>>();
+        self.init_resource::<VulkanAssetInFlight<A>>();
         self.init_resource::<ReplacedAssets>();
         self.init_resource::<DroppedAssets>();
         // No device, no uploads: the read side stays and answers empty, which is what a

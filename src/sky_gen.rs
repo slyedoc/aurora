@@ -298,7 +298,16 @@ fn prepare_sky_gen(
     textures: Res<VulkanAssets<Image>>,
     mut gen_: ResMut<SkyGen>,
     mut commands: ResMut<FrameCommands>,
+    mut image_events: MessageReader<AssetEvent<Image>>,
 ) {
+    // A photo re-uploaded in place keeps its VkImage: refilter on the event instead.
+    let modified: Vec<AssetId<Image>> = image_events
+        .read()
+        .filter_map(|event| match event {
+            AssetEvent::Modified { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
     let ready = modules.get(&gen_.module).is_some();
     let module = gen_.module.clone();
     for (bit, environment) in skies.environments.iter().enumerate() {
@@ -306,6 +315,9 @@ fn prepare_sky_gen(
         if let Sky::Hdr { image, .. } = &environment.sky {
             if slot.texture.is_some() {
                 slot.release(&rd);
+            }
+            if modified.contains(&image.id()) {
+                slot.source = None;
             }
             if let Some(source) = textures.get(image)
                 && ready

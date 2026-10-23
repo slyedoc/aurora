@@ -162,13 +162,18 @@ impl VulkanAsset for ComputeModule {
             .zip(&entry_points)
             .map(|(info, entry)| {
                 let label = format!("{}#{entry}", shader.path);
-                crate::pipeline_binary::create_pipeline(render_device, &label, info, |info, cache| unsafe {
-                    render_device
-                        .device
-                        .create_compute_pipelines(cache, std::slice::from_ref(info), None)
-                        .map(|p| p[0])
-                        .map_err(|(_, e)| e)
-                })
+                crate::pipeline_binary::create_pipeline(
+                    render_device,
+                    &label,
+                    info,
+                    |info, cache| unsafe {
+                        render_device
+                            .device
+                            .create_compute_pipelines(cache, std::slice::from_ref(info), None)
+                            .map(|p| p[0])
+                            .map_err(|(_, e)| e)
+                    },
+                )
                 .unwrap_or_else(|e| panic!("compute pipelines for {} failed: {e:?}", shader.path))
             })
             .collect();
@@ -419,11 +424,34 @@ pub struct TlasRef {
 /// may write instance rows), and those recorded right after it (they trace this frame's TLAS).
 #[derive(Resource, Default)]
 pub struct FrameCommands {
+    uploads: Vec<FrameUpload>,
     before_build: Vec<FrameCommand>,
     after_build: Vec<FrameCommand>,
 }
 
+/// A transfer into an existing resource (an in-place asset re-upload), recorded first.
+pub type FrameUpload = Box<dyn FnOnce(&RenderDevice, vk::CommandBuffer) + Send + Sync>;
+
 impl FrameCommands {
+    /// Queues an upload ahead of everything else this frame (its own GPU scope).
+    pub fn push_upload(
+        &mut self,
+        f: impl FnOnce(&RenderDevice, vk::CommandBuffer) + Send + Sync + 'static,
+    ) {
+        self.uploads.push(Box::new(f));
+    }
+
+    pub fn has_uploads(&self) -> bool {
+        !self.uploads.is_empty()
+    }
+
+    /// Records the queued uploads; each leaves its own writes visible to what reads them.
+    pub fn record_uploads(&mut self, render_device: &RenderDevice, cmd_buffer: vk::CommandBuffer) {
+        for upload in self.uploads.drain(..) {
+            upload(render_device, cmd_buffer);
+        }
+    }
+
     /// Queues `f` ahead of this frame's TLAS build.
     pub fn push(
         &mut self,

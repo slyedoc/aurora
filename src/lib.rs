@@ -114,7 +114,7 @@ pub mod prelude {
         material::{AuroraMaterial, AuroraMaterial3d},
         mesh::{AuroraMesh, AuroraMesh3d},
         picking::{RayCaster, RayHit, RayHits},
-        portal::AuroraPortal,
+        portal::{AuroraPortal, AuroraVolumePortal, VolumeShape},
         procedural_mesh::{ProceduralKernels, ProceduralMesh, ProceduralMesh3d},
         render_settings::{AuroraLens, RenderSettings},
         skinning::{SkinJointsByName, Wind, WindSway},

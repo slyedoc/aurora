@@ -13,6 +13,10 @@
 //! read in place from host-visible memory into [`RayHits`]. A ray set during a frame's
 //! `Update` therefore has its hits in every system of the next frame, before anything that
 //! acted on them could have been drawn.
+//!
+//! A ray reaching an [`AuroraVolumePortal`](crate::portal::AuroraVolumePortal)'s shape carries on
+//! inside its target environment, as the rays drawn there do: the hits past it are what it shows
+//! (target-space points, [`RayHit::through`] naming the portal).
 
 use ash::vk;
 use bevy::prelude::*;
@@ -22,6 +26,7 @@ use gpu_allocator::MemoryLocation;
 use crate::{
     assets::aurora_asset,
     compute::{ComputeModule, ComputeModules, memory_barrier, record_dispatch},
+    portal::PortalTable,
     ray_render_plugin::{RenderSet, TeardownSchedule, on_shutdown},
     render_buffer::{Buffer, BufferProvider, Flip},
     render_device::RenderDevice,
@@ -65,6 +70,9 @@ pub struct RayHit {
     pub triangle: u32,
     /// Barycentrics of the hit within the triangle (vertices 1 and 2).
     pub barycentrics: Vec2,
+    /// The volume portal the ray reached this hit through: `point` and `normal` are then in its
+    /// target environment's space, `distance` still along the ray as cast.
+    pub through: Option<Entity>,
 }
 
 /// The last traced hits of this entity's [`RayCaster`], nearest first; empty on a miss.
@@ -91,7 +99,7 @@ struct GpuHit {
     instance: u32,
     barycentrics: [f32; 2],
     primitive: u32,
-    pad: u32,
+    through: u32,
 }
 
 #[repr(C)]
@@ -103,6 +111,10 @@ struct PickParams {
     count: u32,
     pad: u32,
     slots: u64,
+    portals: u64,
+    instances: u64,
+    portal_count: u32,
+    pad2: u32,
 }
 
 /// The pick pass: this frame's rays, the buffers they trace from and into, and the early
@@ -233,6 +245,7 @@ impl Picker {
         cmd: vk::CommandBuffer,
         modules: &ComputeModules,
         tlas: &TLAS,
+        portals: &PortalTable,
         timeline_waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)],
     ) {
         let count = self.staged.len() as u32;
@@ -270,6 +283,10 @@ impl Picker {
                 count,
                 pad: 0,
                 slots: tlas.instance_slots_address(),
+                portals: portals.address(),
+                instances: tlas.instances_address(),
+                portal_count: portals.count(),
+                pad2: 0,
             },
             count,
             None,
@@ -382,6 +399,10 @@ fn read_hits(
                 normal: Vec3::from_array(hit.normal),
                 triangle: hit.primitive,
                 barycentrics: Vec2::from_array(hit.barycentrics),
+                through: hit
+                    .through
+                    .checked_sub(1)
+                    .and_then(|slot| slots.entity(slot)),
             });
         }
     }

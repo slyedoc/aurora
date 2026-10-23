@@ -15,6 +15,13 @@
 //! Light is NOT transported -- portals carry the view, not next-event estimation, so each
 //! side is lit by its own surroundings (and a portal surface still occludes shadow rays).
 //!
+//! An [`AuroraVolumePortal`] is a closed shape (a disc under a low dome) showing another
+//! environment through it at a scale: a ray entering the small shape carries on inside the target
+//! environment from the matching point of the same shape placed there N times bigger (a straight
+//! affine map, no half-turn), and a ray leaving the big shape comes back out of the small one. What
+//! the ray meets in there is lit by the target's own sky and lights. Where the big shape's wall lies
+//! under the target's ground the small one's surface shows the cut (earth and stone strata).
+//!
 //! [`PortalTraveler`] carries an entity (a camera, a player) through a portal it crosses: the
 //! same map the rays use moves it, and it joins the exit's world (a physics body by avian's
 //! `TransferToEnvironment`, anything else by re-parenting under the exit's world), turns its
@@ -26,7 +33,10 @@ use avian3d::{
     environment::TransferToEnvironment,
     prelude::{AngularVelocity, LinearVelocity, RigidBody},
 };
-use bevy::{ecs::system::SystemParam, math::Affine3A, prelude::*, transform::TransformSystems};
+use bevy::{
+    ecs::system::SystemParam, math::Affine3A, platform::collections::HashMap, prelude::*,
+    transform::TransformSystems,
+};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
@@ -47,25 +57,171 @@ pub struct AuroraPortal {
     pub target: Entity,
 }
 
-/// One table entry; must match the `uvec4` unpack in raygen.slang's `portalRedirect`.
+/// The closed shape of an [`AuroraVolumePortal`], in its entity's local space: a cylinder of
+/// `radius` standing on y = 0 to `wall`, capped by a spherical dome rising `dome` above that (0: a
+/// flat top). Convex as long as `dome <= radius`.
+#[derive(Reflect, Clone, Copy, Debug, PartialEq)]
+#[reflect(Default, Clone, PartialEq)]
+pub struct VolumeShape {
+    pub radius: f32,
+    pub wall: f32,
+    pub dome: f32,
+}
+
+impl Default for VolumeShape {
+    fn default() -> Self {
+        Self {
+            radius: 1.0,
+            wall: 0.15,
+            dome: 0.35,
+        }
+    }
+}
+
+impl VolumeShape {
+    /// The shape as a closed mesh (outward normals), the surface rays enter by.
+    pub fn mesh(&self, segments: u32) -> Mesh {
+        use bevy::{asset::RenderAssetUsages, mesh::Indices, mesh::PrimitiveTopology};
+        let n = segments.max(8);
+        let row = n + 1;
+        let r = self.radius;
+        let dome = self.dome.clamp(0.0, r);
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        let mut uvs: Vec<[f32; 2]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut ring = |radius: f32, y: f32, normal: &dyn Fn(f32) -> Vec3, v: f32| {
+            for i in 0..=n {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                positions.push([radius * a.cos(), y, radius * a.sin()]);
+                normals.push(normal(a).to_array());
+                uvs.push([i as f32 / n as f32, v]);
+            }
+        };
+        // The bottom (rim, then centre), the wall (foot, then top), the cap (rim to apex).
+        ring(r, 0.0, &|_| Vec3::NEG_Y, 1.0);
+        ring(0.0, 0.0, &|_| Vec3::NEG_Y, 0.0);
+        if self.wall > 0.0 {
+            let side = |a: f32| Vec3::new(a.cos(), 0.0, a.sin());
+            ring(r, 0.0, &side, 0.0);
+            ring(r, self.wall, &side, 1.0);
+        }
+        let rings = 24u32;
+        let sphere = (dome > 1e-5).then(|| (r * r + dome * dome) / (2.0 * dome));
+        for k in 0..=rings {
+            let f = 1.0 - k as f32 / rings as f32;
+            match sphere {
+                Some(big) => {
+                    let theta = (r / big).clamp(-1.0, 1.0).asin() * f;
+                    let normal = move |a: f32| {
+                        Vec3::new(theta.sin() * a.cos(), theta.cos(), theta.sin() * a.sin())
+                    };
+                    ring(
+                        big * theta.sin(),
+                        self.wall + dome - big + big * theta.cos(),
+                        &normal,
+                        f,
+                    );
+                }
+                None => ring(r * f, self.wall, &|_| Vec3::Y, f),
+            }
+        }
+        // The bottom faces down: its band runs centre to rim.
+        for i in 0..n {
+            let (b, t) = (row + i, i);
+            indices.extend_from_slice(&[b, t, b + 1, t, t + 1, b + 1]);
+        }
+        // Each band from ring `o` to the next winds outward (lower / outer ring first).
+        let mut band = |o: u32| {
+            for i in 0..n {
+                let (b, t) = (o * row + i, (o + 1) * row + i);
+                indices.extend_from_slice(&[b, t, b + 1, t, t + 1, b + 1]);
+            }
+        };
+        let mut next = 2;
+        if self.wall > 0.0 {
+            band(next);
+            next += 2;
+        }
+        for k in 0..rings {
+            band(next + k);
+        }
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+    }
+}
+
+/// A live diorama: this entity's [`VolumeShape`] shows environment `target_env` through it,
+/// where the same shape stands at `target_transform` (relative to `target_env`; its scale is the
+/// diorama's, e.g. 20 for 1:20). Rays entering the shape carry on in there and come back out
+/// when they leave the big one. The shape's mesh is made for it (the
+/// entity's material shows only on the cut, repainted as strata).
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
+pub struct AuroraVolumePortal {
+    pub target_env: Entity,
+    pub target_transform: Transform,
+    pub shape: VolumeShape,
+}
+
+impl AuroraVolumePortal {
+    /// The big shape's world pose, from its environment's.
+    pub fn target_pose(&self, env: Option<&GlobalTransform>) -> Affine3A {
+        env.map_or(Affine3A::IDENTITY, GlobalTransform::affine)
+            * self.target_transform.compute_affine()
+    }
+}
+
+/// The volume map: world space of the small shape (`source`, its entity's pose) into the
+/// target environment's (`target`, the big shape's pose). Its scale is the diorama's.
+pub fn volume_map(source: Affine3A, target: Affine3A) -> Affine3A {
+    target * source.inverse()
+}
+
+/// One table entry; must match `PORTAL_*` in raygen.slang and pick.slang (8 x uvec4).
 /// `valid = 0` covers unresolved endpoints (instances still streaming in) and the
 /// zero-filled tail of the buffer -- slot 0 is real, so zeros must read as inert.
+/// A volume portal (`kind = 1`) carries its target environment's bit in `target`, the big
+/// shape's world pose, its inverse and the [`VolumeShape`].
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct GpuPortal {
     instance_slot: u32,
-    target_slot: u32,
+    target: u32,
     valid: u32,
-    pad: u32,
+    kind: u32,
+    target_rows: [[f32; 4]; 3],
+    inverse_rows: [[f32; 4]; 3],
+    shape: [f32; 4],
 }
 
 impl GpuPortal {
     const INVALID: Self = Self {
         instance_slot: 0,
-        target_slot: 0,
+        target: 0,
         valid: 0,
-        pad: 0,
+        kind: 0,
+        target_rows: [[0.0; 4]; 3],
+        inverse_rows: [[0.0; 4]; 3],
+        shape: [0.0; 4],
     };
+}
+
+/// The rows of an affine as the instance transform packs them (row k of world_from_local).
+fn affine_rows(a: Affine3A) -> [[f32; 4]; 3] {
+    let m = a.matrix3;
+    let t = a.translation;
+    [
+        [m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x],
+        [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y],
+        [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z],
+    ]
 }
 
 /// The uploaded pair table; the frame uniform carries its address + count.
@@ -97,7 +253,10 @@ impl PortalTable {
 fn upload_portals(
     render_device: Res<RenderDevice>,
     portals: Query<(Entity, &AuroraPortal)>,
+    volumes: Query<(Entity, &AuroraVolumePortal)>,
+    frames: Query<&GlobalTransform>,
     slots: Query<&GpuInstance>,
+    environments: Res<RenderEnvironments>,
     mut table: ResMut<PortalTable>,
 ) {
     let mut entries: Vec<GpuPortal> = Vec::new();
@@ -105,12 +264,37 @@ fn upload_portals(
         entries.push(match (slots.get(entity), slots.get(portal.target)) {
             (Ok(a), Ok(b)) => GpuPortal {
                 instance_slot: a.0,
-                target_slot: b.0,
+                target: b.0,
                 valid: 1,
-                pad: 0,
+                ..GpuPortal::INVALID
             },
             _ => GpuPortal::INVALID,
         });
+    }
+    for (entity, volume) in &volumes {
+        entries.push(
+            match (slots.get(entity), environments.bit(volume.target_env)) {
+                (Ok(slot), Some(bit)) => {
+                    let pose = volume.target_pose(frames.get(volume.target_env).ok());
+                    let shape = volume.shape;
+                    GpuPortal {
+                        instance_slot: slot.0,
+                        target: bit as u32,
+                        valid: 1,
+                        kind: 1,
+                        target_rows: affine_rows(pose),
+                        inverse_rows: affine_rows(pose.inverse()),
+                        shape: [
+                            shape.radius,
+                            shape.wall,
+                            shape.dome.clamp(0.0, shape.radius),
+                            0.0,
+                        ],
+                    }
+                }
+                _ => GpuPortal::INVALID,
+            },
+        );
     }
     if entries == table.last && (table.buffer.is_some() || entries.is_empty()) {
         return;
@@ -314,6 +498,24 @@ fn travel(
     }
 }
 
+/// The shape's mesh, made whenever the shape changes.
+fn build_volume_meshes(
+    mut commands: Commands,
+    volumes: Query<(Entity, &AuroraVolumePortal), Changed<AuroraVolumePortal>>,
+    mut meshes: ResMut<Assets<AuroraMesh>>,
+    mut built: Local<HashMap<Entity, VolumeShape>>,
+) {
+    for (entity, volume) in &volumes {
+        if built.get(&entity) == Some(&volume.shape) {
+            continue;
+        }
+        built.insert(entity, volume.shape);
+        commands.entity(entity).insert(AuroraMesh3d(
+            meshes.add(AuroraMesh::from_shape(volume.shape.mesh(96))),
+        ));
+    }
+}
+
 fn cleanup_portals(mut table: ResMut<PortalTable>, rd: Res<RenderDevice>) {
     if let Some(buffer) = table.buffer.take() {
         rd.destroyer.destroy_buffer(buffer.handle);
@@ -325,7 +527,9 @@ pub struct PortalPlugin;
 impl Plugin for PortalPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<AuroraPortal>()
+            .register_type::<AuroraVolumePortal>()
             .register_type::<PortalTraveler>()
+            .add_systems(PostUpdate, build_volume_meshes)
             .add_systems(PostUpdate, travel.before(TransformSystems::Propagate));
         app.init_resource::<PortalTable>();
         // The Prepare set already gates on the render device existing.

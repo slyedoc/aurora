@@ -9,6 +9,7 @@ import light_eval;
 import fog;
 import water;
 import nrc_record;
+import volume_portal;
 
 // DLSS Ray Reconstruction guides + noisy colour, render resolution, written for the
 // primary hit of sample 0.
@@ -585,32 +586,6 @@ float3 skySample(EnvironmentGpu* env, float u1, float u2, float u3, out float3 d
 }
 
 // ---- ray portals (src/portal.rs) -------------------------------------------------------
-// Instance rows are the VkAccelerationStructureInstanceKHR 3x4 transform, row-major:
-// r_k = row k of world_from_local. Inverse via the 3x3 adjugate, -L^-1 t for translation.
-void portalAffineInverse(float4 r0, float4 r1, float4 r2,
-                         out float4 o0, out float4 o1, out float4 o2) {
-    let c0 = float3(r0.x, r1.x, r2.x);
-    let c1 = float3(r0.y, r1.y, r2.y);
-    let c2 = float3(r0.z, r1.z, r2.z);
-    let t = float3(r0.w, r1.w, r2.w);
-    let inv_det = 1.0 / dot(c0, cross(c1, c2));
-    let i0 = cross(c1, c2) * inv_det;
-    let i1 = cross(c2, c0) * inv_det;
-    let i2 = cross(c0, c1) * inv_det;
-    o0 = float4(i0, -dot(i0, t));
-    o1 = float4(i1, -dot(i1, t));
-    o2 = float4(i2, -dot(i2, t));
-}
-
-float3 portalXformPoint(float4 r0, float4 r1, float4 r2, float3 p) {
-    let h = float4(p, 1.0);
-    return float3(dot(r0, h), dot(r1, h), dot(r2, h));
-}
-
-float3 portalXformDir(float4 r0, float4 r1, float4 r2, float3 v) {
-    return float3(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
-}
-
 // A ray's mask in environment `env`: `env_mask`'s environment bits, and of the camera's
 // render layers those with something in `env` (a first-person body stays in its own world).
 uint viewMask(uint env_mask, uint env) {
@@ -625,8 +600,8 @@ uint viewMask(uint env_mask, uint env) {
 bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout float3 direction,
                     inout uint ray_mask, inout uint ray_env) {
     for (uint i = 0u; i < pc.uniforms.portal_count; i++) {
-        let pair = pc.uniforms.portals[i];
-        if (pair.z == 0u || pair.x != hit_slot) {
+        let pair = pc.uniforms.portals[i * PORTAL_STRIDE];
+        if (pair.z == 0u || pair.w != 0u || pair.x != hit_slot) {
             continue;
         }
         let pb = pair.x * 4u;
@@ -657,6 +632,95 @@ bool portalRedirect(uint hit_slot, float3 hit_pos, inout float3 origin, inout fl
         return true;
     }
     return false;
+}
+
+// ---- volume portals (src/portal.rs AuroraVolumePortal) ----------------------------------
+// A ray carried into a volume keeps `vol` (its table index + 1) and `vol_s` (target metres per
+// source metre) until it leaves the big shape or scatters.
+
+// The volume portal of `slot` (0: none).
+uint volumeOf(uint slot) {
+    return pc.uniforms.portal_count > 0u ? volumePortalOf(pc.uniforms.portals, pc.uniforms.portal_count, slot) : 0u;
+}
+
+// The trace's far end for a ray in volume `vol`: where it leaves the big shape.
+float volumeTmax(uint vol, float3 origin, float3 direction, float tmax) {
+    if (vol == 0u) {
+        return tmax;
+    }
+    return min(tmax, volumeExit(volumePortalLoad(pc.uniforms.portals, vol - 1u), origin, direction));
+}
+
+// The small shape's local space at world `p`, through its live instance rows.
+float3 volumeSourceLocal(VolumePortal v, float3 p, out float3 dir_local, float3 dir) {
+    let sb = v.slot * 4u;
+    float4 s0, s1, s2;
+    portalAffineInverse(pc.cur_instances[sb], pc.cur_instances[sb + 1u], pc.cur_instances[sb + 2u], s0, s1, s2);
+    dir_local = portalXformDir(s0, s1, s2, dir);
+    return portalXformPoint(s0, s1, s2, p);
+}
+
+// A ray that hit the small shape of volume `vol` at `hit_pos` carries on from the big one's
+// matching point, in the target environment.
+void volumeEnter(uint vol, float3 hit_pos, inout float3 origin, inout float3 direction, inout uint ray_mask,
+                 inout uint ray_env, inout float vol_s) {
+    let v = volumePortalLoad(pc.uniforms.portals, vol - 1u);
+    float3 ld;
+    let lp = volumeSourceLocal(v, hit_pos, ld, direction);
+    let d = portalXformDir(v.t0, v.t1, v.t2, ld);
+    let s = length(d);
+    direction = d / s;
+    origin = portalXformPoint(v.t0, v.t1, v.t2, lp) + direction * (1.0e-4 * s);
+    vol_s = s;
+    ray_env = v.env_bit;
+    ray_mask = viewMask(1u << v.env_bit, v.env_bit);
+}
+
+// A ray in volume `vol` that met nothing before the big shape's edge `t` away comes back out of
+// the small one, into the small one's environment.
+void volumeLeave(uint vol, float t, inout float3 origin, inout float3 direction, inout uint ray_mask,
+                 inout uint ray_env) {
+    let v = volumePortalLoad(pc.uniforms.portals, vol - 1u);
+    let lp = portalXformPoint(v.i0, v.i1, v.i2, origin + direction * t);
+    let ld = portalXformDir(v.i0, v.i1, v.i2, direction);
+    let sb = v.slot * 4u;
+    let r0 = pc.cur_instances[sb];
+    let r1 = pc.cur_instances[sb + 1u];
+    let r2 = pc.cur_instances[sb + 2u];
+    direction = normalize(portalXformDir(r0, r1, r2, ld));
+    origin = portalXformPoint(r0, r1, r2, lp) + direction * 1.0e-4;
+    let env_bits = pc.uniforms.environment_bits | 1u;
+    let src_mask = (asuint(pc.cur_instances[sb + 3u].x) >> 24) & 0xFFu;
+    ray_mask = viewMask(src_mask, environmentOf(src_mask, env_bits));
+    ray_env = environmentOf(ray_mask, env_bits);
+}
+
+// The cut: where the small shape's surface at `hit_pos` stands for a point of the big one under
+// the target's ground (straight up from it a ray meets the back of a surface first), its
+// payload becomes that earth. True when it did.
+bool volumeCut(uint vol, float3 hit_pos, inout HitPayload payload) {
+    let v = volumePortalLoad(pc.uniforms.portals, vol - 1u);
+    float3 ld;
+    let lp = volumeSourceLocal(v, hit_pos, ld, float3(0.0, 1.0, 0.0));
+    let up = portalXformDir(v.t0, v.t1, v.t2, float3(0.0, 1.0, 0.0));
+    let s = length(up);
+    RayDesc ray;
+    ray.Origin = portalXformPoint(v.t0, v.t1, v.t2, lp);
+    ray.Direction = up / s;
+    ray.TMin = 0.0;
+    ray.TMax = 1.0e6;
+    ShadowPayload probe = {};
+    HitObject hit = HitObject::TraceRay(topLevelAS, FLAGS_OPAQUE, viewMask(1u << v.env_bit, v.env_bit), 0, 0, 0,
+                                        ray, probe);
+    if (!hit.IsHit() || hit.GetHitKind() != HIT_KIND_TRIANGLE_BACK_FACE) {
+        return false;
+    }
+    let depth = hit.GetRayDesc().TMax / s;
+    payload.color = float4(strataAlbedo(v.shape, depth, lp), 1.0);
+    payload.emission = float3(0.0);
+    payload.lobes = 0u;
+    payload.r_m_t_i = asint(230u << 24);
+    return true;
 }
 
 // ---- Fog light grid (src/fog_grid.rs) ------------------------------------------------------
@@ -874,7 +938,8 @@ void fogGridSegment(EnvironmentGpu* env, float3 o, float3 d, float seg,
 // ray ran before this segment (smooth glass in front: the guides sit at a virtual point along it).
 float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, float3 world_normal,
                   float3 surface_normal, float2 lens, uint2 launch_id, uint2 launch_size,
-                  float guide_dist, uint ray_mask, uint ray_env, float cone_width, float cone_spread) {
+                  float guide_dist, uint ray_mask, uint ray_env, float cone_width, float cone_spread,
+                  float t_scale) {
     let tmin = 0.0;
     let tmax = 1.0e6;
     var meter_albedo = 1.0;
@@ -908,7 +973,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         // the accumulated distance. No glass in between => exactly hit_pos.
         float3 cam_origin, cam_dir;
         lensRay(lens, launch_id, launch_size, cam_origin, cam_dir);
-        let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t);
+        let virtual_pos = cam_origin + cam_dir * (guide_dist + payload.t * t_scale);
         let view_pos = mat4MulVecAt(&pc.uniforms.view[0], float4(virtual_pos, 1.0));
         let linear_depth = max(-view_pos.z, 1.0e-4);
         let albedo = clamp(payload.color.rgb, float3(0.0), float3(1.0));
@@ -937,7 +1002,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
         // The end vertex's own frame-to-frame motion, applied to the virtual point
         // (identical to prev_world_pos when no glass was traversed).
         let prev_clip = mat4MulVecAt(&pc.uniforms.prev_view_proj[0],
-                                   float4(virtual_pos - (hit_pos - payload.prev_world_pos), 1.0));
+                                   float4(virtual_pos - (hit_pos - payload.prev_world_pos) * t_scale, 1.0));
         var motion = float2(0.0);
         if (cur_clip.w > 1.0e-4 && prev_clip.w > 1.0e-4) {
             let cur_uv = (cur_clip.xy / cur_clip.w) * float2(0.5, -0.5);
@@ -963,7 +1028,7 @@ float writeGuides(int2 px, HitPayload payload, float3 origin, float3 direction, 
             probe.miss_flags = ray_env << 1;
             probe.cone = float2(cone_width, cone_spread);
             traceReordered(FLAGS_OPAQUE, ray_mask, leaveSurface(hit_pos, surface_normal, mirror, payload.extent), tmin, mirror, tmax, probe);
-            spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t, SPEC_HIT_FAR);
+            spec_hit = probe.t == 0.0 ? SPEC_HIT_FAR : min(probe.t * t_scale, SPEC_HIT_FAR);
         }
         guide_spec_hit[px] = float4(spec_hit, 0.0, 0.0, 0.0);
     }
@@ -1050,6 +1115,9 @@ void primary() {
     rec.state = PRIMARY_RETRACE;
     var recorded = false;
     var glass = 0u;
+    // The volume portal the chain is inside (its table index + 1) and its scale.
+    var vol = 0u;
+    var vol_s = 1.0;
     // The camera chain shares the path's bounce budget (each cutout or portal is a bounce);
     // past the record only the guides follow, a few smooth-glass vertices at most.
     for (uint bounce = 0u; bounce < MAX_BOUNCES + 4u; bounce++) {
@@ -1067,7 +1135,7 @@ void primary() {
         ray.Origin = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
         ray.Direction = direction;
         ray.TMin = tmin;
-        ray.TMax = tmax;
+        ray.TMax = volumeTmax(vol, ray.Origin, direction, tmax);
         // No reorder: camera rays are coherent already (the sort cost a third of the pass).
         HitObject hit = HitObject::TraceRay(topLevelAS, FLAGS_OPAQUE, trace_mask, 0, 0, 0, ray, payload);
         // The hit's identity, written before it is shaded so the hit object dies here: whether
@@ -1099,22 +1167,50 @@ void primary() {
         if (bounce == 0u) {
             primary_t = payload.t;
         }
+        // Out of the big shape with nothing met: back out of the small one.
+        if (vol != 0u && payload.t == 0.0) {
+            if (!guides_written) {
+                guide_dist += ray.TMax / vol_s;
+            }
+            origin = ray.Origin;
+            volumeLeave(vol, ray.TMax, origin, direction, ray_mask, ray_env);
+            cone_width = (cone_width + cone_spread * ray.TMax) / vol_s;
+            vol = 0u;
+            vol_s = 1.0;
+            surf_n = float3(0.0);
+            continue;
+        }
         cone_width += cone_spread * payload.t;
         let surface_normal = oct_to_float32x3(payload.surface_and_world_normal.xy);
         let world_normal = bendTowardViewer(
             oct_to_float32x3(payload.surface_and_world_normal.zw), -direction);
 
         if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
+            let hv = volumeOf(payload.slot);
+            let hit_pos = origin + direction * payload.t;
+            if (hv != 0u && !volumeCut(hv, hit_pos, payload)) {
+                if (!guides_written) {
+                    guide_dist += payload.t / vol_s;
+                }
+                volumeEnter(hv, hit_pos, origin, direction, ray_mask, ray_env, vol_s);
+                cone_width *= vol_s;
+                vol = hv;
+                surf_n = float3(0.0);
+                in_view = false;
+                continue;
+            }
             var p_origin = origin;
             var p_dir = direction;
             if (portalRedirect(payload.slot, origin + direction * payload.t, p_origin, p_dir, ray_mask, ray_env)) {
                 if (!guides_written) {
-                    guide_dist += payload.t;
+                    guide_dist += payload.t / vol_s;
                 }
                 origin = p_origin;
                 surf_n = float3(0.0);
                 direction = p_dir;
                 in_view = false;
+                vol = 0u;
+                vol_s = 1.0;
                 continue;
             }
         }
@@ -1177,10 +1273,10 @@ void primary() {
             guides_written = true;
             meter_albedo = writeGuides(px, payload, origin, direction, world_normal, surface_normal,
                                        lens, launch_id, launch_size, guide_dist, ray_mask, ray_env,
-                                       cone_width, cone_spread);
+                                       cone_width, cone_spread, 1.0 / vol_s);
         }
         if (!guides_written) {
-            guide_dist += t;
+            guide_dist += t / vol_s;
         }
         if (camera_segment && env.fog_steps > 0u && fog_any) {
             cameraFog(env, ray_env, ray_mask, origin, direction, t, mask, in_view, fog_scale, veil,
@@ -2106,6 +2202,10 @@ void main() {
         // hit's extent (HitPayload::extent), how far it must be left.
         var surf_n = float3(0.0);
         var surf_extent = 0.0;
+        // The volume portal the ray is inside until it leaves or scatters (table index + 1), and
+        // its scale.
+        var vol = 0u;
+        var vol_s = 1.0;
         // PATH_CAMERA: still on the camera ray (through cutouts and portals, before any scatter): it skips
         // the camera's primary-hidden layers, which every other ray sees.
         // Neural radiance cache: the path's footprint (the sum of square roots of its spread so far
@@ -2202,11 +2302,22 @@ void main() {
             let start = any(surf_n != float3(0.0)) ? leaveSurface(origin, surf_n, direction, surf_extent) : origin;
             // The recorded hit is rebuilt, not traced: the primary pass already found it.
             let resumed = resume;
+            let seg_max = volumeTmax(vol, start, direction, tmax);
             if (resume) {
                 resume = false;
                 resumeHit(pc.primary_hits[prim_at], payload);
             } else {
-                traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, tmax, payload);
+                traceReordered(FLAGS_OPAQUE, trace_mask, start, tmin, direction, seg_max, payload);
+            }
+            // Out of the big shape with nothing met: back out of the small one.
+            if (vol != 0u && payload.t == 0.0) {
+                origin = start;
+                volumeLeave(vol, seg_max, origin, direction, ray_mask, ray_env);
+                cone_width = (cone_width + cone_spread * seg_max) / vol_s;
+                vol = 0u;
+                vol_s = 1.0;
+                surf_n = float3(0.0);
+                continue;
             }
             cone_width += cone_spread * payload.t;
             // The water this segment ran through (water.slang): it may scatter in the murk before
@@ -2282,6 +2393,27 @@ void main() {
             // teleport, not a scatter: guides stay deferred (the far side writes them at the
             // virtual distance, PSR-style) and the next emissive hit is taken at full weight
             // (NEE cannot sample lights through a portal, so MIS must not discount them).
+            // A volume portal's small shape carries the ray in the same way, or is the cut.
+            if (payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
+                let hv = volumeOf(payload.slot);
+                let hit_pos = origin + direction * payload.t;
+                if (hv != 0u) {
+                    if (volumeCut(hv, hit_pos, payload)) {
+                        if (!resumed) {
+                            path &= ~PATH_PT_SEARCH;
+                        }
+                    } else if (!resumed) {
+                        volumeEnter(hv, hit_pos, origin, direction, ray_mask, ray_env, vol_s);
+                        cone_width *= vol_s;
+                        vol = hv;
+                        surf_n = float3(0.0);
+                        prev_pdf = 0.0;
+                        mis_pdf = 0.0;
+                        path &= ~PATH_PT_SEARCH;
+                        continue;
+                    }
+                }
+            }
             if (!resumed && payload.t != 0.0 && pc.uniforms.portal_count > 0u) {
                 var p_origin = origin;
                 var p_dir = direction;
@@ -2291,6 +2423,8 @@ void main() {
                     direction = p_dir;
                     prev_pdf = 0.0;
                     mis_pdf = 0.0;
+                    vol = 0u;
+                    vol_s = 1.0;
                     path &= ~PATH_PT_SEARCH;
                     continue;
                 }
@@ -2413,6 +2547,8 @@ void main() {
                 path &= ~PATH_PT_SEARCH;
                 continue;
             }
+            vol = 0u;
+            vol_s = 1.0;
             // The footprint: the camera ray's at the primary vertex (d^2 / (4 pi cos)), then each
             // scattered ray's sqrt(d^2 / (pdf cos)) (a delta bounce spreads nothing).
             if (pc.nrc != nullptr) {

@@ -21,11 +21,13 @@
 //!
 //! The entities whose local or parent changed are also avian's `HierarchyMoves`: physics
 //! recomposes only the collider subtrees under them (`PhysicsTransformConfig::hierarchy_moves`).
+//! Physics waits for the first readback ([`transforms_ready`]): until the module is compiled and
+//! the table built, every `GlobalTransform` is its default.
 
 use std::mem::offset_of;
 
 use ash::vk;
-use avian3d::physics_transform::HierarchyMoves;
+use avian3d::{physics_transform::HierarchyMoves, prelude::PhysicsSystems};
 use bevy::{
     ecs::{
         hierarchy::{ChildOf, Children},
@@ -302,6 +304,10 @@ pub struct GpuTransforms {
     readback_point: crate::timeline::SubmitPoint,
     /// A submitted readback the next `First` has to collect.
     readback_pending: bool,
+    /// That submit recorded the readback dispatch (else the buffer holds an older frame's rows).
+    readback_recorded: bool,
+    /// A real readback has reached `GlobalTransform`: the module is up and the table built.
+    ready: bool,
     /// The build `record` just made was a full rebuild (read back every node).
     rebuilt_full: bool,
 }
@@ -338,6 +344,8 @@ impl GpuTransforms {
             readback_cmd: vk::CommandBuffer::null(),
             readback_point: crate::timeline::SubmitPoint::default(),
             readback_pending: false,
+            readback_recorded: false,
+            ready: false,
             rebuilt_full: false,
         }
     }
@@ -746,7 +754,9 @@ impl GpuTransforms {
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
         );
         let changed = self.record(rd, cmd, modules);
+        self.readback_recorded = false;
         if changed && let Some(module) = modules.get(&self.module) {
+            self.readback_recorded = true;
             let params = ReadbackParams {
                 world: self.world_buf.address,
                 frontier: self.frontier_buf.address,
@@ -875,6 +885,12 @@ pub fn world_barrier(rd: &RenderDevice, cmd: vk::CommandBuffer) {
     );
 }
 
+/// Run condition: `GlobalTransform`s hold real world poses (the first readback has landed).
+/// Physics waits on it; until then every `GlobalTransform` is its default.
+pub fn transforms_ready(table: Option<Res<GpuTransforms>>) -> bool {
+    table.is_none_or(|t| t.ready)
+}
+
 /// `First`: last frame's read-back world rows into `GlobalTransform`.
 fn apply_readback(
     rd: Option<Res<RenderDevice>>,
@@ -889,6 +905,10 @@ fn apply_readback(
         return;
     }
     table.wait_readback(&rd);
+    if !table.readback_recorded {
+        return;
+    }
+    table.ready = true;
     let table = &mut *table;
     let total = rd.map_buffer(&mut table.readback_total).as_slice_mut()[0] as usize;
     let mut view = rd.map_buffer(&mut table.readback);
@@ -1044,6 +1064,17 @@ impl Plugin for GpuTransformPlugin {
         app.insert_resource(GpuTransforms::new(module));
         app.add_systems(Last, extract_transforms.in_set(RenderSet::Extract));
         app.add_systems(First, apply_readback);
+        app.configure_sets(
+            FixedPostUpdate,
+            (
+                PhysicsSystems::First,
+                PhysicsSystems::Prepare,
+                PhysicsSystems::StepSimulation,
+                PhysicsSystems::Writeback,
+                PhysicsSystems::Last,
+            )
+                .distributive_run_if(transforms_ready),
+        );
         app.add_systems(TeardownSchedule, cleanup.before(on_shutdown));
     }
 }

@@ -66,6 +66,7 @@ pub struct RenderTexture {
     pub mip_levels: u32,
     pub width: u32,
     pub height: u32,
+    pub format: vk::Format,
 }
 
 /// Records the blits that fill levels 1.. from level 0 and leaves every level in
@@ -298,6 +299,78 @@ impl VulkanAsset for bevy::prelude::Image {
         res
     }
 
+    fn update_in_place(
+        &self,
+        id: AssetId<Self>,
+        prepared: &Self::PreparedAsset,
+        param: &mut bevy::ecs::system::SystemParamItem<Self::ExtractParam>,
+        render_device: &RenderDevice,
+        commands: &mut crate::compute::FrameCommands,
+    ) -> bool {
+        // Only bytes the rebuild would upload as-is; anything converted or skipped rebuilds.
+        let desc = &self.texture_descriptor;
+        let Some(data) = self.data.as_deref() else {
+            return false;
+        };
+        if param.0.contains(&id)
+            || desc
+                .usage
+                .contains(wgpu_types::TextureUsages::RENDER_ATTACHMENT)
+            || desc.size.depth_or_array_layers > 1
+        {
+            return false;
+        }
+        let Some(format) = vk_format_for(desc.format) else {
+            return false;
+        };
+        let (width, height, levels) = (
+            desc.size.width,
+            desc.size.height,
+            desc.mip_level_count.max(1),
+        );
+        let generate = levels == 1 && generates_mips(format);
+        let mip_levels = if generate {
+            32 - width.max(height).max(1).leading_zeros()
+        } else {
+            levels
+        };
+        let level_sizes: Vec<usize> = (0..levels)
+            .map(|level| level_bytes(format, width, height, level))
+            .collect();
+        if format != prepared.format
+            || width != prepared.width
+            || height != prepared.height
+            || mip_levels != prepared.mip_levels
+            || data.len() != level_sizes.iter().sum::<usize>()
+        {
+            return false;
+        }
+        let mut staging = render_device
+            .create_host_buffer::<u8>(data.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC);
+        render_device
+            .map_buffer(&mut staging)
+            .as_slice_mut()
+            .copy_from_slice(data);
+        let image = prepared.image;
+        commands.push_upload(move |rd, cmd| {
+            record_level_upload(
+                rd,
+                cmd,
+                staging.handle,
+                image,
+                width,
+                height,
+                &level_sizes,
+                mip_levels,
+                generate,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            rd.destroyer.destroy_buffer(staging.handle);
+        });
+        true
+    }
+
     fn destroy_asset(render_device: &RenderDevice, prepared_asset: &Self::PreparedAsset) {
         render_device.unregister_bindless_texture(prepared_asset);
         render_device
@@ -504,88 +577,20 @@ pub fn load_texture_levels(
 
     // One submission: the barriers carry explicit transfer stages so the copy is ordered between
     // the two layout transitions inside the command buffer.
-    // Every level the file supplies is written by the copy; a generated chain's levels are
-    // transitioned by `record_mip_chain`.
-    let all_levels = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(mip_levels)
-        .layer_count(1);
-    let copied_levels = if generate { 1 } else { mip_levels };
-    device.run_transfer_commands(|cmd_buffer| unsafe {
-        let to_transfer = vk_init::layout_transition2(
-            image_handle,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )
-        .subresource_range(all_levels.level_count(copied_levels))
-        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-        device.device.cmd_pipeline_barrier2(
-            cmd_buffer,
-            &vk::DependencyInfo::default()
-                .image_memory_barriers(std::slice::from_ref(&to_transfer)),
-        );
-        let mut offset = 0u64;
-        let regions: Vec<vk::BufferImageCopy> = level_sizes
-            .iter()
-            .enumerate()
-            .map(|(level, size)| {
-                let level = level as u32;
-                let region = vk::BufferImageCopy::default()
-                    .buffer_offset(offset)
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(level)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D {
-                        width: (width >> level).max(1),
-                        height: (height >> level).max(1),
-                        depth: 1,
-                    });
-                offset += *size as u64;
-                region
-            })
-            .collect();
-        device.device.cmd_copy_buffer_to_image(
+    device.run_transfer_commands(|cmd_buffer| {
+        record_level_upload(
+            device,
             cmd_buffer,
             staging_buffer.handle,
             image_handle,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &regions,
+            width,
+            height,
+            &level_sizes,
+            mip_levels,
+            generate,
+            vk::ImageLayout::UNDEFINED,
+            desired_layout,
         );
-        if generate {
-            record_mip_chain(
-                device,
-                cmd_buffer,
-                image_handle,
-                width,
-                height,
-                mip_levels,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::UNDEFINED,
-                desired_layout,
-            );
-        } else {
-            let to_shader = vk_init::layout_transition2(
-                image_handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                desired_layout,
-            )
-            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-            .subresource_range(all_levels);
-            device.device.cmd_pipeline_barrier2(
-                cmd_buffer,
-                &vk::DependencyInfo::default()
-                    .image_memory_barriers(std::slice::from_ref(&to_shader)),
-            );
-        }
     });
 
     device.destroyer.destroy_buffer(staging_buffer.handle);
@@ -600,6 +605,119 @@ pub fn load_texture_levels(
         mip_levels,
         width,
         height,
+        format,
+    }
+}
+
+/// Records the copy of tightly packed `level_sizes` from `buffer` into `image`, then the
+/// generated chain when `generate`, leaving every level in `final_layout`. `from` is UNDEFINED
+/// for a fresh image, else the layout the whole image is sampled in (an in-place re-upload).
+#[allow(clippy::too_many_arguments)]
+pub fn record_level_upload(
+    device: &RenderDevice,
+    cmd_buffer: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    level_sizes: &[usize],
+    mip_levels: u32,
+    generate: bool,
+    from: vk::ImageLayout,
+    final_layout: vk::ImageLayout,
+) {
+    let all_levels = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(mip_levels)
+        .layer_count(1);
+    let copied_levels = if generate { 1 } else { mip_levels };
+    let fresh = from == vk::ImageLayout::UNDEFINED;
+    // A fresh image's generated levels are transitioned by `record_mip_chain`; a live one's
+    // readers must finish before any level is overwritten.
+    let (to_transfer, rest_layout) = if fresh {
+        (
+            vk_init::layout_transition2(image, from, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .subresource_range(all_levels.level_count(copied_levels))
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE),
+            vk::ImageLayout::UNDEFINED,
+        )
+    } else {
+        (
+            vk_init::layout_transition2(image, from, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .subresource_range(all_levels)
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::SHADER_READ),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )
+    };
+    let to_transfer = to_transfer
+        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
+    let mut offset = 0u64;
+    let regions: Vec<vk::BufferImageCopy> = level_sizes
+        .iter()
+        .enumerate()
+        .map(|(level, size)| {
+            let level = level as u32;
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(level)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: (width >> level).max(1),
+                    height: (height >> level).max(1),
+                    depth: 1,
+                });
+            offset += *size as u64;
+            region
+        })
+        .collect();
+    unsafe {
+        device.device.cmd_pipeline_barrier2(
+            cmd_buffer,
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&to_transfer)),
+        );
+        device.device.cmd_copy_buffer_to_image(
+            cmd_buffer,
+            buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+    }
+    if generate {
+        record_mip_chain(
+            device,
+            cmd_buffer,
+            image,
+            width,
+            height,
+            mip_levels,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            rest_layout,
+            final_layout,
+        );
+    } else {
+        let to_shader =
+            vk_init::layout_transition2(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, final_layout)
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                .subresource_range(all_levels);
+        unsafe {
+            device.device.cmd_pipeline_barrier2(
+                cmd_buffer,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&to_shader)),
+            );
+        }
     }
 }
 
@@ -794,6 +912,7 @@ fn create_blank(
         mip_levels,
         width,
         height,
+        format,
     }
 }
 
