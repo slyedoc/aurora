@@ -42,6 +42,7 @@ pub mod mesh;
 pub mod nrc;
 pub mod nsight;
 pub mod omm;
+pub mod optics;
 pub mod picking;
 pub mod pipeline_binary;
 pub mod pointer_picking;
