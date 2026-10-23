@@ -324,8 +324,10 @@ impl Plugin for RayRenderPlugin {
 /// window entity is never despawned early, and no frame runs without a [`RenderDevice`].
 /// (Despawning the window instead left it alive but unregistered for a frame, and every cursor
 /// event the compositor still delivered to it logged a bevy_winit "unknown window" warning.)
-/// Messages are peeked, not consumed, so bevy's own exit handling still sees them.
-fn shutdown(world: &mut World) {
+/// Messages are peeked, not consumed, so bevy's own exit handling still sees them. An exit
+/// written later in the frame (a BRP method, in `RemoteLast`) is caught there by the remote
+/// plugin running this again; past that point winit exits without another update.
+pub(crate) fn shutdown(world: &mut World) {
     if !world.contains_resource::<RenderDevice>() {
         return;
     }

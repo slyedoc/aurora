@@ -1,6 +1,6 @@
 //! The running app over the Bevy Remote Protocol (`--features remote`): BRP's own methods (query
 //! entities, read and change any reflected component or resource: `RenderSettings`, a
-//! `WaterMaterial`, a `Transform`) on <http://127.0.0.1:15702>, plus aurora's:
+//! `WaterMaterial`, a `Transform`) on <http://127.0.0.1:15702> (`--brp-port N` for another), plus aurora's:
 //!
 //! - `aurora.camera` `{position, look_at}` or `{position, yaw, pitch}` (degrees) holds the main
 //!   camera there every frame, `{release: true}` lets it go; no params: its pose now.
@@ -35,7 +35,8 @@ use bevy::{
     platform::collections::HashMap,
     prelude::*,
     remote::{
-        BrpError, BrpResult, RemoteMethodSystemId, RemoteMethods, RemotePlugin,
+        BrpError, BrpResult, RemoteLast, RemoteMethodSystemId, RemoteMethods, RemotePlugin,
+        RemoteSystems,
         http::RemoteHttpPlugin,
     },
 };
@@ -68,11 +69,20 @@ pub struct AuroraRemotePlugin {
 }
 
 impl Default for AuroraRemotePlugin {
+    /// `--brp-port N` on the command line, else BRP's default (15702): several apps can serve
+    /// BRP side by side.
     fn default() -> Self {
         Self {
-            port: bevy::remote::http::DEFAULT_PORT,
+            port: port_from_args().unwrap_or(bevy::remote::http::DEFAULT_PORT),
         }
     }
+}
+
+/// `--brp-port N` on the command line.
+pub fn port_from_args() -> Option<u16> {
+    let args: Vec<String> = std::env::args().collect();
+    let at = args.iter().position(|a| a == "--brp-port")?;
+    args.get(at + 1)?.parse().ok()
 }
 
 impl Plugin for AuroraRemotePlugin {
@@ -87,6 +97,11 @@ impl Plugin for AuroraRemotePlugin {
         .init_resource::<KeepAwake>()
         .add_systems(PostUpdate, hold_pose)
         .add_systems(Last, (note_first_trace, drive_jobs, idle).chain())
+        // `aurora.exit` (any method's AppExit) lands after `Last`'s teardown check.
+        .add_systems(
+            RemoteLast,
+            crate::ray_render_plugin::shutdown.after(RemoteSystems::ProcessRequests),
+        )
         .add_remote_method("aurora.camera", camera_method)
         .add_remote_method("aurora.screenshot", screenshot_method)
         .add_remote_method("aurora.capture", capture_method)
