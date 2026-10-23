@@ -867,6 +867,21 @@ impl Skins {
     /// Records a source for a slot: a changed mesh or kind drops the device state, a changed
     /// pose parameter (joints re-resolved, wind amplitude) keeps it.
     fn set_source(&mut self, slot: u32, source: SkinSource) {
+        // A slot freed this frame and already handed to a new entity: the pending removal would
+        // drop the new entity's record (it rendered unskinned, in its rest pose). The record starts
+        // over and the old device state goes as a rebuild instead.
+        if let Some(at) = self.removed.iter().position(|&s| s == slot) {
+            self.removed.swap_remove(at);
+            if let Some(stale) = self.instances.get_mut(&slot) {
+                stale.source = source;
+                stale.joint_nodes.clear();
+                stale.joints_dirty = true;
+                stale.morph_weights.clear();
+                stale.morph_dirty = true;
+                self.rebuild.push(slot);
+                return;
+            }
+        }
         match self.instances.get_mut(&slot) {
             Some(existing) if existing.source == source => {}
             Some(existing) => {

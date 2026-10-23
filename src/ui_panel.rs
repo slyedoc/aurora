@@ -225,7 +225,7 @@ fn build_panels(
         // One face, facing +Z; `Rectangle` already puts v = 0 at the top, the UI target's
         // image convention.
         let mesh = Mesh::from(Rectangle::new(panel.size.x, panel.size.y));
-        commands.entity(entity).insert((
+        let built = (
             AuroraMesh3d(meshes.add(AuroraMesh::from_mesh(&mesh).expect("cuboid has positions"))),
             AuroraMaterial3d(materials.add(AuroraMaterial {
                 base_color: Color::BLACK,
@@ -254,7 +254,18 @@ fn build_panels(
                 camera,
                 target,
             },
-        ));
+        );
+        // The panel can be despawned before this lands (closed the frame it opened): then its
+        // camera and UI root go with it instead of rendering for nobody.
+        commands.queue(move |world: &mut World| match world.get_entity_mut(entity) {
+            Ok(mut panel) => {
+                panel.insert(built);
+            }
+            Err(_) => {
+                world.despawn(camera);
+                world.despawn(root);
+            }
+        });
     }
 }
 
