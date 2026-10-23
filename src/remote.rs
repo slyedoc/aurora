@@ -3,7 +3,8 @@
 //! `WaterMaterial`, a `Transform`) on <http://127.0.0.1:15702> (`--brp-port N` for another), plus aurora's:
 //!
 //! - `aurora.camera` `{position, look_at}` or `{position, yaw, pitch}` (degrees) holds the main
-//!   camera there every frame, `{release: true}` lets it go; no params: its pose now.
+//!   camera there every frame, `{release: true}` lets it go (a camera gizmo marks where it was
+//!   for a while); no params: its pose now.
 //! - `aurora.screenshot` `{path?, settle?, view?, ...pose}`: the presented frame (Ray
 //!   Reconstruction's, tone mapped) to a PNG once `settle` frames have run at the pose; `view`
 //!   shows a debug view for this shot only. A job.
@@ -92,10 +93,11 @@ impl Plugin for AuroraRemotePlugin {
             RemoteHttpPlugin::default().with_port(self.port),
         ))
         .init_resource::<RemotePose>()
+        .init_resource::<LastPose>()
         .init_resource::<RemoteJobs>()
         .init_resource::<FirstTrace>()
         .init_resource::<KeepAwake>()
-        .add_systems(PostUpdate, hold_pose)
+        .add_systems(PostUpdate, (hold_pose, show_last_pose))
         .add_systems(Last, (note_first_trace, drive_jobs, idle).chain())
         // `aurora.exit` (any method's AppExit) lands after `Last`'s teardown check.
         .add_systems(
@@ -177,15 +179,62 @@ fn main_camera(world: &mut World) -> Option<Entity> {
     active.first().copied()
 }
 
-fn hold_pose(pose: Res<RemotePose>, mut cameras: Query<(&Camera, &mut Transform), With<Camera3d>>) {
+/// Where the last held pose was, and when (real seconds): drawn as a camera for a while after.
+#[derive(Resource, Default)]
+struct LastPose(Option<(Transform, f64)>);
+
+/// How long a released pose stays drawn.
+const POSE_SHOWN_SECS: f64 = 30.0;
+
+fn hold_pose(
+    pose: Res<RemotePose>,
+    time: Res<Time<Real>>,
+    mut last: ResMut<LastPose>,
+    mut cameras: Query<(&Camera, &mut Transform), With<Camera3d>>,
+) {
     let Some(pose) = pose.0 else {
         return;
     };
+    last.0 = Some((pose, time.elapsed_secs_f64()));
     if let Some((_, mut transform)) = cameras.iter_mut().find(|(c, _)| c.is_active) {
         if *transform != pose {
             *transform = pose;
         }
     }
+}
+
+/// Once let go, the remote camera's last pose shows where a shot was taken from: a small camera
+/// (body, lens cone, an up mark) in the world.
+fn show_last_pose(
+    pose: Res<RemotePose>,
+    last: Res<LastPose>,
+    time: Res<Time<Real>>,
+    mut gizmos: Gizmos,
+) {
+    let Some((at, when)) = last.0 else {
+        return;
+    };
+    if pose.0.is_some() || time.elapsed_secs_f64() - when > POSE_SHOWN_SECS {
+        return;
+    }
+    let color = Color::srgb(1.0, 0.55, 0.1);
+    let corner = |x: f32, y: f32, z: f32| at.transform_point(Vec3::new(x, y, z));
+    let (w, h, d) = (0.24, 0.15, 0.4);
+    let base = [
+        corner(-w, -h, -d),
+        corner(w, -h, -d),
+        corner(w, h, -d),
+        corner(-w, h, -d),
+    ];
+    for i in 0..4 {
+        gizmos.line(at.translation, base[i], color);
+        gizmos.line(base[i], base[(i + 1) % 4], color);
+    }
+    gizmos.linestrip(
+        [corner(-0.08, h + 0.02, -d), corner(0.0, h + 0.1, -d), corner(0.08, h + 0.02, -d)],
+        color,
+    );
+    gizmos.sphere(Isometry3d::from_translation(at.translation), 0.05, color);
 }
 
 fn vec3(v: &Value) -> Option<Vec3> {

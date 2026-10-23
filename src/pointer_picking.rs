@@ -7,8 +7,9 @@
 //! (picking.rs). `Pickable` is honoured: an entity that is not hoverable is skipped, and one
 //! that blocks lower stops the list.
 //!
-//! Every [`UiPointerSource`] but the window cursor (the mouse is already a `RayMap` pointer)
-//! traces its ray too: an XR laser off the panels hovers and clicks what it points at.
+//! Every [`UiPointerSource`] traces its ray too: its first hit says which world panel it is on
+//! (`drive_ui_pointers`), and off the panels an XR laser hovers and clicks what it points at (the
+//! mouse's world picks come from its `RayMap` pointer).
 //!
 //! Active only when bevy_picking's `PickingPlugin` is in the app.
 
@@ -78,25 +79,38 @@ fn picks(hits: &[RayHit], camera: Entity, pickables: &Query<&Pickable>) -> Vec<(
 #[derive(Component)]
 struct SourceRay;
 
-/// Each pointer source's ray, traced in its own world. Its hits drive the source's pointer
-/// off the panels (`drive_ui_pointers`).
+/// Each pointer source's ray, traced in its own world (the mouse's in what its camera sees). Its
+/// hits say which panel it is on, and drive it off the panels (`drive_ui_pointers`).
 #[allow(clippy::type_complexity)]
 fn aim_source_rays(
     mut commands: Commands,
-    mut sources: Query<
-        (
-            &Transform,
-            Option<&ChildOf>,
-            &UiPointerSource,
-            &mut UiPointerTrack,
-            Option<&InEnvironment>,
-        ),
-        Without<WindowCursorPointer>,
-    >,
+    mut sources: Query<(
+        &Transform,
+        Option<&ChildOf>,
+        &UiPointerSource,
+        &mut UiPointerTrack,
+        Option<&InEnvironment>,
+        Has<WindowCursorPointer>,
+    )>,
     frames: Query<(&Transform, Option<&ChildOf>)>,
+    views: Query<
+        (
+            &Camera,
+            Option<&RenderLayers>,
+            Option<&InEnvironment>,
+            Option<&AuroraPrimaryHidden>,
+        ),
+        With<Camera3d>,
+    >,
     mut casters: Query<&mut RayCaster, With<SourceRay>>,
 ) {
-    for (local, parent, source, mut track, world) in &mut sources {
+    let view_mask = views
+        .iter()
+        .find(|(c, ..)| c.is_active)
+        .map(|(_, layers, world, hidden)| {
+            environment_mask(layers, world) & !hidden.map_or(0, AuroraPrimaryHidden::mask)
+        });
+    for (local, parent, source, mut track, world, cursor) in &mut sources {
         let pose =
             crate::transform::pose_from_ancestors(local, parent.map(ChildOf::parent), &frames);
         let Ok(dir) = Dir3::new(pose.transform_vector3(Vec3::NEG_Z)) else {
@@ -104,7 +118,10 @@ fn aim_source_rays(
         };
         let mut ray = RayCaster::new(Ray3d::new(pose.translation.into(), dir));
         ray.max_distance = source.max_distance;
-        ray.mask = environment_mask(None, world);
+        ray.mask = match cursor {
+            true => view_mask.unwrap_or(0),
+            false => environment_mask(None, world),
+        };
         match track.world.and_then(|e| casters.get_mut(e).ok()) {
             Some(mut caster) => *caster = ray,
             None => {

@@ -1219,11 +1219,16 @@ void primary() {
 
         // Alpha-cutout pass-through, as the path tracer decides it (masked materials only).
         var pass_through = false;
-        if (payload.t != 0.0 && all(payload.emission == float3(0.0)) && hitPayloadGetMasked(payload)) {
-            if (all(payload.color.rgb == float3(0.0))) {
+        if (payload.t != 0.0 && hitPayloadGetMasked(payload)) {
+            // Cut out: gone, glow and all (an unlit panel glows on every texel, its empty ones too).
+            if (payload.color.a <= 0.0) {
                 pass_through = true;
-            } else if (payload.color.a < 1.0) {
-                pass_through = randf() < 1.0 - payload.color.a;
+            } else if (all(payload.emission == float3(0.0))) {
+                if (all(payload.color.rgb == float3(0.0))) {
+                    pass_through = true;
+                } else if (payload.color.a < 1.0) {
+                    pass_through = randf() < 1.0 - payload.color.a;
+                }
             }
         }
         let guide_defer = payload.t != 0.0
@@ -1232,7 +1237,8 @@ void primary() {
             && !hitPayloadGetGuidesHere(payload);
         let t = payload.t;
         let extent = payload.extent;
-        let ends = any(payload.emission != float3(0.0)) || t == 0.0;
+        // A cut-out texel goes on through, whatever it glows.
+        let ends = (any(payload.emission != float3(0.0)) && !pass_through) || t == 0.0;
         let hit_point = origin + direction * t;
         let env = pc.uniforms.environments + ray_env;
         let fog_any = env.fog_density > 0.0 || pc.uniforms.fog_volume_count > 0u;
@@ -2442,12 +2448,17 @@ void main() {
             // smeared foliage whenever something bright sits behind it.
             // (Spelled out as ifs: the coin is only drawn where GLSL's short-circuit draws it.)
             var pass_through = false;
-            if (!resumed && payload.t != 0.0 && all(payload.emission == float3(0.0))
-                && hitPayloadGetMasked(payload)) {
-                if (all(payload.color.rgb == float3(0.0))) {
+            if (!resumed && payload.t != 0.0 && hitPayloadGetMasked(payload)) {
+                // Cut out: gone, glow and all (an unlit panel glows on every texel, its empty
+                // ones too).
+                if (payload.color.a <= 0.0) {
                     pass_through = true;
-                } else if (payload.color.a < 1.0) {
-                    pass_through = randf() < 1.0 - payload.color.a;
+                } else if (all(payload.emission == float3(0.0))) {
+                    if (all(payload.color.rgb == float3(0.0))) {
+                        pass_through = true;
+                    } else if (payload.color.a < 1.0) {
+                        pass_through = randf() < 1.0 - payload.color.a;
+                    }
                 }
             }
 
@@ -2499,8 +2510,8 @@ void main() {
                 continue;
             }
 
-            // hit an emitter
-            if (any(payload.emission != float3(0.0)) || payload.t == 0.0) {
+            // hit an emitter (not a cut-out texel: the ray carries on through it)
+            if ((any(payload.emission != float3(0.0)) && !pass_through) || payload.t == 0.0) {
                 var contribution = mask * payload.emission;
                 // MIS: a BRDF-sampled ray landing on a table light shares credit with the
                 // next-event estimate taken at the last rough vertex (mis_pdf 0 = camera ray or

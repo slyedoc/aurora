@@ -2404,10 +2404,11 @@ fn aim_window_cursor_pointer(
     }
 }
 
-/// `PreUpdate`, before picking processes input: for every [`UiPointerSource`], intersect its
-/// ray with every [`UiSurfacePanel`] plane and drive its picking pointer on the nearest hit
-/// surface. Off-panel the pointer releases anything it held and parks outside the surface,
-/// ending any hover.
+/// `PreUpdate`, before picking processes input: for every [`UiPointerSource`], its traced ray's
+/// first hit (the TLAS's, so walls, other environments and see-through parts count; a frame
+/// old) says which [`UiSurfacePanel`] it is on, and this frame's ray meets that panel's plane
+/// for the spot. Off-panel the pointer releases anything it held and parks outside the
+/// surface, ending any hover.
 fn drive_ui_pointers(
     mut commands: Commands,
     mut sources: Query<(
@@ -2416,6 +2417,8 @@ fn drive_ui_pointers(
         Option<&ChildOf>,
         &mut UiPointerSource,
         &mut UiPointerTrack,
+        Option<&crate::environment::InEnvironment>,
+        Has<WindowCursorPointer>,
     )>,
     frames: Query<(&Transform, Option<&ChildOf>)>,
     panels: Query<(
@@ -2423,9 +2426,20 @@ fn drive_ui_pointers(
         &GlobalTransform,
         &UiSurfacePanel,
         Option<&InheritedVisibility>,
+        Option<&bevy::camera::visibility::RenderLayers>,
+        Option<&crate::environment::InEnvironment>,
     )>,
+    views: Query<
+        (
+            &Camera,
+            Option<&bevy::camera::visibility::RenderLayers>,
+            Option<&crate::environment::InEnvironment>,
+        ),
+        With<Camera3d>,
+    >,
     targets: Res<UiSurfaceTargets>,
     world_hits: Query<&crate::picking::RayHits>,
+    pickables: Query<&bevy::picking::Pickable>,
     cameras: Query<(&Camera, Option<&RenderTarget>, &GlobalTransform), With<Camera3d>>,
     primary: Query<Entity, With<PrimaryWindow>>,
     mut writer: MessageWriter<PointerInput>,
@@ -2436,7 +2450,16 @@ fn drive_ui_pointers(
         PointerButton::Middle,
     ];
 
-    for (entity, local, parent, mut source, mut track) in &mut sources {
+    // The mouse points through the camera's view; any other source from where it stands.
+    let view_mask = views
+        .iter()
+        .find(|(c, ..)| c.is_active)
+        .map(|(_, layers, world)| crate::environment::environment_mask(layers, world));
+    for (entity, local, parent, mut source, mut track, world, cursor) in &mut sources {
+        let mask = match cursor {
+            true => view_mask.unwrap_or(u8::MAX),
+            false => crate::environment::environment_mask(None, world),
+        };
         let id = *track.id.get_or_insert_with(|| {
             let id = PointerId::Custom(Uuid::new_v4());
             commands.entity(entity).insert(id);
@@ -2450,31 +2473,37 @@ fn drive_ui_pointers(
         let dir = ray_tf.transform_vector3(Vec3::NEG_Z).normalize();
 
         let mut best: Option<(UiPointerHit, &UiSurfacePanel)> = None;
-        if source.active {
-            for (panel_entity, panel_tf, panel, visible) in &panels {
-                // A hidden panel is not there to point at.
-                if visible.is_some_and(|v| !v.get()) {
-                    continue;
-                }
-                let inv = panel_tf.affine().inverse();
-                let o = inv.transform_point3(origin);
-                let d = inv.transform_vector3(dir);
-                // Front side only: the source must sit on +Z and the ray must head towards
-                // the plane.
-                if o.z <= 0.0 || d.z >= -1.0e-6 {
-                    continue;
-                }
+        // The first thing the ray hit that takes a pointer, if it is a panel (seen directly,
+        // not through a portal).
+        let first = track
+            .world
+            .and_then(|caster| world_hits.get(caster).ok())
+            .and_then(|hits| {
+                hits.iter()
+                    .find(|hit| pickables.get(hit.entity).map_or(true, |p| p.is_hoverable))
+                    .copied()
+            })
+            .filter(|hit| hit.through.is_none());
+        if source.active
+            && let Some(first) = first
+            && let Ok((panel_entity, panel_tf, panel, visible, layers, panel_world)) =
+                panels.get(first.entity)
+            && !visible.is_some_and(|v| !v.get())
+            && crate::environment::environment_mask(layers, panel_world) & mask != 0
+        {
+            let inv = panel_tf.affine().inverse();
+            let o = inv.transform_point3(origin);
+            let d = inv.transform_vector3(dir);
+            // Front side only: the source must sit on +Z and the ray must head towards the plane.
+            if o.z > 0.0 && d.z < -1.0e-6 {
                 let t = -o.z / d.z;
                 let p = o + d * t;
-                if p.x.abs() > panel.size.x * 0.5 || p.y.abs() > panel.size.y * 0.5 {
-                    continue;
-                }
                 let point = panel_tf.affine().transform_point3(p);
                 let distance = (point - origin).length();
-                if distance > source.max_distance {
-                    continue;
-                }
-                if best.as_ref().is_none_or(|(b, _)| distance < b.distance) {
+                if p.x.abs() <= panel.size.x * 0.5
+                    && p.y.abs() <= panel.size.y * 0.5
+                    && distance <= source.max_distance
+                {
                     // Image convention: v = 0 at the top.
                     let uv = Vec2::new(p.x / panel.size.x + 0.5, 0.5 - p.y / panel.size.y);
                     best = Some((
