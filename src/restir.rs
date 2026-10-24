@@ -73,7 +73,8 @@ struct RestirFrameGpu {
     light_entries: u32,
     /// [`RenderSettings::ab`].
     ab: u32,
-    pad: u32,
+    /// The live environment bits, and the camera's environment (the grid's) at bit 8.
+    environments: u32,
     /// `AuroraDebugView::Restir`'s buffer (after the matrix: it stays 16-byte aligned).
     debug: u64,
 }
@@ -98,6 +99,9 @@ pub struct RestirInput<'a> {
     pub lights: u64,
     pub instances: u64,
     pub light_entries: u32,
+    /// The live environment bits, and the camera's environment at bit 8: the light grid holds
+    /// that environment's lights, every other surface samples its own environment's CDF.
+    pub environments: u32,
     /// `AuroraDebugView::Restir`'s buffer (0 unless shown).
     pub debug: u64,
     pub settings: &'a RenderSettings,
@@ -257,7 +261,7 @@ impl RestirState {
             grid_candidates: GRID_CANDIDATES,
             light_entries: input.light_entries,
             ab: input.settings.ab,
-            pad: 0,
+            environments: input.environments,
             debug: input.debug,
         };
         // Recorded, not written through a mapping: the previous frame may still read it.

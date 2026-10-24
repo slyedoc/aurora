@@ -618,6 +618,6 @@ mod tests {
         assert!(size_of::<super::RainPush>() as u32 <= COMPUTE_PUSH_CONSTANT_SIZE);
         assert_eq!(size_of::<super::GroundPush>(), 56);
         assert_eq!(size_of::<super::RainPush>(), 96);
-        assert_eq!(size_of::<super::RainRows>(), 72);
+        assert_eq!(size_of::<super::RainRows>(), 96);
     }
 }

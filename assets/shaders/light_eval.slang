@@ -28,27 +28,62 @@ public float lightTrianglePdf(LightCtx ctx, LightInstance li, uint tri, float p_
     return p_pick * t * t / (cos_l * 0.5 * area2);
 }
 
-// The pick probability of light-table entry `e` from the power CDF.
+// The environment whose runs hold entry `e`.
+public uint lightsEntryWorld(LightCtx ctx, uint e) {
+    for (uint w = 0u; w < LIGHT_WORLDS; w++) {
+        let lw = ctx.lights.worlds[w];
+        if ((e >= lw.analytic_first && e < lw.analytic_end)
+            || (e >= lw.triangle_first && e < lw.triangle_end)) {
+            return w;
+        }
+    }
+    return 0u;
+}
+
+// The total power of environment `world`'s lights.
+public float lightsWorldPower(LightCtx ctx, uint world) {
+    let lw = ctx.lights.worlds[min(world, LIGHT_WORLDS - 1u)];
+    return lw.analytic_power + lw.triangle_power;
+}
+
+// The pick probability of light-table entry `e` from the power CDF, among its own
+// environment's lights (the only ones a ray there samples).
 public float lightsEntryPick(LightCtx ctx, uint e) {
     var below = 0.0;
     if (e > 0u) {
         below = ctx.lights.cdf[e - 1u];
     }
-    return (ctx.lights.cdf[e] - below) / ctx.lights.total_power;
+    let total = lightsWorldPower(ctx, lightsEntryWorld(ctx, e));
+    return total > 0.0 ? (ctx.lights.cdf[e] - below) / total : 0.0;
 }
 
-// Entry from the power CDF at cumulative value x, and its pick probability. The guide table
-// narrows the search to x's bin: the answer lies between its first entry and the next bin's,
-// widened by one each way for x rounding into a neighbouring bin at a boundary.
-public uint lightsPickEntry(LightCtx ctx, float x, out float p_pick) {
-    let last = ctx.lights.entry_count - 1u;
-    uint lo = 0u, hi = last;
+// An entry of environment `world` by power, u in [0, 1), and its pick probability (0 when the
+// environment has no lights). u maps into the world's analytic run, then its triangle run, as a
+// point of the global CDF; the guide table narrows the search to that point's bin: the answer
+// lies between its first entry and the next bin's, widened by one each way for x rounding into a
+// neighbouring bin at a boundary.
+public uint lightsPickEntry(LightCtx ctx, uint world, float u, out float p_pick) {
+    p_pick = 0.0;
+    let lw = ctx.lights.worlds[min(world, LIGHT_WORLDS - 1u)];
+    let total = lw.analytic_power + lw.triangle_power;
+    if (total <= 0.0) {
+        return 0u;
+    }
+    let t = u * total;
+    let analytic = t < lw.analytic_power && lw.analytic_end > lw.analytic_first;
+    let x = analytic ? lw.analytic_lo + t : lw.triangle_lo + max(t - lw.analytic_power, 0.0);
+    let first = analytic ? lw.analytic_first : lw.triangle_first;
+    let end = analytic ? lw.analytic_end : lw.triangle_end;
+    if (end <= first) {
+        return 0u;
+    }
+    uint lo = first, hi = end - 1u;
     let bins = ctx.lights.guide_bins;
     if (bins > 0u) {
         let j = min(uint(x / ctx.lights.total_power * float(bins)), bins - 1u);
-        lo = ctx.lights.guide[j];
-        lo = lo > 0u ? lo - 1u : 0u;
-        hi = min(max(ctx.lights.guide[j + 1u], lo) + 1u, last);
+        lo = clamp(ctx.lights.guide[j], first, end - 1u);
+        lo = lo > first ? lo - 1u : first;
+        hi = clamp(max(ctx.lights.guide[j + 1u], lo) + 1u, lo, end - 1u);
     }
     while (lo < hi) {
         let mid = (lo + hi) / 2u;
@@ -58,7 +93,8 @@ public uint lightsPickEntry(LightCtx ctx, float x, out float p_pick) {
             hi = mid;
         }
     }
-    p_pick = lightsEntryPick(ctx, lo);
+    let below = lo > 0u ? ctx.lights.cdf[lo - 1u] : 0.0;
+    p_pick = (ctx.lights.cdf[lo] - below) / total;
     return lo;
 }
 

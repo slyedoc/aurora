@@ -138,6 +138,8 @@ pub struct UniformData {
     /// Per environment bit (a byte each), the render layers with something in it: a portal ray
     /// keeps only those ([`EnvironmentSkies::layers_by_environment`](crate::sky::EnvironmentSkies::layers_by_environment)).
     layer_environments: [u32; 2],
+    /// Per instance slot, its tint (`TLAS::instance_tints_address`).
+    instance_tints: u64,
 }
 
 #[repr(C)]
@@ -1096,6 +1098,7 @@ fn render_frame(
             fog_grid_stride: grid.stride,
             ab: settings.ab,
             layer_environments: skies.layers_by_environment(),
+            instance_tints: tlas.instance_tints_address(),
         };
 
         uniform_uploads.push((view.slot, data));
@@ -1518,6 +1521,8 @@ fn render_frame(
                             lights: light_header,
                             instances: tlas.instances,
                             light_entries,
+                            environments: skies.environment_bits as u32
+                                | (skies.view_environment(view.camera_mask as u8) as u32) << 8,
                             debug: if view.debug_view
                                 == crate::debug_view::AuroraDebugView::Restir.shader_index()
                             {
@@ -3216,6 +3221,11 @@ mod tests {
             98 * 4
         );
         assert_eq!(core::mem::offset_of!(super::UniformData, time), 113 * 4);
+        // surface.slang `instanceTint`.
+        assert_eq!(
+            core::mem::offset_of!(super::UniformData, instance_tints),
+            196 * 4
+        );
         assert_eq!(
             core::mem::offset_of!(super::UniformData, water_medium_count),
             187 * 4

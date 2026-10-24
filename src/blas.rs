@@ -130,6 +130,10 @@ pub mod material_flags {
     /// ends there, a dark texel showing (all but) nothing instead of a black gloss that catches
     /// the sun.
     pub const UNLIT: u32 = 4;
+    /// Emission seen but not bounced (`AuroraMaterial::seen_only`).
+    pub const SEEN_ONLY: u32 = 8;
+    /// Base colour and emission times the instance's tint (`AuroraMaterial::instance_tint`).
+    pub const INSTANCE_TINT: u32 = 16;
 }
 
 /// Absorption coefficients from bevy's `attenuation_color` / `attenuation_distance` pair:

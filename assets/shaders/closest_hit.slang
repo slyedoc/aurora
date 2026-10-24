@@ -25,6 +25,11 @@ void main(inout HitPayload payload, BuiltInTriangleIntersectionAttributes attrib
     payload.emission = materialEmissive(material)
         * sampleGrad(material.base_emissive_texture, hit.uv, hit.duv1, hit.duv2).rgb
         * uniformEmissiveBoost();
+    if ((material.flags & MATERIAL_INSTANCE_TINT) != 0u) {
+        let tint = instanceTint();
+        payload.color *= tint;
+        payload.emission *= tint.rgb;
+    }
     // Unlit: an emitter everywhere, its dark texels too, so the path ends here (no gloss).
     if ((material.flags & MATERIAL_UNLIT) != 0u) {
         payload.emission = max(payload.emission, float3(1.0e-6));

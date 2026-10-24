@@ -19,6 +19,8 @@ public struct Instance {
 public struct BlockRows {
     public Instance* rows;
     public Instance* prev;
+    // Per row, the colour a material with `instance_tint` takes (writeTint).
+    public float4* tints;
     public uint count;
     public uint pad;
 };
@@ -54,4 +56,13 @@ public void writePose(BlockRows b, uint i, uint64_t blas, uint sbt_and_flags) {
     }
     b.rows[i].blas = blas;
     b.rows[i].sbt_and_flags = sbt_and_flags;
+}
+
+// Row `i`'s colour: what a material with `instance_tint` multiplies its base colour and emission
+// by.
+public void writeTint(BlockRows b, uint i, float4 tint) {
+    if (i >= b.count) {
+        return;
+    }
+    b.tints[i] = tint;
 }

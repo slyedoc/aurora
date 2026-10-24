@@ -29,8 +29,11 @@ use bevy::light::{PointLight, RectLight, SpotLight};
 use bevy::prelude::*;
 use bytemuck::{Pod, Zeroable};
 
+use bevy::camera::visibility::RenderLayers;
+
 use crate::{
     assets::aurora_asset,
+    environment::{InEnvironment, environment_mask, view_environment},
     compute::{
         ComputeModule, ComputeModules, compute_to_compute_barrier, memory_barrier, record_dispatch,
     },
@@ -63,7 +66,41 @@ struct LightInstGpu {
     pad: u64,
 }
 
-/// Must match `LightsHeader` in lights.slang and rt_types.slang. 80 bytes.
+/// Environments a light table splits into (a world mask's bits).
+const WORLDS: usize = 8;
+
+/// One environment's share of the table (must match `LightWorld` in lights.slang and
+/// rt_types.slang). Entries are sorted by environment, so its analytic lights and its triangles
+/// are each one run; `light_scan` writes where its runs start in the power CDF and their power.
+/// A ray samples only its own environment's lights: another's could never light it, and their
+/// power drowned the lamp beside it (a place over another place's lamps strobed in grid cells).
+/// 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct LightWorldGpu {
+    /// Entry ranges `[first, end)`.
+    analytic: [u32; 2],
+    triangles: [u32; 2],
+    analytic_lo: f32,
+    analytic_power: f32,
+    triangle_lo: f32,
+    triangle_power: f32,
+}
+
+/// The environment a light lights: its own, else its mask's highest bit (as a view's).
+fn light_world(layers: Option<&RenderLayers>, environment: Option<&InEnvironment>) -> u8 {
+    environment.map_or_else(
+        || view_environment(environment_mask(layers, None)),
+        |e| e.0.min(WORLDS as u8 - 1),
+    )
+}
+
+/// An analytic light's environment (`flags` bits 16..18).
+fn analytic_world(light: &AnalyticLightGpu) -> usize {
+    ((light.flags >> 16) & 7) as usize
+}
+
+/// Must match `LightsHeader` in lights.slang and rt_types.slang. 88 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct LightsHeaderGpu {
@@ -88,6 +125,8 @@ struct LightsHeaderGpu {
     /// entry whose cumulative power reaches `j / guide_bins` of the total, so a pick searches
     /// one bin's entries, not the whole CDF.
     guide: u64,
+    /// `WORLDS` [`LightWorldGpu`]s: each environment's runs of entries.
+    worlds: u64,
 }
 
 /// The guide table's bins for `entries` light-table entries.
@@ -117,7 +156,7 @@ struct AnalyticLightGpu {
     half_extents: [f32; 2],
     /// CDF weight, same units as the triangle entries (flux / pi).
     power: f32,
-    /// Bit 0: two-sided (rect).
+    /// Bit 0: two-sided (rect); bits 8..15 its world mask; bits 16..18 its environment.
     flags: u32,
 }
 
@@ -155,6 +194,7 @@ struct LightScanParams {
     powers: u64,
     header: u64,
     guide: u64,
+    worlds: u64,
     entry_count: u32,
     guide_bins: u32,
 }
@@ -165,6 +205,8 @@ struct LightScanParams {
 struct LightSource {
     mesh: AssetId<AuroraMesh>,
     material: AssetId<AuroraMaterial>,
+    /// The environment it lights ([`light_world`]).
+    world: u8,
 }
 
 #[derive(Resource)]
@@ -181,6 +223,7 @@ pub struct LightManager {
     slot_map: Buffer<u32>,
     cdf: Buffer<f32>,
     guide: Buffer<u32>,
+    worlds: Buffer<LightWorldGpu>,
     entry_to_linst: Buffer<u32>,
     /// Per triangle entry, its world triangle, emission, mask and pick probability, resolved
     /// every frame (`light_prepare`): what a light sample reads.
@@ -221,6 +264,7 @@ impl LightManager {
             slot_map: Buffer::default(),
             cdf: Buffer::default(),
             guide: Buffer::default(),
+            worlds: Buffer::default(),
             entry_to_linst: Buffer::default(),
             prepared: Buffer::default(),
             emissions: Buffer::default(),
@@ -250,6 +294,7 @@ impl LightManager {
             self.slot_map.handle,
             self.cdf.handle,
             self.guide.handle,
+            self.worlds.handle,
             self.entry_to_linst.handle,
             self.prepared.handle,
             self.emissions.handle,
@@ -262,6 +307,7 @@ impl LightManager {
         self.slot_map = Buffer::default();
         self.cdf = Buffer::default();
         self.guide = Buffer::default();
+        self.worlds = Buffer::default();
         self.entry_to_linst = Buffer::default();
         self.prepared = Buffer::default();
         self.emissions = Buffer::default();
@@ -387,6 +433,7 @@ impl LightManager {
             powers: self.cdf.address,
             header: self.header.address,
             guide: self.guide.address,
+            worlds: self.worlds.address,
             entry_count: self.entry_count,
             guide_bins: guide_bins(self.entry_count),
         };
@@ -396,7 +443,8 @@ impl LightManager {
             cmd,
             vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_WRITE,
-            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_READ,
         );
         self.needs_power_pass = false;
@@ -415,17 +463,22 @@ fn track_lights(
             &GpuInstance,
             Option<&AuroraMesh3d>,
             Option<&AuroraMaterial3d>,
+            Option<&RenderLayers>,
+            Option<&InEnvironment>,
         ),
         Or<(
             Added<GpuInstance>,
             Changed<AuroraMaterial3d>,
             Changed<AuroraMesh3d>,
+            Changed<InEnvironment>,
         )>,
     >,
     all: Query<(
         &GpuInstance,
         Option<&AuroraMesh3d>,
         Option<&AuroraMaterial3d>,
+        Option<&RenderLayers>,
+        Option<&InEnvironment>,
     )>,
 ) {
     let mut rescan = false;
@@ -439,6 +492,7 @@ fn track_lights(
     let consider = |slot: u32,
                     mesh: Option<&AuroraMesh3d>,
                     material: Option<&AuroraMaterial3d>,
+                    world: u8,
                     sources: &mut HashMap<u32, LightSource>,
                     pending: &mut HashMap<u32, LightSource>,
                     dirty: &mut bool| {
@@ -448,6 +502,7 @@ fn track_lights(
         let source = LightSource {
             mesh: mesh.0.id(),
             material: material.0.id(),
+            world,
         };
         let Some(asset) = materials.get(&material.0) else {
             pending.insert(slot, source);
@@ -455,7 +510,7 @@ fn track_lights(
         };
         let e = asset.emissive;
         let emissive =
-            0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only;
+            0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only && !asset.seen_only;
         pending.remove(&slot);
         if emissive {
             if sources.insert(slot, source) != Some(source) {
@@ -467,22 +522,24 @@ fn track_lights(
     };
 
     if rescan {
-        for (instance, mesh, material) in all.iter() {
+        for (instance, mesh, material, layers, environment) in all.iter() {
             consider(
                 instance.0,
                 mesh,
                 material,
+                light_world(layers, environment),
                 &mut lights.sources,
                 &mut lights.pending,
                 &mut lights.dirty,
             );
         }
     } else {
-        for (instance, mesh, material) in changed.iter() {
+        for (instance, mesh, material, layers, environment) in changed.iter() {
             consider(
                 instance.0,
                 mesh,
                 material,
+                light_world(layers, environment),
                 &mut lights.sources,
                 &mut lights.pending,
                 &mut lights.dirty,
@@ -499,7 +556,7 @@ fn track_lights(
             };
             let e = asset.emissive;
             let emissive =
-                0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only;
+                0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue > 0.0 && !asset.glow_only && !asset.seen_only;
             lights.pending.remove(&slot);
             if emissive {
                 if lights.sources.insert(slot, source) != Some(source) {
@@ -549,11 +606,26 @@ fn prepare_lights(
     let mut entry_base = analytic_count;
     let mut max_slot = 0u32;
     let mut waiting = false;
+    // By environment (each one run of entries, `LightWorldGpu`), then slot.
     let mut slots: Vec<u32> = lights.sources.keys().copied().collect();
-    slots.sort_unstable();
+    slots.sort_unstable_by_key(|slot| (lights.sources[slot].world, *slot));
+    let mut worlds = [LightWorldGpu::default(); WORLDS];
+    let mut start = 0u32;
+    for (w, world) in worlds.iter_mut().enumerate() {
+        let end = start
+            + lights.analytic_cache[start as usize..]
+                .iter()
+                .take_while(|l| analytic_world(l) == w)
+                .count() as u32;
+        world.analytic = [start, end];
+        start = end;
+    }
+    for world in &mut worlds {
+        world.triangles = [u32::MAX, 0];
+    }
     for slot in slots {
         let (blas, geom_emissions): (&crate::blas::BLAS, Vec<[f32; 3]>) = {
-            let LightSource { mesh, material } = lights.sources[&slot];
+            let LightSource { mesh, material, .. } = lights.sources[&slot];
             {
                 let Some(blas) = meshes.get_by_id(mesh) else {
                     waiting = true;
@@ -601,6 +673,9 @@ fn prepare_lights(
         for e in &geom_emissions {
             emissions.extend_from_slice(e);
         }
+        let run = &mut worlds[lights.sources[&slot].world as usize % WORLDS].triangles;
+        run[0] = run[0].min(entry_base);
+        run[1] = entry_base + tri_count;
         linsts.push(LightInstGpu {
             verts: blas.vertex_buffer.address,
             indices: blas.index_buffer.address,
@@ -618,6 +693,11 @@ fn prepare_lights(
     }
     // Stay dirty (and rebuild again next frame) while any BLAS / material is still loading.
     lights.dirty = waiting;
+    for world in &mut worlds {
+        if world.triangles[0] == u32::MAX {
+            world.triangles = [0, 0];
+        }
+    }
 
     lights.destroy_buffers(&render_device);
     lights.epoch = lights.epoch.wrapping_add(1).max(1);
@@ -649,6 +729,7 @@ fn prepare_lights(
     lights.slot_map = render_device.create_device_buffer(slot_map.len() as u64, storage);
     lights.cdf = render_device.create_device_buffer(entry_base as u64, storage);
     lights.guide = render_device.create_device_buffer(guide_bins(entry_base) as u64 + 1, storage);
+    lights.worlds = render_device.create_device_buffer(WORLDS as u64, storage);
     let mut entry_to_linst = vec![0u32; entry_base as usize];
     for (i, li) in linsts.iter().enumerate() {
         let first = li.entry_base as usize;
@@ -679,6 +760,7 @@ fn prepare_lights(
         entry_to_linst: lights.entry_to_linst.address,
         prepared: lights.prepared.address,
         guide: lights.guide.address,
+        worlds: lights.worlds.address,
     };
     render_device.run_transfer_commands_after_frames(|cmd| {
         if !linsts.is_empty() {
@@ -687,6 +769,7 @@ fn prepare_lights(
         upload_slice(&render_device, cmd, &slot_map, &lights.slot_map);
         upload_slice(&render_device, cmd, &entry_to_linst, &lights.entry_to_linst);
         upload_slice(&render_device, cmd, &[header], &lights.header);
+        upload_slice(&render_device, cmd, &worlds, &lights.worlds);
         // Zero (world mask 0: lights nothing) until the first `light_prepare`.
         unsafe {
             render_device
@@ -754,8 +837,8 @@ fn image_mean_emission(image: &Image) -> Option<[f32; 3]> {
 
 /// Extracts bevy's analytic lights (`PointLight` / `SpotLight` / `RectLight`) into the
 /// table. A changed set rebuilds the table (new epoch); mere movement / re-tuning
-/// re-uploads in place so ReSTIR history survives. Entry order is by entity id, stable
-/// across frames.
+/// re-uploads in place so ReSTIR history survives. Entry order is by environment, then entity
+/// id, stable across frames; a light changing environment rebuilds.
 ///
 /// Units: bevy `intensity` is luminous power in lumens; the tracer works in nits.
 /// Point/spot store luminous intensity `I = lm / 4pi` (contribution `I / d^2`), rects the
@@ -774,15 +857,15 @@ fn track_analytic_lights(
     materials: Res<Assets<AuroraMaterial>>,
     nodes: Query<(&Transform, Option<&ChildOf>)>,
     worlds: Query<(
-        Option<&bevy::camera::visibility::RenderLayers>,
-        Option<&crate::environment::InEnvironment>,
+        Option<&RenderLayers>,
+        Option<&InEnvironment>,
     )>,
 ) {
     use std::f32::consts::PI;
     // The worlds a light lights, in `flags` bits 8..15: the raygen skips it for rays elsewhere.
     let world_flags = |entity: Entity| -> u32 {
         let (layers, world) = worlds.get(entity).unwrap_or((None, None));
-        (crate::environment::environment_mask(layers, world) as u32) << 8
+        ((environment_mask(layers, world) as u32) << 8) | ((light_world(layers, world) as u32) << 16)
     };
     // CPU hierarchy propagation is off (mesh transforms propagate on the GPU), so a child
     // light's GlobalTransform never updates: walk the parent chain here instead. Lights
@@ -912,14 +995,20 @@ fn track_analytic_lights(
             },
         ));
     }
-    found.sort_by_key(|(entity, ..)| *entity);
+    // By environment (each one run of entries, `LightWorldGpu`), then entity id.
+    found.sort_by_key(|(entity, _, l)| (analytic_world(l), *entity));
     let slots: Vec<u32> = found.iter().map(|(_, slot, _)| *slot).collect();
     let found: Vec<AnalyticLightGpu> = found.into_iter().map(|(.., l)| l).collect();
     if found != lights.analytic_cache || slots != lights.analytic_slots {
         for l in &found {
             log::debug!("analytic light: {l:?}");
         }
-        if slots != lights.analytic_slots {
+        let regrouped = found.len() != lights.analytic_cache.len()
+            || found
+                .iter()
+                .zip(&lights.analytic_cache)
+                .any(|(a, b)| analytic_world(a) != analytic_world(b));
+        if slots != lights.analytic_slots || regrouped {
             // The entry layout or the slot map shifts: full rebuild, reservoirs dropped
             // via the epoch.
             lights.dirty = true;

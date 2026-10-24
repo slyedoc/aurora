@@ -764,7 +764,11 @@ float3 fogTableLight(EnvironmentGpu* env, uint ray_mask, float3 x, float3 d, ino
     var ldist = 0.0;
     for (uint c = 0u; c < M; c++) {
         float p_pick;
-        let e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
+        let e = lightsPickEntry(lightCtx(), environmentOf(ray_mask, pc.uniforms.environment_bits),
+                                randf(), p_pick);
+        if (p_pick <= 0.0) {
+            continue;
+        }
         let su = randf();
         let sv = randf();
         float p_area, pdf_solid, cdist;
@@ -2439,6 +2443,12 @@ void main() {
                 }
             }
 
+            // A seen-only emitter reached by a rough bounce: a light carries its light, so the ray
+            // finds a plain surface (camera rays and mirror chains, mis_pdf 0, see it glow).
+            if (payload.t != 0.0 && mis_pdf > 0.0 && hitPayloadGetSeenOnly(payload)) {
+                payload.emission = float3(0.0);
+            }
+
             // Alpha-cutout pass-through (stochastic alpha at the edge texels of a masked material,
             // pure-black texels used as masks) applies to MASKED materials only: an opaque
             // material's texture alpha is data (WoW keeps gloss there) and its black texels are
@@ -2782,7 +2792,8 @@ void main() {
                     // estimator.
                     let M = bounce_idx == 0u ? LIGHT_CANDIDATES : max(1u, LIGHT_CANDIDATES / 4u);
                     let grid = pc.restir_frame;
-                    let cell = grid != nullptr ? gridCell(grid, origin) : 0xFFFFFFFFu;
+                    // The grid holds the camera's environment's lights.
+                    let on_grid = grid != nullptr && ray_env == gridWorld(grid);
                     var wsum = 0.0;
                     // The kept candidate's value over its target (one value fewer live through
                     // the loop, the raygen's register peak).
@@ -2794,6 +2805,9 @@ void main() {
                         uint e;
                         // The candidate's source pdf over its CDF pick probability.
                         var src_ratio = 1.0;
+                        let cell = on_grid
+                            ? gridCell(grid, origin, float3(randf(), randf(), randf()) - 0.5)
+                            : 0xFFFFFFFFu;
                         if (cell != 0xFFFFFFFFu) {
                             let k = min(uint(randf() * float(grid.grid_k)), grid.grid_k - 1u);
                             let gs = grid.grid[cell * grid.grid_k + k];
@@ -2808,7 +2822,10 @@ void main() {
                             }
                             src_ratio = 1.0 / (W * p_pick);
                         } else {
-                            e = lightsPickEntry(lightCtx(), randf() * pc.lights.total_power, p_pick);
+                            e = lightsPickEntry(lightCtx(), ray_env, randf(), p_pick);
+                            if (p_pick <= 0.0) {
+                                continue;
+                            }
                         }
                         let su = randf();
                         let sv = randf();

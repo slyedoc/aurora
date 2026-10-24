@@ -30,6 +30,32 @@ struct Instance {
     uint64_t blas;
 };
 
+// Must match LightWorldGpu in lights.rs (and rt_types.slang's): one environment's runs of
+// entries [first, end) and, written by `light_scan`, their start in the CDF and their power.
+struct LightWorld {
+    uint analytic_first;
+    uint analytic_end;
+    uint triangle_first;
+    uint triangle_end;
+    float analytic_lo;
+    float analytic_power;
+    float triangle_lo;
+    float triangle_power;
+};
+static const uint LIGHT_WORLDS = 8;
+
+// The environment whose runs hold entry `e`.
+uint entryWorld(LightWorld* worlds, uint e) {
+    for (uint w = 0; w < LIGHT_WORLDS; w++) {
+        let lw = worlds[w];
+        if ((e >= lw.analytic_first && e < lw.analytic_end)
+            || (e >= lw.triangle_first && e < lw.triangle_end)) {
+            return w;
+        }
+    }
+    return 0;
+}
+
 // Must match LightsHeaderGpu in lights.rs.
 struct LightsHeader {
     uint entry_count;
@@ -45,6 +71,7 @@ struct LightsHeader {
     uint64_t entry_to_linst;
     uint64_t prepared;
     uint64_t guide;
+    LightWorld* worlds;
 };
 
 // Must match AnalyticLightGpu in lights.rs. 80 bytes; the
@@ -165,8 +192,10 @@ void light_prepare(uint3 gid: SV_DispatchThreadID) {
     float3 w0, w1, w2, emission;
     uint mask;
     resolveTriangle(p.linsts[p.entry_to_linst[e]], p.instances, e, w0, w1, w2, emission, mask);
+    // Picked among its own environment's lights only (light_eval.slang `lightsPickEntry`).
     let below = e > 0 ? p.cdf[e - 1] : 0.0;
-    let total = p.header[0].total_power;
+    let lw = p.header[0].worlds[entryWorld(p.header[0].worlds, e)];
+    let total = lw.analytic_power + lw.triangle_power;
     let p_pick = total > 0.0 ? (p.cdf[e] - below) / total : 0.0;
     let r = p.prepared + e * 4;
     r[0] = float4(w0, asfloat(mask));
@@ -179,6 +208,7 @@ struct LightScanParams {
     float* powers;
     LightsHeader* header;
     uint* guide;
+    LightWorld* worlds;
     uint entry_count;
     uint guide_bins;
 };
@@ -210,4 +240,17 @@ void light_scan(uint3 gid: SV_DispatchThreadID) {
         p.guide[j] = i;
     }
     p.guide[p.guide_bins] = p.entry_count - 1;
+    // Each environment's runs: where they start in the CDF, and their power.
+    for (uint w = 0; w < LIGHT_WORLDS; w++) {
+        var lw = p.worlds[w];
+        let a0 = lw.analytic_first > 0 ? p.powers[lw.analytic_first - 1] : 0.0;
+        let a1 = lw.analytic_end > lw.analytic_first ? p.powers[lw.analytic_end - 1] : a0;
+        let t0 = lw.triangle_first > 0 ? p.powers[lw.triangle_first - 1] : 0.0;
+        let t1 = lw.triangle_end > lw.triangle_first ? p.powers[lw.triangle_end - 1] : t0;
+        lw.analytic_lo = a0;
+        lw.analytic_power = a1 - a0;
+        lw.triangle_lo = t0;
+        lw.triangle_power = t1 - t0;
+        p.worlds[w] = lw;
+    }
 }

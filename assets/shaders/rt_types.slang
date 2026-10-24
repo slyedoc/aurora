@@ -240,6 +240,9 @@ public struct UniformData {
     // Per environment bit (a byte each, low first): the render layers with something in it.
     // A portal ray keeps only those of the exit's environment.
     public uint layer_environments[2];
+    // Per instance slot, its tint (float4): a material with MATERIAL_INSTANCE_TINT multiplies
+    // its base colour and emission by it.
+    public float4* instance_tints;
 };
 
 // The equirectangular mapping of the HDR sky, shared by the miss shader and the environment
@@ -739,6 +742,21 @@ public struct AnalyticLight {
     public uint flags;         // bit 0: two-sided (rect); bits 8..15: the world mask it lights
 };
 
+// One environment's share of the light table (LightWorldGpu in src/lights.rs): its analytic
+// entries and its triangle entries are each one run [first, end); `light_scan` writes where each
+// run starts in the power CDF and its power. A ray samples only its own environment's lights.
+public struct LightWorld {
+    public uint analytic_first;
+    public uint analytic_end;
+    public uint triangle_first;
+    public uint triangle_end;
+    public float analytic_lo;
+    public float analytic_power;
+    public float triangle_lo;
+    public float triangle_power;
+};
+public static const uint LIGHT_WORLDS = 8;
+
 public struct LightsHeader {
     public uint entry_count;
     public uint linst_count;
@@ -761,6 +779,8 @@ public struct LightsHeader {
     // The CDF's guide table, guide_bins + 1 entries (lights.slang `light_scan`): bin j's first
     // entry whose cumulative power reaches j / guide_bins of the total.
     public uint* guide;
+    // LIGHT_WORLDS environments' runs of entries.
+    public LightWorld* worlds;
 };
 
 // Exposure state from the metering (auto_exposure.slang). The raygen applies
@@ -857,7 +877,7 @@ public struct RestirFrame {
     public uint grid_candidates;   // R per grid sample
     public uint light_entries;     // 0 = light NEE off
     public uint ab;                // RenderSettings::ab: 0 the old path under test, 1 the new
-    public uint pad_ab;
+    public uint environments;      // live environment bits | the camera's environment << 8
     // AuroraDebugView::Restir (null unless shown): the gi_debug layout, RESTIR_DBG_* at 3 + 2i.
     public uint* debug;
 };
@@ -874,9 +894,20 @@ public static const uint RESTIR_DBG_FROM_NEIGHBOUR = 32u;
 public static const uint RESTIR_DBG_SHADED = 256u;
 public static const uint RESTIR_DBG_OCCLUDED = 512u;
 
-// The light-grid cell holding `p`, or ~0 outside the grid.
-public uint gridCell(RestirFrame* f, float3 p) {
-    let rel = (p - float3(f.grid_origin_x, f.grid_origin_y, f.grid_origin_z)) / f.grid_cell;
+// The environment the light grid was built for (the camera's).
+public uint gridWorld(RestirFrame* f) {
+    return f.environments >> 8;
+}
+
+// The environment a ReSTIR surface's mask is in.
+public uint restirWorld(RestirFrame* f, uint mask) {
+    return environmentOf(mask, f.environments & 0xFFu);
+}
+
+// The light-grid cell holding `p`, offset by up to `jitter` cells (so cell edges blur rather
+// than one cell's lights ending where the next's begin), or ~0 outside the grid.
+public uint gridCell(RestirFrame* f, float3 p, float3 jitter) {
+    let rel = (p - float3(f.grid_origin_x, f.grid_origin_y, f.grid_origin_z)) / f.grid_cell + jitter;
     let c = int3(floor(rel));
     if (any(c < int3(0)) || c.x >= int(f.grid_x) || c.y >= int(f.grid_y) || c.z >= int(f.grid_z)) {
         return 0xFFFFFFFFu;
@@ -1001,6 +1032,10 @@ public bool hitPayloadGetMasked(HitPayload p) {
 
 public bool hitPayloadGetGuidesHere(HitPayload p) {
     return (p.r_m_t_i & 0x04) != 0;
+}
+
+public bool hitPayloadGetSeenOnly(HitPayload p) {
+    return (p.r_m_t_i & 0x08) != 0;
 }
 
 // Returns +/- 1

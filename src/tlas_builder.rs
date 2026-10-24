@@ -419,6 +419,10 @@ pub struct TLAS {
     /// shaders reproject through its transforms for motion vectors.
     prev_instances_buf: Buffer<u8>,
     instance_node_buf: Buffer<u32>,
+    /// Per slot, a colour (float4) a GPU kernel may write for its block's rows: what a material
+    /// with `instance_tint` multiplies its base colour and emission by (a particle's colour).
+    /// All ones when (re)allocated.
+    tints_buf: Buffer<u8>,
     /// Instance records for the scatter kernel, read in place: one copy per frame in flight.
     staging: Flip<Buffer<InstanceRecord>>,
     rebuild: bool,
@@ -476,6 +480,7 @@ impl TLAS {
             instances_buf: Buffer::default(),
             prev_instances_buf: Buffer::default(),
             instance_node_buf: Buffer::default(),
+            tints_buf: Buffer::default(),
             staging: Flip::default(),
             rebuild: false,
             refittable: false,
@@ -521,6 +526,7 @@ impl TLAS {
         .then(|| BlockRows {
             rows: self.instances_buf.address + block.first as u64 * 64,
             prev: self.prev_instances_buf.address + block.first as u64 * 64,
+            tints: self.tints_buf.address + block.first as u64 * 16,
             count: block.count,
             pad: 0,
         })
@@ -575,6 +581,11 @@ impl TLAS {
     /// `InstanceIndex()` is the packed row, this table its slot.
     pub fn instance_slots_address(&self) -> u64 {
         self.slots_buf.address
+    }
+
+    /// Device address of the per-slot tints (float4 each).
+    pub fn instance_tints_address(&self) -> u64 {
+        self.tints_buf.address
     }
 
     /// Device address of last frame's instance array (0 until the first frame).
@@ -657,6 +668,7 @@ impl TLAS {
         rd.destroyer.destroy_buffer(self.instances_buf.handle);
         rd.destroyer.destroy_buffer(self.prev_instances_buf.handle);
         rd.destroyer.destroy_buffer(self.instance_node_buf.handle);
+        rd.destroyer.destroy_buffer(self.tints_buf.handle);
         for b in [
             self.packed_buf.handle,
             self.slots_buf.handle,
@@ -697,7 +709,10 @@ impl TLAS {
         );
         self.prev_instances_buf = rd.create_device_buffer(self.capacity as u64 * 64, storage);
         self.instance_node_buf = rd.create_device_buffer(self.capacity as u64, storage);
+        self.tints_buf = rd.create_device_buffer(self.capacity as u64 * 16, storage);
         unsafe {
+            rd.device
+                .cmd_fill_buffer(cmd, self.tints_buf.handle, 0, vk::WHOLE_SIZE, 1.0f32.to_bits());
             rd.device
                 .cmd_fill_buffer(cmd, self.instances_buf.handle, 0, vk::WHOLE_SIZE, 0);
             rd.device
@@ -1125,6 +1140,7 @@ impl TLAS {
             self.instances_buf.handle,
             self.prev_instances_buf.handle,
             self.instance_node_buf.handle,
+            self.tints_buf.handle,
             self.packed_buf.handle,
             self.slots_buf.handle,
             self.blocks_buf.handle,

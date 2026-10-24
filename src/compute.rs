@@ -409,6 +409,8 @@ impl<'a> FrameContext<'a> {
 pub struct BlockRows {
     pub rows: u64,
     pub prev: u64,
+    /// The block's per-slot tints (`TLAS::instance_tints_address`).
+    pub tints: u64,
     pub count: u32,
     pub pad: u32,
 }
@@ -573,12 +575,14 @@ mod tests {
             [
                 "public Instance* rows;",
                 "public Instance* prev;",
+                "public float4* tints;",
                 "public uint count;",
                 "public uint pad;"
             ]
         );
         assert_eq!(offset_of!(super::BlockRows, prev), 8);
-        assert_eq!(offset_of!(super::BlockRows, count), 16);
-        assert_eq!(size_of::<super::BlockRows>(), 24);
+        assert_eq!(offset_of!(super::BlockRows, tints), 16);
+        assert_eq!(offset_of!(super::BlockRows, count), 24);
+        assert_eq!(size_of::<super::BlockRows>(), 32);
     }
 }

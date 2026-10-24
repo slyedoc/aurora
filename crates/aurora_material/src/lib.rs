@@ -133,6 +133,15 @@ pub struct AuroraMaterial {
     /// surface (chalk, a screen's text) whose emissive texture is mostly empty, where sampling
     /// the whole quad as a light would mostly land on nothing.
     pub glow_only: bool,
+    /// Its emission is seen (by the camera and through mirrors) but adds nothing after a rough
+    /// bounce: a light carries its light (a flame's particles beside the flame's point light).
+    /// A diffuse ray that reaches it sees a plain surface, so the light is not counted twice
+    /// and the small, bright emitter does not sparkle across every surface that finds it by
+    /// chance.
+    pub seen_only: bool,
+    /// Multiply base colour and emission by the instance's tint, which a GPU kernel writes for
+    /// its block's rows (instance_rows.slang `writeTint`): one material, a colour per particle.
+    pub instance_tint: bool,
     /// Whether distance fog applies. Aurora has no fog pass -- atmosphere and participating
     /// media are the physical equivalents -- so this is round-trip only.
     pub fog_enabled: bool,
@@ -178,6 +187,8 @@ impl Default for AuroraMaterial {
             flip_normal_map_y: false,
             unlit: false,
             glow_only: false,
+            seen_only: false,
+            instance_tint: false,
             fog_enabled: true,
             depth_bias: 0.0,
             parallax_depth_scale: 0.1,

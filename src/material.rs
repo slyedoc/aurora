@@ -62,7 +62,9 @@ impl RTXMaterial {
             diffuse_transmission: material.diffuse_transmission.clamp(0.0, 1.0),
             clearcoat: material.clearcoat.clamp(0.0, 1.0),
             clearcoat_roughness: material.clearcoat_perceptual_roughness.clamp(0.0, 1.0),
-            flags: if material.unlit { material_flags::UNLIT } else { 0 },
+            flags: if material.unlit { material_flags::UNLIT } else { 0 }
+                | if material.seen_only { material_flags::SEEN_ONLY } else { 0 }
+                | if material.instance_tint { material_flags::INSTANCE_TINT } else { 0 },
             uv_scroll: material.uv_scroll.to_array(),
         }
     }

@@ -64,6 +64,11 @@ void closesthit(inout HitPayload payload, SphereAttributes attribs) {
     payload.absorption = float3(0.0);
     payload.color = materialBaseColor(material);
     payload.emission = materialEmissive(material) * uniformEmissiveBoost();
+    if ((material.flags & MATERIAL_INSTANCE_TINT) != 0u) {
+        let tint = instanceTint();
+        payload.color *= tint;
+        payload.emission *= tint.rgb;
+    }
     payload.refract_index = material.refract_index;
     payload.surface_and_world_normal = packNormals(surface_normal, surface_normal);
     payload.slot = 0xFFFFFFFFu;
@@ -79,4 +84,5 @@ void closesthit(inout HitPayload payload, SphereAttributes attribs) {
     hitPayloadSetMetallic(payload, material.metallic_factor);
     hitPayloadSetInside(payload, inside);
     hitPayloadSetMasked(payload, false);
+    hitPayloadSetSeenOnly(payload, (material.flags & MATERIAL_SEEN_ONLY) != 0u);
 }

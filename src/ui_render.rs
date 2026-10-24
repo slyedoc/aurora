@@ -2583,9 +2583,10 @@ fn drive_ui_pointers(
             None => {
                 source.hit = None;
                 // Off every panel but on something the tracer draws: point at it like a mouse
-                // over the camera's view, so world picking sees moves, presses and releases.
-                let on_world = source
-                    .active
+                // over the camera's view, so world picking sees moves, presses and releases. Not
+                // the window cursor: the mouse's own pointer picks the world (a second would click
+                // everything twice).
+                let on_world = (source.active && !cursor)
                     .then(|| track.world.and_then(|e| world_hits.get(e).ok()))
                     .flatten()
                     .and_then(|hits| hits.first().copied())

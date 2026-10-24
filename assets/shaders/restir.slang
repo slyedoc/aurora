@@ -72,7 +72,10 @@ void restir_grid(uint3 gid: SV_DispatchThreadID) {
         return;
     }
     let ctx = ctxOf(f);
-    if (f.light_entries == 0u || ctx.lights.total_power <= 0.0) {
+    // The grid serves the camera's environment: its surfaces are the ones near the camera.
+    let world = gridWorld(f);
+    let world_power = lightsWorldPower(ctx, world);
+    if (f.light_entries == 0u || ctx.lights.total_power <= 0.0 || world_power <= 0.0) {
         f.grid[idx] = uint2(NO_ENTRY, 0u);
         return;
     }
@@ -90,13 +93,13 @@ void restir_grid(uint3 gid: SV_DispatchThreadID) {
     let R = max(f.grid_candidates, 1u);
     for (uint r = 0u; r < R; r++) {
         float p_pick;
-        let e = lightsPickEntry(ctx, randf() * ctx.lights.total_power, p_pick);
+        let e = lightsPickEntry(ctx, world, randf(), p_pick);
         if (p_pick <= 0.0) {
             continue;
         }
         let d = f.positions[e].xyz - centre;
         // power / d^2; the CDF picked by power, so the weight target / p is total / d^2.
-        let target = p_pick * ctx.lights.total_power / max(dot(d, d), floor_d2);
+        let target = p_pick * world_power / max(dot(d, d), floor_d2);
         let w = target / p_pick;
         wsum += w;
         if (randf() * wsum < w) {
@@ -152,8 +155,10 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     let px = uint2(idx % f.width, idx / f.width);
     initRandom(uint2(f.width, f.height), px, f.frame * 7u + 2u);
 
-    // Initial candidates: from the pixel's grid cell, else the global CDF.
-    let cell = gridCell(f, s.position);
+    // Initial candidates: from a grid cell about the pixel (the camera's environment only),
+    // else its environment's power CDF.
+    let world = restirWorld(f, restirRayMask(s));
+    let on_grid = world == gridWorld(f);
     let N = max(f.candidates, 1u);
     var sel_y = NO_ENTRY;
     var sel_uv = 0u;
@@ -163,6 +168,8 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
     for (uint c = 0u; c < N; c++) {
         uint e;
         float p_src; // the candidate light's selection probability
+        let cell = on_grid ? gridCell(f, s.position, float3(randf(), randf(), randf()) - 0.5)
+                           : NO_ENTRY;
         if (cell != NO_ENTRY) {
             let k = min(uint(randf() * float(f.grid_k)), f.grid_k - 1u);
             let gs = f.grid[cell * f.grid_k + k];
@@ -173,7 +180,10 @@ void restir_temporal(uint3 gid: SV_DispatchThreadID) {
             e = gs.x;
             p_src = 1.0 / W;
         } else {
-            e = lightsPickEntry(ctx, randf() * ctx.lights.total_power, p_src);
+            e = lightsPickEntry(ctx, world, randf(), p_src);
+            if (p_src <= 0.0) {
+                continue;
+            }
         }
         let uv_pk = packHalf2(float2(randf(), randf()));
         float p_area_cdf, p_cdf;

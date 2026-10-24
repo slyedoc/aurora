@@ -46,6 +46,8 @@ public struct Material {
 public static const uint MATERIAL_WATER = 1u;
 public static const uint MATERIAL_NO_SHADOW = 2u;
 public static const uint MATERIAL_UNLIT = 4u;
+public static const uint MATERIAL_SEEN_ONLY = 8u;
+public static const uint MATERIAL_INSTANCE_TINT = 16u;
 
 // `Triangle` in blas.rs (32 bytes).
 public struct Triangle {
@@ -60,6 +62,7 @@ public struct Triangle {
 static const uint UNIFORM_LOD_BIAS_FLOAT = 94;
 static const uint UNIFORM_EMISSIVE_BOOST_FLOAT = 103;
 static const uint UNIFORM_CLOCK_FLOAT = 113;
+static const uint UNIFORM_INSTANCE_TINTS_FLOAT = 196;
 
 // `PushConstants` in rt_types.slang, up to the last field a hit shader reads.
 public struct PushConstants {
@@ -180,6 +183,11 @@ public void hitPayloadSetMasked(inout HitPayload p, bool m) {
 // between what lies under and what it reflects pixel by pixel, which the guides must not follow).
 public void hitPayloadSetGuidesHere(inout HitPayload p, bool g) {
     p.r_m_t_i = (p.r_m_t_i & ~0x04) | (g ? 0x04 : 0);
+}
+
+// Its emission is seen but not bounced (MATERIAL_SEEN_ONLY).
+public void hitPayloadSetSeenOnly(inout HitPayload p, bool s) {
+    p.r_m_t_i = (p.r_m_t_i & ~0x08) | (s ? 0x08 : 0);
 }
 
 float2 signNotZero(float2 v) {
@@ -360,6 +368,14 @@ public uint instanceSlot() {
     return pc.instance_slots[InstanceIndex()];
 }
 
+// This hit's instance tint (MATERIAL_INSTANCE_TINT): `UniformData::instance_tints`, a pointer
+// stored as two floats' bits.
+public float4 instanceTint() {
+    let addr = (uint64_t(asuint(pc.uniforms[UNIFORM_INSTANCE_TINTS_FLOAT + 1])) << 32)
+        | uint64_t(asuint(pc.uniforms[UNIFORM_INSTANCE_TINTS_FLOAT]));
+    return ((float4*)addr)[instanceSlot()];
+}
+
 // Where an object-space point of this instance was last frame. A zero row is a slot with no
 // last frame (new, reused, grown, or a scatter cell that just entered): no object motion.
 public float3 prevWorldPos(float3 object_p) {
@@ -397,6 +413,7 @@ public void surfaceWritePayload(inout HitPayload payload, SurfaceHit hit, float3
     }
     payload.prev_world_pos = prevWorldPos(object_p);
     hitPayloadSetInside(payload, hit.inside);
+    hitPayloadSetSeenOnly(payload, (hit.material.flags & MATERIAL_SEEN_ONLY) != 0u);
     payload.lobes = packLobes(hit.material.diffuse_transmission, hit.material.clearcoat,
                               hit.material.clearcoat_roughness);
 }
