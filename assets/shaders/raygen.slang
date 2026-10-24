@@ -2742,6 +2742,12 @@ void main() {
             // The strategies below share one shadow ray: each proposes its unshadowed
             // contribution, one is picked by brightness and scaled by 1 / its pick probability.
             ShadowPick pick = {};
+            // The suns' own shadow ray: in the shared pick their unshadowed light outweighs a
+            // lamp's thousands of times over, so a room under the sun spent its one ray on the
+            // roof and the lamp it had found went dark that frame. ReSTIR PT's reconnection
+            // vertex keeps one ray (its sample carries a single light direction).
+            ShadowPick sun_pick = {};
+            let own_sun_ray = !(GI_ON && bounce_idx == pt_k_bounce);
             var restir_shadow = false;
             if (pc.uniforms.light_entries > 0u && pc.lights.total_power > 0.0) {
                 if (RESTIR_ON && resumed) {
@@ -2856,8 +2862,9 @@ void main() {
                 }
             }
 
-            // Next-event estimation for the world's suns (its DirectionalLights, src/sky.rs): one
-            // shadow ray per sun towards a uniformly sampled point on its disc. Direct sunlight is
+            // Next-event estimation for the world's suns (its DirectionalLights, src/sky.rs): a
+            // shadow ray of their own (one sun picked among them) towards a uniformly sampled
+            // point on its disc. Direct sunlight is
             // the dominant, low-variance term, so it is not firefly-clamped; BRDF-sampled rays that
             // reach a disc afterwards return the sky only (`want_sun` false), so nothing is counted
             // twice.
@@ -2889,7 +2896,11 @@ void main() {
                         // opaque-forced: the any-hit shader lets it through alpha-masked cutouts.
                         let solid_angle = 2.0 * PI * (1.0 - sun.direction.w);
                         let c = mask * f * sun_radiance * solid_angle;
-                        pick.propose(c, l, tmax);
+                        if (own_sun_ray) {
+                            sun_pick.propose(c, l, tmax);
+                        } else {
+                            pick.propose(c, l, tmax);
+                        }
                     }
                 }
             }
@@ -2900,7 +2911,9 @@ void main() {
             if (RESTIR_ON && restir_shadow && pick.first && all(nee == float3(0.0))) {
                 pc.reservoirs_cur[prim_at].W = 0.0;
             }
-            acc += nee;
+            acc += nee
+                + sun_pick.resolve(ray_mask, origin, surface_normal, surf_extent, water,
+                                   hitPayloadWater(payload));
             if (GI_ON && bounce_idx == pt_k_bounce) {
                 pt_nee = nee;
                 pt_nee_dir = pick.direction;
