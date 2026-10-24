@@ -17,6 +17,11 @@ use bevy::{
     prelude::*,
 };
 
+use crate::{
+    material::{AuroraMaterial, AuroraMaterial3d},
+    mesh::{AuroraMesh, AuroraMesh3d},
+};
+
 /// Ordinary crown glass.
 pub const CROWN_GLASS_IOR: f32 = 1.52;
 
@@ -343,6 +348,77 @@ impl Telescope {
         mesh.merge(&Cuboid::new(width, 2.0 * radius, width).mesh().build())
             .expect("cuboids share their attributes");
         Some(mesh)
+    }
+}
+
+/// The barrel [`spawn_telescope`] put round a scope, along its Z: the outer radius over the
+/// objective, where the barrel starts (its front, -Z) and ends (its back), and where the
+/// eyecup ends (past the eye point).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TelescopeBarrel {
+    pub outer: f32,
+    pub front: f32,
+    pub back: f32,
+    pub cup_end: f32,
+}
+
+/// Builds `scope` under `parent`, along the parent's Z and looking down -Z: its two lenses in
+/// glass, a barrel of `barrel` (a wide tube over the objective with a dew shield, closed round a
+/// narrow one over the eyepiece, matte inside so off-axis rays die there), an eyecup out past
+/// the eye point, and a crosshair at a Keplerian's focal plane.
+pub fn spawn_telescope(
+    commands: &mut Commands,
+    meshes: &mut Assets<AuroraMesh>,
+    materials: &mut Assets<AuroraMaterial>,
+    parent: Entity,
+    scope: &Telescope,
+    barrel: &Handle<AuroraMaterial>,
+) -> TelescopeBarrel {
+    let mut part = |mesh: Mesh, material: &Handle<AuroraMaterial>, z: f32| {
+        commands.spawn((
+            ChildOf(parent),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_shape(mesh))),
+            AuroraMaterial3d(material.clone()),
+            Transform::from_xyz(0.0, 0.0, z),
+        ));
+    };
+    let glass = materials.add(AuroraMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.0,
+        ior: scope.ior,
+        specular_transmission: 1.0,
+        ..default()
+    });
+    part(scope.objective.mesh(), &glass, scope.objective_z);
+    part(scope.eyepiece.mesh(), &glass, scope.eyepiece_z);
+
+    let (a1, a2) = (scope.objective.aperture, scope.eyepiece.aperture);
+    let wall = 0.003;
+    let (wide, narrow) = (a1 + 0.001, a2 + 0.001);
+    let front = scope.objective_z - 1.75 * a1;
+    let back = scope.eyepiece_z - 2.25 * a2;
+    let eyepiece_end = scope.eyepiece_z + 2.0 * a2;
+    let cup_end = eyepiece_end.max(scope.eye_z) + 0.035;
+    for (inner, outer, z0, z1) in [
+        (wide, wide + wall, front, back),
+        (narrow, narrow + wall, back - 0.01, eyepiece_end),
+        (narrow + wall, wide + wall, back - 0.004, back),
+        (narrow + wall, narrow + 2.0 * wall, eyepiece_end, cup_end),
+    ] {
+        part(tube_mesh(inner, outer, z1 - z0), barrel, (z0 + z1) / 2.0);
+    }
+    if let Some(z) = scope.focal_plane_z {
+        // The barrel's bore there: the narrow tube's once it has started.
+        let bore = if z < back - 0.01 { wide } else { narrow };
+        if let Some(crosshair) = scope.crosshair_mesh(bore, 0.0002) {
+            part(crosshair, barrel, z);
+        }
+    }
+    TelescopeBarrel {
+        outer: wide + wall,
+        front,
+        back,
+        cup_end,
     }
 }
 

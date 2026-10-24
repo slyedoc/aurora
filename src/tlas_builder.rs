@@ -439,6 +439,9 @@ pub struct TLAS {
     /// read two frames later (finished by then) to size the next build.
     live_readback: [Buffer<u32>; 2],
     built_rows: [u32; 2],
+    /// Whether that pack was a refit's (its copy then also holds the live count now and the
+    /// packed rows gone dead).
+    built_refit: [bool; 2],
     pack_parity: usize,
     warned_module: bool,
     /// Instance blocks by first slot: their length and pose meshes.
@@ -485,6 +488,7 @@ impl TLAS {
             total_buf: Buffer::default(),
             live_readback: Default::default(),
             built_rows: [0; 2],
+            built_refit: [false; 2],
             pack_parity: 0,
             warned_module: false,
             blocks: HashMap::new(),
@@ -668,11 +672,11 @@ impl TLAS {
         );
         self.slots_buf = rd.create_device_buffer(self.capacity as u64, storage);
         self.blocks_buf = rd.create_device_buffer(self.capacity.div_ceil(64) as u64, storage);
-        self.total_buf = rd.create_device_buffer(1, storage | vk::BufferUsageFlags::TRANSFER_SRC);
+        self.total_buf = rd.create_device_buffer(3, storage | vk::BufferUsageFlags::TRANSFER_SRC);
         for readback in &mut self.live_readback {
             if readback.handle == vk::Buffer::null() {
                 *readback = rd.create_buffer(
-                    1,
+                    3,
                     vk::BufferUsageFlags::TRANSFER_DST,
                     gpu_allocator::MemoryLocation::GpuToCpu,
                 );
@@ -684,6 +688,7 @@ impl TLAS {
                 .cmd_fill_buffer(cmd, self.packed_buf.handle, 0, vk::WHOLE_SIZE, 0);
         }
         self.built_rows = [0; 2];
+        self.built_refit = [false; 2];
         self.instances_buf = rd.create_device_buffer(
             self.capacity as u64 * 64,
             storage
@@ -874,21 +879,21 @@ impl TLAS {
         self.build(rd, cmd, module, !structural && allow_refit);
     }
 
-    /// Packs the live rows (instances.slang `live_count`, `live_scan`, `live_write`) and
-    /// returns how many packed rows this build reads: the live count of two frames ago with
-    /// headroom (the core indirect build that could read this frame's count on the GPU is not
-    /// exposed by NVIDIA). A build whose live count reached its size may have dropped the last
-    /// slots: the next one reads every row, and the sizing settles again.
-    fn pack(
-        &mut self,
-        rd: &RenderDevice,
-        cmd: vk::CommandBuffer,
-        module: &CompiledComputeModule,
-    ) -> u32 {
+    /// How many packed rows this build reads: the live count of two frames ago with headroom
+    /// (the core indirect build that could read this frame's count on the GPU is not exposed by
+    /// NVIDIA). A build whose live count reached its size may have dropped the last slots: the
+    /// next one reads every row, and the sizing settles again. Also whether a refit read back
+    /// since found the live set moved (a refit then would turn instances on or off).
+    fn size_rows(&mut self, rd: &RenderDevice) -> (u32, bool) {
         // This parity's copy was written by the pack before last: finished by now.
         self.pack_parity ^= 1;
         let parity = self.pack_parity;
-        let live = rd.map_buffer(&mut self.live_readback[parity])[0];
+        let words = rd.map_buffer(&mut self.live_readback[parity]);
+        let (live, stale) = if self.built_refit[parity] {
+            (words[1], words[2] != 0 || words[1] != words[0])
+        } else {
+            (words[0], false)
+        };
         let read_rows = self.built_rows[parity];
         let rows = if read_rows == 0 || live >= read_rows {
             self.count
@@ -898,7 +903,22 @@ impl TLAS {
                 .min(self.count)
         };
         self.built_rows[parity] = rows;
+        (rows, stale)
+    }
 
+    /// Packs the live rows into the build's `rows` (instances.slang `live_count`, `live_scan`,
+    /// `live_write`). A refit keeps the source build's rows instead and re-reads each from its
+    /// slot (`live_total`, `live_refresh`).
+    fn pack(
+        &mut self,
+        rd: &RenderDevice,
+        cmd: vk::CommandBuffer,
+        module: &CompiledComputeModule,
+        rows: u32,
+        refit: bool,
+    ) {
+        let parity = self.pack_parity;
+        self.built_refit[parity] = refit;
         let blocks = self.count.div_ceil(64);
         let params = LiveParams {
             instances: self.instances_buf.address,
@@ -924,9 +944,15 @@ impl TLAS {
         };
         record_dispatch(rd, cmd, module, "live_count", &params, blocks * 64, base);
         compute_barrier();
-        record_dispatch(rd, cmd, module, "live_scan", &params, 64, None);
-        compute_barrier();
-        record_dispatch(rd, cmd, module, "live_write", &params, blocks * 64, base);
+        if refit {
+            record_dispatch(rd, cmd, module, "live_total", &params, 64, None);
+            compute_barrier();
+            record_dispatch(rd, cmd, module, "live_refresh", &params, rows, base);
+        } else {
+            record_dispatch(rd, cmd, module, "live_scan", &params, 64, None);
+            compute_barrier();
+            record_dispatch(rd, cmd, module, "live_write", &params, blocks * 64, base);
+        }
         memory_barrier(
             rd,
             cmd,
@@ -939,7 +965,7 @@ impl TLAS {
             vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ,
         );
         unsafe {
-            let copy = vk::BufferCopy::default().size(4);
+            let copy = vk::BufferCopy::default().size(12);
             rd.device.cmd_copy_buffer(
                 cmd,
                 self.total_buf.handle,
@@ -947,7 +973,6 @@ impl TLAS {
                 std::slice::from_ref(&copy),
             );
         }
-        rows
     }
 
     fn build(
@@ -1031,10 +1056,16 @@ impl TLAS {
                 rd.create_device_buffer(scratch_size, vk::BufferUsageFlags::STORAGE_BUFFER);
         }
 
-        let rows = self.pack(rd, cmd, module);
+        let (rows, stale) = self.size_rows(rd);
+        if stale {
+            log::debug!("TLAS: the live instances moved under a refit; rebuilding");
+        }
         // A refit keeps the source build's rows: same count, same order (no row scattered).
-        let refit =
-            refit && self.refittable && rows == self.refit_rows && self.refits < REFIT_FRAMES;
+        let refit = refit
+            && !stale
+            && self.refittable
+            && rows == self.refit_rows
+            && self.refits < REFIT_FRAMES;
         if refit {
             self.refits += 1;
         } else {
@@ -1042,6 +1073,7 @@ impl TLAS {
             self.refit_rows = rows;
             self.refittable = true;
         }
+        self.pack(rd, cmd, module, rows, refit);
         let handle = self.acceleration_structure.handle;
         let build_geometry = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
@@ -1313,6 +1345,12 @@ pub fn prepare_instances(
                 tlas.dirty.push(slot as u32);
             }
         }
+        // A block's pose meshes too: kernels write their BLAS addresses into rows every frame.
+        for (first, (_, poses)) in &tlas.blocks {
+            if poses.iter().any(|p| p.untyped() == id) {
+                tlas.dirty.push(*first);
+            }
+        }
     }
     // The micromap toggle lives in the instance flags: flipping it re-resolves every slot.
     let omm = settings.as_ref().is_none_or(|d| d.omm);
@@ -1506,6 +1544,8 @@ impl Plugin for TLASBuilderPlugin {
                 "live_count",
                 "live_scan",
                 "live_write",
+                "live_total",
+                "live_refresh",
             ],
         ));
 

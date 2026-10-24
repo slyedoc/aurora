@@ -211,3 +211,51 @@ void live_write(uint3 gid: SV_DispatchThreadID, uint3 lid: SV_GroupThreadID) {
         p.packed[slot].blas = 0;
     }
 }
+
+// A refit may not turn an instance active or inactive, nor move one to another row: it keeps
+// the source build's packing. `live_total` counts the live slots now (total[1]), `live_refresh`
+// re-reads each packed row from its slot and counts rows whose slot is no longer live
+// (total[2]); the CPU rebuilds once either says the live set moved.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void live_total(uint3 lid: SV_GroupThreadID) {
+    let p = live_params;
+    let run = (p.block_count + 63u) / 64u;
+    let first = lid.x * run;
+    var sum = 0u;
+    for (uint b = first; b < min(first + run, p.block_count); b++) {
+        sum += p.blocks[b];
+    }
+    scan_sums[lid.x] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (lid.x == 0u) {
+        var total = 0u;
+        for (uint t = 0u; t < 64u; t++) {
+            total += scan_sums[t];
+        }
+        p.total[1] = total;
+        p.total[2] = 0u;
+    }
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void live_refresh(uint3 gid: SV_DispatchThreadID) {
+    let p = live_params;
+    let row = p.base + gid.x;
+    if (row >= p.build_count || row >= p.total[0]) {
+        return;
+    }
+    let r = p.instances[p.slots[row]];
+    if (!slotLive(r)) {
+        InterlockedAdd(p.total[2], 1u);
+    }
+    // A slot whose BLAS went away is scattered, and a scatter rebuilds: never seen here.
+    if (r.blas != 0) {
+        p.packed[row] = r;
+    } else {
+        p.packed[row].t0 = float4(0.0);
+        p.packed[row].t1 = float4(0.0);
+        p.packed[row].t2 = float4(0.0);
+    }
+}

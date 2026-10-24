@@ -27,7 +27,7 @@ use bevy_aurora::{
     environment::Environment,
     material::{AuroraMaterial, AuroraMaterial3d},
     mesh::{AuroraMesh, AuroraMesh3d},
-    optics::{Telescope, TelescopeKind, tube_mesh},
+    optics::{Telescope, TelescopeKind, spawn_telescope},
     sky::Sky,
     ui_panel::{UiPanel3d, UiPanel3dRoot},
     util::{
@@ -127,6 +127,28 @@ fn setup(
         })
         .collect();
 
+    let mut cups = Vec::new();
+    for &(root, scope) in &roots {
+        let barrel = spawn_telescope(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            root,
+            scope,
+            &black,
+        );
+        let foot = AXIS_Y - barrel.outer;
+        commands.spawn((
+            ChildOf(root),
+            AuroraMesh3d(meshes.add(AuroraMesh::from_shape(
+                Cuboid::new(0.02, foot, 0.02).mesh().build(),
+            ))),
+            AuroraMaterial3d(black.clone()),
+            Transform::from_xyz(0.0, foot / 2.0 - AXIS_Y, (barrel.front + barrel.back) / 2.0),
+        ));
+        cups.push((root, scope, barrel.cup_end));
+    }
+
     let mut part =
         |parent: Entity, mesh: Mesh, material: &Handle<AuroraMaterial>, at: Transform| {
             commands.spawn((
@@ -136,59 +158,6 @@ fn setup(
                 at,
             ));
         };
-    let mut cups = Vec::new();
-    for &(root, scope) in &roots {
-        let at = |z: f32| Transform::from_xyz(0.0, 0.0, z);
-        let glass = materials.add(AuroraMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.0,
-            ior: scope.ior,
-            specular_transmission: 1.0,
-            ..default()
-        });
-        part(root, scope.objective.mesh(), &glass, at(scope.objective_z));
-        part(root, scope.eyepiece.mesh(), &glass, at(scope.eyepiece_z));
-
-        // Barrel: a wide tube over the objective (a dew shield in front of it), closed at its
-        // back round a narrow one over the eyepiece; matte inside, so off-axis rays die there.
-        // Then an eyecup out past the eye point.
-        let (a1, a2) = (scope.objective.aperture, scope.eyepiece.aperture);
-        let wall = 0.003;
-        let (wide, narrow) = (a1 + 0.001, a2 + 0.001);
-        let front = scope.objective_z - 1.75 * a1;
-        let back = scope.eyepiece_z - 2.25 * a2;
-        let eyepiece_end = scope.eyepiece_z + 2.0 * a2;
-        let cup_end = eyepiece_end.max(scope.eye_z) + 0.035;
-        for (inner, outer, z0, z1) in [
-            (wide, wide + wall, front, back),
-            (narrow, narrow + wall, back - 0.01, eyepiece_end),
-            (narrow + wall, wide + wall, back - 0.004, back),
-            (narrow + wall, narrow + 2.0 * wall, eyepiece_end, cup_end),
-        ] {
-            part(
-                root,
-                tube_mesh(inner, outer, z1 - z0),
-                &black,
-                at((z0 + z1) / 2.0),
-            );
-        }
-        // A crosshair where the objective's image forms (Keplerians only), sharp on the target.
-        if let Some(z) = scope.focal_plane_z {
-            // The barrel's bore there: the narrow tube's once it has started.
-            let bore = if z < back - 0.01 { wide } else { narrow };
-            if let Some(crosshair) = scope.crosshair_mesh(bore, 0.0002) {
-                part(root, crosshair, &black, at(z));
-            }
-        }
-        let foot = AXIS_Y - wide - wall;
-        part(
-            root,
-            Cuboid::new(0.02, foot, 0.02).mesh().build(),
-            &black,
-            Transform::from_xyz(0.0, foot / 2.0 - AXIS_Y, (front + back) / 2.0),
-        );
-        cups.push((root, scope, cup_end));
-    }
 
     // The target: rings sized so the naked eye barely makes them out at 10 m, a checker patch
     // at their upper right inside every scope's field.
