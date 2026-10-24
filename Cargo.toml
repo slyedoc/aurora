@@ -109,6 +109,9 @@ bevy_animation_graph = { git = "https://github.com/slyedoc/bevy_animation_graph"
 # Audio playback (Firewheel), in place of bevy_audio: every aurora app gets it, so a scene that
 # names a sound (a landscape's footsteps) loads anywhere.
 bevy_seedling = { git = "https://github.com/slyedoc/bevy_seedling", branch = "bevy-main" }
+# GPU particles (particles.rs): Hanabi's effect graph, compiled to Slang kernels whose output is
+# TLAS instance rows (slyedoc fork, `aurora` branch: render-free, the wgpu back end gone).
+bevy_hanabi = { git = "https://github.com/slyedoc/bevy_hanabi", branch = "aurora" }
 aurora_material = { path = "crates/aurora_material" }
 # Pure type definitions (`TextureFormat` for `Image::convert`); the version bevy_image resolves to.
 wgpu-types = { version = "30", default-features = false }

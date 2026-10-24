@@ -69,6 +69,7 @@ pub mod shader;
 pub mod skinning;
 pub mod sky;
 pub mod sky_gen;
+pub mod particles;
 pub mod sphere;
 pub mod surface_group;
 pub mod swapchain;
@@ -164,6 +165,7 @@ impl PluginGroup for AuroraDefaultPlugins {
         group = group.add(crate::fog_volume::FogVolumePlugin);
         group = group.add(crate::water::WaterVolumePlugin);
         group = group.add(crate::weather::WeatherPlugin);
+        group = group.add(crate::particles::ParticlesPlugin);
         // `--headless [WxH]`: no window; the frames run on and the camera renders into a
         // WxH image (util/headless.rs, default 1280x720), which screenshots read back.
         let headless = crate::util::headless::headless_size();
